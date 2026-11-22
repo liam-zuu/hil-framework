@@ -1,0 +1,5 @@
+loai,wheel,target,log_seq,pwm_prev,t_esp_us,t_pi_us,moc_t0,bat_dinh_ms,k_first,duty_first,k_vao_dai,t_vao_dai_ms,vao_dai,n_lien_vao_dai,n_khong_bc,cat,cens_ms,cmd_level_ms
+lenh,fl,0,1950,2,40959708,88920423732.036,udp_envelope,2.28228,8181,0.020051,8199,18.498389,True,2892,0,,,
+lenh,fr,0,1950,1,40959708,88920423732.036,udp_envelope,2.28228,8181,0.01999,8189,8.499501,True,2902,0,,,
+lenh,rl,0,1950,1,40959708,88920423732.036,udp_envelope,2.28228,8181,0.021973,8189,8.499501,True,2902,0,,,
+lenh,rr,0,1950,2,40959708,88920423732.036,udp_envelope,2.28228,8181,0.02646,8189,8.499501,True,2902,0,,,

@@ -1,0 +1,389 @@
+{
+ "v": 0.5,
+ "T": 12.194446940209833,
+ "T_r": 1.4573462691476244,
+ "T_cmd": 13.651793209357457,
+ "t_deadline": 15.651793209357457,
+ "t_end": 15.476310720258603,
+ "completed": "true",
+ "status": "ok",
+ "track_err_frames": 0,
+ "n_upper_frames": 0,
+ "n_back_frames": 0,
+ "t_first_track_err": null,
+ "t_progress": 12.962310720258602,
+ "cond2_5_ever": true,
+ "e_perp_max": 0.02907158712286203,
+ "e_perp_max_cens": 0.02907158712286203,
+ "e_perp_global_max": 0.02907158712286203,
+ "e_perp_max_le_D": true,
+ "e_theta_lane_max_deg": 18.527907167906736,
+ "e_theta_cmd_max_deg": 11.183186287287082,
+ "e_s_absmax": 0.03508475909085755,
+ "ds_absmax": 0.03527423307317279,
+ "ds_max": 0.016256048144313993,
+ "ds_min": -0.03527423307317279,
+ "e_trk_max": 0.03599217166799928,
+ "e_perp_rms": 0.011174136344391296,
+ "e_trk_rms": 0.020895632764510463,
+ "e_meas_perp_max": null,
+ "e_meas_note": "no firmware pose columns",
+ "sat_frac": 1.6153001227628092e-05,
+ "sat_any_frac": 6.461200491051237e-05,
+ "stop_dist_origin": 0.009168260070070378,
+ "stop_x": -0.004100170550414869,
+ "stop_y": -0.00820034110082974,
+ "stop_heading_err_deg": 1.0492263557847892,
+ "s_car_end": 6.097223470104872,
+ "S": 6.097223470104872,
+ "e_bao_max": 0.05338260709863652,
+ "e_bao_phys_max": 0.05338260709863652,
+ "g4_tie_frames": 0,
+ "eval_version": "o1_gate_eval_v2",
+ "task": "O1-F05",
+ "tv_duty_h7_1khz": 5.491963144967659,
+ "pi_period_ppm": -0.19191005429242125,
+ "pi_period_steps": [
+  1021,
+  16497
+ ],
+ "pi_period_n": 15476,
+ "pi_period_note": "",
+ "log_end_t": 16.2913107202586,
+ "log_covers_deadline": true,
+ "gate_v3": {
+  "version": "gate_v3.3",
+  "D": 0.1,
+  "theta_max_deg": 7.5,
+  "v_cmd_max": 0.7286738632469467,
+  "wz_cmd_max": 1.6339625675669192,
+  "u_p": 0.0,
+  "u_psi_deg": 0.0,
+  "u_t": 0.0060782544429104635,
+  "g1": {
+   "q": "true",
+   "state": "dat",
+   "t_deadline": 15.651793209357457,
+   "t_done": [
+    15.476310720258603
+   ],
+   "t1": null,
+   "prog_before_t1": null,
+   "cond25_before_deadline": null
+  },
+  "g2": {
+   "q": 0.02907158712286203,
+   "lo": 0.02907158712286203,
+   "hi": 0.02907158712286203,
+   "n_undef": 0,
+   "n_frames": 15477,
+   "threshold": 0.1,
+   "ratio": 0.29071587122862025,
+   "state": "dat",
+   "u": 0.0,
+   "chung": {
+    "q": 0.02907158712286203,
+    "lo": 0.02907158712286203,
+    "hi": 0.02907158712286203,
+    "n_undef": 0
+   }
+  },
+  "g3": {
+   "q": 0.03599217166799928,
+   "lo": 0.03286380969927612,
+   "hi": 0.03912072682055844,
+   "n_undef": 0,
+   "n_frames": 15477,
+   "threshold": 0.1,
+   "ratio": 0.35992171667999273,
+   "state": "dat",
+   "u": 0.004429065146713485,
+   "chung": {
+    "q": 0.03599217166799928,
+    "lo": 0.03286380969927612,
+    "hi": 0.03912072682055844,
+    "n_undef": 0
+   }
+  },
+  "g4": {
+   "q": 0.05338260709863652,
+   "lo": 0.05338260709863652,
+   "hi": 0.05338260709863652,
+   "n_undef": 0,
+   "n_frames": 15477,
+   "threshold": 0.1,
+   "ratio": 0.5338260709863651,
+   "state": "dat",
+   "u": 0.0,
+   "chung": {
+    "q": 0.05338260709863652,
+    "lo": 0.05338260709863652,
+    "hi": 0.05338260709863652,
+    "n_undef": 0
+   }
+  },
+  "g5": {
+   "q": 11.183186287287082,
+   "lo": 10.614145218129817,
+   "hi": 11.752227356444347,
+   "n_undef": 0,
+   "n_frames": 15477,
+   "threshold": 7.5,
+   "ratio": 1.491091504971611,
+   "state": "khong_dat",
+   "u": 0.5690410691572643,
+   "chung": {
+    "q": 11.183186287287082,
+    "lo": 10.614145218129817,
+    "hi": 11.752227356444347,
+    "n_undef": 0
+   }
+  },
+  "outcome": "khong_dat",
+  "outcome_decide": "khong_dat",
+  "complete": true,
+  "any_certain_fail": true,
+  "decide": [
+   "g1",
+   "g2",
+   "g3",
+   "g4",
+   "g5"
+  ],
+  "conditions": "G1,G2,G3,G4,G5",
+  "max_ratio": 1.491091504971611,
+  "track_err": false,
+  "note": "HIL: t = 0 at the ESP32 run_active edge, plant step 1020.69 (+18.69 ms from the RUN step); U_t = 6.08 ms from the mapping (RS-4)",
+  "u_mode": "khung",
+  "level": null,
+  "gate_file_sha256": null,
+  "report_only": [],
+  "required": [
+   "g1",
+   "g2",
+   "g3",
+   "g4",
+   "g5"
+  ],
+  "g1_fields_note": ""
+ },
+ "frame_log": "f05a_frames.npz",
+ "k0": 1021,
+ "k_run": 1002,
+ "t0_step": 1020.6892797413991,
+ "t0_src": "esp32_run_active_edge",
+ "frames_scored": 16292,
+ "edge_map": {
+  "ok": true,
+  "reason": "",
+  "method": "count_feasible_set_L100_h7_clock_P1_frame_id",
+  "k_run": 1002,
+  "period_s": 0.001,
+  "counts_per_rev": 1320,
+  "omega_min": 0.3,
+  "fw": [
+   {
+    "sha": "5bde4c55bf3a",
+    "dirty": "0",
+    "env": "ladrc"
+   },
+   {
+    "sha": "5bde4c55bf3a",
+    "dirty": "0",
+    "env": "ladrc"
+   },
+   {
+    "sha": "5bde4c55bf3a",
+    "dirty": "0",
+    "env": "ladrc"
+   }
+  ],
+  "esp_pi_ppm": 11.81417718658292,
+  "constants": {
+   "fw_counts_at_tick": [
+    "16702ff0e688",
+    "5bde4c55bf3a"
+   ],
+   "j_read_us": 50.0,
+   "fit_s": 3.0,
+   "tol_int": 2.0,
+   "e_start": 4.0,
+   "retime_max": 2.0,
+   "tol_margin": 1.0,
+   "grid_us": 10.0,
+   "coarse_us": 250.0,
+   "rho_max_ppm": 1000.0,
+   "frame_len": 48,
+   "anchor_gap_max_s": 1.0,
+   "bracket_max_steps": 25.0,
+   "pwm_lag_max_steps": 15.0,
+   "pwm_windows_s": [
+    1.0,
+    2.0,
+    3.0
+   ],
+   "pwm_cost_max": 100.0,
+   "min_corr": 0.8,
+   "unique_ratio": 1.5
+  },
+  "n_edges": 1,
+  "edge_log_seq": 3627,
+  "edge_timestamp_us": 60795595,
+  "h7_apply": {
+   "ok": true,
+   "applied": 3732,
+   "n_not_applied": 0,
+   "range": [
+    882,
+    4614
+   ],
+   "max_gap": 1,
+   "max_anchor_send_gap_s": 0.0010208860000000001,
+   "run_id": "4540e097",
+   "foreign_n": 0,
+   "window_us": {
+    "max": 60.0,
+    "median": 8.0,
+    "pre_max": 634.0
+   }
+  },
+  "count_side": {
+   "n_lines": 319,
+   "n_invalid_lines": 0,
+   "fit_span_s": 3.1811749999999996,
+   "search_us": [
+    20001.2375,
+    520012.1875
+   ],
+   "best_ratio_coarse": 0.31288536760150987,
+   "best_ratio": 0.3108328940728084,
+   "components_us": [
+    [
+     132621.2375,
+     144781.2375
+    ]
+   ],
+   "ok": true,
+   "s_lo": 132621.2375,
+   "s_hi": 144781.2375
+  },
+  "pwm_side": {
+   "fits": {
+    "1.0": {
+     "a": 1024.779999999999,
+     "a_lo": 1024.779999999999,
+     "a_hi": 1024.809999999999,
+     "cost": 7.962685558192352,
+     "corr": [
+      0.9997840343700449,
+      0.9996958916470716,
+      0.9997430930264424,
+      0.999784010038311
+     ],
+     "sign": [
+      -1.0,
+      -1.0,
+      -1.0,
+      -1.0
+     ],
+     "n_frames": 1148,
+     "n_glitch": 0,
+     "t_end_us": 61815158.0,
+     "unique": true,
+     "on_edge": false
+    },
+    "2.0": {
+     "a": 1024.809999999999,
+     "a_lo": 1024.809999999999,
+     "a_hi": 1024.819999999999,
+     "cost": 5.518293004876259,
+     "corr": [
+      0.9998804099220157,
+      0.9997800577787576,
+      0.9998294040579981,
+      0.9998273610451055
+     ],
+     "sign": [
+      -1.0,
+      -1.0,
+      -1.0,
+      -1.0
+     ],
+     "n_frames": 2148,
+     "n_glitch": 0,
+     "t_end_us": 62815177.0,
+     "unique": true,
+     "on_edge": false
+    },
+    "3.0": {
+     "a": 1024.809999999999,
+     "a_lo": 1024.809999999999,
+     "a_hi": 1024.819999999999,
+     "cost": 8.013275422688954,
+     "corr": [
+      0.9999115157185672,
+      0.9995728627685201,
+      0.9997961324123044,
+      0.9998693896893596
+     ],
+     "sign": [
+      -1.0,
+      -1.0,
+      -1.0,
+      -1.0
+     ],
+     "n_frames": 3148,
+     "n_glitch": 0,
+     "t_end_us": 63815169.0,
+     "unique": true,
+     "on_edge": false
+    }
+   },
+   "ok": true,
+   "a_lo": 1024.779999999999,
+   "a_hi": 1024.819999999999,
+   "t_end_us": 63815169.0
+  },
+  "early_step": 1014.6110252984887,
+  "late_step": 1026.7675341843096,
+  "edge_step": 1020.6892797413991,
+  "offset_ms": 18.689279741399105,
+  "edge_h7_time_us": [
+   132621.2375,
+   144781.2375
+  ],
+  "u_t_s": 0.0060782544429104635,
+  "u_t_parts_s": {
+   "half_bracket_steps": 0.0060782544429104635
+  },
+  "esp_log": "f05a.csv"
+ },
+ "start_pose": [
+  0.0,
+  0.0,
+  0.0
+ ],
+ "plant": "MecanumPlant",
+ "plant_src": {
+  "plant_step_py": "e56afd1fa6a7e671ccd828c647daac3e2d4790cb",
+  "params_py": "501e5f5e24defc8ec5e8c2dd45d4ee921596e0fa",
+  "method": "git hash-object"
+ },
+ "imu_noise": {
+  "model": "replay",
+  "rate_hz": 20.0,
+  "seed": 0,
+  "start_row": 5114,
+  "n_rows": 6013,
+  "file": "imu_noise_replay_20hz.csv",
+  "file_sha256": "5a03ed716ad68e34e1bbda23062cc4215500a4ddf10c28624525f659751e7870",
+  "source": "05_DATA/results/IMU_NOISE/2026-11-10_run01_20hz/raw_static.csv",
+  "source_sha256": "dac4b434ea8eae99b3b51f9135e4bf29e3672e28e897c5237845e2a545d92b7c"
+ },
+ "lifecycle_outcome": "completed",
+ "miso_crc_bad": 0,
+ "miso_empty": 0,
+ "b81_15_check": "manifest",
+ "validity": "see tools/s06_frames_decode.py (L50)",
+ "rule": "S05 v3.7 4.6: evaluate_v7, S03 section 4; gate v3.2: o1_gate_eval + o1_gate"
+}

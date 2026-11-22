@@ -30,30 +30,70 @@ def t6_row(duty_to=0.7, leave_ms='', follow_ms='', settled=False, span=50.0):
                 follow_ms=follow_ms, leave_ms=leave_ms, settled=settled)
 
 
+def def_rows3():
+    return [t3_row(delay_us=3000.0, vii='do_duoc', quant_us=100.0),
+            t3_row(delay_us=5000.0),
+            t3_row(delay_us=8000.0, vii='do_duoc', quant_us=200.0),
+            t3_row(vi='het_han'), t3_row(vi='no_data'), t3_row(vi='chua_ghep'),
+            t3_row(vi='khong_dat')]
+
+
+def def_rows6():
+    return [t6_row(duty_to=0.7, leave_ms=4.0, follow_ms=12.0, settled=True),
+            t6_row(duty_to=0.9, leave_ms=6.0, follow_ms=20.0, settled=True),
+            t6_row(duty_to=0.5, settled=False),                       # not settled, no leave
+            t6_row(duty_to=0.0, leave_ms=3.0, follow_ms=8.0, settled=True),   # flat -> rieng
+            t6_row(duty_to=1.0, leave_ms=9.0, settled=False)]        # flat leave, not settled
+
+
+def full_rows3():
+    """Every T3 step measured at (i) and (ii): nothing censored."""
+    return [t3_row(delay_us=3000.0, vii='do_duoc', quant_us=100.0),
+            t3_row(delay_us=5000.0, vii='do_duoc', quant_us=150.0),
+            t3_row(delay_us=8000.0, vii='do_duoc', quant_us=200.0)]
+
+
+def full_rows6():
+    """Every non-flat transition leaves and settles; flat ones are reported apart."""
+    return [t6_row(duty_to=0.7, leave_ms=4.0, follow_ms=12.0, settled=True),
+            t6_row(duty_to=0.9, leave_ms=6.0, follow_ms=20.0, settled=True),
+            t6_row(duty_to=0.0, leave_ms=3.0, follow_ms=8.0, settled=True),
+            t6_row(duty_to=1.0, leave_ms=9.0, settled=False)]
+
+
 def write_inputs(tmp, rows3=None, rows6=None):
     p3 = str(tmp / 'T3_result.csv')
-    t3m.write_rows(p3, rows3 if rows3 is not None else [
-        t3_row(delay_us=3000.0, vii='do_duoc', quant_us=100.0),
-        t3_row(delay_us=5000.0),
-        t3_row(delay_us=8000.0, vii='do_duoc', quant_us=200.0),
-        t3_row(vi='het_han'), t3_row(vi='no_data'), t3_row(vi='chua_ghep'),
-        t3_row(vi='khong_dat')])
+    t3m.write_rows(p3, rows3 if rows3 is not None else def_rows3())
     p6 = str(tmp / 'T6_follow.csv')
-    t6m.write_csv(p6, rows6 if rows6 is not None else [
-        t6_row(duty_to=0.7, leave_ms=4.0, follow_ms=12.0, settled=True),
-        t6_row(duty_to=0.9, leave_ms=6.0, follow_ms=20.0, settled=True),
-        t6_row(duty_to=0.5, settled=False),                       # not settled, no leave
-        t6_row(duty_to=0.0, leave_ms=3.0, follow_ms=8.0, settled=True),   # flat -> rieng
-        t6_row(duty_to=1.0, leave_ms=9.0, settled=False)],        # flat leave, not settled
-        t6m.FOLLOW_COLS)
+    t6m.write_csv(p6, rows6 if rows6 is not None else def_rows6(), t6m.FOLLOW_COLS)
     return p3, p6
 
 
-def write_summaries(tmp, sync='manual', limit=0.0055, u_us=12.3):
+def t3_summary_block(rows3):
+    """`summary` of T3_summary.json as s06_t3_score.score counts it on the same rows."""
+    v = [r['verdict_i'] for r in rows3]
+    d = [r['delay_us'] for r in rows3 if r['verdict_i'] == 'do_duoc']
+    return dict(steps=len(rows3), measured=v.count('do_duoc'), expired=v.count('het_han'),
+                expired_ii=sum(1 for r in rows3 if r['verdict_i'] == 'do_duoc'
+                               and r['verdict_ii'] == 'het_han'),
+                extra_pulse=v.count('khong_dat'), no_data=v.count('no_data'),
+                unsynced=v.count('chua_ghep'), delay_max_us=max(d) if d else None)
+
+
+def write_summaries(tmp, sync='manual', limit=0.0055, u_us=12.3, rows3=None, rows6=None,
+                    run_frames_bad=0, faults=(), qseq=None, t3_extra=None):
+    """Summaries of the SAME capture as write_inputs(rows3, rows6) (C3-16 binding)."""
+    rows3 = rows3 if rows3 is not None else def_rows3()
+    rows6 = rows6 if rows6 is not None else def_rows6()
     t6s = str(tmp / 'T6_summary.json')
-    json.dump({'sync': {'kind': sync}, 'limit': limit}, open(t6s, 'w'))
+    json.dump({'sync': {'kind': sync}, 'limit': limit, 'follow': t6m.follow_summary(rows6),
+               'run_frames_bad': run_frames_bad, 'frame_log_faults': list(faults),
+               'qseq_stream': qseq if qseq is not None else {'ok': True, 'known': True}},
+              open(t6s, 'w'))
     t3s = str(tmp / 'T3_summary.json')
-    json.dump({'u_us': u_us}, open(t3s, 'w'))
+    blk = t3_summary_block(rows3)
+    blk.update(t3_extra or {})
+    json.dump({'u_us': u_us, 'summary': blk}, open(t3s, 'w'))
     return t6s, t3s
 
 
@@ -76,8 +116,15 @@ def test_known_stats(tmp_path, capsys):
     code, last = run_cli(capsys, ['--t3-result', p3, '--t6-follow', p6,
                                   '--t6-summary', t6s, '--t3-summary', t3s,
                                   '--out', str(tmp_path / 'o')])
-    assert code == 0 and last == '#ket_qua,ma=0'
+    # C3-16: 4 of 7 T3 steps not measured and one non-flat T6 transition censored -> not
+    # enough evidence (was 0 before C3-16: the statistics below are still written)
+    assert code == 3 and last == '#ket_qua,ma=3,ly_do=thieu_bang_chung'
     r, summ = read_out(tmp_path / 'o')
+    assert r['tre_vong_chet']['trang_thai'].startswith('thieu')
+    assert '4/7 bac T3' in r['tre_vong_chet']['trang_thai']
+    assert 'khong roi muc cu' in r['t6_leave']['trang_thai']
+    assert 'khong on dinh' in r['t6_follow']['trang_thai']
+    assert r['t6_flat_leave']['trang_thai'] == ''
     # t3_i = [3,5,8]; t3_i_ii = [3.1, 8.2]
     assert int(r['t3_i']['n']) == 3
     assert float(r['t3_i']['median_ms']) == 5.0 and float(r['t3_i']['max_ms']) == 8.0
@@ -108,8 +155,11 @@ def test_known_stats(tmp_path, capsys):
     assert summ['t6_excluded'] == {'not_settled': 2, 'no_leave': 1}
     assert summ['t_mark_span_us_max'] == 50.0
     assert summ['t6'] == {'sync_kind': 'manual', 'limit': 0.0055}
-    assert summ['t3'] == {'u_us': 12.3}
+    assert summ['t3'] == {'u_us': 12.3, 'u_max_us': 250.0}
     assert len(summ['thieu']) == 3                     # chi cac manh co dinh khong do duoc
+    assert summ['t6_cat_khong_phang'] == {'not_settled': 1, 'no_leave': 1}
+    assert 'Descartes' in summ['phuong_phap_tong'] and 'Descartes' in r['tre_vong_chet']['ghi_chu']
+    assert summ['chot']['dau_vao_2ms'] is None
 
 
 def test_io_pair_edges():
@@ -161,7 +211,113 @@ def test_summary_gates(tmp_path):
     t6s, t3s = write_summaries(tmp_path, u_us=None)
     assert tv.main(['--t3-result', p3, '--t6-follow', p6, '--t6-summary', t6s,
                     '--t3-summary', t3s, '--out', str(tmp_path / 'o4')]) == 3
-    # day du manual + 0.0055 + u -> 0
-    t6s, t3s = write_summaries(tmp_path)
+    # day du manual + 0.0055 + u, and (C3-16) nothing censored -> 0
+    r3, r6 = full_rows3(), full_rows6()
+    p3, p6 = write_inputs(tmp_path, r3, r6)
+    t6s, t3s = write_summaries(tmp_path, rows3=r3, rows6=r6)
     assert tv.main(['--t3-result', p3, '--t6-follow', p6, '--t6-summary', t6s,
                     '--t3-summary', t3s, '--out', str(tmp_path / 'o5')]) == 0
+
+
+# ---- C3-16: evidence for the statistic, CSV bound to its summary ----
+
+def _run(tmp_path, capsys, r3, r6, out, extra=(), **kw):
+    p3, p6 = write_inputs(tmp_path, r3, r6)
+    t6s, t3s = write_summaries(tmp_path, rows3=r3, rows6=r6, **kw)
+    code, last = run_cli(capsys, ['--t3-result', p3, '--t6-follow', p6, '--t6-summary', t6s,
+                                  '--t3-summary', t3s, '--out', str(tmp_path / out)]
+                         + list(extra))
+    return code, last
+
+
+def test_c3_16_codex_counterexample(tmp_path, capsys):
+    """Codex C3-16: one pair for tre_vong_chet, 99 of 100 T3 steps expired, u_us = 251,
+    tre_vong_tren without a sample: the old draft returned 0."""
+    r3 = [t3_row(delay_us=3000.0)] + [t3_row(vi='het_han') for _ in range(99)]
+    r6 = [t6_row(duty_to=0.7, leave_ms=4.0, settled=False)]
+    code, last = _run(tmp_path, capsys, r3, r6, 'o', u_us=251.0)
+    assert code == 3 and last == '#ket_qua,ma=3,ly_do=thieu_bang_chung'
+    r, summ = read_out(tmp_path / 'o')
+    assert int(r['tre_vong_chet']['n']) == 1                       # still reported
+    s1 = r['tre_vong_chet']['trang_thai']
+    assert s1.startswith('thieu') and '99/100 bac T3' in s1 and 'u_us 251 > 250' in s1
+    assert int(r['tre_vong_tren']['n']) == 0
+    assert 'khong co mau' in r['tre_vong_tren']['trang_thai']
+    assert summ['trang_thai']['tre_vong_chet'] == s1
+    # the same with the statistic chosen: still not an input of the >= 2 ms condition
+    code, _ = _run(tmp_path, capsys, r3, r6, 'o2', extra=['--chot', 'tre_vong_chet:median'],
+                   u_us=251.0)
+    assert code == 3
+    _, summ = read_out(tmp_path / 'o2')
+    assert summ['chot']['gia_tri_ms'] == 7.0 and summ['chot']['dau_vao_2ms'] is None
+
+
+def test_c3_16_u_boundary(tmp_path, capsys):
+    r3, r6 = full_rows3(), full_rows6()
+    for i, (u, want) in enumerate([(250.0, 0), (250.0 + 5e-10, 0), (250.001, 3),
+                                   (float('nan'), 3)]):
+        code, _ = _run(tmp_path, capsys, r3, r6, f'o{i}', u_us=u)
+        assert code == want, (u, code)
+    r, summ = read_out(tmp_path / 'o0')
+    assert r['tre_vong_chet']['trang_thai'] == 'du' == r['tre_vong_tren']['trang_thai']
+    assert float(r['tre_vong_chet']['bat_dinh_ms']) == pytest.approx((250.0 + 50.0) / 1000)
+    assert summ['bat_dinh_tong_ms'] == pytest.approx(0.3)
+
+
+def test_c3_16_t6_evidence_gates(tmp_path, capsys):
+    r3, r6 = full_rows3(), full_rows6()
+    for i, kw in enumerate([dict(run_frames_bad=1), dict(run_frames_bad=None),
+                            dict(faults=['mat frame']), dict(qseq={'ok': True, 'known': False}),
+                            dict(sync='udp_envelope'), dict(limit=0.006)]):
+        code, _ = _run(tmp_path, capsys, r3, r6, f'o{i}', **kw)
+        assert code == 3, kw
+        r, _ = read_out(tmp_path / f'o{i}')
+        assert r['t6_leave']['trang_thai'].startswith('thieu') and \
+            r['t3_i']['trang_thai'] == 'du', kw
+
+
+def test_c3_16_binding_mismatch(tmp_path, capsys):
+    r3, r6 = full_rows3(), full_rows6()
+    p3, p6 = write_inputs(tmp_path, r3, r6)
+    cases = [dict(t3_extra={'steps': 4}), dict(t3_extra={'expired': 1}),
+             dict(t3_extra={'delay_max_us': 8000.5}),
+             dict(rows6=r6[:1] + r6[2:]),                 # T6 summary of another capture
+             dict(rows3=r3 + [t3_row(vi='het_han')])]     # T3 summary of another capture
+    for i, kw in enumerate(cases):
+        t6s, t3s = write_summaries(tmp_path, **{'rows3': r3, 'rows6': r6, **kw})
+        assert tv.main(['--t3-result', p3, '--t6-follow', p6, '--t6-summary', t6s,
+                        '--t3-summary', t3s, '--out', str(tmp_path / f'o{i}')]) == 2, kw
+    # delay_max_us within the 3-decimal rounding of the CSV still binds
+    t6s, t3s = write_summaries(tmp_path, rows3=r3, rows6=r6,
+                               t3_extra={'delay_max_us': 8000.0004})
+    assert tv.main(['--t3-result', p3, '--t6-follow', p6, '--t6-summary', t6s,
+                    '--t3-summary', t3s, '--out', str(tmp_path / 'ok')]) == 0
+    # summaries without the blocks to bind to -> input error
+    t3s = str(tmp_path / 'bare3.json')
+    json.dump({'u_us': 12.3}, open(t3s, 'w'))
+    assert tv.main(['--t3-result', p3, '--t6-follow', p6, '--t3-summary', t3s,
+                    '--out', str(tmp_path / 'b3')]) == 2
+    t6s = str(tmp_path / 'bare6.json')
+    json.dump({'sync': {'kind': 'manual'}, 'limit': 0.0055}, open(t6s, 'w'))
+    assert tv.main(['--t3-result', p3, '--t6-follow', p6, '--t6-summary', t6s,
+                    '--out', str(tmp_path / 'b6')]) == 2
+
+
+def test_c3_16_chot(tmp_path, capsys):
+    """S1 complete, S2 censored (one non-flat transition never settles)."""
+    r3 = full_rows3()
+    r6 = full_rows6() + [t6_row(duty_to=0.5, leave_ms=5.0, settled=False)]
+    code, _ = _run(tmp_path, capsys, r3, r6, 'o1', extra=['--chot', 'tre_vong_chet:p95'])
+    assert code == 0
+    r, summ = read_out(tmp_path / 'o1')
+    assert r['tre_vong_chet']['trang_thai'] == 'du'
+    assert summ['chot']['dau_vao_2ms'] == float(r['tre_vong_chet']['p95_ms'])
+    code, _ = _run(tmp_path, capsys, r3, r6, 'o2', extra=['--chot', 'tre_vong_tren:max'])
+    assert code == 3
+    _, summ = read_out(tmp_path / 'o2')
+    assert summ['chot']['dau_vao_2ms'] is None and summ['chot']['trang_thai'].startswith('thieu')
+    code, _ = _run(tmp_path, capsys, r3, r6, 'o3')            # not chosen: both sums needed
+    assert code == 3
+    for bad in ('tre_vong_chet', 'tre_vong_chet:mean', 'S1:p95'):
+        code, _ = _run(tmp_path, capsys, r3, r6, 'o4', extra=['--chot', bad])
+        assert code == 2

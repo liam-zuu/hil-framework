@@ -1,0 +1,5 @@
+loai,wheel,target,log_seq,pwm_prev,t_esp_us,t_pi_us,moc_t0,bat_dinh_ms,k_first,duty_first,k_vao_dai,t_vao_dai_ms,vao_dai,n_lien_vao_dai,n_khong_bc,cat,cens_ms,cmd_level_ms
+tat_motor,fl,0,6504,-81,107099708,3941803704.534,udp_envelope+tick_dt_med,2.2519,11087,0.081973,,,False,0,0,het_log,10.060024,
+tat_motor,fr,0,6504,-62,107099708,3941803704.534,udp_envelope+tick_dt_med,2.2519,11087,0.059999,,,False,0,0,het_log,10.060024,
+tat_motor,rl,0,6504,-61,107099708,3941803704.534,udp_envelope+tick_dt_med,2.2519,11087,0.059999,,,False,0,0,het_log,10.060024,
+tat_motor,rr,0,6504,-82,107099708,3941803704.534,udp_envelope+tick_dt_med,2.2519,11087,0.079989,,,False,0,0,het_log,10.060024,

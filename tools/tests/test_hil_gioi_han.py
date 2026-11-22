@@ -7,6 +7,7 @@ exactly 0 or +-1000 (PWM_TIMEOUT), restarts the 50 ms at every pin change, and f
 -pwm/1000 with a 2 ms lag otherwise; events with pwm +-1000 held < 50 ms never appear in
 MISO -> censored. All data synthetic under tmp_path. Run: python -m pytest <this file>"""
 import base64
+import binascii
 import csv
 import json
 import math
@@ -38,8 +39,18 @@ CHANGES = {5: [(3, 1000)], 10: [(3, 0)], 50: [(0, 1000)], 120: [(0, 0)],
            200: [(1, -1000)], 260: [(1, 0)], 300: [(3, 1000)]}
 
 
+def set_crc(frame):
+    """MISO v4 CRC-16/CCITT-FALSE at bytes 8-9 (LE) over bytes 0-7 and 10-end
+    (protocol.miso_check)."""
+    b = bytes(frame)
+    struct.pack_into('<H', frame, P.OFS_MISO_CRC,
+                     binascii.crc_hqx(b[:P.OFS_MISO_CRC] + b[P.OFS_MISO_CRC + 2:], 0xFFFF))
+
+
 def write_npz(path, n, k0=100, period_us=1000, state=None, duty=None, has_manifest=True,
-              lifecycle=True, valid_ref=True):
+              lifecycle=True, valid_ref=True, post=None):
+    """Frames as the Pi logs them: MOSI seq = step & 0xFF, MISO with a good CRC.
+    post(mosi, miso, t_send_ns): optional in-place faults (empty MISO, bad CRC, gaps)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     state = state or (lambda k: np.zeros(10))
     duty = duty or (lambda k: np.zeros(4))
@@ -55,13 +66,17 @@ def write_npz(path, n, k0=100, period_us=1000, state=None, duty=None, has_manife
                 struct.pack_into('>h', mosi[k], P.OFS_TRAJ_REF + i * 2,
                                  int(round(v / P.REF_RANGES[i] * 32767)))
             mosi[k][P.OFS_TRAJ_FLAGS] = P.TRAJ_VALID
+        mosi[k][P.OFS_SEQ] = k & 0xFF
         d = np.asarray(duty(k), float)
         for i in range(4):
             struct.pack_into('>h', miso[k], i * 2,
                              max(-32768, min(32767, int(round(d[i] * 32767)))))
         miso[k][16] = 1                                   # status byte: MISO never empty
-    kw = dict(mosi=mosi, miso=miso,
-              t_send_ns=T0_NS + np.arange(n, dtype=np.int64) * int(period_us * 1000))
+        set_crc(miso[k])
+    t_send = T0_NS + np.arange(n, dtype=np.int64) * int(period_us * 1000)
+    if post is not None:
+        post(mosi, miso, t_send)
+    kw = dict(mosi=mosi, miso=miso, t_send_ns=t_send)
     if has_manifest:
         m = {'period_us': period_us}
         if lifecycle:
@@ -121,8 +136,9 @@ def report_level(t, changes):
 
 
 def build_run(tmp_path, name='x', sign=-1, drop=(), n_frames=6000, k0=150, n_lines=400,
-              changes=CHANGES):
-    """npz + esp log where t_pin_i (true Pi time of line i) = T0+2ms + ~10ms*i."""
+              changes=CHANGES, post=None, duty_wrap=None):
+    """npz + esp log where t_pin_i (true Pi time of line i) = T0+2ms + ~10ms*i.
+    duty_wrap(k, duty_list) -> duty_list: optional override of the modelled MISO duty."""
     ts, seq, pwm = esp_series(n_lines, changes)
     off = T0_NS / 1e3 + 2000.0 - (1.0 + PPM) * E0_US
     esp = str(tmp_path / f'{name}.csv')
@@ -134,10 +150,11 @@ def build_run(tmp_path, name='x', sign=-1, drop=(), n_frames=6000, k0=150, n_lin
 
     def duty(k):
         t = (T0_NS + k * 1_000_000) / 1e3
-        return [sign * report_level(t, sorted(changes_pi.get(w, ()))) / 1000.0
-                for w in range(4)]
+        d = [sign * report_level(t, sorted(changes_pi.get(w, ()))) / 1000.0
+             for w in range(4)]
+        return duty_wrap(k, d) if duty_wrap is not None else d
     npz = str(tmp_path / f'{name}_frames.npz')
-    write_npz(npz, n_frames, k0=k0, duty=duty)
+    write_npz(npz, n_frames, k0=k0, duty=duty, post=post)
     return npz, esp
 
 
@@ -260,34 +277,43 @@ def test_normal_hold(tmp_path, capsys):
     for w in hg.WHEELS:
         assert int(row[f'sign_ok_{w}']) == 1 and float(row[f'corr_{w}']) < -0.8
         assert int(row[f'sign_{w}']) == -1
-    assert int(row['n_ev_1']) == 4 and int(row['n_follow_1']) == 3
+    assert int(row['n_ev_1']) == 4 and int(row['n_vao_dai_1']) == 3
     assert int(row['n_cens_1']) == 1
-    assert int(row['n_ev_0']) == 4 and int(row['n_follow_0']) == 3
+    assert int(row['n_ev_0']) == 4 and int(row['n_vao_dai_0']) == 3
     assert int(row['n_cens_0']) == 1
     assert int(row['n_ev_outside']) == 2
     assert int(row['n_ev_seqgap']) == 0 and int(row['n_ev_sign_unknown']) == 0
-    assert 45.0 <= float(row['hold_med_ms_1']) <= 55.0
-    assert 45.0 <= float(row['hold_max_ms_1']) <= 55.0
+    assert 45.0 <= float(row['t_vao_dai_med_ms_1']) <= 55.0
+    assert 45.0 <= float(row['t_vao_dai_max_ms_1']) <= 55.0
     assert 19.0 <= float(row['cens_max_ms_1']) <= 21.0
+    # both censored events end at a command change, not at the end of the log
+    assert int(row['n_cat_doi_lenh_0']) == 1 and int(row['n_cat_doi_lenh_1']) == 1
+    assert int(row['n_cat_het_log_0']) == int(row['n_cat_het_log_1']) == 0
+    assert int(row['n_ev_mat_mau_0']) == int(row['n_ev_mat_mau_1']) == 0
     ev = read_rows(tmp_path / 'o' / 'x_su_kien_a11.csv')
     assert len(ev) == 8                                 # 4 +-1000 + 4 zero, all in-run
-    cens = sorted((e for e in ev if e['followed'] == 'False'),
+    assert all(e['moc_t0'] == 'udp_envelope' for e in ev)
+    assert all(float(e['bat_dinh_ms']) == pytest.approx(float(row['sync_resid_max_us']) / 1e3,
+                                                        abs=1e-6) for e in ev)
+    cens = sorted((e for e in ev if e['vao_dai'] == 'False'),
                   key=lambda e: int(e['log_seq']))
     # ->0 at 179: window ends at the +1000 command (10 ms) while duty is stuck at -0.8
     assert len(cens) == 2 and cens[0]['wheel'] == 'rl' and cens[0]['target'] == '0'
-    assert 9.0 <= float(cens[0]['cens_ms']) <= 11.0 and cens[0]['hold_ms'] == ''
+    assert 9.0 <= float(cens[0]['cens_ms']) <= 11.0 and cens[0]['t_vao_dai_ms'] == ''
+    assert cens[0]['cat'] == 'doi_lenh'
     # ->+1000 at 180: 20 ms pulse, duty never leaves -0.8 within the window
     assert cens[1]['wheel'] == 'rl' and cens[1]['target'] == '-1'
-    assert 19.0 <= float(cens[1]['cens_ms']) <= 21.0 and cens[1]['hold_ms'] == ''
+    assert 19.0 <= float(cens[1]['cens_ms']) <= 21.0 and cens[1]['t_vao_dai_ms'] == ''
     w2_zero = sorted((e for e in ev if e['wheel'] == 'rl' and e['target'] == '0'),
                      key=lambda e: int(e['log_seq']))
-    assert len(w2_zero) == 2 and w2_zero[0]['followed'] == 'False'
+    assert len(w2_zero) == 2 and w2_zero[0]['vao_dai'] == 'False'
     # ->0 at 182: normal 50 ms flat hold of the -0.8 level
-    assert w2_zero[1]['followed'] == 'True'
-    assert 45.0 <= float(w2_zero[1]['hold_ms']) <= 55.0
+    assert w2_zero[1]['vao_dai'] == 'True' and w2_zero[1]['cat'] == ''
+    assert 45.0 <= float(w2_zero[1]['t_vao_dai_ms']) <= 55.0
     for e in ev:
-        if e['followed'] == 'True' and e['wheel'] != 'rl':
-            assert 45.0 <= float(e['hold_ms']) <= 55.0
+        if e['vao_dai'] == 'True' and e['wheel'] != 'rl':
+            assert 45.0 <= float(e['t_vao_dai_ms']) <= 55.0
+            assert int(e['n_lien_vao_dai']) > 100 and int(e['n_khong_bc']) == 0
     seg = read_rows(tmp_path / 'o' / 'x_doan_phang.csv')
     fl_neg = [s for s in seg if s['wheel'] == 'fl' and s['kind'] == '-1']
     assert fl_neg and all(600 <= int(s['len_frames']) <= 750 for s in fl_neg)
@@ -300,7 +326,7 @@ def test_seqgap_event_skipped(tmp_path):
     row = read_one(out / 'x_gioi_han.csv')
     assert int(row['n_ev_seqgap']) == 1                  # the ->0 event of w0 hit the gap
     assert int(row['n_ev_0']) == 3                       # rl@179, rl@182 and fr@260 remain
-    assert int(row['n_follow_0']) == 2 and int(row['n_cens_0']) == 1
+    assert int(row['n_vao_dai_0']) == 2 and int(row['n_cens_0']) == 1
 
 
 def test_wrong_sign_not_scored(tmp_path):
@@ -313,7 +339,7 @@ def test_wrong_sign_not_scored(tmp_path):
     assert int(row['n_ev_sign_unknown']) == 4            # all in-run +-1000 events
     assert int(row['n_ev_1']) == 0
     assert int(row['n_ev_0']) == 4                       # target-0 still scored
-    assert int(row['n_follow_0']) == 3 and int(row['n_cens_0']) == 1
+    assert int(row['n_vao_dai_0']) == 3 and int(row['n_cens_0']) == 1
 
 
 def test_miso_only(tmp_path):
@@ -395,27 +421,31 @@ def test_motor_off_events(tmp_path, capsys):
     assert int(row['motor_on_col']) == 1
     assert float(row['tick_dt_min_ms']) == float(row['tick_dt_med_ms']) == \
         float(row['tick_dt_max_ms']) == 10.0
-    # 4 'tat_motor' events, all followed ~50 ms after the true stop tick
-    assert int(row['n_ev_off']) == 4 and int(row['n_follow_off']) == 4
+    # 4 'tat_motor' events, all first seen in band ~50 ms after the true stop tick
+    assert int(row['n_ev_off']) == 4 and int(row['n_vao_dai_off']) == 4
     assert int(row['n_cens_off']) == 0 and int(row['n_off_unproven']) == 0
-    assert 46.0 <= float(row['hold_med_ms_off']) <= 54.0
-    assert 46.0 <= float(row['hold_max_ms_off']) <= 54.0
+    assert 46.0 <= float(row['t_vao_dai_med_ms_off']) <= 54.0
+    assert 46.0 <= float(row['t_vao_dai_max_ms_off']) <= 54.0
     # 'lenh': fl@100 ->0 (doi, ~50 ms) and fr@210 ->0 (trivial, already within tol)
-    assert int(row['n_ev_0']) == 2 and int(row['n_follow_0']) == 2
-    assert int(row['n_ev_doi_0']) == 1 and int(row['n_follow_doi_0']) == 1
-    assert 45.0 <= float(row['hold_med_doi_ms_0']) <= 55.0
+    assert int(row['n_ev_0']) == 2 and int(row['n_vao_dai_0']) == 2
+    assert int(row['n_ev_doi_0']) == 1 and int(row['n_vao_dai_doi_0']) == 1
+    assert 45.0 <= float(row['t_vao_dai_med_ms_doi_0']) <= 55.0
     # the 1340->1344 footer gap and the idle pwm-0 lines create no 'lenh' event
     assert int(row['n_ev_seqgap']) == 0
     ev = read_rows(tmp_path / 'o' / 's_su_kien_a11.csv')
     off_ev = [e for e in ev if e['loai'] == 'tat_motor']
-    assert len(off_ev) == 4 and all(e['followed'] == 'True' for e in off_ev)
-    assert all(e['log_seq'] == '1340' and 45.0 <= float(e['hold_ms']) <= 55.0
+    assert len(off_ev) == 4 and all(e['vao_dai'] == 'True' for e in off_ev)
+    assert all(e['log_seq'] == '1340' and 45.0 <= float(e['t_vao_dai_ms']) <= 55.0
                for e in off_ev)
+    # anchor: line time + tick median; uncertainty = fit residual + tick spread (0 here)
+    assert all(e['moc_t0'] == 'udp_envelope+tick_dt_med' for e in off_ev)
+    assert all(float(e['bat_dinh_ms']) == pytest.approx(float(row['sync_resid_max_us']) / 1e3,
+                                                        abs=1e-6) for e in off_ev)
     assert sorted(int(e['pwm_prev']) for e in off_ev) == [-50, -50, 40, 200]
     lenh_ev = [e for e in ev if e['loai'] == 'lenh']
     assert len(lenh_ev) == 2 and all(e['log_seq'] != '1344' for e in lenh_ev)
     tr = [e for e in lenh_ev if e['wheel'] == 'fr'][0]
-    assert tr['pwm_prev'] == '3' and float(tr['hold_ms']) < 2.0     # trivial: hold ~0
+    assert tr['pwm_prev'] == '3' and float(tr['t_vao_dai_ms']) < 2.0     # trivial: ~0
 
 
 def test_motor_off_unproven(tmp_path):
@@ -435,7 +465,7 @@ def test_motor_off_outside(tmp_path):
     assert hg.main(['--frame-log', npz, '--esp-log', esp, '--out', str(out)]) == 0
     row = read_one(out / 's_gioi_han.csv')
     assert int(row['n_off_outside']) == 4 and int(row['n_ev_off']) == 0
-    assert int(row['n_follow_off']) == 0 and int(row['n_cens_off']) == 0
+    assert int(row['n_vao_dai_off']) == 0 and int(row['n_cens_off']) == 0
     ev = read_rows(out / 's_su_kien_a11.csv')
     assert all(e['loai'] == 'lenh' for e in ev)
 
@@ -466,3 +496,230 @@ def test_segments_duplicate_and_conflict(tmp_path, capsys):
     assert code == 3 and last == '#ket_qua,ma=3,ly_do=thieu_bang_chung'
     row = read_one(tmp_path / 'o2' / 'x_gioi_han.csv')
     assert row['esp_part'].startswith('loi')
+
+
+# ---- C3-14: empty / bad-CRC MISO frames and sample gaps are not duty-0 evidence ----
+
+def test_c3_14_empty_miso_not_duty0(tmp_path):
+    """Codex C3-14 counterexample: 60 consecutive empty MISO frames at 1 kHz inside a run
+    whose real duty is 0.5 on every wheel. dem_s1 (compat columns) reads them as a 60 ms
+    four-wheel duty-0 run; the evidence columns must not."""
+    def post(mosi, miso, t):
+        miso[1000:1060] = 0
+    npz = str(tmp_path / 'e_frames.npz')
+    write_npz(npz, 2000, k0=100, duty=lambda k: [0.5] * 4, post=post)
+    assert hg.main(['--frame-log', npz, '--out', str(tmp_path / 'o')]) == 3
+    row = read_one(tmp_path / 'o' / 'e_gioi_han.csv')
+    # compat (dem_s1) unchanged
+    assert int(row['n_all4_duty0']) == 60 and int(row['max_all4_0_ms']) == 60
+    assert int(row['n_duty0_any']) == 60 and int(row['n_miso_empty_run']) == 60
+    # evidence
+    assert int(row['n_khong_bc_run']) == 60 and int(row['n_miso_crc_bad_run']) == 0
+    assert int(row['n_mat_mau_run']) == 0
+    assert int(row['n_all4_duty0_bc']) == 0 and float(row['max_all4_0_bc_ms']) == 0.0
+    assert int(row['n_duty0_any_bc']) == 0 and int(row['n_flat_any_bc']) == 0
+    assert float(row['max_flat_bc_ms']) == 0.0
+    for w in hg.WHEELS:
+        assert int(row[f'n_d0_{w}']) == 0 and int(row[f'n_d0_tol_{w}']) == 0
+        assert int(row[f'n_seg_tol_{w}']) == 0
+    assert int(row['n_d0_tol_any']) == 0 and int(row['n_flat_tol_any']) == 0
+    assert read_rows(tmp_path / 'o' / 'e_doan_phang.csv') == []
+
+
+def test_c3_14_crc_and_gaps_cut_segments(tmp_path):
+    """duty 0 on every wheel for the whole run (k0 = 100 .. 1999). Frame 1000 has a bad
+    CRC; t_send steps exactly 1.5 periods before frame 300 (not a gap: '>' strict) and
+    1.5 periods + 1 ns before frame 600 (a gap), 5 ms before frame 1500 (a gap); the MOSI
+    seq skips one before frame 1700 (a gap). Evidence runs: [100,600) [600,1000)
+    [1001,1500) [1500,1700) [1700,2000) -> 500, 400, 499, 200, 300 frames."""
+    def post(mosi, miso, t):
+        miso[1000][P.OFS_MISO_CRC] ^= 0xFF
+        t[300:] += 500_000
+        t[600:] += 500_001
+        t[1500:] += 4_000_000
+        for k in range(1700, len(mosi)):
+            mosi[k][P.OFS_SEQ] = (k + 1) & 0xFF
+    npz = str(tmp_path / 'g_frames.npz')
+    write_npz(npz, 2000, k0=100, post=post)
+    assert hg.main(['--frame-log', npz, '--out', str(tmp_path / 'o')]) == 3
+    row = read_one(tmp_path / 'o' / 'g_gioi_han.csv')
+    assert int(row['n_all4_duty0']) == 1900 and int(row['max_all4_0_ms']) == 1900   # compat
+    assert int(row['n_miso_crc_bad_run']) == 1 and int(row['n_khong_bc_run']) == 1
+    assert int(row['n_mat_mau_run']) == 3
+    assert int(row['n_all4_duty0_bc']) == 1899 and float(row['max_all4_0_bc_ms']) == 500.0
+    assert float(row['max_flat_bc_ms']) == 500.0 and float(row['max_flat_tol_ms']) == 500.0
+    for w in hg.WHEELS:
+        assert int(row[f'n_seg_tol_{w}']) == 5 and float(row[f'max_seg_tol_ms_{w}']) == 500.0
+        assert int(row[f'n_d0_tol_{w}']) == 1899 and int(row[f'n_d0_{w}']) == 1899
+    seg = read_rows(tmp_path / 'o' / 'g_doan_phang.csv')
+    fl = sorted((int(s['k_start']), int(s['len_frames'])) for s in seg if s['wheel'] == 'fl')
+    assert fl == [(100, 500), (600, 400), (1001, 499), (1500, 200), (1700, 300)]
+
+
+def test_c3_14_bad_crc_frame_not_first_in_band(tmp_path):
+    """A11: the first in-band frame of the fl ->0 event (log line 120) carries a bad CRC: it
+    is not evidence, so the first observed entry moves to the next frame and the event
+    counts one unobserved frame."""
+    npz, esp = build_run(tmp_path, name='a')
+    out = tmp_path / 'o1'
+    assert hg.main(['--frame-log', npz, '--esp-log', esp, '--out', str(out)]) == 0
+    ev = [e for e in read_rows(out / 'a_su_kien_a11.csv')
+          if e['wheel'] == 'fl' and e['target'] == '0']
+    assert len(ev) == 1 and ev[0]['vao_dai'] == 'True' and ev[0]['n_khong_bc'] == '0'
+    k_in = int(ev[0]['k_vao_dai'])
+
+    def post(mosi, miso, t):
+        miso[k_in][P.OFS_MISO_CRC] ^= 0xFF
+    npz, esp = build_run(tmp_path, name='b', post=post)
+    out = tmp_path / 'o2'
+    assert hg.main(['--frame-log', npz, '--esp-log', esp, '--out', str(out)]) == 0
+    ev = [e for e in read_rows(out / 'b_su_kien_a11.csv')
+          if e['wheel'] == 'fl' and e['target'] == '0']
+    assert int(ev[0]['k_vao_dai']) == k_in + 1 and ev[0]['n_khong_bc'] == '1'
+    row = read_one(out / 'b_gioi_han.csv')
+    assert int(row['n_ev_mat_mau_0']) == 1 and int(row['n_miso_crc_bad_run']) == 1
+
+
+# ---- C3-15: A11 reports the time to the first observed in-band frame, not "followed" ----
+
+def test_c3_15_single_frame_in_band(tmp_path):
+    """Codex C3-15 counterexample: after fl goes 200 -> 0 (log line 120) the MISO reads
+    -0.2 -> 0.004 (one frame, in the +-0.0055 band) -> -0.2 again (the 50 ms hold). The
+    result is named the first observed entry, with n_lien_vao_dai = 1, not 'followed'."""
+    ch = {50: [(0, 200)], 120: [(0, 0)], 300: [(0, 300)]}
+    blip = 1210                                  # ~8 ms after the ->0 line reaches the Pi
+
+    def wrap(k, d):
+        if k == blip:
+            d[0] = 0.004
+        return d
+    npz, esp = build_run(tmp_path, name='c', changes=ch, duty_wrap=wrap)
+    out = tmp_path / 'o'
+    assert hg.main(['--frame-log', npz, '--esp-log', esp, '--out', str(out)]) == 0
+    head = next(csv.reader(open(out / 'c_su_kien_a11.csv', newline='', encoding='utf-8')))
+    assert 'followed' not in head and 'hold_ms' not in head and 'k_follow' not in head
+    ev = [e for e in read_rows(out / 'c_su_kien_a11.csv')
+          if e['wheel'] == 'fl' and e['target'] == '0']
+    assert len(ev) == 1
+    e = ev[0]
+    assert e['vao_dai'] == 'True' and int(e['k_vao_dai']) == blip
+    assert int(e['n_lien_vao_dai']) == 1 and e['n_khong_bc'] == '0' and e['cat'] == ''
+    assert 5.0 <= float(e['t_vao_dai_ms']) <= 10.0
+    assert e['moc_t0'] == 'udp_envelope' and float(e['bat_dinh_ms']) >= 0.0
+    row = read_one(out / 'c_gioi_han.csv')
+    assert not any(c.startswith(('n_follow', 'hold_')) for c in row)
+    assert int(row['n_vao_dai_0']) == 1 and float(row['t_vao_dai_max_ms_0']) <= 10.0
+
+
+def test_c3_15_censored_by_log_end(tmp_path):
+    """fl 200 -> 0 at log line 560 (~5.6 s); the frame log ends ~20 ms later, inside the
+    50 ms hold: censored, cut by the end of the log (cat 'het_log'), not by a new command."""
+    ch = {50: [(0, 200)], 560: [(0, 0)]}
+    npz, esp = build_run(tmp_path, name='d', changes=ch, n_lines=600, n_frames=5625)
+    out = tmp_path / 'o'
+    assert hg.main(['--frame-log', npz, '--esp-log', esp, '--out', str(out)]) == 0
+    ev = [e for e in read_rows(out / 'd_su_kien_a11.csv')
+          if e['wheel'] == 'fl' and e['target'] == '0']
+    assert len(ev) == 1 and ev[0]['vao_dai'] == 'False' and ev[0]['cat'] == 'het_log'
+    assert ev[0]['n_lien_vao_dai'] == '0' and 15.0 <= float(ev[0]['cens_ms']) <= 25.0
+    row = read_one(out / 'd_gioi_han.csv')
+    assert int(row['n_cat_het_log_0']) == 1 and int(row['n_cat_doi_lenh_0']) == 0
+
+
+# ---- C3-17: band count on the completion window of the scorer ----
+
+def _score(**kw):
+    s = dict(k0=100, t0_step=100.0, T_cmd=10.0, t_deadline=12.0, t_end=10.5,
+             completed='true', frames_scored=12100, frame_log='o_frames.npz',
+             t0_src='lifecycle_RUN')
+    s.update(kw)
+    return s
+
+
+def _speed_npz(tmp_path, name='o', n=12200):
+    st = np.zeros(10)
+    st[7] = 0.012                                          # vx in the 10-14.6 mm/s band
+    npz = str(tmp_path / f'{name}_frames.npz')
+    write_npz(npz, n, k0=100, state=lambda k: st)
+    return npz
+
+
+def test_c3_17_score_window(tmp_path):
+    """Codex C3-17 counterexample: completion at t_end = 10.5 s, deadline 12 s. Ticks after
+    t_end but before the deadline are in the nominal window (compat n_vband_win) but not in
+    the completion window of the scorer (n_vband_ht)."""
+    npz = _speed_npz(tmp_path)
+    cases = [(_score(), 501),                              # t = 10.000 .. 10.500 inclusive
+             (_score(t_end=10.5 - 5e-10), 501),            # within 1e-9 of a frame
+             (_score(t_end=10.4995), 500),
+             (_score(t_end=None, completed='false'), 2000)]    # [10, 12): deadline strict
+    for i, (sc, n_ht) in enumerate(cases):
+        sj = tmp_path / f's{i}.json'
+        sj.write_text(json.dumps(sc), encoding='utf-8')
+        out = tmp_path / f'o{i}'
+        assert hg.main(['--frame-log', npz, '--task', 'O1-F08', '--score-json', str(sj),
+                        '--out', str(out)]) == 3
+        row = read_one(out / 'o_gioi_han.csv')
+        assert int(row['n_vband_win']) == 2000 and row['win_kind'] == 'O1_[Tcmd,deadline)'
+        assert int(row['win_ht_n']) == n_ht and int(row['n_vband_ht']) == n_ht, i
+        assert row['win_ht_src'].startswith('hil_o1_score:lifecycle_RUN')
+        assert float(row['t_ht0_s']) == 10.0
+    # no scorer result: no completion-window count; the last second stays descriptive
+    out = tmp_path / 'on'
+    assert hg.main(['--frame-log', npz, '--out', str(out)]) == 3
+    row = read_one(out / 'o_gioi_han.csv')
+    assert row['win_ht_src'] == 'khong_co_ket_qua_cham' and row['n_vband_ht'] == ''
+    assert row['win_kind'] == 'last1s_gia_dinh'
+    assert int(row['n_vband_win']) == int(row['n_vband_last1s']) == 1001
+
+
+def test_c3_17_score_json_mismatch(tmp_path):
+    npz = _speed_npz(tmp_path)
+    for i, sc in enumerate([_score(frames_scored=12099), _score(frame_log='z_frames.npz'),
+                            {k: v for k, v in _score().items() if k != 'T_cmd'}]):
+        sj = tmp_path / f'm{i}.json'
+        sj.write_text(json.dumps(sc), encoding='utf-8')
+        assert hg.main(['--frame-log', npz, '--task', 'O1-F08', '--score-json', str(sj),
+                        '--out', str(tmp_path / f'o{i}')]) == 2
+
+
+def test_c3_17_batch_cham(tmp_path, capsys, monkeypatch):
+    """--cham runs the scorer (stubbed here) on O1 rows, keeps its JSON under cham/ and
+    takes the mask from it; a scorer failure is recorded, the batch goes on; the dem_s1
+    compat columns still match."""
+    root = tmp_path / 'root'
+    for run in ('runA', 'runB'):
+        st = np.zeros(10)
+        st[7] = 0.012
+        write_npz(str(root / run / 'frames' / 'o_frames.npz'), 12200, k0=100,
+                  state=lambda k, s=st: s)
+
+    def fake_score(path, task, **kw):
+        if 'runB' in path:
+            raise ValueError('khong cham duoc')
+        assert kw.get('allow_final_set') and kw.get('allow_pre_b81_15')
+        return _score()
+    monkeypatch.setattr(hg.hil_o1_score, 'score', fake_score)
+    s1 = tmp_path / 'ket_qua_s1.csv'
+    with open(s1, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=['run', 'npz', 'name', 'task'] + hg.CMP_SAME
+                           + [cs for cs, _ in hg.CMP_PAIRS])
+        w.writeheader()
+        for run in ('runA', 'runB'):
+            row = hg.count_run(str(root / run / 'frames' / 'o_frames.npz'), 'O1-F08')[0]
+            r = dict(run=run, npz='o_frames.npz', name='o', task='O1-F08')
+            r.update({c: row[c] for c in hg.CMP_SAME})
+            r.update({cs: row[ce] for cs, ce in hg.CMP_PAIRS})
+            w.writerow(r)
+    out = tmp_path / 'e2'
+    code, last = run_cli(capsys, ['--batch-from-s1', str(s1), '--root', str(root),
+                                  '--out', str(out), '--cham'])
+    assert code == 3
+    e2 = {r['run']: r for r in read_rows(out / 'ket_qua_e2.csv')}
+    assert e2['runA']['win_ht_src'].startswith('hil_o1_score') and \
+        int(e2['runA']['n_vband_ht']) == 501
+    assert e2['runB']['win_ht_src'].startswith('loi_cham: ValueError') and \
+        e2['runB']['n_vband_ht'] == '' and e2['runB']['error'] == ''
+    assert json.load(open(out / 'cham' / 'runA__o_score.json'))['t_end'] == 10.5
+    assert not (out / 'cham' / 'runB__o_score.json').exists()
+    assert read_rows(out / 'so_khop_s1.csv') == []

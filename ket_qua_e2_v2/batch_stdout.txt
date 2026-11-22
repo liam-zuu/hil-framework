@@ -1,0 +1,3 @@
+python tools/hil_gioi_han.py --batch-from-s1 D:/CLAUDE_THESIS/05_DATA/results/HIL_GIOI_HAN/2026-11-22_run01/ket_qua_s1.csv --root D:/CLAUDE_THESIS/05_DATA/results/CLOSED_LOOP --out D:/HIL_WT/devin_e2/ket_qua_e2_v2 --cham
+rows=158 errors=0 no_esp=10 mismatches=0
+#ket_qua,ma=3,ly_do=thieu_bang_chung

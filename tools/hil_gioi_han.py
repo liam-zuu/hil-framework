@@ -18,6 +18,16 @@ ESP32 (pwm -> duty MISO) khi có log phía Pi.
     tools/hil_o1_score.py decode_frames (state int16 BE / 32767 x STATE_RANGES; duty MISO
     bytes 0-7 int16 BE / 32767) và command_start (k0 = bước RUN của lifecycle, nếu không có
     thì frame VALID khác 0 đầu tiên; không có cả hai -> ValueError -> mã 2).
+    Các cột n_*_win / win_kind / win_n là số TƯƠNG THÍCH dem_s1 (C3-17): cửa sổ danh định
+    [Tcmd; Tcmd + T_LATE), hay 1 s cuối khi task không phải O1 / không có --task — KHÔNG dùng
+    làm bằng chứng. Số đếm trong CỬA SỔ HOÀN THÀNH của bộ chấm (cột *_ht): mặt nạ đọc từ kết
+    quả tools/hil_o1_score.py score() (JSON của --score-json, hay lô --cham chạy chính bộ chấm,
+    lưu cham/<run>__<ten>_score.json): frame k >= k0 của bộ chấm, t_k = (k - t0_step) x period
+    (mốc của bộ chấm, có thể là cạnh run_active ESP32), T_cmd - 1e-9 <= t_k < t_deadline - 1e-9
+    và t_k <= t_end + 1e-9 (t_end = lúc hoàn thành khi completed 'true', không thì frame cuối
+    bộ chấm xét). JSON phải khớp log (frame_log cùng tên, frames_scored = n - k0), không thì
+    ValueError -> mã 2. Không có kết quả chấm -> win_ht_src 'khong_co_ket_qua_cham', cột *_ht
+    rỗng; số 1 s cuối là số mô tả riêng ở cột *_last1s.
 
 (b) Băng mù theo bánh (đề xuất v6 C3(b)): blind_band(omega32) -> (n,4) bool, a = |omega32|
     float32, (a > 0) & (a <= float32(0.3)): H7 không phát xung encoder khi
@@ -28,19 +38,34 @@ ESP32 (pwm -> duty MISO) khi có log phía Pi.
     công cụ này đếm (0; 0.3f] float32 theo từng bánh (n_wb_*_<banh>) và cột any-wheel
     (n_wband_any_*) để so sánh với n_wband_* của dem_s1 (so_khop_s1.csv).
 
-(c) MISO trên khoảng chạy:
-    - exact (tương thích dem_s1, từ int16 raw): duty0 (raw == 0), sat (|raw| == 32767),
-      flat = duty0 | sat, all4 duty0, dòng MISO rỗng (mọi byte 0 -> decode ra duty 0, đếm
-      riêng n_miso_empty_run để trừ khi cần), max đoạn liên tục [ms] = int(run * period_ms).
-    - tolerance TOL = 0.0055 + EPS (spec S06 v3.5 T6 dòng 120): |d| <= TOL + EPS -> loại 0;
-      |d| >= 1 - TOL - EPS -> loại +1 / -1 theo dấu; còn lại 'khác' (cắt đoạn). Mỗi bánh: số
+(c) MISO trên khoảng chạy (C3-14: tách số tương thích khỏi số làm bằng chứng):
+    - TƯƠNG THÍCH dem_s1 (chỉ các cột của CMP_SAME, để so_khop_s1; KHÔNG làm bằng chứng):
+      n_duty0_any, n_sat_any, n_flat_any, max_flat_ms, n_all4_duty0, max_all4_0_ms từ int16
+      raw (duty0 raw == 0, sat |raw| == 32767, flat = duty0 | sat), gồm cả frame MISO rỗng
+      (mọi byte 0 -> decode ra duty 0) và frame sai CRC; n_miso_empty_run; max đoạn [ms] =
+      int(run * period_ms).
+    - Frame đủ bằng chứng (valid): protocol.miso_check == MISO_OK (không rỗng, CRC-16 bytes
+      8-9 đúng; cùng luật s06_frames_decode / s06_t6_check). Khoảng mất mẫu (cut[k]: đoạn
+      mới bắt đầu ở k): seq MOSI (byte OFS_SEQ = bước & 0xFF) không tăng đúng 1 so với k-1,
+      hay t_send_ns[k] - t_send_ns[k-1] > GAP_FACTOR x period [ĐỀ XUẤT 1,5]. Cột:
+      n_miso_crc_bad_run, n_mat_mau_run (số chỗ cắt), n_khong_bc_run (frame rỗng + sai CRC).
+    - BẰNG CHỨNG: mọi số MISO còn lại chỉ đếm frame valid, đoạn liền bị cắt tại frame không
+      valid và tại khoảng mất mẫu: n_d0_<bánh>, n_sat_<bánh>; *_bc (n_duty0_any_bc,
+      n_sat_any_bc, n_flat_any_bc, max_flat_bc_ms, n_all4_duty0_bc, max_all4_0_bc_ms; ms =
+      số frame x period_ms); tolerance TOL = 0.0055 + EPS (spec S06 v3.5 T6 dòng 120):
+      |d| <= TOL + EPS -> loại 0; |d| >= 1 - TOL - EPS -> loại +1 / -1 theo dấu; còn lại
+      'khác'; frame không valid là loại 3; loại 2, 3 và chỗ cắt đều cắt đoạn. Mỗi bánh: số
       frame loại 0 / loại sat, số đoạn liên tục tối đa cùng một loại trong {0,+1,-1}, median
       và max độ dài đoạn [ms]; any-wheel: n_d0_tol_any, n_sat_tol_any, n_flat_tol_any,
       max_flat_tol_ms. CSV đoạn phẳng: wheel, kind, k_start (chỉ số frame trong npz),
       len_frames, len_ms.
-    - CRC MISO KHÔNG kiểm (như dem_s1).
 
-(c-ESP32) Thời gian giữ mức A11 (đề xuất v6 C5(c), E mục 2), chỉ khi có --esp-log:
+(c-ESP32) A11 (đề xuất v6 C5(c), E mục 2), chỉ khi có --esp-log. C3-15: số báo ra là THỜI
+    GIAN TỚI LẦN ĐẦU QUAN SÁT VÀO DẢI ±TOL (t_vao_dai_ms), KHÔNG phải "theo kịp" theo nghĩa
+    T6 (T6: mốc ghi compare, rời mức cũ, 100 frame liền): log cũ không có mốc ghi compare,
+    mốc t0 suy từ giờ nhận UDP (moc_t0, bat_dinh_ms ở mỗi sự kiện), và một frame vào dải
+    rồi ra lại vẫn là "lần đầu vào dải" (n_lien_vao_dai cho biết số frame valid liền trong
+    dải từ lần đầu, trong mức lệnh). Chỉ báo, không là tiêu chí nghiệm thu:
     - read_esp_pwm: CSV agv_logger theo tên cột (cần timestamp_us, log_seq, pwm_fl..pwm_rr;
       thiếu -> ValueError -> mã 2). Trùng lặp xử lý y hệt hil_edge_map.read_esp_log: có
       <log>.segments.csv thì bỏ dòng 'duplicate' sau khi kiểm bằng một dòng đã giữ,
@@ -70,9 +95,15 @@ ESP32 (pwm -> duty MISO) khi có log phía Pi.
       d* = 0 hay SIGN_CODE x pwm/1000. t0 = to_pi(ts[i]); chỉ giữ t0 trong
       [t_f[k0]; t_f[-1]], ngoài -> n_ev_outside. Cuối mức t_end = to_pi(ts[j]) của dòng j kế
       có pwm[j] != pwm[i] (không có -> +inf). Tìm frame k với t_f[k] >= t0, t_f[k] < t_end,
-      bỏ frame MISO rỗng: frame đầu |duty[k] - d*| <= TOL + EPS -> theo kịp, hold_ms =
-      (t_f[k] - t0)/1000; không có -> censored ("> khoảng giữ", KHÔNG bỏ), cens_ms =
-      (min(t_end, t_f[-1]) - t0)/1000.
+      bỏ frame không valid (rỗng, sai CRC): frame đầu |duty[k] - d*| <= TOL + EPS -> vao_dai,
+      k_vao_dai, t_vao_dai_ms = (t_f[k] - t0)/1000; không có -> censored ("> khoảng giữ",
+      KHÔNG bỏ), cens_ms = (min(t_end, t_f[-1]) - t0)/1000, cat = 'doi_lenh' (lệnh đổi mức
+      trước frame cuối của log) hay 'het_log' (log frame hết trước). n_khong_bc = số frame
+      không valid + số chỗ cắt mất mẫu trong khoảng đã quét [k_first; lần vào dải] (hay tới
+      k_last): > 0 thì lần vào dải thật có thể sớm hơn số báo (frame không quan sát được).
+      moc_t0 'udp_envelope'; bat_dinh_ms = sync_resid_max_us/1000 (± của đường khớp), cộng
+      độ lệch MỘT PHÍA chưa đo: trễ UDP nhỏ nhất làm t0 suy ra trễ hơn thật, nên t_vao_dai_ms
+      có thể NGẮN hơn thật tới chừng đó (vd. mốc trễ 4 ms: đáp ứng 4 ms ghi thành 0 ms).
     - Sự kiện 'tat_motor' (dừng motor cuối lượt; firmware AGV src/main.c: vòng
       vTaskDelay(pdMS_TO_TICKS(10)) :387; tick đầu motor-off gọi motor_stop_all() và
       push_run_end() :641-644; dòng idle 10 Hz pwm 0 chỉ được đẩy ~10 tick sau :646-650, nên
@@ -84,28 +115,35 @@ ESP32 (pwm -> duty MISO) khi có log phía Pi.
       dt_med = median của hiệu ts các cặp dòng motor_on liên tiếp seq (bất định trong
       [dt_min - dt_med; dt_max - dt_med] — suy ra từ vòng firmware và chính log, không đo
       trên pin; cột tick_dt_min/med/max_ms). Mục tiêu d* = 0; t_end = to_pi(ts[j]) của
-      dòng j >= i đầu có pwm[j] != 0 (không có -> +inf); cùng phép tìm follow. Cột:
-      n_ev_off, n_follow_off, n_cens_off, hold_med/p95/max_ms_off, cens_max_ms_off,
+      dòng j >= i đầu có pwm[j] != 0 (không có -> +inf); cùng phép tìm lần đầu vào dải;
+      moc_t0 'udp_envelope+tick_dt_med', bat_dinh_ms = sync_resid_max_us/1000 +
+      max(dt_med - dt_min, dt_max - dt_med)/1000. Cột thống kê A11_STAT với hậu tố _off,
       n_off_unproven, n_off_outside — tách khỏi thống kê 'lenh' mục tiêu 0. Ứng viên
       có t0 ngoài [t_f[k0]; t_f[-1]] -> n_off_outside, không chấm: lượt dừng cuối run
       thường đến SAU khi frame log kết thúc (lượt HIL dừng trước, DUT tắt motor sau khi
       mất lệnh), nên thời gian giữ mức lúc dừng không quan sát được trong các log này.
     - Tách sự kiện hiển nhiên ('doi' = đổi thật) cho 'lenh': chỉ giữ sự kiện có
       |SIGN_CODE x pwm_prev/1000 - d*| > TOL + EPS (pwm_prev = pwm[i-1] của bánh đó):
-      n_ev_doi_<T>, n_follow_doi_<T>, n_cens_doi_<T>, hold_med/p95/max_doi_ms_<T>,
-      T in (0,1). Các cột mọi-sự-kiện vẫn giữ.
-    - CSV sự kiện: thêm loai ('lenh' / 'tat_motor') và pwm_prev.
+      cột A11_STAT với hậu tố _doi_<T>, T in (0,1). Các cột mọi-sự-kiện (hậu tố _<T>) vẫn giữ.
+      A11_STAT: n_ev, n_vao_dai, n_cens, t_vao_dai_med/p95/max_ms, cens_max_ms,
+      n_cat_doi_lenh, n_cat_het_log, n_ev_mat_mau (sự kiện có n_khong_bc > 0).
+    - CSV sự kiện: loai ('lenh' / 'tat_motor'), pwm_prev, moc_t0, bat_dinh_ms, k_vao_dai,
+      t_vao_dai_ms, vao_dai, n_lien_vao_dai, n_khong_bc, cat.
     - 9 npz của 2026-11-08_run08/run09/run11 (w1, w2, w3) không có log ESP32 phía Pi (chỉ
       esp32_COM5.txt serial không giờ Pi) -> chỉ phần MISO, esp_part 'khong_co_log_ESP32'.
 
 Chạy một lượt:
   python tools/hil_gioi_han.py --frame-log X_frames.npz [--esp-log X.csv] [--task O1-F02]
-      --out DIR
+      [--score-json score.json] --out DIR
   Ghi DIR/<ten>_gioi_han.csv (một dòng), DIR/<ten>_su_kien_a11.csv (sự kiện ESP32),
   DIR/<ten>_doan_phang.csv (đoạn phẳng MISO). <ten> = tên npz bỏ '_frames.npz' (hay '.npz').
 
 Chạy theo lô:
-  python tools/hil_gioi_han.py --batch-from-s1 ket_qua_s1.csv --root CLOSED_LOOP --out DIR
+  python tools/hil_gioi_han.py --batch-from-s1 ket_qua_s1.csv --root CLOSED_LOOP --out DIR [--cham]
+  --cham: dòng có task 'O1-*' được chấm bằng hil_o1_score.score(npz, task,
+  allow_final_set=True, esp_log=<log ESP32 nếu có>, allow_pre_b81_15=True) (log phát triển
+  trước kiểm B81-15), JSON ghi DIR/cham/<run>__<ten>_score.json, mặt nạ *_ht lấy từ đó;
+  bộ chấm lỗi -> win_ht_src 'loi_cham: ...', cột *_ht rỗng, lô chạy tiếp.
   Mỗi dòng s1: frame log = root/run/frames/npz, log ESP32 = root/run/pi/<ten>.csv nếu có,
   task = cột 'task' của s1 (nhận diện của dem_s1 từ meta.yaml, đã kiểm). Ghi ket_qua_e2.csv
   (một dòng/npz, cột run, npz, name, task đứng đầu), su_kien/<run>__<ten>_su_kien_a11.csv,
@@ -136,6 +174,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 for _p in (os.path.join(HERE, '..', 'rpi5'), os.path.join(HERE, '..', 'fwsim'), HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+import protocol                                    # noqa: E402  rpi5/: miso_check, OFS_SEQ
 import hil_o1_score                                # noqa: E402
 import hil_edge_map                                # noqa: E402
 import s06_t5_score                                # noqa: E402
@@ -156,14 +195,29 @@ CLOCK_BIN_US = 1e6                  # s06_t6_check.py CLOCK_BIN_US (bin chặn d
 ESP_NEED = ('timestamp_us', 'log_seq') + tuple('pwm_' + w for w in WHEELS)
 SEG_MARK_COLS = ['row', 'log_seq', 'timestamp_us', 'segment', 'status']   # <log>.segments.csv
 PWM_COLS = tuple('pwm_' + w for w in WHEELS)
+GAP_FACTOR = 1.5                    # [ĐỀ XUẤT] bước t_send > 1,5 chu kỳ = khoảng mất mẫu (C3-14)
+KIND_INVALID = 3                    # loại của frame MISO không valid trong phân đoạn dung sai
+# thống kê A11 (C3-15: thời gian tới lần đầu quan sát vào dải, không phải "theo kịp" T6)
+A11_STAT = ('n_ev', 'n_vao_dai', 'n_cens', 't_vao_dai_med_ms', 't_vao_dai_p95_ms',
+            't_vao_dai_max_ms', 'cens_max_ms', 'n_cat_doi_lenh', 'n_cat_het_log', 'n_ev_mat_mau')
+
+
+def a11_cols(sfx):
+    return [f'{c}_{sfx}' for c in A11_STAT]
+
 
 ROW_COLS = ['n_frames', 'k0', 'k0_src', 'n_run', 'period_us', 't_last_s', 't_cmd_s',
             'win_kind', 'win_n', 'n_vband_win', 'n_vband_last1s', 'n_vband_run',
             'n_wband_any_win', 'n_wband_any_last1s', 'n_wband_any_run']
 for _w in WHEELS:
     ROW_COLS += [f'n_wb_win_{_w}', f'n_wb_last1s_{_w}', f'n_wb_run_{_w}']
+ROW_COLS += ['win_ht_src', 't_ht0_s', 't_ht1_s', 'win_ht_n', 'n_vband_ht', 'n_wband_any_ht']
+ROW_COLS += [f'n_wb_ht_{_w}' for _w in WHEELS]
 ROW_COLS += ['n_duty0_any', 'n_sat_any', 'n_flat_any', 'max_flat_ms', 'n_all4_duty0',
-             'max_all4_0_ms', 'n_miso_empty_run']
+             'max_all4_0_ms', 'n_miso_empty_run',
+             'n_miso_crc_bad_run', 'n_mat_mau_run', 'n_khong_bc_run', 'n_duty0_any_bc',
+             'n_sat_any_bc', 'n_flat_any_bc', 'max_flat_bc_ms', 'n_all4_duty0_bc',
+             'max_all4_0_bc_ms']
 for _w in WHEELS:
     ROW_COLS += [f'n_d0_{_w}', f'n_sat_{_w}']
 for _w in WHEELS:
@@ -175,20 +229,16 @@ ROW_COLS += ['n_d0_tol_any', 'n_sat_tol_any', 'n_flat_tol_any', 'max_flat_tol_ms
 for _w in WHEELS:
     ROW_COLS += [f'corr_{_w}', f'sign_{_w}', f'sign_ok_{_w}']
 for _t in (0, 1):
-    ROW_COLS += [f'n_ev_{_t}', f'n_follow_{_t}', f'n_cens_{_t}', f'hold_med_ms_{_t}',
-                 f'hold_p95_ms_{_t}', f'hold_max_ms_{_t}', f'cens_max_ms_{_t}']
+    ROW_COLS += a11_cols(_t)
 ROW_COLS += ['n_ev_seqgap', 'n_ev_outside', 'n_ev_sign_unknown',
-             'motor_on_col', 'tick_dt_min_ms', 'tick_dt_med_ms', 'tick_dt_max_ms',
-             'n_ev_off', 'n_follow_off', 'n_cens_off', 'hold_med_ms_off',
-             'hold_p95_ms_off', 'hold_max_ms_off', 'cens_max_ms_off', 'n_off_unproven',
-             'n_off_outside']
+             'motor_on_col', 'tick_dt_min_ms', 'tick_dt_med_ms', 'tick_dt_max_ms']
+ROW_COLS += a11_cols('off') + ['n_off_unproven', 'n_off_outside']
 for _t in (0, 1):
-    ROW_COLS += [f'n_ev_doi_{_t}', f'n_follow_doi_{_t}', f'n_cens_doi_{_t}',
-                 f'hold_med_doi_ms_{_t}', f'hold_p95_doi_ms_{_t}', f'hold_max_doi_ms_{_t}']
+    ROW_COLS += a11_cols(f'doi_{_t}')
 
 EVENT_COLS = ['loai', 'wheel', 'target', 'log_seq', 'pwm_prev', 't_esp_us', 't_pi_us',
-              'k_first', 'duty_first', 'k_follow', 'hold_ms', 'followed', 'cens_ms',
-              'cmd_level_ms']
+              'moc_t0', 'bat_dinh_ms', 'k_first', 'duty_first', 'k_vao_dai', 't_vao_dai_ms',
+              'vao_dai', 'n_lien_vao_dai', 'n_khong_bc', 'cat', 'cens_ms', 'cmd_level_ms']
 SEG_OUT_COLS = ['wheel', 'kind', 'k_start', 'len_frames', 'len_ms']
 
 CMP_SAME = ['n_frames', 'k0', 'n_run', 'win_kind', 'win_n', 'n_vband_win', 'n_vband_last1s',
@@ -216,19 +266,27 @@ def name_of(npz_name):
     return npz_name[:-4] if npz_name.endswith('.npz') else npz_name
 
 
-def longest_run(mask):
-    """Đoạn True liên tục dài nhất của mảng bool (như dem_s1, vector hoá)."""
+def longest_run(mask, cut=None):
+    """Đoạn True liên tục dài nhất của mảng bool (như dem_s1, vector hoá). cut (tuỳ chọn,
+    C3-14): cut[k] True = đoạn mới bắt đầu ở k (khoảng mất mẫu giữa k-1 và k)."""
     m = np.asarray(mask, dtype=bool)
     if not m.any():
         return 0
-    d = np.diff(m.astype(np.int8))
-    starts = np.nonzero(d == 1)[0] + 1
-    ends = np.nonzero(d == -1)[0] + 1
-    if m[0]:
-        starts = np.concatenate(([0], starts))
-    if m[-1]:
-        ends = np.concatenate((ends, [len(m)]))
-    return int((ends - starts).max())
+    if cut is None:
+        d = np.diff(m.astype(np.int8))
+        starts = np.nonzero(d == 1)[0] + 1
+        ends = np.nonzero(d == -1)[0] + 1
+        if m[0]:
+            starts = np.concatenate(([0], starts))
+        if m[-1]:
+            ends = np.concatenate((ends, [len(m)]))
+        return int((ends - starts).max())
+    c = np.asarray(cut, dtype=bool)
+    st = m.copy()
+    st[1:] &= ~m[:-1] | c[1:]
+    en = m.copy()
+    en[:-1] &= ~m[1:] | c[1:]
+    return int((np.nonzero(en)[0] - np.nonzero(st)[0]).max()) + 1
 
 
 def in_speed_band(spd):
@@ -253,14 +311,61 @@ def duty_kind(d):
     return kind
 
 
-def tol_segments(kind):
+def tol_segments(kind, cut=None):
     """Các đoạn liên tục tối đa cùng loại in {0,+1,-1} -> list (kind, k_start, len_frames);
-    frame 'khác' (kind 2) cắt đoạn."""
+    frame 'khác' (kind 2) và không valid (KIND_INVALID) cắt đoạn; cut[k] True (khoảng mất
+    mẫu, C3-14) cũng bắt đầu đoạn mới ở k."""
     a = np.asarray(kind)
-    edges = np.nonzero(np.diff(a.astype(np.int16)) != 0)[0] + 1
+    chg = np.diff(a.astype(np.int16)) != 0
+    if cut is not None:
+        chg |= np.asarray(cut, dtype=bool)[1:]
+    edges = np.nonzero(chg)[0] + 1
     starts = np.concatenate(([0], edges))
     ends = np.concatenate((edges, [len(a)]))
-    return [(int(a[s]), int(s), int(e - s)) for s, e in zip(starts, ends) if a[s] != 2]
+    return [(int(a[s]), int(s), int(e - s)) for s, e in zip(starts, ends)
+            if a[s] not in (2, KIND_INVALID)]
+
+
+def frame_validity(mosi, miso, t_send_ns, period_us):
+    """C3-14 -> (valid, crc_bad, cut), mỗi mảng (n,) bool. valid = protocol.miso_check ==
+    MISO_OK (không rỗng, CRC đúng); cut[k] (k >= 1) = khoảng mất mẫu giữa k-1 và k: seq MOSI
+    không tăng đúng 1 (mod 256), hay bước t_send_ns > GAP_FACTOR x period (khi có t_send_ns)."""
+    miso = np.asarray(miso, dtype=np.uint8)
+    n = len(miso)
+    chk = np.fromiter((protocol.miso_check(bytes(b)) for b in miso), dtype=np.int8, count=n)
+    cut = np.zeros(n, dtype=bool)
+    if n > 1:
+        sq = np.asarray(mosi, dtype=np.uint8)[:, protocol.OFS_SEQ].astype(np.int16)
+        cut[1:] = (np.diff(sq) % 256) != 1
+        if t_send_ns is not None:
+            cut[1:] |= (np.diff(np.asarray(t_send_ns, dtype=np.int64))
+                        > GAP_FACTOR * period_us * 1000.0)
+    return chk == protocol.MISO_OK, chk == protocol.MISO_CRC_BAD, cut
+
+
+def score_window(score, npz_name, n, period):
+    """C3-17: mặt nạ cửa sổ hoàn thành (n,) bool từ kết quả hil_o1_score.score (docstring mục
+    a) -> (mask, t_ht0, t_ht1, src). JSON không khớp log -> ValueError."""
+    try:
+        k0s, a = int(score['k0']), float(score['t0_step'])
+        t_cmd, t_dl = float(score['T_cmd']), float(score['t_deadline'])
+        fs = int(score['frames_scored'])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f'ket qua cham thieu/sai truong: {exc}') from None
+    fl = score.get('frame_log')
+    if fl is not None and fl != npz_name:
+        raise ValueError(f'ket qua cham cua {fl!r}, khong phai {npz_name!r}')
+    if fs != n - k0s:
+        raise ValueError(f'ket qua cham frames_scored={fs}, log co {n} frame, k0={k0s}')
+    t = (np.arange(n) - a) * period
+    m = (np.arange(n) >= k0s) & (t >= t_cmd - 1e-9) & (t < t_dl - 1e-9)
+    t_end = score.get('t_end')
+    t1 = t_dl
+    if t_end is not None and math.isfinite(float(t_end)):
+        m &= t <= float(t_end) + 1e-9
+        t1 = min(t_dl, float(t_end))
+    src = f"hil_o1_score:{score.get('t0_src', '')}:completed={score.get('completed', '')}"
+    return m, t_cmd, t1, src
 
 
 def _pearson(a, b):
@@ -376,9 +481,10 @@ def clock_pairs(raw_path):
     return np.asarray(rx, dtype=float), np.asarray(te, dtype=float)
 
 
-def count_run(npz_path, task):
+def count_run(npz_path, task, score=None):
     """Phần MOSI/MISO của một frame log (docstring mục a-c) -> (row, aux, segs).
-    aux: duty (n,4) float64, t_f (n,) µs từ t_send_ns hoặc None, miso_empty, k0."""
+    score: kết quả hil_o1_score.score (dict) cho cửa sổ hoàn thành, hay None.
+    aux: duty (n,4) float64, t_f (n,) µs từ t_send_ns hoặc None, miso_empty, valid, cut, k0."""
     with np.load(npz_path, allow_pickle=False) as z:
         if 'manifest' not in z.files:
             raise ValueError(f'{npz_path}: không có khoá manifest')
@@ -387,8 +493,8 @@ def count_run(npz_path, task):
             if k not in z.files:
                 raise ValueError(f'{npz_path}: không có khoá {k}')
         mosi, miso = z['mosi'], z['miso']
-        t_f = (np.asarray(z['t_send_ns'], dtype=np.float64) / 1e3
-               if 't_send_ns' in z.files else None)
+        t_ns = np.asarray(z['t_send_ns'], dtype=np.int64) if 't_send_ns' in z.files else None
+    t_f = t_ns.astype(np.float64) / 1e3 if t_ns is not None else None
     n = len(mosi)
     state, ref, flags, duty = hil_o1_score.decode_frames(mosi, miso)
     k0, k0_src = hil_o1_score.command_start(manifest, ref, flags)
@@ -399,13 +505,23 @@ def count_run(npz_path, task):
     sl = slice(k0, n)
     t_r = t[sl]
     vband = in_speed_band(np.hypot(state[sl, 7], state[sl, 8]))
-    wband = blind_band(hil_edge_map.h7_omega32(mosi)[sl])
+    wband_all = blind_band(hil_edge_map.h7_omega32(mosi))
+    wband = wband_all[sl]
     dr = _int16(miso, 0, 4).astype(np.int64)[sl]
     miso_empty = ~np.asarray(miso, dtype=np.uint8).any(axis=1)
     d0, sat = dr == 0, np.abs(dr) == SAT_RAW
     flat_any = np.any(d0 | sat, axis=1)
     all4_0 = np.all(d0, axis=1)
+    # C3-14: bằng chứng chỉ trên frame valid, đoạn cắt tại frame không valid và mất mẫu
+    valid_all, crc_bad_all, cut_all = frame_validity(mosi, miso, t_ns, period_us)
+    valid, crc_bad, cut = valid_all[sl], crc_bad_all[sl], cut_all[sl].copy()
+    if len(cut):
+        cut[0] = False
     kind = duty_kind(duty[sl])
+    kind[~valid] = KIND_INVALID
+    d0_bc, sat_bc = d0 & valid[:, None], sat & valid[:, None]
+    flat_bc, all4_bc = flat_any & valid, all4_0 & valid
+    flat_tol = np.any(np.abs(kind) <= 1, axis=1)
 
     win_kind, t_cmd = 'last1s_gia_dinh', None
     if task.startswith('O1-'):
@@ -434,28 +550,48 @@ def count_run(npz_path, task):
         n_all4_duty0=int(all4_0.sum()),
         max_all4_0_ms=int(longest_run(all4_0) * period * 1e3),
         n_miso_empty_run=int(miso_empty[sl].sum()),
+        n_miso_crc_bad_run=int(crc_bad.sum()),
+        n_mat_mau_run=int(cut.sum()),
+        n_khong_bc_run=int((~valid).sum()),
+        n_duty0_any_bc=int(np.any(d0_bc, axis=1).sum()),
+        n_sat_any_bc=int(np.any(sat_bc, axis=1).sum()),
+        n_flat_any_bc=int(flat_bc.sum()),
+        max_flat_bc_ms=float(longest_run(flat_bc, cut) * period_ms),
+        n_all4_duty0_bc=int(all4_bc.sum()),
+        max_all4_0_bc_ms=float(longest_run(all4_bc, cut) * period_ms),
         n_d0_tol_any=int(np.any(kind == 0, axis=1).sum()),
         n_sat_tol_any=int(np.any(np.abs(kind) == 1, axis=1).sum()),
-        n_flat_tol_any=int(np.any(kind != 2, axis=1).sum()),
-        max_flat_tol_ms=float(longest_run(np.any(kind != 2, axis=1)) * period_ms),
+        n_flat_tol_any=int(flat_tol.sum()),
+        max_flat_tol_ms=float(longest_run(flat_tol, cut) * period_ms),
     )
+    # C3-17: cửa sổ hoàn thành của bộ chấm (mặt nạ trên mọi frame của log)
+    if score is not None:
+        ht, t_ht0, t_ht1, src = score_window(score, os.path.basename(npz_path), n, period)
+        row.update(win_ht_src=src, t_ht0_s=round(t_ht0, 6), t_ht1_s=round(t_ht1, 6),
+                   win_ht_n=int(ht.sum()),
+                   n_vband_ht=int((in_speed_band(np.hypot(state[:, 7], state[:, 8])) & ht).sum()),
+                   n_wband_any_ht=int((wband_all.any(axis=1) & ht).sum()))
+        for w, nm in enumerate(WHEELS):
+            row[f'n_wb_ht_{nm}'] = int((wband_all[:, w] & ht).sum())
+    else:
+        row['win_ht_src'] = 'khong_co_ket_qua_cham'
     segs = []
     for w, nm in enumerate(WHEELS):
         row[f'n_wb_win_{nm}'] = int((wband[:, w] & wmask).sum())
         row[f'n_wb_last1s_{nm}'] = int((wband[:, w] & last1).sum())
         row[f'n_wb_run_{nm}'] = int(wband[:, w].sum())
-        row[f'n_d0_{nm}'] = int(d0[:, w].sum())
-        row[f'n_sat_{nm}'] = int(sat[:, w].sum())
+        row[f'n_d0_{nm}'] = int(d0_bc[:, w].sum())
+        row[f'n_sat_{nm}'] = int(sat_bc[:, w].sum())
         row[f'n_d0_tol_{nm}'] = int((kind[:, w] == 0).sum())
         row[f'n_sat_tol_{nm}'] = int((np.abs(kind[:, w]) == 1).sum())
-        sg = tol_segments(kind[:, w])
+        sg = tol_segments(kind[:, w], cut)
         row[f'n_seg_tol_{nm}'] = len(sg)
         lens = [L * period_ms for _, _, L in sg]
         row[f'seg_med_ms_{nm}'] = float(np.median(lens)) if lens else ''
         row[f'max_seg_tol_ms_{nm}'] = max(lens) if lens else ''
         segs += [dict(wheel=nm, kind=kd, k_start=k0 + s, len_frames=L, len_ms=L * period_ms)
                  for kd, s, L in sg]
-    aux = dict(duty=duty, t_f=t_f, miso_empty=miso_empty, k0=k0)
+    aux = dict(duty=duty, t_f=t_f, miso_empty=miso_empty, valid=valid_all, cut=cut_all, k0=k0)
     return row, aux, segs
 
 
@@ -476,11 +612,12 @@ def esp_measure(esp_path, aux):
     t_pi = fit['a_us'] + (1.0 + fit['b']) * log['ts'].astype(np.float64)
     out.update(esp_part='co', sync_kind='udp_envelope', sync_ppm=fit['ppm'],
                sync_resid_max_us=fit['resid_max_us'], sync_span_s=fit['span_s'])
-    duty, t_f, miso_empty, k0 = aux['duty'], aux['t_f'], aux['miso_empty'], aux['k0']
+    duty, t_f, k0 = aux['duty'], aux['t_f'], aux['k0']
+    valid, cut = aux['valid'], aux['cut']
     n = len(t_f)
 
-    # dấu từng bánh: pwm giữ tại mỗi frame không rỗng của khoảng chạy so với duty MISO
-    sel = np.nonzero(~miso_empty[k0:])[0] + k0
+    # dấu từng bánh: pwm giữ tại mỗi frame valid của khoảng chạy so với duty MISO
+    sel = np.nonzero(valid[k0:])[0] + k0
     idx = np.searchsorted(t_pi, t_f[sel], side='right') - 1
     have = idx >= 0
     sign_ok = []
@@ -493,11 +630,11 @@ def esp_measure(esp_path, aux):
         out[f'sign_ok_{nm}'] = int(ok)
         sign_ok.append(ok)
 
-    # frame kế tiếp thoả |duty - d*| <= TOL+EPS cho từng (bánh, mục tiêu) (frame rỗng bỏ qua)
+    # frame kế tiếp thoả |duty - d*| <= TOL+EPS cho từng (bánh, mục tiêu) (frame không valid bỏ qua)
     next_hit = {}
     for w in range(4):
         for tv in (-1.0, 0.0, 1.0):
-            hit = np.nonzero(~miso_empty & (np.abs(duty[:, w] - tv) <= TOL + EPS))[0]
+            hit = np.nonzero(valid & (np.abs(duty[:, w] - tv) <= TOL + EPS))[0]
             nxt = np.full(n, n, dtype=np.int64)
             if len(hit):
                 pos = np.searchsorted(hit, np.arange(n), 'left')
@@ -509,10 +646,35 @@ def esp_measure(esp_path, aux):
     out['motor_on_col'] = int(mon is not None)
     to_pi = lambda x: float(fit['a_us'] + (1.0 + fit['b']) * x)   # noqa: E731
     events, n_seqgap, n_outside, n_unk = [], 0, 0, 0
+    resid_ms = float(fit['resid_max_us']) / 1000.0
 
-    def follow(k_first0, k_last0, w0, d_t0):
-        kf = int(next_hit[(w0, d_t0)][k_first0]) if k_first0 < n else n
-        return kf, kf < k_last0
+    def event(loai, nm, w, d_t, t0, t_end, moc, bat_dinh, **kw):
+        """C3-15: lần đầu quan sát vào dải trong [t0; t_end), kèm số frame liền trong dải,
+        frame không quan sát được trên đoạn đã quét và lý do bị cắt (docstring c-ESP32)."""
+        k_first = int(np.searchsorted(t_f, t0, 'left'))
+        k_last = int(np.searchsorted(t_f, t_end, 'left')) if math.isfinite(t_end) else n
+        kf = int(next_hit[(w, d_t)][k_first]) if k_first < n else n
+        inb = kf < k_last
+        k_stop = kf + 1 if inb else min(k_last, n)
+        n_kbc = int((~valid[k_first:k_stop]).sum() + cut[k_first + 1:k_stop].sum())
+        n_lien = 0
+        if inb:
+            k = kf
+            while (k < k_last and valid[k] and (k == kf or not cut[k])
+                   and abs(duty[k, w] - d_t) <= TOL + EPS):
+                n_lien += 1
+                k += 1
+        cat = '' if inb else ('doi_lenh' if t_end <= t_f[-1] else 'het_log')
+        return dict(
+            loai=loai, wheel=nm, target=int(d_t), t_pi_us=round(t0, 3), moc_t0=moc,
+            bat_dinh_ms=round(bat_dinh, 6), k_first=k_first,
+            duty_first=round(float(duty[k_first, w]), 6) if k_first < n else '',
+            k_vao_dai=kf if inb else '',
+            t_vao_dai_ms=round((t_f[kf] - t0) / 1000.0, 6) if inb else '',
+            vao_dai=inb, n_lien_vao_dai=n_lien, n_khong_bc=n_kbc, cat=cat,
+            cens_ms='' if inb else round((min(t_end, t_f[-1]) - t0) / 1000.0, 6),
+            cmd_level_ms='' if not math.isfinite(t_end) else round((t_end - t0) / 1000.0, 6),
+            **kw)
 
     for w, nm in enumerate(WHEELS):
         pw = pwm[:, w]
@@ -536,20 +698,9 @@ def esp_measure(esp_path, aux):
             while j < len(pw) and pw[j] == pw[i]:
                 j += 1
             t_end = float(t_pi[j]) if j < len(pw) else math.inf
-            k_first = int(np.searchsorted(t_f, t0, 'left'))
-            k_last = int(np.searchsorted(t_f, t_end, 'left')) if math.isfinite(t_end) else n
-            k_follow, followed = follow(k_first, k_last, w, d_t)
-            events.append(dict(
-                loai='lenh', wheel=nm, target=int(d_t), log_seq=int(seq[i]),
-                pwm_prev=int(pw[i - 1]), t_esp_us=int(ts[i]),
-                t_pi_us=round(t0, 3), k_first=k_first,
-                duty_first=round(float(duty[k_first, w]), 6),
-                k_follow=k_follow if followed else '',
-                hold_ms=round((t_f[k_follow] - t0) / 1000.0, 6) if followed else '',
-                followed=followed,
-                cens_ms='' if followed else round((min(t_end, t_f[-1]) - t0) / 1000.0, 6),
-                cmd_level_ms='' if not math.isfinite(t_end)
-                else round((t_end - t0) / 1000.0, 6)))
+            events.append(event('lenh', nm, w, d_t, t0, t_end, 'udp_envelope', resid_ms,
+                                log_seq=int(seq[i]), pwm_prev=int(pw[i - 1]),
+                                t_esp_us=int(ts[i])))
     out.update(n_ev_seqgap=n_seqgap, n_ev_outside=n_outside, n_ev_sign_unknown=n_unk)
 
     # sự kiện tắt motor ('tat_motor'): dòng đầu motor_on 1->0, chứng minh bằng last_data_seq
@@ -561,6 +712,8 @@ def esp_measure(esp_path, aux):
                    tick_dt_med_ms=dt_med / 1e3 if dt_med is not None else '',
                    tick_dt_max_ms=float(dt.max()) / 1e3 if len(dt) else '')
         proven = run_end_seqs(esp_path)
+        bd_off = (resid_ms + max(dt_med - float(dt.min()), float(dt.max()) - dt_med) / 1000.0
+                  if dt_med is not None else '')
         for i in range(1, len(mon)):
             if not (mon[i] == 0 and mon[i - 1] == 1):
                 continue
@@ -578,61 +731,39 @@ def esp_measure(esp_path, aux):
                 while j < len(pwm) and pwm[j, w] == 0:
                     j += 1
                 t_end = float(t_pi[j]) if j < len(pwm) else math.inf
-                k_first = int(np.searchsorted(t_f, t0, 'left'))
-                k_last = (int(np.searchsorted(t_f, t_end, 'left'))
-                          if math.isfinite(t_end) else n)
-                k_follow, followed = follow(k_first, k_last, w, 0.0)
-                events.append(dict(
-                    loai='tat_motor', wheel=nm, target=0, log_seq=int(seq[i - 1]),
-                    pwm_prev=int(pwm[i - 1, w]),
-                    t_esp_us=int(round(float(ts[i - 1]) + dt_med)),
-                    t_pi_us=round(t0, 3), k_first=k_first,
-                    duty_first=round(float(duty[k_first, w]), 6) if k_first < n else '',
-                    k_follow=k_follow if followed else '',
-                    hold_ms=round((t_f[k_follow] - t0) / 1000.0, 6) if followed else '',
-                    followed=followed,
-                    cens_ms='' if followed
-                    else round((min(t_end, t_f[-1]) - t0) / 1000.0, 6),
-                    cmd_level_ms='' if not math.isfinite(t_end)
-                    else round((t_end - t0) / 1000.0, 6)))
-    off = [e for e in events if e['loai'] == 'tat_motor']
-    fol_o = [e['hold_ms'] for e in off if e['followed']]
-    cen_o = [e['cens_ms'] for e in off if not e['followed']]
-    out.update(n_ev_off=len(off), n_follow_off=len(fol_o), n_cens_off=len(cen_o),
-               hold_med_ms_off=float(np.median(fol_o)) if fol_o else '',
-               hold_p95_ms_off=(float(np.percentile(fol_o, 95, method='higher'))
-                                if fol_o else ''),
-               hold_max_ms_off=max(fol_o) if fol_o else '',
-               cens_max_ms_off=max(cen_o) if cen_o else '',
+                events.append(event('tat_motor', nm, w, 0.0, t0, t_end,
+                                    'udp_envelope+tick_dt_med', bd_off,
+                                    log_seq=int(seq[i - 1]), pwm_prev=int(pwm[i - 1, w]),
+                                    t_esp_us=int(round(float(ts[i - 1]) + dt_med))))
+    out.update(a11_stats([e for e in events if e['loai'] == 'tat_motor'], 'off'),
                n_off_unproven=n_off_unpr, n_off_outside=n_off_out)
     lenh = [e for e in events if e['loai'] == 'lenh']
     for T in (0, 1):
         ev = [e for e in lenh if abs(e['target']) == T]
-        fol = [e['hold_ms'] for e in ev if e['followed']]
-        cen = [e['cens_ms'] for e in ev if not e['followed']]
-        out.update({
-            f'n_ev_{T}': len(ev), f'n_follow_{T}': len(fol), f'n_cens_{T}': len(cen),
-            f'hold_med_ms_{T}': float(np.median(fol)) if fol else '',
-            f'hold_p95_ms_{T}': float(np.percentile(fol, 95, method='higher')) if fol else '',
-            f'hold_max_ms_{T}': max(fol) if fol else '',
-            f'cens_max_ms_{T}': max(cen) if cen else ''})
-        doi = [e for e in ev
-               if abs(SIGN_CODE * e['pwm_prev'] / 1000.0 - e['target']) > TOL + EPS]
-        fol_d = [e['hold_ms'] for e in doi if e['followed']]
-        out.update({
-            f'n_ev_doi_{T}': len(doi),
-            f'n_follow_doi_{T}': len(fol_d),
-            f'n_cens_doi_{T}': len(doi) - len(fol_d),
-            f'hold_med_doi_ms_{T}': float(np.median(fol_d)) if fol_d else '',
-            f'hold_p95_doi_ms_{T}': (float(np.percentile(fol_d, 95, method='higher'))
-                                     if fol_d else ''),
-            f'hold_max_doi_ms_{T}': max(fol_d) if fol_d else ''})
+        out.update(a11_stats(ev, T))
+        out.update(a11_stats([e for e in ev if abs(SIGN_CODE * e['pwm_prev'] / 1000.0
+                                                   - e['target']) > TOL + EPS], f'doi_{T}'))
     return out, events
 
 
-def process_one(npz_path, esp_path, task):
-    """Một npz (+ log ESP32 nếu có) -> (row, segs, events). ValueError/OSError -> caller."""
-    row, aux, segs = count_run(npz_path, task)
+def a11_stats(ev, sfx):
+    """Các cột A11_STAT (hậu tố sfx) của một nhóm sự kiện (docstring c-ESP32)."""
+    fol = [e['t_vao_dai_ms'] for e in ev if e['vao_dai']]
+    cen = [e['cens_ms'] for e in ev if not e['vao_dai']]
+    v = (len(ev), len(fol), len(cen),
+         float(np.median(fol)) if fol else '',
+         float(np.percentile(fol, 95, method='higher')) if fol else '',
+         max(fol) if fol else '', max(cen) if cen else '',
+         sum(1 for e in ev if e['cat'] == 'doi_lenh'),
+         sum(1 for e in ev if e['cat'] == 'het_log'),
+         sum(1 for e in ev if e['n_khong_bc'] > 0))
+    return dict(zip(a11_cols(sfx), v))
+
+
+def process_one(npz_path, esp_path, task, score=None):
+    """Một npz (+ log ESP32 nếu có, + kết quả chấm nếu có) -> (row, segs, events).
+    ValueError/OSError -> caller."""
+    row, aux, segs = count_run(npz_path, task, score)
     if esp_path is None:
         row['esp_part'] = 'khong_co_log_ESP32'
         return row, segs, []
@@ -692,21 +823,36 @@ def batch(a):
         return s06_stream.report_result(2)
     os.makedirs(os.path.join(a.out, 'su_kien'), exist_ok=True)
     os.makedirs(os.path.join(a.out, 'doan_phang'), exist_ok=True)
+    if a.cham:
+        os.makedirs(os.path.join(a.out, 'cham'), exist_ok=True)
     rows, mis, n_err = [], [], 0
     for r in s1_rows:
         run, fn = r.get('run', ''), r.get('npz', '')
         name = r.get('name') or name_of(fn)
         task = r.get('task', '')
+        fl = os.path.join(a.root, run, 'frames', fn)
+        esp = os.path.join(a.root, run, 'pi', name + '.csv')
+        esp = esp if os.path.isfile(esp) else None
+        score, cham_err = None, ''
+        if a.cham and task.startswith('O1-'):
+            # C3-17: mặt nạ cửa sổ hoàn thành từ chính bộ chấm (docstring "Chạy theo lô")
+            try:
+                score = hil_o1_score._json_safe(hil_o1_score.score(
+                    fl, task, allow_final_set=True, esp_log=esp, allow_pre_b81_15=True))
+                with open(os.path.join(a.out, 'cham', f'{run}__{name}_score.json'), 'w',
+                          encoding='utf-8') as f:
+                    json.dump(score, f, ensure_ascii=False, indent=1)
+            except Exception as exc:                         # noqa: BLE001  ghi lại, lô chạy tiếp
+                score, cham_err = None, f'loi_cham: {type(exc).__name__}: {exc}'
         try:
-            fl = os.path.join(a.root, run, 'frames', fn)
-            esp = os.path.join(a.root, run, 'pi', name + '.csv')
-            esp = esp if os.path.isfile(esp) else None
-            row, segs, events = process_one(fl, esp, task)
+            row, segs, events = process_one(fl, esp, task, score)
         except (OSError, KeyError, ValueError) as exc:
             rows.append(dict(run=run, npz=fn, name=name, task=task,
                              error=f'{type(exc).__name__}: {exc}'))
             n_err += 1
             continue
+        if cham_err:
+            row['win_ht_src'] = cham_err
         rows.append(dict(run=run, npz=fn, name=name, task=task, **row))
         write_csv(os.path.join(a.out, 'su_kien', f'{run}__{name}_su_kien_a11.csv'),
                   EVENT_COLS, events)
@@ -731,6 +877,10 @@ def main(argv=None):
     ap.add_argument('--out', required=True)
     ap.add_argument('--batch-from-s1', help='ket_qua_s1.csv của dem_s1.py')
     ap.add_argument('--root', help='thư mục CLOSED_LOOP (cho --batch-from-s1)')
+    ap.add_argument('--score-json', help='kết quả hil_o1_score.py --out của cùng lượt '
+                    '(mặt nạ cửa sổ hoàn thành, cột *_ht)')
+    ap.add_argument('--cham', action='store_true',
+                    help='lô: chấm dòng O1-* bằng hil_o1_score.score, mặt nạ *_ht từ kết quả')
     a = ap.parse_args(argv)
     if a.batch_from_s1:
         return batch(a)
@@ -738,7 +888,13 @@ def main(argv=None):
         print('loi dau vao: can --frame-log hoac --batch-from-s1', file=sys.stderr)
         return s06_stream.report_result(2)
     try:
-        row, segs, events = process_one(a.frame_log, a.esp_log, a.task)
+        score = None
+        if a.score_json:
+            with open(a.score_json, encoding='utf-8') as f:
+                score = json.load(f)
+            if not isinstance(score, dict):
+                raise ValueError(f'{a.score_json}: khong phai JSON object')
+        row, segs, events = process_one(a.frame_log, a.esp_log, a.task, score)
     except (OSError, KeyError, ValueError) as exc:
         print(f'loi dau vao: {exc}', file=sys.stderr)
         return s06_stream.report_result(2)

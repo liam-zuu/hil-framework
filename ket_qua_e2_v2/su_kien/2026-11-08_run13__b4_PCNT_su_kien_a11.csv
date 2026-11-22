@@ -1,0 +1,4 @@
+loai,wheel,target,log_seq,pwm_prev,t_esp_us,t_pi_us,moc_t0,bat_dinh_ms,k_first,duty_first,k_vao_dai,t_vao_dai_ms,vao_dai,n_lien_vao_dai,n_khong_bc,cat,cens_ms,cmd_level_ms
+lenh,fr,0,14327,23,192789677,20196709043.016,udp_envelope,0.975771,61131,-0.022645,61140,9.1471,True,1,0,,,9.971234
+lenh,rl,0,14409,-6,193609217,20197528602.248,udp_envelope,0.975771,61951,0.05298,,,False,0,0,doi_lenh,8.268194,8.268194
+lenh,rr,0,14421,-6,193727678,20197647066.027,udp_envelope,0.975771,62069,0.0,62069,0.124175,True,11,0,,,11.09226
