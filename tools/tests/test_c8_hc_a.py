@@ -1945,3 +1945,138 @@ def test_tinh_and_cua_so_k2_q_from_k1(tmp_path):
     assert cfg['q_m'] is None and cfg['q_nguon'] is None and 'chua xac minh' in cfg['q_ly_do']
 
 
+# ------------------------------------------------------------------ option B (CODE 22/11): align off-A6 when frames lost
+def _far_cut(F, cut_m=0.04):
+    """A chain-like F whose frames near the far end of the 12b legs are lost (session 2 K1: 'a6_khung:ngoai_mien'):
+    the frames with the tag centre within cut_m of the largest x of the attempt."""
+    G = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in F.items()}
+    far = np.asarray(G['x']) > np.nanmax(G['x'][G['ok']]) - cut_m
+    G['ok'] = G['ok'] & ~far
+    for k in ('x', 'y', 'psi', 'tx', 'ty'):
+        if k in G:
+            G[k] = np.where(far, np.nan, G[k])
+    G['chuoi'] = 'khoa'
+    return G
+
+
+def test_align_off_a6_when_far_end_lost(tmp_path):
+    """K1 with the far-end frames lost: before, align raised (code 2, no F2/F5); now align runs on the frames before
+    the chain, the windows without chain frames make their legs 'thieu', and tinh gives chua_ket_luan."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1')
+    A = ca.load_attempt(d)
+    _, info = ca.kiem(A)
+    G = ca.frames_basic(os.path.join(d, 'frames.csv'), os.path.join(d, 'track.json'))
+    F = _far_cut(G)
+    assert int(F['ok'].sum()) < int(G['ok'].sum())
+    with pytest.raises(ca.AError, match='camera intervals'):
+        ca.analyse(A, F, info)                                           # the old behaviour on such frames
+    an = ca.analyse(A, F, info, F_gio=G)
+    assert an['can_gio'] == dict(khung='chua_A6', n_khung_chuoi_mat=int(G['ok'].sum() - F['ok'].sum()))
+    assert an['D'] == ca.analyse(A, G, info)['D']                        # the same alignment as off-A6 frames
+    st = [lg['trang_thai'] for lg in an['legs']]
+    assert 'thieu' in st and any('frames' in (lg.get('ly_do') or '') for lg in an['legs'])
+    r = ca.place_result('K1', [('HC_K1_1', an)], 'HC_K1_1', e_hieu=E(0.0), q=[0, 0], du_m=0.0, neo=0.0, psi_cuc=0.0)
+    assert r['trang_thai'] == 'chua_ket_luan' and r['a_k_deg'] is None
+
+
+def test_cua_so_tinh_write_files_when_far_end_lost(tmp_path, monkeypatch):
+    """cua_so writes F2 and F5 (legs thieu, can_gio recorded) instead of code 2, so K2 can take --q-tu from it; tinh
+    gives the place chua_ket_luan with code 1."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1')
+    monkeypatch.setattr(ca, 'frames_chain', lambda fr, a6_, xo, track=None, cho=None, **k:
+                        _far_cut(ca.frames_basic(fr, track)))
+    a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2', tam_id='T1'))
+    xo = write_json(str(tmp_path / 'xo.json'), dict(version='xoay_v1', cho={}))
+    assert ca.main(['cua_so', d, '--frames', os.path.join(d, 'frames.csv'), '--track', os.path.join(d, 'track.json'),
+                    '--a6', a6, '--xoay', xo, '--ra', str(tmp_path / 'r2')]) == 0
+    f5 = json.load(open(tmp_path / 'r2' / 'doan_12b_v1.json', encoding='utf-8'))
+    assert f5['can_gio']['khung'] == 'chua_A6' and f5['can_gio']['n_khung_chuoi_mat'] > 0
+    assert any(x['trang_thai'] == 'thieu' for x in f5['doan']) and ca.f5_problems(f5) == []
+    out = str(tmp_path / 'f7.json')
+    assert ca.main(tinh_args(d, 'K1', '--a6', a6, '--xoay', xo, '--out', out)) == 1
+    r = json.load(open(out, encoding='utf-8'))
+    assert r['trang_thai'] == 'chua_ket_luan' and r['luot_thu'][0]['can_gio']['khung'] == 'chua_A6'
+
+
+def test_full_chain_unchanged_bit_for_bit(tmp_path):
+    """No frame lost by the chain: analyse with F_gio gives exactly the old result (align on the chain frames)."""
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+    A = ca.load_attempt(d)
+    _, info = ca.kiem(A)
+    G = ca.frames_basic(os.path.join(d, 'frames.csv'), os.path.join(d, 'track.json'))
+    F = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in G.items()}
+    F['psi'] = F['psi'] + 1e-4                       # a chain that changes the values but loses no frame
+    F['x'] = F['x'] * 1.002                          # (speeds change, so aligning on G would move D)
+    old, new = ca.analyse(A, F, info), ca.analyse(A, F, info, F_gio=G)
+    assert new['can_gio'] == dict(khung='chuoi', n_khung_chuoi_mat=None)
+    assert old['D'] != ca.analyse(A, G, info)['D']   # the check below can see an align on the wrong frames
+    assert (old['D'], old['u_D'], old['diffs']) == (new['D'], new['u_D'], new['diffs'])
+    for a_, b_ in zip(old['legs'], new['legs']):
+        assert a_.keys() == b_.keys()
+        for k in a_:
+            va, vb = a_[k], b_[k]
+            assert (np.array_equal(va, vb) if isinstance(va, np.ndarray) else va == vb), k
+    assert old['truot_cheo'] == new['truot_cheo'] and old['thang_hang_m'] == new['thang_hang_m']
+
+
+# ------------------------------------------------------------------ option A in the CAM chain (CAM 63dd13d)
+def _fake_ck_q(monkeypatch, seen):
+    import types
+    m = types.ModuleType('c7_chuoi_khung')
+
+    def chuoi_khung(frames_csv, a6_, xoay, lan_lap=None, track=None, cho=None, tam_id=None, cho_q=None, ll_id=None,
+                    ll_id_q=None):
+        seen.append(dict(cho=cho, cho_q=cho_q, ll_id=ll_id, ll_id_q=ll_id_q))
+        return [_row(0), _row(1), _row(2)]
+    m.doc_a6, m.chuoi_khung = (lambda p: dict(sha256='x')), chuoi_khung
+    monkeypatch.setitem(sys.modules, 'c7_chuoi_khung', m)
+
+
+def test_frames_chain_passes_option_a_to_cam(tmp_path, monkeypatch):
+    a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2', tam_id='T1'))
+    seen = []
+    _fake_ck_q(monkeypatch, seen)
+    ca.frames_chain('f.csv', a6, 'xoay.json', cho='K2', cho_q='K1', ll_id='L2', ll_id_q='L2')
+    ca.frames_chain('f.csv', a6, 'xoay.json', cho='K1')
+    assert seen == [dict(cho='K2', cho_q='K1', ll_id='L2', ll_id_q='L2'),
+                    dict(cho='K1', cho_q=None, ll_id=None, ll_id_q=None)]
+    old = _fake_ck(monkeypatch, rows=[_row(0), _row(1)])                  # a CAM without cho_q: not passed
+    assert ca.frames_chain('f.csv', a6, 'xoay.json', cho='K2', cho_q='K1', ll_id='L2', ll_id_q='L2') is not None
+    assert old['cho'] == 'K2'
+
+
+def test_q_cung_lan_lap_inputs(tmp_path):
+    a6, xv, x = _k2_setup(tmp_path)
+    k1 = _f5_file(tmp_path, 'f5_k1', 'K1', 'HC_K1_2', 'L2', xv, a6)
+    assert ca.q_cung_lan_lap(x, 'K2', k1, 'L2') == dict(cho_q='K1', ll_id='L2', ll_id_q='L2')
+    assert ca.q_cung_lan_lap(x, 'K2', k1, None) == dict(cho_q='K1', ll_id=None, ll_id_q='L2')   # CAM refuses
+    assert ca.q_cung_lan_lap(x, 'K1', k1, 'L2') is None                  # own block: CAM reads it, no option A
+    assert ca.q_cung_lan_lap(x, 'K2', None, 'L2') is None
+    with pytest.raises(ca.AError):
+        ca.q_cung_lan_lap(x, 'K2', _f5_file(tmp_path, 'f5_k2', 'K2', 'HC_K2_1', 'L2', xv, a6), 'L2')
+
+
+def test_cua_so_tinh_give_cam_the_mounting_ids(tmp_path, monkeypatch):
+    """cua_so (K2, --lan-lap absent: ll_id None) and tinh (ll_id from the F5 of the issued attempt) pass cho_q and the
+    two lan_lap_id to the CAM chain."""
+    a6, xv, x = _k2_setup(tmp_path)
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    k1 = _f5_file(tmp_path, 'f5_k1', 'K1', 'HC_K1_2', 'L2', xv, a6)
+    own = _f5_file(tmp_path, 'f5_k2_own', 'K2', 'HC_K2_1', 'L2', xv, a6)
+    seen = []
+
+    def fake(fr, a6_, xo, track=None, cho=None, **k):
+        seen.append(dict(cho=cho, **k))
+        return None                                                       # chain refused: basic frames
+    monkeypatch.setattr(ca, 'frames_chain', fake)
+    assert ca.main(['cua_so', d, '--frames', os.path.join(d, 'frames.csv'), '--track', os.path.join(d, 'track.json'),
+                    '--a6', a6, '--xoay', xv, '--q-tu', k1, '--ra', str(tmp_path / 'r')]) == 0
+    assert seen[-1] == dict(cho='K2', cho_q='K1', ll_id=None, ll_id_q='L2')
+    assert ca.main(tinh_args(d, 'K2', '--xoay', xv, '--a6', a6, '--q-tu', k1, '--doan', own,
+                             '--out', str(tmp_path / 'f7.json'))) in (0, 1)
+    assert seen[-1] == dict(cho='K2', cho_q='K1', ll_id='L2', ll_id_q='L2')
+    n = len(seen)
+    assert ca.main(tinh_args(d, 'K2', '--xoay', xv, '--a6', a6, '--out', str(tmp_path / 'f7b.json'))) in (0, 1)
+    assert seen[n] == dict(cho='K2')                                      # no --q-tu: nothing extra
+
+
