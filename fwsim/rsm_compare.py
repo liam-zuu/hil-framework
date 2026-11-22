@@ -114,7 +114,8 @@ INTERPRETATIONS = [
     'mu the two base fits are the same model and are checked equal',
     'rank: numpy.linalg.matrix_rank with its default tolerance; a fit of rank < 36 has no coefficients',
     'SLSQP with the analytic gradient; converged = scipy OptimizeResult.success with a finite solution whose move '
-    'back into [-1, 1]^7 is at most 1e-9 (rounding; RSM-15); f1_hat, f2_hat on the clipped point',
+    'back into [-1, 1]^7 is at most 1e-9 (rounding; RSM-15); ADRC: and inside the triangle margin (next items); '
+    'f1_hat, f2_hat on the clipped point',
     'duplicates: greedy in the sorted order, a candidate within 1e-4 (Euclidean, codes) of a kept one is dropped '
     '(Codex RSM-15 on chains A-B-C: kept, deterministic)',
     'code to gain: s03_doe.decode on levels.csv; bounds: s03_doe.check_bounds; edge flag and level source: '
@@ -161,13 +162,16 @@ INTERPRETATIONS = [
     '(compared: the LF value, so a checkout with core.autocrlf keeps the lock valid)',
     'no x_GA (send_to_HIL infeasible in S04) stops the run: 12.5 does not define the classes without it',
     'S04 v6.8 12.3 (G-Q4): for ADRC both SLSQP steps carry omega_c + 2 omega_o <= 199.99 per axis (xy, wz) on the '
-    'real values after s03_doe.decode, analytic Jacobian; no further tolerance is applied to this constraint when '
-    'the candidates are listed (the solver success flag decides); the float32 check of the next item is the hard one',
+    'real values after s03_doe.decode, analytic Jacobian; C3-11: each solver result of both steps is checked again '
+    'on the binary64 gains decoded from its code (omega_c + 2 omega_o <= 199.99 on each axis, no tolerance, whatever '
+    'SLSQP reports): a result above is not converged (starts.csv tri_sums, tri_ok), so it sets neither f1* nor a '
+    'candidate; when no result of a step is left the state is (i); the float32 check of the next item is kept '
+    'before M is counted',
     'code to gain (S04 v6.8 12.3 (ii)): after s03_doe.check_bounds the float32 gains go through s04_ga.gain_check '
-    '(tools/gain_table.check): a gain outside the range table stops the run; a candidate outside the LADRC triangle '
-    'on float32 is dropped before M is counted (result.csv n_ngoai_tam_giac), the kept candidates are ranked 1..M, '
-    'and M = 0 after the drop is state (ii); a GA candidate with status ngoai_bang (not run) is counted as '
-    'unlabelled in ga_errors.csv',
+    '(tools/gain_table.py: its classify() Verdict when the module has it, else the texts of check()): a gain outside '
+    'the range table stops the run; a candidate outside the LADRC triangle on float32 is dropped before M is '
+    'counted (result.csv n_ngoai_tam_giac), the kept candidates are ranked 1..M, and M = 0 after the drop is state '
+    '(ii); a GA candidate with status ngoai_bang (not run) is counted as unlabelled in ga_errors.csv',
     'S04 v6.8 12.3: result.csv ga_tri_sums = omega_c + 2 omega_o per axis of x_GA on its real values, '
     'ga_in_tri_band = true when one is above 199.99 (the band below 200 that the RSM search does not cover); both '
     'empty for PID',
@@ -997,9 +1001,21 @@ def triangle_constraints(ctrl, dom):
     return tuple(out)
 
 
-def optimise(b1, b2, starts, extra=()):
+def triangle_check(ctrl, dom):
+    """S04 v6.8 12.3 (C3-11): None for PID; for LADRC a function code -> {axis: omega_c + 2 omega_o} on the binary64
+    gains decoded from the code as to_gains decodes them (s03_doe.decode on the locked domain dom). optimise checks
+    every solver result of both steps with it against TRI_MAX, whatever SLSQP reports."""
+    if ctrl != 'ADRC':
+        return None
+    lv = [(d['name'], d['L'], d['H'], d['scale']) for d in dom]
+    return lambda code: triangle_sums(ctrl, {n: s3.decode(float(c), L, H, sc) for (n, L, H, sc), c in zip(lv, code)})
+
+
+def optimise(b1, b2, starts, extra=(), tri=None):
     """12.3: (state, f1_star, start rows, candidates [dict code, f1h, f2h]). state None or 'i' / 'ii'.
-    extra: SLSQP constraints added to both steps (S04 v6.8 12.3: the LADRC triangle)."""
+    extra: SLSQP constraints added to both steps (S04 v6.8 12.3: the LADRC triangle).
+    tri: triangle_check(...): a result of either step with a sum above TRI_MAX on binary64, no tolerance, is not
+    converged (C3-11)."""
     from scipy.optimize import minimize
     bounds = [(-1.0, 1.0)] * 7
     opts = dict(ftol=SOLVER['ftol'], maxiter=SOLVER['maxiter'])
@@ -1012,13 +1028,16 @@ def optimise(b1, b2, starts, extra=()):
         finite = bool(np.all(np.isfinite(raw)))
         x = np.clip(raw, -1.0, 1.0) if finite else raw
         move = float(np.max(np.abs(raw - x))) if finite else float('inf')
+        sums = tri(x) if tri is not None and finite else {}
+        tri_ok = all(v <= TRI_MAX for v in sums.values())      # C3-11: binary64, no tolerance (NaN fails)
         # RSM-15: only a rounding move back into the box keeps the solver's success
-        ok = bool(res.success) and finite and move <= CLIP_TOL
+        ok = bool(res.success) and finite and move <= CLIP_TOL and tri_ok
         rows.append(dict(step=step, start=k, start_code=json.dumps([float(v) for v in x0]), success=bool(res.success),
                          converged=ok, status=int(res.status), nit=int(getattr(res, 'nit', -1)),
                          message=str(res.message), raw_code=json.dumps([repr(float(v)) for v in raw]), clip_move=move,
                          code=json.dumps([repr(float(v)) for v in x]),
-                         f1_hat=predict(b1, x) if finite else '', f2_hat=predict(b2, x) if finite else ''))
+                         f1_hat=predict(b1, x) if finite else '', f2_hat=predict(b2, x) if finite else '',
+                         tri_sums=json.dumps(sums) if sums else '', tri_ok=tri_ok if sums else ''))
         return ok, x
 
     f1 = (lambda c: predict(b1, c)), (lambda c: gradient(b1, c))
@@ -1365,7 +1384,8 @@ def run_opt(inp, ctx, log=print):
         b1, b2 = coefs[(ctrl, 'main', 'base', 'f1')], coefs[(ctrl, 'main', 'base', 'f2')]
         starts = [np.array([float(p[f'X{k}']) for k in range(1, 8)]) for p in sorted(fitp[ctrl], key=lambda p: int(p['point_id']))]
         dom = inp.ctrl_lock(ctrl)['domain']
-        state, f1s, srows, cands = optimise(b1, b2, starts, triangle_constraints(ctrl, dom))
+        state, f1s, srows, cands = optimise(b1, b2, starts, triangle_constraints(ctrl, dom),
+                                            triangle_check(ctrl, dom))
         starts_rows += [dict(controller=ctrl, **r) for r in srows]
         kept, n_tri = [], 0
         for c in cands:

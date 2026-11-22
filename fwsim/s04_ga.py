@@ -113,7 +113,6 @@ B0_FACTORS = (0.7, 0.85, 1.0, 1.15, 1.3)
 R_FACTORS = (0.8, 0.9, 1.0, 1.1, 1.2)
 REL_LIMIT = 0.5               # B0_SENS criterion: e_perp_max change > 50 %
 PRECONDITIONS = ('s03_run_and_locked', 'final_test_set_locked', 'ctrl_imu_checked_on_board', 'x3_compared')
-CMP_EPS = 1e-12               # S4C-14: rounding tolerance of the inclusive mu-rule bounds (m; relative for Y3)
 MU_RULE_BOXES = ('centre', 'outer', 'inner')        # S04 v6 section 9 item 4 (S03 v8 axial / test excluded)
 MU_RULE_POINTS = ({('0', 'centre')} | {(str(i), 'outer') for i in range(1, 129)} |
                   {(str(i), 'inner') for i in range(129, 257)})   # the 257 point_id locked for the mu rule
@@ -308,6 +307,8 @@ def edge_flags(dom, x):
 
 
 GRID_END_SOURCES = ('hết lưới', 'hết lưới dưới')   # S03 v8.4 level sources: the original grid ended there (v6.6)
+TABLE_CEILING_SOURCE = 'trần bảng chặn'   # S03 v8.6 3.1 level source: H = T, the range-table ceiling of the gain
+EDGE_LIMIT_TABLE = 'vùng ngoài bảng chặn không thuộc thí nghiệm (DUT từ chối gain đó)'   # S04 v6.8 section 2
 
 
 def edge_sides(dom, x):
@@ -329,15 +330,20 @@ def edge_report(dom, x):
     edge_side = factor:side; edge_src = factor:side:source of that bound (S03 levels.csv, '?' when the S03 run
     has none); edge_limit = the flagged factors whose bound on that side is a grid end ('hết lưới',
     'hết lưới dưới'): the limit 'vùng ngoài biên chưa khảo sát bằng GA', each with the result of the S03 v8.4
-    out-of-range check on that side ('?' when the S03 run has no check file). No flag, no limit, whatever the
-    sources. The four keys are fixed (rsm_compare.py writes them for the RSM candidates, section 12)."""
+    out-of-range check on that side ('?' when the S03 run has no check file). A flagged bound whose source is
+    'trần bảng chặn' adds EDGE_LIMIT_TABLE (no out-of-range result: the grid is cut at T); the two kinds are
+    joined by ' | '. No flag, no limit, whatever the sources. The four keys are fixed (rsm_compare.py writes
+    them for the RSM candidates, section 12)."""
     by = {d['name']: d for d in dom}
     sides = edge_sides(dom, x)
     src = [(n, s, by[n].get('L_src' if s == 'L' else 'H_src') or '') for n, s in sides]
     lim = [f'{n}:{s} [kiểm ngoài miền: {by[n].get(s + "_kiem") or "?"}]' for n, s, c in src if c in GRID_END_SOURCES]
+    tab = [f'{n}:{s}' for n, s, c in src if c == TABLE_CEILING_SOURCE]
+    limits = ((['vùng ngoài biên chưa khảo sát bằng GA: ' + ' '.join(lim)] if lim else [])
+              + ([EDGE_LIMIT_TABLE + ': ' + ' '.join(tab)] if tab else []))
     return dict(edge=' '.join(edge_flags(dom, x)), edge_side=' '.join(f'{n}:{s}' for n, s in sides),
                 edge_src=' | '.join(f'{n}:{s}:{c or "?"}' for n, s, c in src),
-                edge_limit=('vùng ngoài biên chưa khảo sát bằng GA: ' + ' '.join(lim)) if lim else '')
+                edge_limit=' | '.join(limits))
 
 
 def gate_state_of(r, c, where):
@@ -354,13 +360,22 @@ def gate_state_of(r, c, where):
              f'(S03 v8.2 section 7; S04 v6.7 section 9 item 7)')
 
 
+def mu_within(x, ref, thr):
+    """S04 section 3 (C3-6): |x - ref| <= thr with the comparison convention of S03 (s03_doe.exact, not_above_by:
+    inclusive, exact on the decimal of each number as written in runs.csv, no tolerance). A value that is not
+    finite is not within (not comparable, as s03_doe.comparable)."""
+    return (math.isfinite(x) and math.isfinite(ref)
+            and s3.not_above_by(x, ref, thr) and s3.not_above_by(ref, x, thr))
+
+
 def mu_rule(s03_dir, ctrl, gate, mu_levels):
     """Section 3: ('mid', report) when every S03 design point (the 257 points of the centre,
     outer and inner boxes; S03 v8 axial and test points are not used) at every gate
     speed has the same Y1 at the three mu, the same G3, G4 and G5 state at the three mu
     (gate state columns of sealed/runs.csv), |dY2| <= 0.01 m and |dY3| <= 0.4 1/s (S04 v6.8:
     the absolute threshold of S03 5.2) versus the middle mu, no track error, no inconclusive;
-    else ('all', report)."""
+    else ('all', report). The dY2 / dY3 bounds are compared as S03 compares (mu_within,
+    s03_doe.not_above_by); a Y2 or Y3 that is not finite does not satisfy the rule (C3-6)."""
     # S04 v6 section 9 item 4 (S03 v8 adds axial and test points): the mu rule uses only the
     # 257 points of the centre, outer and inner boxes, filtered by box in BOTH files before the
     # completeness and membership checks; the point_id list used is locked to 0..256
@@ -405,12 +420,13 @@ def mu_rule(s03_dir, ctrl, gate, mu_levels):
                 why.append('y1 inconclusive')
             if len({r['completed'] for r in rs.values()}) > 1:
                 why.append('y1 differs over mu')
-            y2 = {m: float(r['e_perp_max']) for m, r in rs.items()}
-            if max(abs(y2[lo] - y2[mid]), abs(y2[hi] - y2[mid])) > MU_Y2_TOL + CMP_EPS:     # S4C-14
-                why.append('dY2 > 0.01 m')
-            y3 = {m: float(r['tv_duty']) for m, r in rs.items()}
-            if max(abs(y3[lo] - y3[mid]), abs(y3[hi] - y3[mid])) > MU_Y3_TOL * (1 + CMP_EPS):
-                why.append('dY3 > 0.4 1/s')
+            for key, tol, text in (('e_perp_max', MU_Y2_TOL, 'dY2 > 0.01 m'),
+                                   ('tv_duty', MU_Y3_TOL, 'dY3 > 0.4 1/s')):
+                y = {m: float(r[key]) for m, r in rs.items()}
+                if not all(math.isfinite(x) for x in y.values()):
+                    why.append(f'{key} not finite')
+                elif not (mu_within(y[lo], y[mid], tol) and mu_within(y[hi], y[mid], tol)):
+                    why.append(text)                # C3-6: the S03 convention, no tolerance of its own
             for c in MU_RULE_GATE:
                 st = {gate_state_of(r, c, f'{s03_dir}/sealed/runs.csv: {ctrl} point {pid} ({box}) v = {v} mu = {m}')
                       for m, r in rs.items()}
@@ -428,19 +444,27 @@ def mu_rule(s03_dir, ctrl, gate, mu_levels):
 
 def gain_check(ctrl, g):
     """S04 v6.8 section 2 (S03 v8.6 2.1, 3.1b item 4): one gain set against the range table of the campaign
-    binary and the LADRC triangle, on the float32 values the firmware gets. The check itself is
-    tools/gain_table.check (never recomputed here; its warnings are not violations). Returns (table, triangle):
-    the violations of one gain against its own bounds (texts '<gain>=...') and every other violation check()
-    reports (ADRC: omega_c + 2 omega_o of an axis not below 200). S03Stop for a gain set check() cannot read and
-    for a PID violation that is not a bound (PID has no triangle)."""
+    binary and the LADRC triangle, on the float32 values the firmware gets. The check itself is in
+    tools/gain_table.py (never recomputed here; its warnings are not violations): the classify() Verdict
+    when the module has it (C3-11), else the texts of check(). Returns (table, triangle): the violations
+    of one gain against its own bounds and the other violations (ADRC: omega_c + 2 omega_o of an axis not
+    below 200). S03Stop for a gain set the table cannot read and for a PID violation that is not a bound
+    (PID has no triangle)."""
+    classify = getattr(gain_table, 'classify', None)
     try:
-        violations, _ = gain_table.check(ctrl, dict(g))
+        if classify is not None:               # C3-11: the Verdict decides, never the wording of a message
+            v = classify(ctrl, dict(g))
+            table = list(v.vi_pham_bang) or ([] if v.trong_bang else ['outside the range table'])
+            other = list(v.vi_pham_tam_giac) or ([] if v.trong_tam_giac or not v.trong_bang
+                                                 else ['outside the LADRC triangle'])
+        else:                                  # a gain_table without classify(): the texts of check()
+            violations, _ = gain_table.check(ctrl, dict(g))
+            table = [v for v in violations if any(v.startswith(n + '=') for n in gain_table.NAMES[ctrl])]
+            other = [v for v in violations if v not in table]
     except ValueError as e:
-        raise s3.S03Stop(f'{ctrl}: gain set {g!r} refused by gain_table.check ({e})') from None
-    table = [v for v in violations if any(v.startswith(n + '=') for n in gain_table.NAMES[ctrl])]
-    other = [v for v in violations if v not in table]
+        raise s3.S03Stop(f'{ctrl}: gain set {g!r} refused by tools/gain_table ({e})') from None
     if other and ctrl != 'ADRC':
-        raise s3.S03Stop(f'{ctrl}: gain_table.check reports {other}: not a bound of one gain (tool error)')
+        raise s3.S03Stop(f'{ctrl}: tools/gain_table reports {other}: not a bound of one gain (tool error)')
     return table, other
 
 
@@ -568,10 +592,11 @@ def score_ngoai_bang(n):
 
 def score(rows, error):
     """f1, f2, g1 .. g5 and counts of one candidate from its [(mu, v, row)] (section 3, S04 v6.2)."""
-    # S04 v6.7 section 3: a run with tv_duty missing or not finite counts as a run_error also when the caller
-    # did not convert the row (Evaluator.candidate does, tv_duty_run_error)
-    error = bool(error) or any(r.get('status') != 'run_error' and _finite(r.get('tv_duty')) is None
-                               for _, _, r in rows)
+    # S04 v6.7 section 3 (C3-9): a run with tv_duty missing or not finite counts as a run_error also when the
+    # caller did not convert the row (Evaluator.candidate does): the SAME converted row gives the score, the
+    # penalty flags and the counts
+    rows = [(mu, v, tv_duty_run_error(r)) for mu, v, r in rows]
+    error = bool(error) or any(r.get('status') == 'run_error' for _, _, r in rows)
     n = len(rows)
     counts = dict(n_runs=n, n_false=sum(r['completed'] == 'false' for _, _, r in rows),
                   n_inconclusive=sum(r['completed'] == 'inconclusive' for _, _, r in rows),
@@ -730,18 +755,20 @@ def summarise(ctrl, dom, finals):
     return rows, dict(n_seeds=n_seeds, n_feasible_seeds=n_feas, per_seed_selected=stats)
 
 
-def seed_error_rates(evals, ctrl):
+def seed_error_rates(evals, ctrl, seeds=None):
     """Section 3 (v4, B8b-7): per seed, first-attempt runs inconclusive or run_error / first-attempt runs.
     S04 v6.8 section 2 (CC1-3): a row with status 'ngoai_bang' (should a tool write one) is in neither the
-    numerator nor the denominator."""
-    out = {}
+    numerator nor the denominator. seeds = the seeds run (the locked list in a main run); a seed of that
+    list with no first-attempt run (every candidate ngoai_bang, not run) is reported with n = 0 and rate
+    None (JSON null), not left out (C3-10)."""
+    out = {int(s): [0, 0] for s in seeds or ()}
     for r in evals:
         if r['controller'] != ctrl or int(r['attempt']) != 1 or r.get('status') == 'ngoai_bang':
             continue
         c = out.setdefault(int(r['ga_seed']), [0, 0])
         c[1] += 1
         c[0] += r['completed'] == 'inconclusive' or r['status'] == 'run_error'
-    return {s: dict(rate=a / n if n else 0.0, n=n, over_10pct=n > 0 and a / n > SEED_ERR_LIMIT)
+    return {s: dict(rate=a / n if n else None, n=n, over_10pct=n > 0 and a / n > SEED_ERR_LIMIT)
             for s, (a, n) in sorted(out.items())}
 
 
@@ -900,7 +927,7 @@ def submodel_spectral_radius(ctrl, g):
 
 def pre_hil_check(ctrl, g):
     """S04 v6.8 section 6, before the selected gains go to HIL: inside the range table of the campaign binary
-    (float32) and, for LADRC, inside the triangle of each axis (gain_check, i.e. tools/gain_table.check). A
+    (float32) and, for LADRC, inside the triangle of each axis (gain_check, i.e. tools/gain_table.py). A
     failure is reported (tell Liam); the gains are never chosen again here."""
     try:
         table, tri = gain_check(ctrl, g)
@@ -910,6 +937,13 @@ def pre_hil_check(ctrl, g):
                 table_violations=table, triangle_violations=tri,
                 spectral_radius=submodel_spectral_radius(ctrl, g),
                 spectral_radius_note='TODO: not computed in this version (S04 v6.8 section 6)')
+
+
+CHO_LIAM_NOTE = ('S04 section 6: cho_liam not empty = tell Liam before HIL (post returns 2); the selected gains are '
+                 'kept, never chosen again here. It lists the pre-HIL check (range table, LADRC triangle) and the '
+                 'three-mu check (a run of the selected gains not passing G1-G5 at a mu level, gate state columns). '
+                 'Not in this list: the b0 / R sensitivity result '
+                 '(notes["<controller> b0_factor" / "<controller> r_factor"]["sensitive"])')
 
 
 def post(a):
@@ -930,7 +964,7 @@ def post(a):
     t0 = time.time()
     fw, path = fwsim.FirmwareSim(a.dll), o1.Path8()
     det, sens, mu3, notes, plant_full = [], [], [], {}, {}
-    pre_bad = 0
+    cho_liam = []                       # S04 section 6: what Liam must see before HIL; the selected gains are kept
     for s in sel:
         ctrl = s['controller']
         if s.get('feasible') != 'true':
@@ -938,8 +972,10 @@ def post(a):
             continue
         L = lock['controllers'][ctrl]
         g = {n: float(s[n]) for n in s3.FACTORS[ctrl]}          # read back from the file (section 6)
-        notes[f'{ctrl} pre_hil'] = pre_hil_check(ctrl, g)       # S04 v6.8 section 6
-        pre_bad += not notes[f'{ctrl} pre_hil']['ok']
+        ph = notes[f'{ctrl} pre_hil'] = pre_hil_check(ctrl, g)  # S04 v6.8 section 6
+        if not ph['ok']:
+            cho_liam.append(dict(controller=ctrl, check='pre_hil',
+                                 reasons=ph['table_violations'] + ph['triangle_violations']))
         mus, speeds = L['eval_mu'], L['speeds']
         key = (s['ga_seed'], s['gen'], s['cand_id'])
         ref = {(float(e['v']), float(e['mu'])): e['log_sha256'] for e in evals
@@ -988,6 +1024,8 @@ def post(a):
                 notes[f'{ctrl} three_mu'] = dict(done=True, findings=warn,
                                                  note='findings: runs not passing the gate; empty = every run has '
                                                       'status ok and G1-G5 dat (gate state columns)')
+                if warn:                        # C3-8: a run not passing G1-G5 waits for Liam
+                    cho_liam.append(dict(controller=ctrl, check='three_mu', reasons=warn))
     write_rows(os.path.join(pc, 'determinism.csv'), det)
     write_rows(os.path.join(pc, 'sensitivity.csv'), sens)
     write_rows(os.path.join(pc, 'three_mu.csv'), mu3)
@@ -1000,6 +1038,7 @@ def post(a):
         os.rmdir(work)
     with open(os.path.join(pc, 'notes.json'), 'w', encoding='utf-8') as f:
         json.dump(dict(tool_check=tc, determinism_all_equal=all(d['equal'] for d in det) if det else None, notes=notes,
+                       cho_liam=cho_liam, cho_liam_note=CHO_LIAM_NOTE,
                        script=s3.git_state(os.path.join(HERE, '..')), dll_sha256=s3.sha256_file(a.dll),
                        criterion='B0_SENS/2026-11-05_run01: sensitive if completed changes, e_perp_max <= D changes, '
                                  'a G3, G4 or G5 state changes (gate state columns, S04 v6.2), or e_perp_max changes '
@@ -1011,11 +1050,13 @@ def post(a):
     print(f'post checks -> {pc}; tool_check {tc}; determinism equal: {all(d["equal"] for d in det) if det else None}')
     for k, v in notes.items():
         print(f'  {k}: {v}')
-    if pre_bad:
+    if any(c['check'] == 'pre_hil' for c in cho_liam):
         print('TELL LIAM before HIL: selected gains outside the range table or the LADRC triangle (S04 v6.8 '
               'section 6); no reselection')
-        return 2
-    return 0
+    if any(c['check'] == 'three_mu' for c in cho_liam):
+        print('TELL LIAM before HIL: the selected gains do not pass G1-G5 at a mu level of the three-mu check '
+              '(S04 section 6; post_checks/notes.json cho_liam); no reselection')
+    return 2 if cho_liam else 0
 
 
 def delay_steps(measured_ms):
@@ -1276,7 +1317,7 @@ def main():
     for seed in seeds:
         finals[seed], _, _ = run_seed(ev, dom, seed, L['pop'], L['n_gen'], ref, history, hv_rows)
     sel, stats = summarise(ctrl, dom, finals)
-    errs = seed_error_rates(ev.evals, ctrl)
+    errs = seed_error_rates(ev.evals, ctrl, seeds)
     n_ngoai = ngoai_bang_counts(history, ctrl)
     check_eval_keys(ev.evals)                                                   # S4C-13
     for name, rows, cols in ((f'history_{ctrl}.csv', history, None), (f'evals_{ctrl}.csv', ev.evals, EVAL_COLS),
@@ -1543,7 +1584,7 @@ plant_by_mu: {json.dumps(plant)}
 imu: {json.dumps(s3.IMU)}
 plant_seed: {s3.SEED}
 objectives: "f1 = max e_perp_max over the evaluation runs (m); f2 = max over mu of the mean over the gate speeds of tv_duty (1/s); minimised"
-constraints: "g1 = runs not completed, inconclusive or with a track error (all runs when a run_error); g2 = (f1 - D) / D, D = {D} m; g3 = (max e_trk_max - D) / D; g4 = (max e_bao_max - D) / D; g5 = (max e_theta_cmd_max_deg - {THETA_MAX_DEG}) / {THETA_MAX_DEG} (S04 v6.2); a run_error run, or a quantity missing or not finite, takes {PENALTY:g} with pen_<quantity> = 1 in evals.csv (S04 v6.3 RS2-8); a candidate outside the LADRC triangle (tools/gain_table.check) is not run: the same penalty as a run_error candidate, status ngoai_bang (S04 v6.8 section 2); pymoo G <= 0"
+constraints: "g1 = runs not completed, inconclusive or with a track error (all runs when a run_error); g2 = (f1 - D) / D, D = {D} m; g3 = (max e_trk_max - D) / D; g4 = (max e_bao_max - D) / D; g5 = (max e_theta_cmd_max_deg - {THETA_MAX_DEG}) / {THETA_MAX_DEG} (S04 v6.2); a run_error run, or a quantity missing or not finite, takes {PENALTY:g} with pen_<quantity> = 1 in evals.csv (S04 v6.3 RS2-8); a candidate outside the LADRC triangle (tools/gain_table.py) is not run: the same penalty as a run_error candidate, status ngoai_bang (S04 v6.8 section 2); pymoo G <= 0"
 pymoo: {json.dumps(dict(version=pymoo.__version__, checked_version=PYMOO_CHECKED, constraint_handling=PYMOO_CV,
                        recheck=pymoo.__version__ != PYMOO_CHECKED))}
 libraries: {json.dumps(fwsim.lib_versions())}
@@ -1551,7 +1592,8 @@ interpretations:   # of this script, not written in S04 v5; Liam or THESIS corre
   - "a new script fwsim/s04_ga.py (S04 9.1 names tune_ga.py): tune_ga.py keeps its velocity objective for the old runs, unchanged"
   - "S04 v6.4 (C14-2; Liam 15/11 CODE_FEAS 'Code ngay + Codex'): selected.csv keeps edge (the 5 % flag, formula unchanged) and adds edge_side (factor:L or :H), edge_src (factor:side:source of that bound from the S03 levels.csv L_nguon / H_nguon, ? when the S03 run has none) and edge_limit (the flagged factors whose bound is a grid end, 'het luoi noi' or 'het luoi duoi': the limit 'vung ngoai bien chua khao sat'); no flag, no limit; RSM candidates (section 12) are not in this script yet"
   - "S04 v6.6 (Liam 17/11 THESIS_SLIDE; script: Liam 17/11 CODE_FEAS 'Code + Codex 2 vong'): the GA domain is [L, H] of the original S03 grid (S03 v8.4: the extension only for the out-of-range check); levels of S03 v8.3 (H_nguon 'het luoi noi' or H above b) are refused; edge_limit names the grid ends 'het luoi', 'het luoi duoi' (limit 'vung ngoai bien chua khao sat bang GA') with the S03 kiem_ngoai_mien.csv result on that side (? without the file)"
-  - "mu rule: every S03 design point that ran (centre, outer, inner box: the inner box always runs since L41), every gate speed; status other than ok (track_err, run_error) or y1 inconclusive at any mu is 'not satisfied'; the G3, G4, G5 states must be the same at the three mu, read from the gate state columns g3_state, g4_state, g5_state of the S03 sealed/runs.csv (a row without them stops the rule; S04 v6.2, v6.7 9.7); a state that is the same at the three mu satisfies the rule whatever it is (S04 3 asks for the same state only); S04 v6.8: |dY3| <= 0.4 1/s (absolute, S03 5.2), the y3_reference of the S03 meta.yaml is not read"
+  - "S04 v6.8 section 2 (C3-7): a flagged bound whose source is 'tran bang chan' (H = T, the range-table ceiling) adds to edge_limit the limit 'vung ngoai bang chan khong thuoc thi nghiem (DUT tu choi gain do)' with factor:side (written with its accents in the file); the two kinds of limit are joined by ' | '; no flag, no limit"
+  - "mu rule: every S03 design point that ran (centre, outer, inner box: the inner box always runs since L41), every gate speed; status other than ok (track_err, run_error) or y1 inconclusive at any mu is 'not satisfied'; the G3, G4, G5 states must be the same at the three mu, read from the gate state columns g3_state, g4_state, g5_state of the S03 sealed/runs.csv (a row without them stops the rule; S04 v6.2, v6.7 9.7); a state that is the same at the three mu satisfies the rule whatever it is (S04 3 asks for the same state only); S04 v6.8: |dY3| <= 0.4 1/s (absolute, S03 5.2), the y3_reference of the S03 meta.yaml is not read; C3-6: both bounds are compared as S03 compares (s03_doe.not_above_by: inclusive, exact on the decimal of each number as written in runs.csv, no tolerance of its own); a Y2 or Y3 that is not finite does not satisfy the rule"
   - "HV: exact 2-D staircase on the feasible non-dominated points of the population after each generation's survival, strictly inside the reference (S04 v6.8 4.2: (D; 800 1/s), fixed; a point with f1 >= D or f2 >= 800 adds 0 and is counted in hv.csv n_nd_on_or_beyond_ref); the trial rule compares generation gen_base with gen_base - 5 (15 and 20); with --tool-check and gen_base < 6 with generation 1"
   - "pareto.csv: per seed's final population, the non-dominated points among the feasible points and, separately, among the infeasible points (column feasible; nondominated_feasible true only for the first group, nondominated_in_group true for both); always written with its header, also when empty; final_population.csv: every point of it with both flags (S04 8)"
   - "S04 v6.8 4.2: the HV reference no longer comes from the default gains; the trial does not run them (no evals.csv row with ga_seed 0, no default_f2 in lock.yaml)"
@@ -1561,9 +1603,9 @@ interpretations:   # of this script, not written in S04 v5; Liam or THESIS corre
   - "gains stored as Python repr (17 significant digits) and as the float32 value the firmware receives (fwsim set_pid / set_adrc take c_float)"
   - "g3-g5 (S04 v6.2, R134 package): e_bao_max of o1_gate_eval.evaluate_fig8 (evaluate_v7 unchanged inside); the diagnosis attempt 2 of a run_error runs s03_doe's evaluator in a new process (diagnosis only; pen_e_bao_max = 1 when that s03_doe writes no e_bao_max); a candidate with a run_error takes 1e6 for every quantity as for f1"
   - "S04 v6.7 9.7: the post checks read G1-G5 from the gate state columns (o1_gate.gate called as s03_doe.run_one calls it: U = 0, every condition deciding): run_custom scores with o1_gate_eval.evaluate_fig8 and the gate; sensitive when a G3, G4 or G5 state changes; three_mu.csv and sensitivity.csv carry g1_state .. g5_state; a three-mu run passes only with status ok and the five states dat"
-  - "S04 v6.8 2: every candidate is checked by tools/gain_table.check before it runs (float32 values): a gain outside the range table stops the run (tool error); an ADRC candidate outside the triangle is not run: penalty of a run_error candidate, status ngoai_bang in history.csv, no evals.csv row (so in neither part of the seed error rate), n_runs 0, pen_f1 1; the number per seed is n_ngoai_bang_per_seed of meta_<controller>.yaml; what counts as a triangle violation is decided by gain_table.check alone (its warnings are not violations)"
+  - "S04 v6.8 2: every candidate is checked by tools/gain_table.py (gain_check) before it runs (float32 values): a gain outside the range table stops the run (tool error); an ADRC candidate outside the triangle is not run: penalty of a run_error candidate, status ngoai_bang in history.csv, no evals.csv row (so in neither part of the seed error rate), n_runs 0, pen_f1 1; the number per seed is n_ngoai_bang_per_seed of meta_<controller>.yaml; what counts as a table or a triangle violation is decided by tools/gain_table.py alone: its classify() Verdict when the module has it (C3-11), else the texts of check() (its warnings are not violations); C3-10: a seed whose candidates were all ngoai_bang has no evals.csv row and is reported in seed_error_rates with n 0 and rate null"
   - "S04 v6.7 3: a run that is not a run_error but has tv_duty missing or not finite is recorded with status run_error and the reason in error (its other fields kept), then treated as any run_error (diagnosis rerun, candidate penalty, seed error rate)"
-  - "S04 v6.8 6: before HIL (post) the selected gains are checked against the range table and the triangle (post_checks/notes.json '<controller> pre_hil', copied to meta.yaml pre_hil; a failure is reported with exit code 2, no reselection); the spectral radius of the sub-model is not computed in this version (TODO, null)"
+  - "S04 v6.8 6: before HIL (post) the selected gains are checked against the range table and the triangle (post_checks/notes.json '<controller> pre_hil', copied to meta.yaml pre_hil; a failure is reported with exit code 2, no reselection); the spectral radius of the sub-model is not computed in this version (TODO, null); C3-8: a run of the three-mu check that does not pass G1-G5 (three mu levels, check done) is listed with the pre-HIL failures in post_checks/notes.json cho_liam, and post then returns 2 as well (no reselection)"
   - "S04 v6.8 6: --phase sens_after (sensitivity check after selection, report only) has only the loop-delay variant (io_delay_ms; --io-delay-ms is the measured bench delay: not whole -> rounding down and up, within 1e-9 ms of a whole number -> that number; not given -> 1 and 2 ms) plus io_delay_ms 0 as baseline rows; output in sens_after/ only (phases.json, meta.yaml, post_checks/ not written); the three plant variants of S04 v6.1 6 are not in this script; the GA, the trial and the post checks run with io_delay_ms = 0 and slip_omega_s = 0.1 (run_gate stops on another slip_omega_s)"
 """)
 
