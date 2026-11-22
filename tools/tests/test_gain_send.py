@@ -271,3 +271,35 @@ def test_query_incomplete_answer_is_4(fake, capsys):
     """Codex L90-12: an answer without the running set is not a successful query."""
     assert gs.main(args(fake, '--query')) == 4
     assert 'INCOMPLETE' in capsys.readouterr().out
+
+
+def test_gain_table_violation_sends_nothing(fake, tmp_path, capsys):
+    assert gs.main(args(fake, '--ctrl', 'PID', '--id', '3',
+                        '--gains', gains_arg(dict(PID, kp_xy='41.01')))) == 1
+    cap = capsys.readouterr()
+    assert cap.out.rstrip().endswith('#ket_qua,ma=1')
+    assert 'kp_xy' in cap.err and 'upper bound' in cap.err
+    assert fake.received == []
+    adrc = FakeEsp32(ctrl='ADRC')
+    try:
+        a = dict(omega_c_xy='100', omega_o_xy='50', omega_c_wz='8', omega_o_wz='30',
+                 pos_kp='6', pos_ki='3', k_psi='1')
+        assert gs.main(args(adrc, '--ctrl', 'ADRC', '--id', '3', '--gains', gains_arg(a))) == 1
+        assert 'omega_c_xy + 2*omega_o_xy' in capsys.readouterr().err
+        assert adrc.received == []
+    finally:
+        adrc.close()
+    f = tmp_path / 'gain_violating.json'
+    f.write_text(json.dumps(dict(ctrl='PID', id=4,
+                                 gains={k: float(v) for k, v in dict(PID, kp_xy='41.01').items()})))
+    assert gs.main(args(fake, '--file', str(f))) == 1
+    assert fake.received == []
+
+
+@pytest.mark.parametrize('fake', [dict(ctrl='ADRC')], indirect=True)
+def test_gain_table_warning_still_sends(fake, capsys):
+    a = dict(omega_c_xy='8', omega_o_xy='30', omega_c_wz='100', omega_o_wz='50',
+             pos_kp='6', pos_ki='3', k_psi='1')
+    assert gs.main(args(fake, '--ctrl', 'ADRC', '--id', '3', '--gains', gains_arg(a))) == 0
+    out = capsys.readouterr().out
+    assert '# warning: omega_c_wz' in out and len(fake.received) == 1

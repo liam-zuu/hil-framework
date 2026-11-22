@@ -22,6 +22,9 @@ Gains: 7 per controller, the fwsim names (fwsim/tune_ga.py VARS_BY_MODE):
 --file: JSON {"ctrl": "PID", "id": 3, "gains": {name: value, ...}} or a flat {name: value} (then
 --ctrl is needed); --id / --ctrl on the command line must agree with the file when both are given.
 Every value is rounded to float32 and sent as %.9g, so the ESP32 gets exactly those bits.
+Before sending, the set is checked against the PC gain table tools/gain_table.py (range, ADRC xy
+omega_c_xy + 2*omega_o_xy < 200); a violation sends nothing (exit 1, like bad arguments); warnings
+are printed and the set is still sent.
 
 Packets (protocol after Codex round 1, 12/11): '#gain_set,v=1,tx=<nonce>,id=..,ctrl=..,<7 gains>' and
 '#gain_get,v=1,tx=<nonce>'. tx is a new random number for every packet sent; only an answer from the
@@ -37,7 +40,7 @@ The running set is not kept over a reset: after a reboot the ESP32 runs the buil
 
 Exit code / last line '#ket_qua,ma=N': 0 applied and verified (or --query read a complete set);
 2 rejected by the ESP32 (err=..); 3 no answer; 4 answer does not match what was sent (or another
-board's MAC); 1 bad arguments.
+board's MAC); 1 bad arguments or refused by the PC gain table.
 """
 import argparse
 import json
@@ -47,6 +50,8 @@ import socket
 import struct
 import sys
 import time
+
+import gain_table
 
 PORT = 5014
 NAMES = {'PID': ['kp_xy', 'ki_xy', 'kp_wz', 'ki_wz', 'pos_kp', 'pos_ki', 'k_psi'],
@@ -325,6 +330,17 @@ def main(argv=None):
         print(f'error: {e}', file=sys.stderr)
         print('#ket_qua,ma=1')
         return 1
+
+    violations, warnings = gain_table.check(ctrl, gains)
+    if violations:
+        for v in violations:
+            print(f'error: {v}', file=sys.stderr)
+        print(f'error: refused by the PC gain table ({gain_table.TABLE_VERSION}); nothing sent',
+              file=sys.stderr)
+        print('#ket_qua,ma=1')
+        return 1
+    for w in warnings:
+        print(f'# warning: {w}')
 
     print(f'# send {a.ip}:{a.port} ' + build_packet(set_id, ctrl, gains, 0).replace(',tx=0,', ',tx=<new each try>,'))
     ack, n = exchange(a.ip, a.port, lambda tx: build_packet(set_id, ctrl, gains, tx), a.timeout, a.tries)
