@@ -22,6 +22,7 @@
 #include "encoder.h"
 #include "vel_ctrl.h"
 #include <string.h>
+#include <math.h>
 
 /* Firmware with the position loop (AGV feat/pos-loop, O1 PA3, 04/11): optional, so older
  * firmware trees still build. */
@@ -35,6 +36,14 @@
 #define FWSIM_HAS_WS 1
 #else
 #define FWSIM_HAS_WS 0
+#endif
+/* PID integral clamp indicator ("tick cham kep", spec S03 v8.6 section 2.1): needs v_cmd of
+ * vel_ctrl_out_t (VEL_CTRL_HAS_BLOCK, firmware since 05/11); fwsim_kep_cols() = 0 without it.
+ * -DFWSIM_NO_KEP: the counter is not compiled in at all (the DLL of before it was added). */
+#if defined(VEL_CTRL_HAS_BLOCK) && !defined(FWSIM_NO_KEP)
+#define FWSIM_HAS_KEP 1
+#else
+#define FWSIM_HAS_KEP 0
 #endif
 
 #define FWSIM_API __declspec(dllexport)
@@ -51,6 +60,11 @@ static int imu_on;                  /* 0: no imu_get() copy yet (vel_ctrl gets N
 static int run_active = 1, wheels_lifted;
 static int imu_fail;                /* imu_init() failed at boot: g_imu_fail in main.c */
 static int block[4];                /* obstacle blocked fwd, bwd, left, right (main.c s_*_blocked) */
+#ifndef FWSIM_NO_KEP
+#define FWSIM_KEP_COLS 7
+static double kep[FWSIM_KEP_COLS];  /* integral clamp indicator of the last tick (fwsim_kep_last) */
+static int on_prev;                 /* motor_on of the tick before (g_motor_prev of vel_ctrl.c) */
+#endif
 
 FWSIM_API int fwsim_abi(void) { return FWSIM_ABI; }
 /* After a tick: encoder_get_count() per wheel and the vel_ctrl metric counters
@@ -78,6 +92,10 @@ FWSIM_API void fwsim_reset(int pcnt_mode) {
     wheels_lifted = 0;
     imu_fail = 0;
     for (int i = 0; i < 4; i++) block[i] = 0;
+#ifndef FWSIM_NO_KEP
+    memset(kep, 0, sizeof(kep));
+    on_prev = 0;
+#endif
     motor_init();
     encoder_init();
     vel_ctrl_init();
@@ -239,6 +257,52 @@ FWSIM_API void fwsim_imu_last(double out[FWSIM_IMU_COLS]) {
     memcpy(out, v, sizeof(v));
 }
 
+/* PID integral clamp indicator of the last tick ("tick cham kep", spec S03 v8.6 section 2.1;
+ * fwsim_kep_cols() = 0 with firmware before VEL_CTRL_HAS_BLOCK):
+ * out[0..2] flag vx, vy, wz: 1 when, right after the clamp of pid.c pid_axis_update, |integral| equals
+ *           integral_limit (also when the sum lands on the limit without being cut)
+ * out[3..5] that integral, vx, vy, wz
+ * out[6]    self-check of kep_step(), must be 0
+ * All 0 on a tick where the PID did not run (motor off, CTRL_ADRC). */
+#ifndef FWSIM_NO_KEP
+FWSIM_API int fwsim_kep_cols(void) { return FWSIM_HAS_KEP ? FWSIM_KEP_COLS : 0; }
+FWSIM_API void fwsim_kep_last(double out[FWSIM_KEP_COLS]) { memcpy(out, kep, sizeof(kep)); }
+#endif
+
+#if FWSIM_HAS_KEP
+/* Called right after vel_ctrl_step(). The integral after the clamp is read from the firmware's own PID
+ * state (vel_ctrl_pid()), which nothing changes between the clamp and the end of the step, except in the
+ * standstill hold (vc->still): there vel_ctrl_step resets the PID after the update. For that tick the value
+ * is recomputed by the firmware's own pid_update_*() on a copy of the state held before the step (pre), with
+ * the inputs vel_ctrl_step gave them. The same replay runs on every other PID tick too, where it must give
+ * the firmware's state bit for bit: out[6] = 1 when it does not (vel_ctrl_step no longer calls the PID so).
+ * On a hold tick the firmware state must instead be the reset state (integral 0, prev_error 0, not
+ * initialized): out[6] = 1 otherwise, so a hold branch that leaves the PID un-reset, or resets it before
+ * the update, is caught. A hold branch that resets and skips the update leaves the same state as the real
+ * one and cannot be seen from here; that case is covered by the trace DLL of tests/test_fwsim_kep.py. */
+static void kep_step(const pid_controller_t *pre, const vel_ctrl_in_t *in, const vel_ctrl_out_t *vc) {
+    memset(kep, 0, sizeof(kep));
+    if (!in->motor_on || vel_ctrl_mode() != CTRL_PID) return;
+    pid_controller_t c = *pre;
+    if (!on_prev) pid_reset(&c);                 /* motor off -> on: vel_ctrl_step resets before the update */
+    pid_update_vx(&c, vc->v_cmd.vx, vc->actual.vx, in->dt);
+    pid_update_vy(&c, vc->v_cmd.vy, vc->actual.vy, in->dt);
+    pid_update_wz(&c, vc->wz_cmd, vc->imu.wz_meas, in->dt);
+    const pid_controller_t *g = vel_ctrl_pid();
+    const pid_t *replay[3] = { &c.vx, &c.vy, &c.wz }, *held[3] = { &g->vx, &g->vy, &g->wz };
+    const float zero = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        const pid_t *p = vc->still ? replay[i] : held[i];
+        if (vc->still) {
+            if (memcmp(&held[i]->integral, &zero, sizeof(float)) || memcmp(&held[i]->prev_error, &zero, sizeof(float))
+                || held[i]->initialized) kep[6] = 1;
+        } else if (memcmp(&replay[i]->integral, &held[i]->integral, sizeof(float))) kep[6] = 1;
+        kep[i] = fabsf(p->integral) == p->integral_limit;
+        kep[3 + i] = p->integral;
+    }
+}
+#endif
+
 /* axis 0 vx, 1 vy, 2 wz */
 FWSIM_API void fwsim_set_pid(int axis, float kp, float ki, float kd, float int_limit, float out_limit) {
     pid_controller_t *c = vel_ctrl_pid();
@@ -323,7 +387,14 @@ FWSIM_API int fwsim_tick(int64_t t_us, const int32_t counts[4], const float sp[3
 #endif
     };
     for (int i = 0; i < 4; i++) { in.enc_rpm[i] = enc_rpm[i]; in.enc_count[i] = enc_count[i]; }
+#if FWSIM_HAS_KEP
+    pid_controller_t pid_pre = *vel_ctrl_pid();     /* PID state before the step, for kep_step() */
+#endif
     vel_ctrl_out_t vc = vel_ctrl_step(&in);
+#if FWSIM_HAS_KEP
+    kep_step(&pid_pre, &in, &vc);
+    on_prev = on;
+#endif
     if (on) {
         /* main.c: motor_set() then vel_ctrl_applied() with the PWM applied. Hard cutoff of main.c
          * (obstacle_enabled): with a blocked direction, PWM 0 when the original command (intent,
