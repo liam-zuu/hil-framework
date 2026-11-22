@@ -1008,3 +1008,161 @@ def test_acc_of_and_dong_build():
     bad['r2'] = (dict(runs['r2'][0], session_sha256='6' * 64), ses, TopCam())
     with pytest.raises(A.A6Error):
         A.dong_build(bad, 'T1')
+
+
+# ── dong_huong: U_chuyen.dong from the heading channel of the runs (22/11 night) ─────────────────
+
+def _run_huong(lid, gk, gm, j, n=900, scale=0.003, off=7.0, drift=0.0004, D=3.21, noise=0.0, seed=0):
+    """A scored run (the car moves and turns, tag surface with the four slopes of fit_gk) and its IMU: the true
+    heading with a scale error, whole turns and a constant, a slow drift, on the log clock (camera + D)."""
+    rng = np.random.default_rng(seed + j)
+    tt = np.arange(n) / 60.0
+    cen = C + np.column_stack([0.9 * np.cos(0.7 * tt + j) + 0.3 * np.sin(2.3 * tt), 0.6 * np.sin(1.1 * tt + j)])
+    psi = 1.3 * np.sin(0.8 * tt + j) + 0.9 * tt + j
+    r = A.body(SIDE)
+    Ps = []
+    for c_, p_ in zip(cen, psi):
+        P0 = A.lifted_corners(c_, p_, (0.0, 0.0), 0.0, C, H, HB, SIDE)
+        R = A._rot(p_)
+        u = ((P0 - C) / (H - HB)) @ R
+        dl = np.column_stack([u[:, 0] * (gm[0] * r[:, 0] + gk[1] * r[:, 1]),
+                              u[:, 1] * (gk[0] * r[:, 0] + gm[1] * r[:, 1])])
+        Ps.append(P0 + dl @ R.T + rng.normal(0, noise, (4, 2)))
+    khung = [[int(k), float(a_), [float(v) for v in q.ravel()]] for k, a_, q in zip(range(n), tt, Ps)]
+    g = dict(schema=A.SCHEMA_GOC, luot_id=lid, session_sha256='5' * 64, khung=khung)
+    S = dict(t=tt + D, psi=psi * (1.0 + scale) + off + drift * tt, n_late=0)
+    return g, dict(path=lid, S=S), D
+
+
+@pytest.fixture()
+def imu_patch(monkeypatch):
+    monkeypatch.setattr(A.cu, 'rv_samples', lambda L: L['S'])
+    monkeypatch.setattr(A.cu, 'interp_yaw', lambda S_, tq, h_lim=None: np.interp(tq, S_['t'], S_['psi'],
+                                                                                 left=np.nan, right=np.nan))
+
+
+def _runs_huong(ids, gk, gm, **kw):
+    ses = dict(_ses(), sha256='5' * 64)
+    out = {}
+    for j, lid in enumerate(ids):
+        g, L, D = _run_huong(lid, gk, gm, j, **kw)
+        out[lid] = A.yaw_run(g, ses, L, D)
+    return out
+
+
+def test_dong_huong_recovers_the_slope_and_splits_at_the_median(imu_patch):
+    gk, gm = np.array([-0.0185, 0.0037]), np.array([-0.0050, 0.0052])
+    runs = _runs_huong(('r1', 'r2', 'r3', 'r4', 'r5'), gk, gm)
+    assert all(r['n_ok'] == r['n'] - 2 * A.SG_HALF for r in runs.values())
+    d = A.dong_huong_build(runs, 'T1', KHOA)
+    assert d['schema'] == A.SCHEMA_DONG_H and d['kenh'] == A.DONG_KENH_H and d['chia_nua'] == A.CHIA_TV
+    assert d['khoa_truoc_sha256'] == KHOA and [b['ten'] for b in d['dai_dinh_nghia']] == ['a', 'a_thap', 'a_cao']
+    full, lo_, hi_ = d['dai_dinh_nghia']
+    a_all = np.concatenate([r['a'][r['ok']] for r in runs.values()])
+    assert lo_['a_hi'] == hi_['a_lo'] == pytest.approx(np.median(a_all)) and full['a_hi'] == pytest.approx(a_all.max())
+    assert lo_['a_hi'] != pytest.approx(full['a_hi'] / 2, rel=0.02)   # the median, not the middle of the range
+    for lid in runs:
+        x = d['luot'][lid]
+        assert x['bo_luot'] == [k for k in runs if k != lid]
+        n_lo, n_hi = x['dai']['a_thap']['n_khung'], x['dai']['a_cao']['n_khung']
+        assert abs(n_lo - n_hi) <= 0.25 * (n_lo + n_hi)                # halves of about the same size
+        for nm in ('a', 'a_thap', 'a_cao'):
+            e = x['dai'][nm]
+            # the IMU scale error (0.3 % over several rad is larger than the A6 signal), the whole turns, the drift
+            # do not reach the slopes
+            assert e['trang_thai'] == 'dat' and e['n_luot'] == 4, (lid, nm, e)
+            assert e['g_bar'] == pytest.approx(gk, abs=3e-4) and np.linalg.norm(e['SE']) < 3e-4
+            assert np.linalg.norm(np.array(e['g_bar']) - gm) > 0.01   # the heading follows gk, not gm
+    f = A.with_sha(d)
+    blk, why = A.kiem_dong(f, 'T1', gk, KHOA)
+    assert why == [] and blk['kenh'] == A.DONG_KENH_H and blk['chia_nua'] == A.CHIA_TV and blk['max'] < 1e-3
+    assert blk['nua_cua'] == {'a': ['a_thap', 'a_cao']}
+    for bad, txt in ((dict(d, kenh='meo'), 'kenh'), (dict(d, chia_nua='giua'), 'chia_nua'),
+                     (dict(d, khoa_truoc_sha256='z' * 64), 'lock')):
+        blk2, why2 = A.kiem_dong(A.with_sha(bad), 'T1', gk, KHOA)
+        assert blk2 is None and any(txt in w for w in why2), (txt, why2)
+    assert A.kiem_dong(f, 'T1', gk, None)[0] is None                  # a v2 file without the lock of the A6 file
+    # a slope that differs on the runs is seen: the index grows by the difference
+    blk3, _ = A.kiem_dong(f, 'T1', gk + [0.004, 0.0], KHOA)
+    assert blk3['max'] == pytest.approx(0.004, abs=6e-4)
+    with pytest.raises(A.A6Error):
+        A.dong_huong_build(runs, 'T1', None)
+    with pytest.raises(A.A6Error):
+        A.dong_huong_build({'r1': runs['r1']}, 'T1', KHOA)
+    with pytest.raises(A.A6Error):
+        A.dong_huong_build(dict(runs, r2=dict(runs['r2'], H=H + 0.01)), 'T1', KHOA)
+
+
+def test_dong_huong_too_few_runs_or_no_imu_is_thieu(imu_patch):
+    gk, gm = np.array([-0.0185, 0.0037]), np.array([-0.0050, 0.0052])
+    runs = _runs_huong(('r1', 'r2', 'r3'), gk, gm)                    # two other runs: no jackknife over runs
+    d = A.dong_huong_build(runs, 'T1', KHOA)
+    assert all(e['trang_thai'] == 'thieu' and 'other runs' in e['ly_do']
+               for x in d['luot'].values() for e in x['dai'].values())
+    blk, why = A.kiem_dong(A.with_sha(d), 'T1', gk, KHOA)
+    assert blk is None and any('no band with data' in w for w in why)
+    ses = dict(_ses(), sha256='5' * 64)
+    g, L, D = _run_huong('r9', gk, gm, 0)
+    r = A.yaw_run(g, ses, L, D + 100.0)                              # the clock offset far off: no IMU yaw
+    assert r['n_ok'] == 0
+    with pytest.raises(A.A6Error):
+        A.dong_huong_build(dict(runs, r9=r), 'T1', KHOA)
+    with pytest.raises(A.A6Error):
+        A.yaw_run(dict(g, session_sha256='6' * 64), ses, L, D)
+
+
+def test_dong_v2_through_gop_and_the_half_band_rule(places):
+    g_hat = np.mean([p['g_E'] for p in places], axis=0)
+    d = _dong(g_hat)
+    d.pop('sha256', None)
+    d['dai_dinh_nghia'][1]['a_hi'] = d['dai_dinh_nghia'][2]['a_lo'] = 0.2       # halves meet off the middle
+    o = _gop(places, dong=A.with_sha(dict(d)))                        # v1: the halves must be the middle
+    assert o['trang_thai']['a6'] == 'thieu' and any('two half bands' in w for w in o['ly_do'])
+    v2 = dict(d, schema=A.SCHEMA_DONG_H, kenh=A.DONG_KENH_H, chia_nua=A.CHIA_TV, khoa_truoc_sha256=KHOA)
+    o = _gop(places, dong=A.with_sha(dict(v2)))
+    assert o['trang_thai']['a6'] == 'dat', o['ly_do']
+    assert o['dong']['schema'] == A.SCHEMA_DONG_H and o['dong']['kenh'] == A.DONG_KENH_H
+    assert A.a6du_rad(o, 0.5, 'r1', ['a0', 'a0_hi']) is not None
+    o = _gop(places, dong=A.with_sha(dict(v2, khoa_truoc_sha256='z' * 64)))
+    assert o['trang_thai']['a6'] == 'thieu' and any('dong v2' in w and 'lock' in w for w in o['ly_do'])
+    gap = dict(v2)
+    gap['dai_dinh_nghia'] = [dict(b) for b in v2['dai_dinh_nghia']]
+    gap['dai_dinh_nghia'][2]['a_lo'] = 0.3                            # the halves do not meet at one point
+    o = _gop(places, dong=A.with_sha(gap))
+    assert o['trang_thai']['a6'] == 'thieu' and any('meeting at one point' in w for w in o['ly_do'])
+    assert _gop(places)['dong']['kenh'] == 'meo_4_goc'                # a v1 file is still read as before
+
+
+def test_read_gio_offset_tied_to_frames_and_log(tmp_path):
+    p = tmp_path / 'gio.json'
+    base = dict(format=A.SCHEMA_GIO, ok=True, center_s=34.7, half_s=0.011, sha256=dict(frames='f' * 64, esp32='e' * 64))
+    p.write_text(json.dumps(base), encoding='utf-8')
+    assert A.read_gio_offset(str(p), 'f' * 64, 'e' * 64) == (34.7, 0.011)
+    for bad in (dict(base, ok=False), dict(base, format='x'), dict(base, sha256=dict(frames='f' * 64, esp32='0' * 64)),
+                dict(base, center_s=None), dict(base, half_s=-1.0)):
+        p.write_text(json.dumps(bad), encoding='utf-8')
+        with pytest.raises(A.A6Error):
+            A.read_gio_offset(str(p), 'f' * 64, 'e' * 64)
+    with pytest.raises(A.A6Error):
+        p.write_text(json.dumps(base), encoding='utf-8')
+        A.read_gio_offset(str(p), '0' * 64, 'e' * 64)
+
+
+def test_dong_huong_clock_error_and_noise(imu_patch):
+    gk, gm = np.array([-0.0185, 0.0037]), np.array([-0.0050, 0.0052])
+    ses = dict(_ses(), sha256='5' * 64)
+    runs = {}
+    for j, lid in enumerate(('r1', 'r2', 'r3', 'r4', 'r5')):
+        g, L, D = _run_huong(lid, gk, gm, j, noise=0.0002)
+        runs[lid] = A.yaw_run(g, ses, L, D + (0.012, -0.009, 0.011, -0.012, 0.006)[j])    # clock error per run
+    d = A.dong_huong_build(runs, 'T1', KHOA)
+    blk, why = A.kiem_dong(A.with_sha(d), 'T1', gk, KHOA)
+    assert why == []
+    for lid in runs:
+        e = d['luot'][lid]['dai']['a']
+        # 12 ms at about 1 rad/s is 0.012 rad of heading, more than the A6 signal: the per-run omega column takes it
+        assert e['trang_thai'] == 'dat' and e['g_bar'] == pytest.approx(gk, abs=6e-4), (lid, e)
+        se = np.linalg.norm(e['SE'])
+        gs = np.array(list(e['g_bo_tung_luot'].values()))
+        assert se == pytest.approx(np.linalg.norm(np.sqrt(3 / 4 * np.sum((gs - gs.mean(0)) ** 2, axis=0)))) and se > 1e-6
+        assert blk['theo_luot'][lid]['a'] == pytest.approx(np.linalg.norm(np.array(e['g_bar']) - gk) + 2 * se)
