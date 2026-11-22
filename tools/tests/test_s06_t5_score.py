@@ -17,6 +17,7 @@ HERE = os.path.dirname(__file__)
 ROOT = os.path.abspath(os.path.join(HERE, '..', '..'))
 sys.path[:0] = [os.path.join(ROOT, 'tools'), os.path.join(ROOT, 'rpi5')]
 import s06_t5_score as sc  # noqa: E402
+import t3b_schedule as ts  # noqa: E402
 import t5_schedule as t5  # noqa: E402
 
 READ_STEP_US, READ_SPAN_US = 5000.0, 30.0
@@ -65,7 +66,16 @@ def test_exact_generator_passes_and_offset_found(sched1, offset_us, lead_us):
     off, corr, rows = run(synth(sched1, offset_us, lead_us=lead_us), sched1)
     assert abs(off - offset_us) <= sc.ALIGN_BIN_US and corr > 0.99
     scored = [r for r in rows if r['kind'] != 'indicator']
-    assert len(scored) == 15 * 5 * 4 and all(r['verdict'] == 'pass' for r in scored)
+    # v3.5 adds 8 point visits (4 off-grid points x 2 directions): 22 point + 1 w15 scored visits
+    assert len(scored) == 23 * 5 * 4 and all(r['verdict'] == 'pass' for r in scored)
+    for m in t5.OFF_GRID_POINTS:
+        for w in (m, -m):
+            rm = [r for r in scored if r['omega_cmd'] == w]
+            assert len(rm) == 5 * 4
+            assert all(r['omega_d'] == ts.quantize(w) for r in rm)
+            # f_cmd_hz is signed (K * omega_d); compare magnitudes
+            assert all(abs(r['f_cmd_hz']) == pytest.approx(K * abs(ts.quantize(w)), rel=1e-12) for r in rm)
+            assert all(r['verdict'] == 'pass' for r in rm)
     assert sc.exit_code(rows) == 0
     ind = [r for r in rows if r['kind'] == 'indicator']
     assert len(ind) == 2 * 5 * 4
@@ -76,6 +86,51 @@ def test_exact_generator_passes_and_offset_found(sched1, offset_us, lead_us):
     assert r['f_cmd_hz'] == pytest.approx(K * 0.31983, rel=2e-5)           # spec: omega_d = 0.31983
     assert all(r['f_cmd_hz'] == 0.0 for r in rows if r['kind'] == 'indicator')   # 0.29 -> 0.29054 <= 0.3
     assert abs(r['t_window_end_us'] - r['t_window_start_us'] - 1e7) < READ_STEP_US
+
+
+def test_old_17_visit_schedule_rejected(monkeypatch):
+    # S18 + spec v3.5: the v3.4 schedule without the 4 off-grid points is no longer the locked one
+    monkeypatch.setattr(t5, 'POINTS', (0.32, 0.5, 1.0, 2.0, 10.0, 20.0, 39.2))
+    old = t5.make_schedule(1)
+    monkeypatch.undo()
+    assert len(old) == 17
+    assert sc.schedule_matches_locked(old) != []
+    assert sc.schedule_matches_locked(t5.make_schedule(1)) == []
+
+
+def test_c3_18_schedule_with_old_9995_not_locked(monkeypatch):
+    # C3-18: 9.995 (int16 8188) moved to 9.9942 (int16 8187); a schedule still carrying 9.995 is not locked
+    monkeypatch.setattr(t5, 'POINTS', tuple(9.995 if m == 9.9942 else m for m in t5.POINTS))
+    old = t5.make_schedule(1)
+    monkeypatch.undo()
+    assert sum(abs(v.w_fl) == 9.995 for v in old) == 2
+    assert sc.schedule_matches_locked(old) != []
+    new = t5.make_schedule(1)
+    for v in new:                                           # 1e-12 off in the CSV: still the locked one
+        v.w_fl, v.w_fr, v.w_rl, v.w_rr = (w + 1e-12 for w in v.omegas)
+    assert sc.schedule_matches_locked(new) == []
+
+
+def test_c3_18_point_9_9942_scored_indicator_not(sched1):
+    # C3-18: the moved point is scored in both directions with f_cmd from code 8187; the 0.29 indicator
+    # visits report their counts and never enter the H5 score
+    reads = synth(sched1, 5e6)
+    v0 = sched1[0]
+    assert v0.kind == 'indicator'
+    reads.c[reads.tb > 5e6 + v0.t_start_ms * 1000.0 + 3.5e7, 0] += 50     # stray counts in window 3 of visit 0
+    rows = sc.score_run(reads, sched1, 5e6)
+    wd = 8187 / 32767 * 40.0
+    for s in (1, -1):
+        rm = [r for r in rows if r['omega_cmd'] == s * 9.9942]
+        assert len(rm) == 5 * 4 and all(r['kind'] == 'point' and r['verdict'] == 'pass' for r in rm)
+        assert all(r['omega_d'] == pytest.approx(s * wd, rel=1e-15) for r in rm)
+        assert all(r['f_cmd_hz'] == pytest.approx(s * K * wd, rel=1e-12) for r in rm)
+    assert not any(abs(r['omega_cmd']) == 9.995 for r in rows)
+    ind = [r for r in rows if r['kind'] == 'indicator']
+    assert len(ind) == 2 * 5 * 4 and {r['verdict'] for r in ind} == {'indicator_ok', 'indicator_counts'}
+    assert all(p['kind'] != 'indicator' for p in sc.points(rows)) and len(sc.points(rows)) == 23 * 4
+    summ = sc.summarize(rows)
+    assert summ['pass'] == 23 * 5 * 4 and summ['indicator_counts_total'] == 50 and sc.exit_code(rows) == 0
 
 
 def test_small_error_passes_large_error_fails(sched1):
