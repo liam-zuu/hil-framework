@@ -1,8 +1,10 @@
 """
 t5_schedule.py — wheel-speed schedule of S06 T5 (H5, encoder frequency error; spec S06 v3.4, W15, Y16, Z1).
 
-Points: omega in {0.32, 0.5, 1, 2, 10, 20, 39.2} rad/s, both directions, scored; 0.29 rad/s is the
-indicator point (omega_d = 0.29054 <= 0.3, expect 0 counts, not scored). Pass 1 sweeps up, pass 2
+Points: omega in {0.32, 0.5, 1, 2, 10, 20, 39.2} rad/s plus the four off-grid points {9.995, 19.979,
+31.68, 38.78} rad/s (spec S06 v3.5, T5, câu 7: half period 9519.98/omega ticks with a fraction near 0.5;
+checked on the decoded omega_d and the encoder_gen.c rounding in ket_qua_e3/bang.csv), both directions,
+scored; 0.29 rad/s is the indicator point (omega_d = 0.29054 <= 0.3, expect 0 counts, not scored). Pass 1 sweeps up, pass 2
 sweeps down; at each omega the direction alternates (+ then -). W15: one visit per pass where the
 4 wheels get different speeds, so a swapped wheel shows up (H4).
 
@@ -24,7 +26,8 @@ import math
 from dataclasses import dataclass, asdict, fields
 from typing import List, Sequence
 
-POINTS = (0.32, 0.5, 1.0, 2.0, 10.0, 20.0, 39.2)    # scored, rad/s (Z1, Q5)
+OFF_GRID_POINTS = (9.995, 19.979, 31.68, 38.78)    # v3.5 câu 7, frac of the H7 half period in [0.43; 0.51]
+POINTS = (0.32, 0.5, 1.0, 2.0, 9.995, 10.0, 19.979, 20.0, 31.68, 38.78, 39.2)   # scored, rad/s (Z1, Q5, v3.5)
 INDICATOR = 0.29                                    # omega_d 0.29054 <= deadband 0.3: expect 0 counts
 W15_OMEGAS = (1.0, -2.0, 10.0, -20.0)               # FL, FR, RL, RR [ĐỀ XUẤT]
 WINDOW_S = 10.0

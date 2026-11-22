@@ -17,6 +17,7 @@ HERE = os.path.dirname(__file__)
 ROOT = os.path.abspath(os.path.join(HERE, '..', '..'))
 sys.path[:0] = [os.path.join(ROOT, 'tools'), os.path.join(ROOT, 'rpi5')]
 import s06_t5_score as sc  # noqa: E402
+import t3b_schedule as ts  # noqa: E402
 import t5_schedule as t5  # noqa: E402
 
 READ_STEP_US, READ_SPAN_US = 5000.0, 30.0
@@ -65,7 +66,16 @@ def test_exact_generator_passes_and_offset_found(sched1, offset_us, lead_us):
     off, corr, rows = run(synth(sched1, offset_us, lead_us=lead_us), sched1)
     assert abs(off - offset_us) <= sc.ALIGN_BIN_US and corr > 0.99
     scored = [r for r in rows if r['kind'] != 'indicator']
-    assert len(scored) == 15 * 5 * 4 and all(r['verdict'] == 'pass' for r in scored)
+    # v3.5 adds 8 point visits (4 off-grid points x 2 directions): 22 point + 1 w15 scored visits
+    assert len(scored) == 23 * 5 * 4 and all(r['verdict'] == 'pass' for r in scored)
+    for m in t5.OFF_GRID_POINTS:
+        for w in (m, -m):
+            rm = [r for r in scored if r['omega_cmd'] == w]
+            assert len(rm) == 5 * 4
+            assert all(r['omega_d'] == ts.quantize(w) for r in rm)
+            # f_cmd_hz is signed (K * omega_d); compare magnitudes
+            assert all(abs(r['f_cmd_hz']) == pytest.approx(K * abs(ts.quantize(w)), rel=1e-12) for r in rm)
+            assert all(r['verdict'] == 'pass' for r in rm)
     assert sc.exit_code(rows) == 0
     ind = [r for r in rows if r['kind'] == 'indicator']
     assert len(ind) == 2 * 5 * 4
@@ -76,6 +86,16 @@ def test_exact_generator_passes_and_offset_found(sched1, offset_us, lead_us):
     assert r['f_cmd_hz'] == pytest.approx(K * 0.31983, rel=2e-5)           # spec: omega_d = 0.31983
     assert all(r['f_cmd_hz'] == 0.0 for r in rows if r['kind'] == 'indicator')   # 0.29 -> 0.29054 <= 0.3
     assert abs(r['t_window_end_us'] - r['t_window_start_us'] - 1e7) < READ_STEP_US
+
+
+def test_old_17_visit_schedule_rejected(monkeypatch):
+    # S18 + spec v3.5: the v3.4 schedule without the 4 off-grid points is no longer the locked one
+    monkeypatch.setattr(t5, 'POINTS', (0.32, 0.5, 1.0, 2.0, 10.0, 20.0, 39.2))
+    old = t5.make_schedule(1)
+    monkeypatch.undo()
+    assert len(old) == 17
+    assert sc.schedule_matches_locked(old) != []
+    assert sc.schedule_matches_locked(t5.make_schedule(1)) == []
 
 
 def test_small_error_passes_large_error_fails(sched1):

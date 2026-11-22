@@ -1,0 +1,26 @@
+Nguồn từng công thức của bang.csv (worktree D:/HIL_WT/devin_e3, nhánh feat/devin-e3-t5-bon-diem)
+
+- int16 trong frame: round(clamp(ω, ±40) / 40 × 32767), Python round
+    rpi5/protocol.py:131-137 (_to_int16), :197-198 (encode_state), STATE_RANGES :114
+- ω_d phía Pi (float64): int16 / 32767 × 40
+    rpi5/protocol.py:157-159 (_from_int16); rpi5/t3b_schedule.py:84-87 (quantize, dùng ở tools/s06_t5_score.py:94-96)
+- ω_d phía H7 (float32): (float)int16 × (40.0f / 32767.0f)
+    stm32h7/Core/Src/spi1_handler.c:96-99 (_rd16), :116-119; hil_protocol.h:44, :63, :170 (float omega[4]); main.c:594, :600 (EncoderGen_SetOmega(i, g_state.omega[i]))
+- có phát xung: |ω| > 0.3f (so float32); không thì dừng bánh
+    stm32h7/Core/Src/encoder_gen.c:5, :211-218
+- nửa chu kỳ trước làm tròn (float32): hp = (1e6f × (float)M_PI) / (fabsf(ω) × 330.0f)
+    stm32h7/Core/Src/encoder_gen.c:38-46, :211, :220; encoder_gen.h:57, :75-77
+- hằng 9 519,98: ENC_TIMER_FREQ × π / ENC_PPR = 1e6 × π / 330
+    stm32h7/Core/Inc/encoder_gen.h:26-27, :57, :77; PSC 239 → 1 MHz: encoder_gen.h:15-17, tim.c:62, :130, :178, :226
+- làm tròn timer: kẹp [1; 65535], rồi (uint32_t)(hp + 0.5f): làm tròn nửa lên (cộng 0,5 rồi cắt)
+    stm32h7/Core/Src/encoder_gen.c:47-49
+- chu kỳ phát: mỗi kênh đảo mức mỗi hp tick (cộng hp vào CCR sau mỗi cạnh): chu kỳ A = 2·hp tick
+    stm32h7/Core/Src/encoder_gen.c:261-264 (OC_Callback), :130-177 (_retime giữ hp nguyên)
+- tần số phát thật: f_A = 1e6 / (2·hp_timer) Hz; tốc độ count ESP32 (4 cạnh / xung A) = 2e6 / hp_timer count/s
+    encoder_gen.h:20-27; encoder_gen.c:277-284 (measured_freq = TICKS / (2·ch1_period))
+- f_lệnh của bộ chấm: K·ω_d, K = 1320 / 2π
+    tools/s06_t5_score.py:79, :94-96, :243; rpi5/t3b_schedule.py:39
+
+Hằng: 40.0f/32767.0f = 0.0012207403779029846; 1e6f*(float)M_PI = 3141592.75; 1e6*pi/330 = 9519.977738150888; K = 210.08452488130186
+Giả định: tick timer đúng 1 MHz danh định (ENC_CLOCK_CAL = 1.0); đồng hồ H7 thật không có trong bảng.
+Cột: frac_f32 = phần lẻ của hp float32 của H7 (trước làm tròn), từ ω_d H7; frac_exact_set = phần lẻ 9519.98/ω đặt (như spec); hp_timer = giá trị thật sau (uint32_t)(hp + 0.5f); err_vs_set = (2e6/hp_timer)/(K·|ω đặt|) − 1; err_vs_d = so f_lệnh của bộ chấm (K·ω_d); err_round = hp_f32/hp_timer − 1.
