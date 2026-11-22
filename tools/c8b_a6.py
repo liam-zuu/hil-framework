@@ -17,6 +17,18 @@ g_E = gk (c8b_a6_cho_v3; g_gian, g_phang kept as information); gop takes the cal
 eps_g, not in the status), needs the held-out camera-IMU check of E clips (kiem_imu), accepts ONE mounting in the lap
 file (mot_lan_lap, lap = 0) and the cell file c8b_a6_o as optional; new subcommands kiem_imu, goc, dong.
 
+22/11/2026 night (CODE_C8B local_30b86c78, Fable 5.2; Liam at CODE_C8B, box, verbatim: "Lam theo de xuat (Recommended)"
+after "de xuat giup toi phuong an tot nhat cho van de nay di"; note 03_CODE/docs/2026-11-22_Giam_can_A6_dong_kenh_huong_v1.md,
+diagnosis 05_DATA/results/C8/2026-11-20_run02/c8b/T7_a6_dong_chan_doan/; not through Codex yet, L138): fit_gk on the
+frames of the scored runs does not measure the slope of the tag (the car does not turn in place there, so the map
+residual fixed in the floor, which changes with the position, cannot be told from the columns u (x) slope: same tag,
+same paths, camera segment 3 gives gk_x -0.0094 and segment 2 -0.0150). So U_chuyen.dong is measured in the HEADING
+channel: new subcommand dong_huong (c8b_a6_dong_v2, kenh huong_imu): per scored run and acceleration band, camera
+heading minus IMU yaw on the frames of every OTHER run, regressed on per-run [1, time, omega] and shared [IMU scale,
+u_y / 2, -u_x / 2]; SE by the jackknife over runs; the two half bands split at the MEDIAN acceleration of the frames
+(the upper half of the range held 1.5 % of them). Same index |g_bar - g_b| + 2 |SE|, same leave-one-run-out; g_b is
+still the camera number of the E clips. gop accepts both dong files; a v2 file must carry the lock of the A6 file.
+
 Model (exact for the lifted points of car_pose): a corner at height h_i = hbar + g.r_i + v s_i (r_i the corner in the
 tag frame, car_corners_body order ArUco 0..3, s = (+1, -1, +1, -1)) lifted with ONE height hbar lands at
     P_i = X_i + (g.r_i + v s_i) d_i,   d_i = (P_i - C) / (H - hbar),   X_i = T + R(psi) (1 + sigma) r_i
@@ -88,6 +100,8 @@ Every number before the margin 1.25 (C8B applies it once, in c8b_khoa_v5). Const
   python tools/c8b_a6.py goc --track track/RUN --session session.json --cua-so F2/cua_so_v1.jsonl --luot-id RUN \
       --out goc_RUN.json
   python tools/c8b_a6.py dong --goc goc_RUN1.json --goc goc_RUN2.json --tam-id T --out dong.json
+  python tools/c8b_a6.py dong_huong --luot goc_RUN1.json pi/RUN1.csv gio_so_bo_RUN1.json --luot ... --tam-id T \
+      --khoa-truoc khoa.json --out dong_huong.json
 Last line: #ket_qua,ma=0 written / 2 refused or error.
 """
 from __future__ import annotations
@@ -117,6 +131,11 @@ MO_HINH = 'c8b_a6_canh_v1'                                 # four slopes: gk (ed
 SCHEMA_O = 'c8b_a6_o_v1'                                   # cells of the camera-IMU check (design 2b, 7c)
 SCHEMA_LAP = 'c8b_a6_lap_v1'                               # U_chuyen.lap source (design 2c)
 SCHEMA_DONG = 'c8b_a6_dong_v1'                             # U_chuyen.dong source (design 2c, V5-02)
+SCHEMA_DONG_H = 'c8b_a6_dong_v2'                           # 22/11 night: the same from the heading channel of the runs
+DONG_KENH_H = 'huong_imu'                                  # camera heading - IMU yaw (game RV)
+CHIA_TV = 'trung_vi_so_khung'                              # half bands split at the median acceleration of the frames
+SCHEMA_GIO = 'c8b_gio_v1'                                  # preliminary clock of a run (c8b_gio): log = camera + D
+DONG_H_MIN_RUNS = 3                                        # a jackknife over runs needs three (as se_jackknife: nb >= 3)
 SCHEMA_UH = 'c8b_u_h_chung_v1'                             # u_h_chung source (design 3, video multi-height)
 SCHEMA_IMU = 'c8b_a6_kiem_imu_v1'                          # held-out camera-IMU check of gk on an E clip (22/11)
 SCHEMA_GOC = 'c8b_a6_goc_v1'                               # lifted corners of the frames of a run (for dong)
@@ -165,7 +184,11 @@ TOL_L125 = 1e-6                                            # the session numbers
 SU_THEO_SESSION = ('session_sha256', 'cam_tam_m')                # da session (A): set-up fields of the camera
 U_H_HANG_M = 0.0001                                        # design 3: the 0.1 mm term of u_h_chung
 HEX64 = re.compile(r'^[0-9a-f]{64}$')
-GIOI_HAN = [
+GIOI_HAN_DONG_H = (
+    '22/11 dem: U_chuyen.dong tu file c8b_a6_dong_v2 la chi so cua kenh huong camera - IMU tren cac luot khac (bo luot '
+    'dang cham): gom ca sai huong theo vi tri cua ban do (A3) va sai IMU ngoai mo hinh, khong tach; hai nua dai chia o '
+    'trung vi gia toc, nen hieu ung chi co o gia toc rat cao bi pha loang; phep kiem quyet cho yaw la o D2 (T14)')
+GIOI_HAN = [                                               # + GIOI_HAN_DONG_H only when dong is a c8b_a6_dong_v2 file
     '22/11: g_b la do doc doc theo canh ma gk (mo hinh c8b_a6_canh_v1); mat ma khong phang (gk khac do doc gian gm), co '
     'che vat ly chua xac dinh (mat cong hay bo noi cua tam); e_bc, mien nghieng, h_goc van tinh theo mat phang do doc gk',
     '22/11: g_cal (thuoc kep, lan dat dau buoi 1) chi tham khao; kiem cheo la kiem_imu (camera - IMU) tren clip E giu '
@@ -950,8 +973,9 @@ def _load(path, schema):
     cu.check_path(path)
     with open(path, encoding='utf-8') as f:
         d = json.load(f)
-    if not isinstance(d, dict) or d.get('schema') != schema:
-        raise A6Error(f'{path}: not a {schema} file')
+    ok = (schema,) if isinstance(schema, str) else tuple(schema)
+    if not isinstance(d, dict) or d.get('schema') not in ok:
+        raise A6Error(f'{path}: not a {" / ".join(ok)} file')
     _check_sha(d, path)
     return d
 
@@ -1028,13 +1052,24 @@ def kiem_lap(d, tam_id):
     return max(us), [], per
 
 
-def kiem_dong(d, tam_id, g_hat):
+def kiem_dong(d, tam_id, g_hat, khoa_sha=None):
     """U_chuyen.dong from a c8b_a6_dong_v1 (design 2c, V5-02): per target run, a fit of g by acceleration band and half
     band on the C8 runs WITHOUT the target run; u = |g_bar - g_hat| + 2 |SE| (noise added); a band with fewer than
-    N_MIN frames or no other run -> thieu for the frames of that band. Returns (block or None, reasons)."""
+    N_MIN frames or no other run -> thieu for the frames of that band. Returns (block or None, reasons).
+    22/11 night: also a c8b_a6_dong_v2 (dong_huong: g_bar from the heading channel camera - IMU, half bands split at
+    the median acceleration); that file is written after the lock, so it must carry khoa_sha, the lock of the A6
+    file; the index and the reading of the bands are the same."""
     if d is None:
-        return None, ['U_chuyen.dong missing (c8b_a6_dong_v1: leave-one-run-out by acceleration band, design 2c)']
+        return None, ['U_chuyen.dong missing (c8b_a6_dong_v1 / v2: leave-one-run-out by acceleration band, design 2c)']
     why = []
+    v2 = d.get('schema') == SCHEMA_DONG_H
+    if d.get('schema') not in (SCHEMA_DONG, SCHEMA_DONG_H):
+        why.append(f'dong: schema {d.get("schema")!r}')
+    if v2:
+        if d.get('kenh') != DONG_KENH_H or d.get('chia_nua') != CHIA_TV:
+            why.append(f'dong v2: kenh {d.get("kenh")!r} / chia_nua {d.get("chia_nua")!r}')
+        if khoa_sha is None or d.get('khoa_truoc_sha256') != khoa_sha:
+            why.append('dong v2: khoa_truoc_sha256 is not the lock of this A6 file')
     if d.get('tam_id') != tam_id:
         why.append(f'dong: plate {d.get("tam_id")!r}, not {tam_id!r}')
     if d.get('trang_thai') != 'dat':
@@ -1046,7 +1081,7 @@ def kiem_dong(d, tam_id, g_hat):
         why.append('dong: dai_dinh_nghia needs unique bands, full and half bands')
     else:
         try:
-            nua_cua = _dong_halves(dn)
+            nua_cua = _dong_halves(dn, CHIA_TV if v2 else None)
         except A6Error as e:
             why.append(f'dong: {e}')
     luot = d.get('luot')
@@ -1085,12 +1120,15 @@ def kiem_dong(d, tam_id, g_hat):
     if not vals:
         return None, ['dong: no band with data']
     return dict(theo_luot=theo, max=max(vals), thieu=thieu, dai_dinh_nghia=dn,
-                nua_cua={k: list(v) for k, v in nua_cua.items()}), []
+                nua_cua={k: list(v) for k, v in nua_cua.items()}, schema=d.get('schema'),
+                kenh=d.get('kenh') if v2 else 'meo_4_goc', chia_nua=d.get('chia_nua') if v2 else 'giua_khoang'), []
 
 
-def _dong_halves(dn):
+def _dong_halves(dn, chia=None):
     """A6C2-4: every full band [a_lo, a_hi] has exactly its two half bands [a_lo, mid], [mid, a_hi] (mid the middle),
-    every half band belongs to one full band; edges finite, a_lo < a_hi. Returns {full band: (low half, high half)}."""
+    every half band belongs to one full band; edges finite, a_lo < a_hi. Returns {full band: (low half, high half)}.
+    chia CHIA_TV (dong v2): the two halves meet at ONE point strictly inside the band (the median acceleration of
+    the frames), not necessarily the middle."""
     eg = {}
     for x in dn:
         lo, hi = _num(x.get('a_lo'), f'band {x.get("ten")} a_lo'), _num(x.get('a_hi'), f'band {x.get("ten")} a_hi')
@@ -1103,6 +1141,14 @@ def _dong_halves(dn):
     for k, (lo, hi, _) in full.items():
         mid = 0.5 * (lo + hi)
         tol = 1e-12 * max(1.0, abs(hi))
+        if chia == CHIA_TV:
+            a = [h for h, (l2, h2, _) in half.items() if abs(l2 - lo) <= tol and lo < h2 < hi]
+            b = [h for h, (l2, h2, _) in half.items() if abs(h2 - hi) <= tol and lo < l2 < hi]
+            if len(a) != 1 or len(b) != 1 or abs(half[a[0]][1] - half[b[0]][0]) > tol:
+                raise A6Error(f'full band {k} [{lo}, {hi}] without exactly two half bands meeting at one point')
+            out[k] = (a[0], b[0])
+            used |= {a[0], b[0]}
+            continue
         a = [h for h, (l2, h2, _) in half.items() if abs(l2 - lo) <= tol and abs(h2 - mid) <= tol]
         b = [h for h, (l2, h2, _) in half.items() if abs(l2 - mid) <= tol and abs(h2 - hi) <= tol]
         if len(a) != 1 or len(b) != 1:
@@ -1379,7 +1425,7 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
         why.append('one place only: U_chuyen.cho (goc - K1) not measured')
     else:
         why.append('a place without a usable g (F15 full dat): U_chuyen.cho not measured')
-    dong_b, w_dong = kiem_dong(dong, tam_id, g_hat)
+    dong_b, w_dong = kiem_dong(dong, tam_id, g_hat, khoa_truoc_sha256)
     why += w_dong
     u_dong = None if dong_b is None else dong_b['max']
     # per place consistency with the caliper numbers (A6C1-6), every place must pass
@@ -1505,7 +1551,8 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
                 eps_g_khong_meo_khong_dong=eps0_km,
                 ghep_A3_A6=dict(cach='replay chung theo ca H32 (2b) khi hai dau cung mot cho co A3 tung ca; '
                                      'khong thi cong rieng (du phong)', theo_cho=ca_cho),
-                trang_thai=dict(a6=st_a6, h=st_h), ly_do=why, ly_do_h=why_h, gioi_han=list(GIOI_HAN),
+                trang_thai=dict(a6=st_a6, h=st_h), ly_do=why, ly_do_h=why_h,
+                gioi_han=([GIOI_HAN_DONG_H] if (dong or {}).get('schema') == SCHEMA_DONG_H else []) + list(GIOI_HAN),
                 khoa_truoc_sha256=khoa_truoc_sha256, khoa_truoc_sha=khoa_truoc_sha256,      # F3 2.C name (alias)
                 commit=(script or {}).get('commit'),
                 commit_dirty=(script or {}).get('dirty'), nguon=list(nguon), so_tay=SO_TAY, truoc_le=True)
@@ -1776,6 +1823,157 @@ def dong_build(runs, tam_id, log=None):
     return dict(schema=SCHEMA_DONG, tam_id=tam_id, trang_thai='dat', mo_hinh=MO_HINH, dai_dinh_nghia=dn, luot=luot,
                 a_max_nguon='gia toc than lon nhat tren moi khung dua vao (acc_of: khop bac hai +-%d khung)' % SG_HALF,
                 bien_dang=list(DONG_BD), n_khung_luot={k: v['n'] for k, v in dat.items()}, truoc_le=True)
+
+
+# ── dong_huong: U_chuyen.dong from the heading channel of the runs (22/11 night) ─────────────────
+
+def read_gio_offset(path, frames_sha, log_sha):
+    """(D, half) [s] of a run from its preliminary clock file c8b_gio_v1 (chain step T5): log time = camera time + D,
+    D = center_s; the file must be ok and of this frames.csv and this log (sha)."""
+    cu.check_path(path)
+    try:
+        with open(path, encoding='utf-8') as f:
+            d = json.load(f)
+    except ValueError as e:
+        raise A6Error(f'{path}: {e}')
+    if not isinstance(d, dict) or d.get('format') != SCHEMA_GIO or d.get('ok') is not True:
+        raise A6Error(f'{path}: not a {SCHEMA_GIO} file with ok true')
+    sh = d.get('sha256') if isinstance(d.get('sha256'), dict) else {}
+    if sh.get('frames') != frames_sha or sh.get('esp32') != log_sha:
+        raise A6Error(f'{path}: the clock file is of another frames.csv or another log (sha256)')
+    return _num(d.get('center_s'), f'{path} center_s'), _num(d.get('half_s'), f'{path} half_s', 0.0)
+
+
+def yaw_run(g, ses, L, D):
+    """Heading-channel data of the frames of one scored run (a c8b_a6_goc_v1 file g, its session, its log L, the clock
+    offset D): t, e = Kabsch heading of the lifted corners (no A6 correction) minus the IMU yaw (game RV:
+    c8_u_imu.rv_samples, interp_yaw at t + D), the IMU yaw pim, omega, the body acceleration a, u = R^T (T - C) /
+    (H - hbar), and ok: the frames with an IMU yaw, omega and a (no window across a gap). The whole turns between the
+    two unwrapped headings are a constant of the run: e is taken within pi of its first usable value."""
+    if g.get('schema') != SCHEMA_GOC or g.get('session_sha256') != ses['sha256']:
+        raise A6Error(f'dong_huong {g.get("luot_id")!r}: not a {SCHEMA_GOC} file of this session')
+    t = np.array([k[1] for k in g['khung']], float)
+    P = np.array([k[2] for k in g['khung']], float).reshape(-1, 4, 2)
+    if len(t) < 2 * SG_HALF + 1 or np.any(np.diff(t) <= 0) or not np.all(np.isfinite(P)):
+        raise A6Error(f'dong_huong {g.get("luot_id")!r}: too few frames, times not increasing or corners not finite')
+    C, H, hb, side = ses['C'], ses['H'], ses['hbar'], ses['side']
+    psi = np.unwrap(np.array([kabsch_psi(q, side) for q in P]))
+    w = omega_of(t, P, side)
+    Tc = P.mean(1)
+    a = acc_of(t, Tc)
+    S = cu.rv_samples(L)
+    pim = cu.interp_yaw(S, t + float(D))
+    c_, s_ = np.cos(psi), np.sin(psi)
+    dfl = (Tc - C) / (H - hb)
+    u = np.column_stack([c_ * dfl[:, 0] + s_ * dfl[:, 1], -s_ * dfl[:, 0] + c_ * dfl[:, 1]])
+    ok = np.isfinite(pim) & np.isfinite(w) & np.isfinite(a)
+    e = psi - pim
+    if ok.any():
+        e0 = e[np.flatnonzero(ok)[0]]
+        e = e0 + _wrap(e - e0)
+    tb = S.get('t_break', math.inf)
+    return dict(t=t, e=e, pim=pim, w=w, a=a, u=u, ok=ok, n=int(len(t)), n_ok=int(ok.sum()),
+                n_late=S.get('n_late'), n_imu=int(np.isfinite(pim).sum()),
+                t_break_log_s=float(tb) if math.isfinite(tb) else None, C=C, H=H, hb=hb, side=side)
+
+
+def _yaw_fit_runs(blocks):
+    """Least squares of the heading-channel difference over the frames of several runs. blocks: per run (e, t, w, pim,
+    u). Columns: per run [1, t - mean, omega] (constant, drift, the rest of the clock offset and the shutter skew);
+    shared [pim - mean of the run (IMU scale), u_y / 2, -u_x / 2 (the two slopes of design 2a)]. Returns
+    (g (2,), cond of the column-scaled design or inf, rms [rad], n)."""
+    m, n = len(blocks), int(sum(len(b[0]) for b in blocks))
+    X, y, k = np.zeros((n, 3 * m + 3)), np.zeros(n), 0
+    for j, (e, t, w, pim, u) in enumerate(blocks):
+        sl = slice(k, k + len(e))
+        X[sl, 3 * j], X[sl, 3 * j + 1], X[sl, 3 * j + 2] = 1.0, t - t.mean(), w
+        X[sl, 3 * m], X[sl, 3 * m + 1], X[sl, 3 * m + 2] = pim - pim.mean(), 0.5 * u[:, 1], -0.5 * u[:, 0]
+        y[sl] = e
+        k += len(e)
+    nrm = np.linalg.norm(X, axis=0)
+    if n <= X.shape[1] or not np.all(np.isfinite(X)) or not np.all(np.isfinite(y)) or np.any(nrm == 0):
+        return np.full(2, np.nan), math.inf, math.nan, n
+    co = np.linalg.lstsq(X, y, rcond=None)[0]
+    return co[3 * m + 1:3 * m + 3], float(np.linalg.cond(X / nrm)), float(np.sqrt(np.mean((y - X @ co) ** 2))), n
+
+
+def dong_huong_build(runs, tam_id, khoa_sha, log=None):
+    """c8b_a6_dong_v2 (22/11 night; Liam at CODE_C8B, box: "Lam theo de xuat (Recommended)"; rules locked before the
+    run in khoa_truoc_a6_v2.json): U_chuyen.dong from the HEADING channel. runs: {luot_id: yaw_run dict}. Bands: one
+    full band [0, a_max] (a_max the largest body acceleration of the usable frames given) and its two halves split at
+    the MEDIAN acceleration of those frames (no number chosen). Per target run and band: _yaw_fit_runs on the usable
+    frames of EVERY OTHER run in the band; SE of the two slopes by the jackknife over those runs (leave one run out);
+    dat when the band has at least N_MIN frames from at least DONG_H_MIN_RUNS other runs and the main fit and every
+    jackknife fit are well conditioned (cond <= sqrt(COND_MAX), as kiem_imu). No omega limit: the bound must cover
+    every scored frame. g_bar is compared with g_b in gop (kiem_dong): |g_bar - g_b| + 2 |SE|. A run without a usable
+    frame is listed in luot_khong_khung_dung: it gives nothing to the fits and is still a target."""
+    if not khoa_sha:
+        raise A6Error('dong_huong: the lock (--khoa-truoc) is needed: the file is written after it')
+    if len(runs) < 2:
+        raise A6Error('dong_huong: at least two runs')
+    r0 = next(iter(runs.values()))
+    for lid, r in runs.items():
+        if abs(r['H'] - r0['H']) > TOL_SETUP or abs(r['hb'] - r0['hb']) > TOL_SETUP \
+                or abs(r['side'] - r0['side']) > TOL_SETUP or np.max(np.abs(r['C'] - r0['C'])) > TOL_SETUP:
+            raise A6Error(f'dong_huong {lid}: another car_pose set-up (L125)')
+    # a run without a usable frame (its IMU yaw not usable: c8_u_imu t_break, a hole) gives no frame to the other
+    # runs; it is still a target and takes its bound from the others (the locked rule: the frames of every other run)
+    if sum(1 for r in runs.values() if r['n_ok'] > 0) < 2:
+        raise A6Error('dong_huong: fewer than two runs with a usable frame (IMU yaw, omega, acceleration)')
+    a_all = np.concatenate([r['a'][r['ok']] for r in runs.values()])
+    a_max, a_tv = float(np.max(a_all)), float(np.median(a_all))
+    if not 0.0 < a_tv < a_max:
+        raise A6Error(f'dong_huong: median acceleration {a_tv} not inside (0, {a_max})')
+    dn = [dict(ten='a', a_lo=0.0, a_hi=a_max, nua=False), dict(ten='a_thap', a_lo=0.0, a_hi=a_tv, nua=True),
+          dict(ten='a_cao', a_lo=a_tv, a_hi=a_max, nua=True)]
+    cmax = math.sqrt(COND_MAX)
+    luot = {}
+    for lid in runs:
+        others = [x for x in runs if x != lid]
+        luot[lid] = dict(bo_luot=others, dai={})
+        for b in dn:
+            blocks, ten = [], []
+            for x in others:
+                r = runs[x]
+                m = r['ok'] & (r['a'] >= b['a_lo']) & (r['a'] <= b['a_hi'])
+                if m.any():
+                    blocks.append((r['e'][m], r['t'][m], r['w'][m], r['pim'][m], r['u'][m]))
+                    ten.append(x)
+            n = int(sum(len(q[0]) for q in blocks))
+            ent = dict(n_khung=n, n_luot=len(blocks), luot_co_khung=ten, g_bar=None, SE=None, trang_thai='thieu')
+            if n < N_MIN:
+                ent['ly_do'] = f'{n} frames < {N_MIN}'
+            elif len(blocks) < DONG_H_MIN_RUNS:
+                ent['ly_do'] = f'{len(blocks)} other runs with frames in the band < {DONG_H_MIN_RUNS}'
+            else:
+                g, cond, rms, _ = _yaw_fit_runs(blocks)
+                jk = [_yaw_fit_runs(blocks[:j] + blocks[j + 1:]) for j in range(len(blocks))]
+                gs = np.array([q[0] for q in jk])
+                cj = max(q[1] for q in jk)
+                mb = len(blocks)
+                ent.update(cond=cond, cond_jackknife_max=cj, rms_rad=rms)
+                if not (math.isfinite(cond) and cond <= cmax and math.isfinite(cj) and cj <= cmax
+                        and np.all(np.isfinite(gs)) and np.all(np.isfinite(g))):
+                    ent['ly_do'] = f'design ill conditioned (main {cond:.3g}, jackknife {cj:.3g} > {cmax:.3g})'
+                else:
+                    se = np.sqrt((mb - 1) / mb * np.sum((gs - gs.mean(0)) ** 2, axis=0))
+                    ent.update(g_bar=[float(v) for v in g], SE=[float(v) for v in se], trang_thai='dat',
+                               g_bo_tung_luot={x: [float(v) for v in q] for x, q in zip(ten, gs)})
+            luot[lid]['dai'][b['ten']] = ent
+            if log:
+                log(f'dong_huong {lid} {b["ten"]}: n {ent["n_khung"]} runs {ent["n_luot"]} g_bar {ent["g_bar"]} '
+                    f'SE {ent["SE"]} {ent["trang_thai"]} {ent.get("ly_do", "")}')
+    return dict(schema=SCHEMA_DONG_H, kenh=DONG_KENH_H, chia_nua=CHIA_TV, tam_id=tam_id, trang_thai='dat',
+                dai_dinh_nghia=dn, luot=luot, khoa_truoc_sha256=khoa_sha,
+                a_max_nguon='gia toc than lon nhat tren moi khung dung duoc dua vao (acc_of: khop bac hai +-%d khung)'
+                            % SG_HALF,
+                a_chia_nguon='trung vi gia toc than cua moi khung dung duoc cua cac luot dua vao',
+                cach='e = psi Kabsch 4 goc da nang (chua sua A6) - yaw IMU (game RV, tai t_cam + D cua c8b_gio so bo); '
+                     'hoi quy tren moi luot [1, t - tb, omega] va chung [yaw IMU - tb luot (thang), u_y/2, -u_x/2]; '
+                     'SE: jackknife bo tung luot; khung dung duoc: co yaw IMU, omega, gia toc huu han; khong loc omega',
+                n_khung_luot={k: v['n'] for k, v in runs.items()},
+                n_khung_dung_luot={k: v['n_ok'] for k, v in runs.items()},
+                luot_khong_khung_dung=[k for k, v in runs.items() if v['n_ok'] < 1], truoc_le=True)
 
 
 # ── readers ──────────────────────────────────────────────────────────────────────────────────────
@@ -2167,7 +2365,7 @@ def main(argv=None):
     a2.add_argument('--tam-cal-id', required=True, help='plate of the caliper numbers (another plate: new plate)')
     a2.add_argument('--lan-lap-cal-id', default=None, help='mounting of the caliper numbers (others add U_chuyen.lap)')
     a2.add_argument('--lap', default=None, help=f'{SCHEMA_LAP} file')
-    a2.add_argument('--dong', default=None, help=f'{SCHEMA_DONG} file')
+    a2.add_argument('--dong', default=None, help=f'{SCHEMA_DONG} or {SCHEMA_DONG_H} file')
     a2.add_argument('--giu-ngoai', default=None, help=f'{SCHEMA_O} file (camera-IMU held-out check)')
     a2.add_argument('--u-h-chung', default=None, help=f'{SCHEMA_UH} file')
     a2.add_argument('--khoa-truoc', default=None, help='the lock manifest written before the checks (its sha256)')
@@ -2197,6 +2395,12 @@ def main(argv=None):
     a5.add_argument('--goc', action='append', required=True, help=f'{SCHEMA_GOC} file of a run (repeat)')
     a5.add_argument('--tam-id', required=True)
     a5.add_argument('--out', required=True)
+    a6_ = sub.add_parser('dong_huong', help=f'{SCHEMA_DONG_H}: U_chuyen.dong from camera heading - IMU yaw of the runs')
+    a6_.add_argument('--luot', action='append', nargs=3, required=True, metavar=('GOC', 'LOG', 'GIO'),
+                     help=f'a scored run: its {SCHEMA_GOC} file, its agv_logger csv, its preliminary {SCHEMA_GIO} file')
+    a6_.add_argument('--tam-id', required=True)
+    a6_.add_argument('--khoa-truoc', required=True)
+    a6_.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
         if a.cmd == 'do':
@@ -2266,6 +2470,31 @@ def main(argv=None):
                        luc=datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
             _write(a.out, with_sha(_clean(out)))
             print(f'dong: a_max {out["dai_dinh_nghia"][0]["a_hi"]:.4f} m/s^2, {len(out["luot"])} runs')
+        elif a.cmd == 'dong_huong':
+            cu.check_path(a.khoa_truoc)
+            khoa = cu.sha256(a.khoa_truoc)
+            runs, nguon, gio = {}, [dict(vai='khoa_truoc', file=os.path.abspath(a.khoa_truoc), sha256=khoa)], {}
+            for gp, lp, op in a.luot:
+                g = _load(gp, SCHEMA_GOC)
+                lid = g['luot_id']
+                if lid in runs:
+                    raise A6Error(f'run {lid} given twice')
+                ses = read_session(g['session_file'])
+                cu.check_path(lp)
+                lsha = cu.sha256(lp)
+                D, half = read_gio_offset(op, g['frames_sha256'], lsha)
+                runs[lid] = yaw_run(g, ses, cu.load_log(lp), D)
+                gio[lid] = dict(D_s=D, half_s=half, n_late=runs[lid]['n_late'], n_khung_co_yaw=runs[lid]['n_imu'],
+                                t_break_log_s=runs[lid]['t_break_log_s'])
+                nguon += [dict(vai=f'goc {lid}', file=os.path.abspath(gp), sha256=cu.sha256(gp)),
+                          dict(vai=f'log {lid}', file=os.path.abspath(lp), sha256=lsha),
+                          dict(vai=f'gio {lid}', file=os.path.abspath(op), sha256=cu.sha256(op))]
+            out = dong_huong_build(runs, a.tam_id, khoa, log=lambda m: print(m, flush=True))
+            out.update(gio_luot=gio, nguon=nguon, script=script_state(),
+                       luc=datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
+            _write(a.out, with_sha(_clean(out)))
+            dn = out['dai_dinh_nghia']
+            print(f'dong_huong: a_max {dn[0]["a_hi"]:.4f} a_tv {dn[1]["a_hi"]:.4f} m/s^2, {len(out["luot"])} runs')
         else:
             places, nguon, shas = [], [], []
             for p in a.cho_file:
@@ -2281,7 +2510,7 @@ def main(argv=None):
             if len({p['cho'] for p in places}) != len(places):
                 raise A6Error('a place given twice')
             src = {}
-            for key, path, sch in (('lap', a.lap, SCHEMA_LAP), ('dong', a.dong, SCHEMA_DONG),
+            for key, path, sch in (('lap', a.lap, SCHEMA_LAP), ('dong', a.dong, (SCHEMA_DONG, SCHEMA_DONG_H)),
                                    ('giu_ngoai', a.giu_ngoai, SCHEMA_O), ('u_h', a.u_h_chung, SCHEMA_UH)):
                 src[key] = _load(path, sch) if path else None
                 if path:

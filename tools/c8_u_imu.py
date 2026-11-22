@@ -25,6 +25,15 @@ reports at most h_lim apart unwrap normally; across a longer gap the branch is c
 over the gap (gyro reports at most h_lim apart there), else (or more than pi/2 away) the yaw after the gap is
 not usable: interp_yaw gives NaN from there. Each step divided by (1 + s_plus) when positive, by (1 + s_minus)
 when negative (F9). A change of reset_n (IMU reset) in a window is refused.
+22/11/2026 night (CODE_C8B local_30b86c78; Liam at CODE_C8B, box, verbatim: "Sua luat (Recommended)"; note CLAUDE_THESIS
+03_CODE/docs/2026-11-22_Luat_ho_mau_IMU_nhanh_theo_encoder_v1.md; not through Codex yet, L138): when the gyro
+cannot give the branch of a long gap (its reports have a gap above h_lim there too), the branch is taken from the
+WHEEL COUNTS of the log rows (fl_count .. rr_count, cumulative, in every row): the turn of the body by the
+kinematics of the firmware over the rows that bracket the gap, rows at most h_lim apart; the same test (more than
+pi/2 from the unwrapped step, or no counts: the yaw after the gap is not usable). On the 16 runs of C8 session 2
+all 32 long gaps were with the motors off and the car standing (the idle log writes 10 rows / s and so catches every
+second report, 100 ms apart; a slip of the phase gives 150 ms), 7 of them with the same gap in the gyro reports:
+two runs lost the yaw of the whole run for a gap in which the yaw changed by less than 0.0001 rad.
 Scale: s = dpsi_raw / (+-N 2 pi) - 1 (signed denominator, design 2.1 after CU-22).
 
 Sign: positive = the IMU yaw increases = 'ccw' (the scale run checks the sign the operator gives).
@@ -85,6 +94,13 @@ END_STILL_S = 3.0          # kiem closure: still frames in [t_off + tail, t_off 
 T_CMD_TOL_S = 0.1          # CU-8: run_active at least T_cmd - 0.1 s
 FORBIDDEN = {'sealed', 'sealed_test', 'o1_feas'}
 LOG_COLS = ('timestamp_us', 'yaw_rad', 'rv_n', 'age_r_ms', 'gz', 'gyro_n', 'age_g_ms', 'reset_n')
+# 22/11 night: wheel counts (optional columns) for the branch of a long RV gap without gyro. Body turn per count of
+# the firmware kinematics: wz = (r / 4) / (lx + ly) (-w_fl + w_fr - w_rl + w_rr) (AGV src/kinematics/kinematics.c 28;
+# kinematics.h WHEEL_RADIUS 0.0485 m, LX = LY 0.12 m; src/encoder/encoder.h PPR 1320 counts / wheel turn)
+COUNT_COLS = ('fl_count', 'fr_count', 'rl_count', 'rr_count')
+COUNT_SIGN = (-1.0, 1.0, -1.0, 1.0)
+ENC_WHEEL_R_M, ENC_LX_M, ENC_LY_M, ENC_PPR = 0.0485, 0.12, 0.12, 1320
+ENC_YAW_PER_COUNT = 2.0 * math.pi / ENC_PPR * ENC_WHEEL_R_M / (4.0 * (ENC_LX_M + ENC_LY_M))     # 2.405e-4 rad
 SCALE_RUNS = {('rc', 'cham'), ('rc', 'nhanh'), ('tay', 'cham'), ('tay', 'nhanh')}     # design 2.1 (CU-15)
 HAND_RUNS = {('tay', 'cham'), ('tay', 'nhanh')}
 
@@ -161,6 +177,8 @@ def load_log(path, need=LOG_COLS):
         raise InputError(f'{path}: no column {miss}')
     rows, n_dup = _drop_duplicates(path, rows)
     cols = set(need) | ({'run_active', 'roll', 'pitch', 'r_valid', 'g_valid'} & set(rows[0]))
+    if all(c in rows[0] for c in COUNT_COLS):                # all four or none (the body turn needs the four wheels)
+        cols |= set(COUNT_COLS)
     try:
         L = {c: np.array([float(r[c]) if r[c] not in ('', None) else np.nan for r in rows]) for c in cols}
     except ValueError as exc:
@@ -360,12 +378,34 @@ def _gz_integral(tg, gz, a, b, h_lim):
     return float(np.sum((g[1:] + g[:-1]) / 2 * np.diff(t)))
 
 
+def _enc_turn(L, a, b, h_lim):
+    """Turn of the body [rad] by the wheel counts over the log rows that bracket [a, b] (the last row at or before
+    a, the first row at or after b): ENC_YAW_PER_COUNT x (-d fl + d fr - d rl + d rr), the kinematics of the
+    firmware. None without the four count columns, without a bracketing row on a side, with a count that is not
+    finite there, or with two of those rows more than h_lim apart (a hole of the log: the counts are cumulative, but
+    a restart of the counters inside a hole would not be seen)."""
+    if not all(c in L for c in COUNT_COLS):
+        return None
+    ts = L['timestamp_us'] * 1e-6
+    i0, i1 = int(np.searchsorted(ts, a + 1e-9, 'right')) - 1, int(np.searchsorted(ts, b - 1e-9, 'left'))   # 1 ns
+    if i0 < 0 or i1 >= len(ts) or i1 <= i0:
+        return None
+    if np.max(np.diff(ts[i0:i1 + 1])) > h_lim + 1e-9:
+        return None
+    dc = [L[c][i1] - L[c][i0] for c in COUNT_COLS]
+    if not all(math.isfinite(v) for v in dc):
+        return None
+    return float(ENC_YAW_PER_COUNT * sum(sg * v for sg, v in zip(COUNT_SIGN, dc)))
+
+
 def rv_samples(L, period_s=PERIOD_S, tau_hat=0.0, s_plus=0.0, s_minus=0.0, j_lim=J_LIM_S, h_lim=H_LIM_S):
     """Game rotation vector samples of a log. Every report: t_all (grid sample time minus tau_hat, ESP32 clock),
     psi_all (unwrapped, scale-corrected yaw), n_all (grid index), t_recv; kept reports (on the grid): t, psi.
     t_break (same clock as t): the yaw is not usable from the last report before a gap that could not be
     unwrapped (CU-3, CU2-2) or before an IMU reset (CU-4); resets: row times where reset_n changed.
-    Also tg, gz: the gyro reports (receive times), for turn_totals."""
+    Also tg, gz: the gyro reports (receive times), for turn_totals. nhanh_ho: per gap above h_lim, the receive time
+    before it, its length, the source of the branch ('gyro', 'encoder' when the gyro has a gap there too (22/11
+    night, _enc_turn), None), the unwrapped step, the turn of that source and whether the yaw breaks there."""
     for v, w in ((tau_hat, 'tau_hat'), (s_plus, 's_plus'), (s_minus, 's_minus'), (j_lim, 'j_lim'), (h_lim, 'h_lim')):
         _finite(v, w)
     if not (-0.1 < s_plus < 0.1 and -0.1 < s_minus < 0.1):
@@ -387,13 +427,19 @@ def rv_samples(L, period_s=PERIOD_S, tau_hat=0.0, s_plus=0.0, s_minus=0.0, j_lim
     d0 = (np.diff(y) + math.pi) % (2 * math.pi) - math.pi
     d = d0.copy()
     t_break = math.inf
+    nhanh_ho = []
     for k in np.nonzero(np.diff(r) > h_lim)[0]:              # CU-3: branch over a long gap from the gyro
-        ig = _gz_integral(tg, gz, r[k], r[k + 1], h_lim)
+        ig, src = _gz_integral(tg, gz, r[k], r[k + 1], h_lim), 'gyro'
+        if ig is None:                                       # 22/11 night: the gyro has a gap there: wheel counts
+            ig, src = _enc_turn(L, r[k], r[k + 1], h_lim), 'encoder'
         if ig is not None:
             m = round((ig - d0[k]) / (2 * math.pi))
             d[k] = d0[k] + 2 * math.pi * m
-        if ig is None or abs(d[k] - ig) > math.pi / 2:
+        gay = bool(ig is None or abs(d[k] - ig) > math.pi / 2)
+        if gay:
             t_break = min(t_break, t_all[k])                  # CU2-2: from the report BEFORE the gap
+        nhanh_ho.append(dict(t_recv_s=float(r[k]), ho_s=float(r[k + 1] - r[k]), nguon=src if ig is not None else None,
+                             buoc_rad=float(d[k]), quay_nguon_rad=ig, gay=gay))
     rs = L['reset_n']
     ch = np.nonzero(np.diff(rs) != 0)[0] + 1
     resets = [float(L['timestamp_us'][i] * 1e-6) for i in ch]
@@ -405,7 +451,7 @@ def rv_samples(L, period_s=PERIOD_S, tau_hat=0.0, s_plus=0.0, s_minus=0.0, j_lim
     return dict(t=t_all[keep], psi=psi[keep], t_all=t_all, psi_all=psi, n_all=n, t_recv=r, j=j, keep=keep,
                 n_samples=int(idx.size), n_late=int((~keep & valid).sum()), n_invalid=int((~valid).sum()),
                 valid=valid, period_fit_s=float(b), rows=idx, h_lim=h_lim,
-                t_break=t_break, resets=resets, tg=tg, gz=gz)
+                t_break=t_break, resets=resets, tg=tg, gz=gz, nhanh_ho=nhanh_ho)
 
 
 def interp_yaw(S, t, h_lim=None):
