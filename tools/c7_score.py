@@ -2459,6 +2459,22 @@ def bind_gates(pre, hs, track, fsha):
                          f'{gates!r}')
 
 
+def bind_session(pre, track):
+    """Several camera segments (CODE 20/11 khuya, chain A; c7_ghep_cua_so --doan): the camera of a run is chosen by the
+    session_sha256 of ITS F2 row, so the frames scored must be tracked with that session: the track.json beside
+    frames.csv must name the same session_sha256. A row without session_sha256 (older F2) is not checked."""
+    want = pre.get('session_sha256')
+    if want is None:
+        return
+    have = (track or {}).get('session_sha256')
+    if have is None:
+        raise ValueError(f'cua_so_v1 row of {pre.get("luot_id")} names session {want[:12]}, but there is no '
+                         'track.json with session_sha256 beside frames.csv')
+    if have != want:
+        raise ValueError(f'cua_so_v1 row of {pre.get("luot_id")} is of session {want[:12]}, frames.csv was tracked '
+                         f'with session {have[:12]} (another camera segment)')
+
+
 def _track_beside(frames_path):
     tj = os.path.join(os.path.dirname(os.path.abspath(frames_path)), 'track.json')
     if not os.path.isfile(tj):
@@ -2674,6 +2690,7 @@ def main_rel(argv):
             pre = _pre_of(cua_rows, a.luot_id)
             if pre.get('frames_sha256') != fsha:
                 raise ValueError('cua_so_v1 was made from another frames.csv')
+            bind_session(pre, track)
             ll = ck.doc_lan_lap(a.lan_lap, pre.get('luot_id'))
             bind_lan_lap(ll, pre, cm.sha256(a.cua_so), a.task, _post_of(cua_rows, pre.get('luot_id')))
             a6 = ck.doc_a6(a.a6)
@@ -2703,6 +2720,7 @@ def load_rel(a, frames, track, fsha, esha, task, hs):
         raise ValueError('cua_so_v1 was made from another frames.csv or ESP32 log')
     chuoi_gio = bind_clock(pre, a, hs)
     bind_gates(pre, hs, track, fsha)
+    bind_session(pre, track)
     tcf = ctd.read_json(a.tham_chieu)
     if tcf.get('schema') != ctd.THAM_CHIEU_SCHEMA or tcf.get('cua_so_v1_sha256') != cm.sha256(a.cua_so):
         raise ValueError('tham_chieu_v1 does not name this cua_so_v1 (sha256)')

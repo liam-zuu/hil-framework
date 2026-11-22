@@ -7,7 +7,14 @@ The readers take JSON lines, so the join is a concatenation of the rows (each ra
 cua_so_v1 kept); the order of the files is the recording order of their clips in thu_tu_clip.csv.
 
   python c7_ghep_cua_so.py --thu-tu thu_tu_clip.csv --manifest video/manifest_usb.csv
-      --cua-so <file> [<file> ...] [--bo KEY=LY_DO ...] --out <dir>/cua_so_v1.jsonl
+      --cua-so <file> [<file> ...] [--bo KEY=LY_DO ...] [--doan TEN=<session.json>@<buoc H dau> ...]
+      --out <dir>/cua_so_v1.jsonl
+
+Several camera segments (CODE 20/11 khuya, chain A "da session"; C8 session 2 had three: the iPhone was taken off and
+put back twice): --doan TEN=<session.json>@<buoc> per segment, <buoc> the thu_tu_clip.csv step of the clip H that
+opens it (H0a, H2a, H3a). A row of thu_tu_clip.csv belongs to the last segment opened at or above it; every window row
+of a file must carry the session_sha256 of ITS segment (sha256 of that session.json); a required row above the first
+segment is refused. Without --doan: one session in the whole file, as before.
 
 Binding: each file -> the clip_sha256 of its rows (one clip per file) -> the clip name in manifest_usb.csv -> the
 thu_tu_clip.csv row of that clip. Rows of thu_tu_clip.csv that need a window file ("required"): `buoc` a run code
@@ -21,10 +28,14 @@ file with rows of several clips, rows without luot_id / clip_sha256 / session_sh
 row; the same luot_id in two files; clips not in recording order (created_utc of the manifest decreasing along
 thu_tu_clip.csv); rows of several session_sha256 (one session per session: the H clip at the start, guide 33); the
 order check of the readers failing on the joined rows (inside each clip the first PTS of every window increases with
-the raw row order, and post after pre of a run: NHACTAM LLC1-15, else every run gets thu_tu_mau_thuan).
+the raw row order, and post after pre of a run: NHACTAM LLC1-15, else every run gets thu_tu_mau_thuan). With --doan:
+a --doan whose <buoc> is not exactly one thu_tu_clip.csv row, two segments opened on one row, a repeated name or
+session file, a required row above the first segment, and a file whose session_sha256 is not the one of the segment
+of its clip.
 
 Writes --out (JSON lines) and <out>.nguon.json (schema cua_so_ghep_v1: each source file with path, sha256, row count,
-its thu_tu_clip.csv line; the --bo list; sha256 of thu_tu_clip.csv, manifest, output; commit_hil). Last line
+its thu_tu_clip.csv line, session_sha256 and segment; the --bo list; the segments (doan: name, session path
+and sha256, opening step and line; [] without --doan); sha256 of thu_tu_clip.csv, manifest, output; commit_hil). Last line
 `#ket_qua,ma=0|2`.
 """
 from __future__ import annotations
@@ -166,7 +177,46 @@ def check_order(rows):
     return sai
 
 
-def ghep(thu_tu_path, manifest_path, files, bo, out_path):
+def parse_doan(specs, tt):
+    """[{ten, session, sha256, buoc_dau, pos, dong}] of --doan TEN=<session.json>@<buoc>, in thu_tu_clip.csv order."""
+    out, names, shas = [], set(), set()
+    for s in specs:
+        ten, sep, rest = s.partition('=')
+        path, sep2, buoc = rest.rpartition('@')
+        ten, path, buoc = ten.strip(), path.strip(), buoc.strip()
+        if not sep or not sep2 or not ten or not path or not buoc:
+            raise GhepError(f'--doan {s!r}: can TEN=<session.json>@<buoc clip H dau doan>')
+        if ten in names:
+            raise GhepError(f'--doan {ten}: dua hai lan')
+        if not os.path.isfile(path):
+            raise GhepError(f'--doan {ten}: khong co file session {path}')
+        sha = sha256_file(path)
+        if sha in shas:
+            raise GhepError(f'--doan {ten}: session {path} da la session cua doan khac')
+        pos = [i for i, r in enumerate(tt) if r['buoc'] == buoc]
+        if len(pos) != 1:
+            raise GhepError(f'--doan {ten}: buoc {buoc!r} o {len(pos)} dong cua thu_tu_clip.csv (can dung 1)')
+        names.add(ten)
+        shas.add(sha)
+        out.append(dict(ten=ten, session=os.path.abspath(path), sha256=sha, buoc_dau=buoc, pos=pos[0],
+                        dong=tt[pos[0]]['_dong']))
+    out.sort(key=lambda d: d['pos'])
+    for a, b in zip(out, out[1:]):
+        if a['pos'] == b['pos']:
+            raise GhepError(f'--doan {a["ten"]}, {b["ten"]}: cung mot dong mo doan')
+    return out
+
+
+def doan_of_row(doans, pos):
+    """The segment of the thu_tu_clip.csv row at index pos (the last one opened at or above it), or None."""
+    d = None
+    for x in doans:
+        if x['pos'] <= pos:
+            d = x
+    return d
+
+
+def ghep(thu_tu_path, manifest_path, files, bo, out_path, doan=()):
     if os.path.exists(out_path):
         raise GhepError(f'{out_path} da co: dung file moi')
     nguon_path = out_path + '.nguon.json'
@@ -174,7 +224,13 @@ def ghep(thu_tu_path, manifest_path, files, bo, out_path):
         raise GhepError(f'{nguon_path} da co: dung file moi')
     tt = read_thu_tu(thu_tu_path)
     man = read_manifest(manifest_path)
+    doans = parse_doan(doan, tt)
+    pos = {id(r): i for i, r in enumerate(tt)}
     req = [r for r in tt if is_required(r['buoc'])]
+    if doans:
+        tren = [r['buoc'] for r in req if doan_of_row(doans, pos[id(r)]) is None]
+        if tren:
+            raise GhepError(f'luot truoc doan dau tien (khong co session): {tren}')
     key_of = {id(r): (r['thu_id'] or r['buoc']) for r in req}
     keys = [key_of[id(r)] for r in req]
     dup = sorted({k for k in keys if keys.count(k) > 1})
@@ -231,18 +287,23 @@ def ghep(thu_tu_path, manifest_path, files, bo, out_path):
             raise GhepError(f'{p}: luot_id {lid!r} khac khoa {k!r} cua thu_tu_clip.csv dong {r["_dong"]}')
         if id(r) in by_row:
             raise GhepError(f'{p}: luot {k} trung voi {by_row[id(r)]["duong_dan"]}')
+        fses = {w['session_sha256'] for _, w in rr}
+        d = doan_of_row(doans, pos[id(r)]) if doans else None
+        if d is not None and fses != {d['sha256']}:
+            raise GhepError(f'{p}: session_sha256 {sorted(x[:12] for x in fses)} khong phai session cua doan '
+                            f'{d["ten"]} ({d["sha256"][:12]}, {d["session"]}) cua clip {r["clip"]}')
         if lid in seen_luot:
             raise GhepError(f'{p}: luot_id {lid} trung voi {seen_luot[lid]}')
         seen_luot[lid] = p
-        item = dict(r=r, rows=rr, duong_dan=os.path.abspath(p), sha256=sha256_file(p), clip_sha256=csha)
+        item = dict(r=r, rows=rr, duong_dan=os.path.abspath(p), sha256=sha256_file(p), clip_sha256=csha,
+                    session_sha256=next(iter(fses)) if len(fses) == 1 else None, doan=d and d['ten'])
         by_row[id(r)] = item
         src.append(item)
     thieu = [key_of[id(r)] for r in req if id(r) not in by_row and key_of[id(r)] not in bo_map]
     if thieu:
         raise GhepError(f'luot trong thu_tu_clip.csv khong co file cua so (them file hay --bo KEY=LY_DO): {thieu}')
-    if len(sess) > 1:
-        raise GhepError(f'nhieu session_sha256 trong buoi: {sorted(s[:12] for s in sess)}')
-    pos = {id(r): i for i, r in enumerate(tt)}
+    if len(sess) > 1 and not doans:
+        raise GhepError(f'nhieu session_sha256 trong buoi: {sorted(s[:12] for s in sess)} (nhieu doan camera: --doan)')
     src.sort(key=lambda it: pos[id(it['r'])])
     prev = None
     for it in src:
@@ -268,7 +329,9 @@ def ghep(thu_tu_path, manifest_path, files, bo, out_path):
         nguon=[dict(thu_tu_dong=it['r']['_dong'], clip=it['r']['clip'], buoc=it['r']['buoc'],
                     thu_id=it['r']['thu_id'] or None, luot_id=it['rows'][0][1]['luot_id'],
                     clip_sha256=it['clip_sha256'], duong_dan=it['duong_dan'], sha256=it['sha256'],
-                    so_dong=len(it['rows'])) for it in src],
+                    so_dong=len(it['rows']), session_sha256=it['session_sha256'], doan=it['doan']) for it in src],
+        doan=[dict(ten=d['ten'], session=dict(duong_dan=d['session'], sha256=d['sha256']), buoc_dau=d['buoc_dau'],
+                   thu_tu_dong=d['dong']) for d in doans],
         bo=[dict(khoa=k, ly_do=v) for k, v in bo_map.items()],
         ra=dict(duong_dan=os.path.abspath(out_path), sha256=out_sha, so_dong=len(rows)),
         commit_hil=commit_hil())
@@ -283,15 +346,18 @@ def main(argv=None):
     ap.add_argument('--manifest', required=True, help='manifest_usb.csv of the session (clip name -> sha256)')
     ap.add_argument('--cua-so', nargs='+', required=True, help='cua_so_v1.jsonl of each run / HC attempt')
     ap.add_argument('--bo', action='append', default=[], help='KEY=LY_DO: a required run without a window file')
+    ap.add_argument('--doan', action='append', default=[],
+                    help='TEN=<session.json>@<buoc>: a camera segment and the clip H step that opens it (several)')
     ap.add_argument('--out', required=True, help='joined cua_so_v1.jsonl (new file)')
     a = ap.parse_args(argv)
     try:
-        n = ghep(a.thu_tu, a.manifest, a.cua_so, a.bo, a.out)
+        n = ghep(a.thu_tu, a.manifest, a.cua_so, a.bo, a.out, a.doan)
     except (GhepError, OSError, KeyError, ValueError) as exc:
         print(f'c7_ghep_cua_so: {type(exc).__name__}: {exc}', file=sys.stderr)
         print('#ket_qua,ma=2')
         return 2
-    print(f'ghep {len(n["nguon"])} file, {n["ra"]["so_dong"]} dong, bo {len(n["bo"])}; sha256 {n["ra"]["sha256"]}')
+    print(f'ghep {len(n["nguon"])} file, {n["ra"]["so_dong"]} dong, bo {len(n["bo"])}, doan {len(n["doan"])}; '
+          f'sha256 {n["ra"]["sha256"]}')
     print('#ket_qua,ma=0')
     return 0
 

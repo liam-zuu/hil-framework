@@ -154,3 +154,63 @@ def test_out_da_co_va_schema_khac(buoi):
     r['schema'] = 'cua_so_v0'
     f = write_jsonl(buoi['d'] / 's.jsonl', [r])
     assert run(buoi, [buoi['hc'], f, buoi['k1']], out='ra2/x.jsonl') == 2
+
+
+# ---- several camera segments (--doan; CODE 20/11 khuya chain A, C8 session 2 had three)
+def _ses(b, name):
+    p = b['d'] / f'{name}.json'
+    p.write_text(json.dumps(dict(kind='c7_session', ten=name)), encoding='utf-8')
+    return str(p), g.sha256_file(p)
+
+
+def _hai_doan(b, ses_k1=None):
+    pa, sa = _ses(b, 'sesA')
+    pb, sb = _ses(b, 'sesB')
+    hc = write_jsonl(b['d'] / 'hcA.jsonl', [win('HC_goc_1', 'a' * 64, 'ref_12b', 1.0, ses=sa)])
+    f02 = write_jsonl(b['d'] / 'f02A.jsonl', [win('C8-P-F02-1', 'b' * 64, 'pre', 1.0, ses=sa),
+                                              win('C8-P-F02-1', 'b' * 64, 'post', 30.0, ses=sa)])
+    k1 = write_jsonl(b['d'] / 'k1B.jsonl', [win('C8-P-K1-1', 'd' * 64, 'pre', 1.0, cho='K1', ses=ses_k1 or sb)])
+    return pa, sa, pb, sb, [hc, f02, k1]
+
+
+def run_doan(b, files, doan, out='ra/cua_so_v1.jsonl'):
+    argv = ['--thu-tu', b['tt'], '--manifest', b['man'], '--cua-so', *files, '--out', str(b['d'] / out)]
+    for x in doan:
+        argv += ['--doan', x]
+    return g.main(argv)
+
+
+def test_hai_doan_moi_file_dung_session_doan_minh(buoi):
+    pa, sa, pb, sb, files = _hai_doan(buoi)
+    # segment 2 opened at the IMG_3 row (C8-P-K1-1_khoa); the K1 run below it is of session B
+    assert run_doan(buoi, files, [f'doan2={pb}@C8-P-K1-1_khoa', f'doan1={pa}@H0a']) == 0
+    n = json.load(open(str(buoi['d'] / 'ra' / 'cua_so_v1.jsonl') + '.nguon.json', encoding='utf-8'))
+    assert [(d['ten'], d['session']['sha256'], d['buoc_dau'], d['thu_tu_dong']) for d in n['doan']] == \
+        [('doan1', sa, 'H0a', 2), ('doan2', sb, 'C8-P-K1-1_khoa', 5)]
+    assert [(s['luot_id'], s['doan'], s['session_sha256']) for s in n['nguon']] == \
+        [('HC_goc_1', 'doan1', sa), ('C8-P-F02-1', 'doan1', sa), ('C8-P-K1-1', 'doan2', sb)]
+
+
+def test_hai_doan_session_sai_doan_bi_tu_choi(buoi):
+    pa, sa, pb, sb, files = _hai_doan(buoi, ses_k1='0' * 64)
+    assert run_doan(buoi, files, [f'doan1={pa}@H0a', f'doan2={pb}@C8-P-K1-1_khoa']) == 2
+    pa, sa, pb, sb, files = _hai_doan(buoi, ses_k1=None)
+    # the K1 run is of session B, but segment 2 is not declared: it falls in segment 1 (session A)
+    assert run_doan(buoi, files, [f'doan1={pa}@H0a'], out='ra2/x.jsonl') == 2
+    assert not (buoi['d'] / 'ra2' / 'x.jsonl').exists()
+
+
+def test_khong_doan_van_tu_choi_nhieu_session(buoi):
+    pa, sa, pb, sb, files = _hai_doan(buoi)
+    assert run(buoi, files) == 2
+
+
+@pytest.mark.parametrize('kieu', ['buoc_khong_co', 'ten_trung', 'session_trung', 'cung_dong', 'thieu_at',
+                                  'luot_tren_doan_dau'])
+def test_doan_sai_bi_tu_choi(buoi, kieu):
+    pa, sa, pb, sb, files = _hai_doan(buoi)
+    d1, d2 = f'doan1={pa}@H0a', f'doan2={pb}@C8-P-K1-1_khoa'
+    doan = {'buoc_khong_co': [d1, f'doan2={pb}@H9z'], 'ten_trung': [d1, f'doan1={pb}@C8-P-K1-1_khoa'],
+            'session_trung': [d1, f'doan2={pa}@C8-P-K1-1_khoa'], 'cung_dong': [d1, f'doan2={pb}@H0a'],
+            'thieu_at': [d1, f'doan2={pb}'], 'luot_tren_doan_dau': [f'doan1={pa}@C8-P-F02-1', d2]}[kieu]
+    assert run_doan(buoi, files, doan) == 2
