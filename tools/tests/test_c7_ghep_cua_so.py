@@ -247,3 +247,20 @@ def test_clip_ngoai_khoang_gio_doan_bi_tu_choi(buoi):
     with open(buoi['man'], 'w', encoding='utf-8', newline='') as f:
         csv.writer(f).writerows(rows)
     assert run_doan(buoi, files, [f'doan1={pa}@H0a', f'doan2={pb}@C8-P-K1-1_khoa']) == 2
+
+
+# ---- CODE 22/11 (contract C8 sec 3): E_dau may repeat the last dung_12b window, nothing else may tie
+def _hc_e(b, e_khung_khac=False, loai_truoc='dung_12b'):
+    d = win('HC_goc_1', 'a' * 64, loai_truoc, 5.0)
+    e = win('HC_goc_1', 'a' * 64, 'E_dau', 5.0, n=4 if e_khung_khac else 3)
+    return write_jsonl(b['d'] / f'hce_{e_khung_khac}_{loai_truoc}.jsonl',
+                       [win('HC_goc_1', 'a' * 64, 'ref_12b', 1.0), d, e, win('HC_goc_1', 'a' * 64, 'E_cuoi', 20.0)])
+
+
+def test_e_dau_trung_dung_12b_cuoi_hop_le(buoi):
+    assert run(buoi, [_hc_e(buoi), buoi['f02'], buoi['k1']]) == 0
+
+
+@pytest.mark.parametrize('khac, loai', [(True, 'dung_12b'), (False, 'ref_12b')])
+def test_bang_nhau_khong_phai_cap_trung_bi_tu_choi(buoi, khac, loai):
+    assert run(buoi, [_hc_e(buoi, khac, loai), buoi['f02'], buoi['k1']]) == 2

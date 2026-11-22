@@ -158,9 +158,19 @@ def first_pts(w):
     return min(pts) if pts else None
 
 
+def same_frames(a, b):
+    """The two windows list exactly the same frames (id and PTS, in order)."""
+    fa = [(int(k['id']), float(k['pts_s'])) for k in a.get('khung') or []]
+    fb = [(int(k['id']), float(k['pts_s'])) for k in b.get('khung') or []]
+    return bool(fa) and fa == fb
+
+
 def check_order(rows):
     """NHACTAM LLC1-15 on the joined rows: per clip, the first PTS of each window strictly increases with the raw row
-    order; the post of a run starts after its pre when both are on one clip. Returns a list of problems."""
+    order; the post of a run starts after its pre when both are on one clip. One exception (CODE 22/11, contract C8
+    section 3; HIEUCHUAN design v2, v3 line 41 "E_dau ... trung dung_12b cuoi khi chay lien"): two consecutive windows of
+    a clip may start at the same PTS ONLY when the pair is (dung_12b, E_dau) and their frame lists are identical; any
+    other tie is still an order problem. Returns a list of problems."""
     sai, by_clip, t0, prepost = [], {}, {}, {}
     for i, w in enumerate(rows):
         p = first_pts(w)
@@ -171,6 +181,9 @@ def check_order(rows):
             prepost.setdefault(w['luot_id'], {})[w['loai']] = i
     for c, v in by_clip.items():
         for (ia, pa), (ib, pb) in zip(v, v[1:]):
+            if pb == pa and rows[ia].get('loai') == 'dung_12b' and rows[ib].get('loai') == 'E_dau' \
+                    and same_frames(rows[ia], rows[ib]):
+                continue
             if pb <= pa:
                 sai.append(f'clip {c[:12]}: dong {ib} (pts {pb}) khong sau dong {ia} (pts {pa})')
     for lid, d in prepost.items():
