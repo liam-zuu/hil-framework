@@ -11,6 +11,7 @@ import json
 import os
 import socket
 import struct
+import subprocess
 import sys
 import threading
 
@@ -111,6 +112,17 @@ def gains_arg(d):
 
 def sent_tx(text):
     return dict(p.split('=', 1) for p in text.split(',')[1:])['tx']
+
+
+def spy_exchange(monkeypatch):
+    """Record calls to gs.exchange while still running the real one; returns the calls list."""
+    calls = []
+    real = gs.exchange
+    def spy(*a, **kw):
+        calls.append(a)
+        return real(*a, **kw)
+    monkeypatch.setattr(gs, 'exchange', spy)
+    return calls
 
 
 def test_float32_format_round_trips_bits():
@@ -273,33 +285,59 @@ def test_query_incomplete_answer_is_4(fake, capsys):
     assert 'INCOMPLETE' in capsys.readouterr().out
 
 
-def test_gain_table_violation_sends_nothing(fake, tmp_path, capsys):
+def test_gain_table_violation_sends_nothing(fake, tmp_path, capsys, monkeypatch):
+    calls = spy_exchange(monkeypatch)
     assert gs.main(args(fake, '--ctrl', 'PID', '--id', '3',
                         '--gains', gains_arg(dict(PID, kp_xy='41.01')))) == 1
     cap = capsys.readouterr()
     assert cap.out.rstrip().endswith('#ket_qua,ma=1')
-    assert 'kp_xy' in cap.err and 'upper bound' in cap.err
-    assert fake.received == []
+    assert 'kp_xy' in cap.err and 'upper bound' in cap.err and 'nothing sent' in cap.err
+    assert len(calls) == 0 and fake.received == []
     adrc = FakeEsp32(ctrl='ADRC')
     try:
         a = dict(omega_c_xy='100', omega_o_xy='50', omega_c_wz='8', omega_o_wz='30',
                  pos_kp='6', pos_ki='3', k_psi='1')
         assert gs.main(args(adrc, '--ctrl', 'ADRC', '--id', '3', '--gains', gains_arg(a))) == 1
-        assert 'omega_c_xy + 2*omega_o_xy' in capsys.readouterr().err
-        assert adrc.received == []
+        cap = capsys.readouterr()
+        assert cap.out.rstrip().endswith('#ket_qua,ma=1')
+        assert 'omega_c_xy + 2*omega_o_xy' in cap.err and 'nothing sent' in cap.err
+        assert len(calls) == 0 and adrc.received == []
     finally:
         adrc.close()
     f = tmp_path / 'gain_violating.json'
     f.write_text(json.dumps(dict(ctrl='PID', id=4,
                                  gains={k: float(v) for k, v in dict(PID, kp_xy='41.01').items()})))
     assert gs.main(args(fake, '--file', str(f))) == 1
-    assert fake.received == []
+    cap = capsys.readouterr()
+    assert cap.out.rstrip().endswith('#ket_qua,ma=1')
+    assert 'upper bound' in cap.err and 'nothing sent' in cap.err
+    assert len(calls) == 0 and fake.received == []
 
 
 @pytest.mark.parametrize('fake', [dict(ctrl='ADRC')], indirect=True)
-def test_gain_table_warning_still_sends(fake, capsys):
+def test_gain_table_warning_still_sends(fake, capsys, monkeypatch):
+    calls = spy_exchange(monkeypatch)
     a = dict(omega_c_xy='8', omega_o_xy='30', omega_c_wz='100', omega_o_wz='50',
              pos_kp='6', pos_ki='3', k_psi='1')
     assert gs.main(args(fake, '--ctrl', 'ADRC', '--id', '3', '--gains', gains_arg(a))) == 0
     out = capsys.readouterr().out
     assert '# warning: omega_c_wz' in out and len(fake.received) == 1
+    assert len(calls) == 1                       # the spy sits on the real send path
+
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+@pytest.mark.parametrize('argv', [
+    ('tools/gain_send.py', '--help'),
+    ('-m', 'tools.gain_send', '--help'),
+    ('-c', 'import tools.gain_send'),
+])
+def test_runs_as_script_module_and_import(argv):
+    """gain_send must run as tools/gain_send.py, as -m tools.gain_send, and import as tools.gain_send."""
+    env = {k: v for k, v in os.environ.items() if k != 'PYTHONPATH'}
+    env['PYTHONIOENCODING'] = 'utf-8'            # the --help docstring has Vietnamese chars
+    r = subprocess.run([sys.executable, *argv], cwd=ROOT, capture_output=True, encoding='utf-8', env=env)
+    assert r.returncode == 0, r.stderr
+    if '--help' in argv:
+        assert 'gain_send.py' in r.stdout

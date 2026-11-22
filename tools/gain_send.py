@@ -51,7 +51,10 @@ import struct
 import sys
 import time
 
-import gain_table
+if __package__:
+    from . import gain_table                 # run as -m tools.gain_send (tools is a namespace package)
+else:
+    import gain_table                        # run as tools/gain_send.py
 
 PORT = 5014
 NAMES = {'PID': ['kp_xy', 'ki_xy', 'kp_wz', 'ki_wz', 'pos_kp', 'pos_ki', 'k_psi'],

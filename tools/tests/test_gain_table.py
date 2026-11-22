@@ -18,6 +18,33 @@ needs_fw = pytest.mark.skipif(not os.path.isfile(FW), reason='firmware tree not 
 PID = dict(kp_xy=1.2, ki_xy=0.4, kp_wz=1.0, ki_wz=0.05, pos_kp=6, pos_ki=3, k_psi=1)
 ADRC = dict(omega_c_xy=8, omega_o_xy=30, omega_c_wz=8, omega_o_wz=30, pos_kp=6, pos_ki=3, k_psi=1)
 
+# expected table contents, written out here by hand (not derived from gt)
+EXPECT_LO = {'PID': (0.0,) * 7, 'ADRC': (0.5, 1.0, 0.5, 1.0, 0.0, 0.0, 0.0)}
+EXPECT_HI = {'PID': (41.0, 1500.0, 4.6, 230.0, 200.0, 5500.0, 50.0),
+             'ADRC': (200.0, 100.0, 200.0, 100.0, 200.0, 40000.0, 50.0)}
+
+PC_FW = '''
+static const float LO_PID[GAIN_N]  = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+static const float HI_PID[GAIN_N]  = { 41.0f, 1500.0f, 4.6f, 230.0f, 200.0f, 5500.0f, 50.0f };
+static const float LO_ADRC[GAIN_N] = { 0.5f, 1.0f, 0.5f, 1.0f, 0.0f, 0.0f, 0.0f };
+static const float HI_ADRC[GAIN_N] = { 200.0f, 100.0f, 200.0f, 100.0f, 200.0f, 40000.0f, 50.0f };
+'''
+
+FW_DIFF = ['HI_PID[0] kp_xy: PC 41, firmware 20',
+           'HI_PID[1] ki_xy: PC 1500, firmware 50',
+           'HI_PID[2] kp_wz: PC 4.5999999, firmware 20',
+           'HI_PID[3] ki_wz: PC 230, firmware 50',
+           'HI_PID[4] pos_kp: PC 200, firmware 30',
+           'HI_PID[5] pos_ki: PC 5500, firmware 30',
+           'HI_PID[6] k_psi: PC 50, firmware 10',
+           'HI_ADRC[0] omega_c_xy: PC 200, firmware 50',
+           'HI_ADRC[1] omega_o_xy: PC 100, firmware 49',
+           'HI_ADRC[2] omega_c_wz: PC 200, firmware 50',
+           'HI_ADRC[3] omega_o_wz: PC 100, firmware 49',
+           'HI_ADRC[4] pos_kp: PC 200, firmware 30',
+           'HI_ADRC[5] pos_ki: PC 40000, firmware 30',
+           'HI_ADRC[6] k_psi: PC 50, firmware 10']
+
 GOOD_FW = '''
 static const float LO_PID[GAIN_N]  = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
 static const float HI_PID[GAIN_N]  = { 20.0f, 50.0f, 20.0f, 50.0f, 30.0f, 30.0f, 10.0f };
@@ -31,9 +58,23 @@ def ulp_up(x):
     return struct.unpack('<f', struct.pack('<I', struct.unpack('<I', struct.pack('<f', x))[0] + 1))[0]
 
 
+def f32_bits(x):
+    return struct.unpack('<I', struct.pack('<f', x))[0]
+
+
 def test_names_aliases_version():
     assert gt.NAMES == gs.NAMES and gt.ALIASES == gs.ALIASES
     assert gt.TABLE_VERSION == '2026-11-22 chot chung cau 1 + vong 6 a.7 (Liam 21/11)'
+
+
+def test_table_values_and_float32_bits():
+    assert gt.LO == EXPECT_LO and gt.HI == EXPECT_HI
+    pc = gt.pc_arrays()
+    for arr in gt.FW_ARRAYS:
+        ctrl = 'PID' if arr.endswith('PID') else 'ADRC'
+        exp = EXPECT_LO[ctrl] if arr.startswith('LO') else EXPECT_HI[ctrl]
+        assert pc[arr] == [gt._f32(x) for x in exp]
+    assert f32_bits(pc['HI_PID'][2]) == 0x40933333        # kp_wz = f32(4.6)
 
 
 def test_base_sets_are_clean():
@@ -44,7 +85,7 @@ def test_base_sets_are_clean():
 @pytest.mark.parametrize('ctrl,base', [('PID', PID), ('ADRC', ADRC)])
 def test_bounds_themselves_are_allowed(ctrl, base):
     for i, n in enumerate(gt.NAMES[ctrl]):
-        for bound in (gt.LO[ctrl][i], gt.HI[ctrl][i]):
+        for bound in (EXPECT_LO[ctrl][i], EXPECT_HI[ctrl][i]):
             gains = dict(base)
             if ctrl == 'ADRC' and n == 'omega_c_xy':
                 gains['omega_o_xy'] = 1          # keep the xy triangle small
@@ -52,7 +93,7 @@ def test_bounds_themselves_are_allowed(ctrl, base):
                 gains['omega_c_xy'] = 0.5
             gains[n] = bound
             v, w = gt.check(ctrl, gains)
-            if ctrl == 'ADRC' and n in ('omega_c_xy', 'omega_o_xy') and bound == gt.HI[ctrl][i]:
+            if ctrl == 'ADRC' and n in ('omega_c_xy', 'omega_o_xy') and bound == EXPECT_HI[ctrl][i]:
                 # the ADRC xy upper bounds can never pass: the triangle fires first
                 assert len(v) == 1 and v[0].startswith('omega_c_xy + 2*omega_o_xy')
             else:
@@ -67,7 +108,7 @@ def test_pid_kp_wz_bound_is_the_f32():
 def test_one_ulp_above_upper_is_a_violation(ctrl, base):
     xy = ('omega_c_xy', 'omega_o_xy')
     for i, n in enumerate(gt.NAMES[ctrl]):
-        v, w = gt.check(ctrl, dict(base, **{n: ulp_up(gt.HI[ctrl][i])}))
+        v, w = gt.check(ctrl, dict(base, **{n: ulp_up(EXPECT_HI[ctrl][i])}))
         assert any(n in x and 'upper bound' in x for x in v), (ctrl, n, v)
         if not (ctrl == 'ADRC' and n in xy):
             assert len(v) == 1, (ctrl, n, v)     # the ADRC xy pair also trips the triangle
@@ -90,6 +131,26 @@ def test_xy_triangle():
     assert gt.check('ADRC', dict(ADRC, omega_c_xy=99.9, omega_o_xy=50)) == ([], [])
     v, w = gt.check('ADRC', dict(ADRC, omega_c_xy=100, omega_o_xy=50))
     assert len(v) == 1 and v[0].startswith('omega_c_xy + 2*omega_o_xy')
+
+
+def test_xy_sum_is_float32():
+    # 0x42c7ffff + 2*50 rounds to exactly 200.0 in float32 (tie to even), so it violates
+    assert f32_bits(99.99999237060547) == 0x42c7ffff
+    v, w = gt.check('ADRC', dict(ADRC, omega_c_xy=99.99999237060547, omega_o_xy=50))
+    assert len(v) == 1 and v[0].startswith('omega_c_xy + 2*omega_o_xy')
+
+
+def test_wz_sum_is_float32():
+    assert f32_bits(99.99999237060547) == 0x42c7ffff
+    v, w = gt.check('ADRC', dict(ADRC, omega_c_wz=99.99999237060547, omega_o_wz=50))
+    assert v == [] and any('omega_c_wz' in x for x in w)
+
+
+def test_wedge_quotient_is_float32():
+    # f32(1/5.5) is 0x3e3a2e8c; a pos_kp equal to that float32 still warns (kp <= q)
+    assert f32_bits(0.1818181872367859) == 0x3e3a2e8c
+    v, w = gt.check('ADRC', dict(ADRC, pos_ki=1, pos_kp=0.1818181872367859))
+    assert v == [] and any('pos_kp' in x for x in w)
 
 
 def test_wz_sum_warns_only():
@@ -130,6 +191,8 @@ def test_missing_and_extra_gains():
         gt.check('PID', dict(PID, omega_c_xy=3))
     with pytest.raises(ValueError, match='object'):
         gt.check('PID', [])
+    with pytest.raises(ValueError, match='not a string'):
+        gt.check('PID', {**PID, 1: 0})
 
 
 @needs_fw
@@ -156,29 +219,61 @@ def test_read_firmware_table_bad(tmp_path):
     assert t['HI_PID'] == [20.0, 50.0, 20.0, 50.0, 30.0, 30.0, 10.0] and t['LO_PID'] == [0.0] * 7
 
 
+def test_read_firmware_table_static_and_commas(tmp_path):
+    f = tmp_path / 'gain_set.c'
+    f.write_text(PC_FW.replace('static const float HI_PID', 'static/**/const float HI_PID'))
+    assert gt.read_firmware_table(str(f))['HI_PID'] == [gt._f32(x) for x in EXPECT_HI['PID']]
+    f.write_text(PC_FW.replace('50.0f };', '50.0f, };'))          # one trailing comma is fine
+    t = gt.read_firmware_table(str(f))
+    assert t['HI_PID'] == [gt._f32(x) for x in EXPECT_HI['PID']]
+    for bad in ('{ 41.0f,, 1500.0f', '{ , 41.0f'):               # empty item not at the end
+        f.write_text(PC_FW.replace('{ 41.0f', bad, 1))
+        with pytest.raises(ValueError):
+            gt.read_firmware_table(str(f))
+    f.write_text(PC_FW.replace('50.0f };', '50.0f,, };'))        # two trailing commas
+    with pytest.raises(ValueError):
+        gt.read_firmware_table(str(f))
+
+
+LITERAL_OK = [('41.000001907348633f', 41.000003814697266, 0x42240001),   # rounds past the double
+              ('41.000001907348633', 41.0, 0x42240000),                  # no f = double constant
+              ('2E+1F', 20.0, 0x41a00000),
+              ('.5f', 0.5, 0x3f000000),
+              ('5.f', 5.0, 0x40a00000),
+              ('041.0f', 41.0, 0x42240000),                              # leading zero, still decimal
+              ('41', 41.0, 0x42240000),
+              ('0', 0.0, 0x00000000),
+              ('-41.0f', -41.0, 0xc2240000)]
+LITERAL_BAD = ['041', '00', '0x29', '0x1p5f', '41.0L', '41.0l', '41u', '41U', '41f', 'x', '1..0f']
+
+
+@pytest.mark.parametrize('lit,val,bits', LITERAL_OK)
+def test_firmware_literal_accepted(tmp_path, lit, val, bits):
+    f = tmp_path / 'gain_set.c'
+    f.write_text(PC_FW.replace('41.0f', lit, 1))
+    got = gt.read_firmware_table(str(f))['HI_PID'][0]
+    assert got == val and f32_bits(got) == bits
+
+
+@pytest.mark.parametrize('lit', LITERAL_BAD)
+def test_firmware_literal_rejected(tmp_path, lit):
+    # e.g. 041 in place of HI_PID[0] must raise (binary 33), not be read as 41 and report equal
+    f = tmp_path / 'gain_set.c'
+    f.write_text(PC_FW.replace('41.0f', lit, 1))
+    with pytest.raises(ValueError):
+        gt.read_firmware_table(str(f))
+
+
 @needs_fw
 def test_diff_with_firmware():
-    assert gt.diff_with_firmware(FW) == [
-        'HI_PID[0] kp_xy: PC 41, firmware 20',
-        'HI_PID[1] ki_xy: PC 1500, firmware 50',
-        f'HI_PID[2] kp_wz: PC {gt._f32(4.6):.9g}, firmware 20',
-        'HI_PID[3] ki_wz: PC 230, firmware 50',
-        'HI_PID[4] pos_kp: PC 200, firmware 30',
-        'HI_PID[5] pos_ki: PC 5500, firmware 30',
-        'HI_PID[6] k_psi: PC 50, firmware 10',
-        'HI_ADRC[0] omega_c_xy: PC 200, firmware 50',
-        'HI_ADRC[1] omega_o_xy: PC 100, firmware 49',
-        'HI_ADRC[2] omega_c_wz: PC 200, firmware 50',
-        'HI_ADRC[3] omega_o_wz: PC 100, firmware 49',
-        'HI_ADRC[4] pos_kp: PC 200, firmware 30',
-        'HI_ADRC[5] pos_ki: PC 40000, firmware 30',
-        'HI_ADRC[6] k_psi: PC 50, firmware 10']
+    assert gt.diff_with_firmware(FW) == FW_DIFF
 
 
 def test_diff_empty_when_equal(tmp_path):
-    text = ''.join(f'static const float {a}[GAIN_N] = {{'
-                   + ', '.join(f'{v:.9g}f' for v in gt.pc_arrays()[a]) + '};\n'
-                   for a in gt.FW_ARRAYS)
     f = tmp_path / 'gain_set.c'
-    f.write_text(text)
+    f.write_text(PC_FW)
     assert gt.diff_with_firmware(str(f)) == []
+    f.write_text(PC_FW.replace('41.0f', '40.0f', 1))
+    assert gt.diff_with_firmware(str(f)) == ['HI_PID[0] kp_xy: PC 41, firmware 40']
+    f.write_text(GOOD_FW)
+    assert gt.diff_with_firmware(str(f)) == FW_DIFF
