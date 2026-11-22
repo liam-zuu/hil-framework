@@ -81,6 +81,7 @@ GAINS_S03 = {'PID': {'kp_xy', 'ki_xy', 'kp_wz', 'ki_wz', 'pos_kp', 'pos_ki', 'k_
              'ADRC': {'omega_c_xy', 'omega_o_xy', 'omega_c_wz', 'omega_o_wz', 'pos_kp', 'pos_ki', 'k_psi'}}
 OMEGA_O = ('omega_o_xy', 'omega_o_wz')
 OMEGA_O_MAX = 48.0
+TRAN_RTOL = 1e-9                        # S03 v8.6 §3.1 (s03_doe.TRAN_RTOL): a grid point this near the ceiling T became T
 DEFAULT_ROWS = ('(default check)', '(default)')
 LUOI = ('log', 'mac_dinh', '0', 'noi')
 LEVEL_COLS = ('a', 'b', 'b_n', 'L_nguon', 'H_nguon')   # S03 v8.3/v8.4 §3.1 (CODE_FEAS); b_n again: S05 v3.48 §2.5
@@ -799,7 +800,8 @@ def mien_rows(run):
     """Opens only sweep.csv, levels.csv, kiem_ngoai_mien.csv, meta.yaml at the root of the run (by name). The A
     domain per gain: the WHOLE sweep grid after the cut at the gain-table ceiling, original and extension points,
     up to b_n — the largest grid point after the cut (S05 v3.48 §2.5, S03 v8.6 §3.1; omega_o has no extension and
-    goes up to b)."""
+    goes up to b). The original grid ends at min(b, b_n), or at T = b_n when the cut made its last point b, within
+    1e-9 below T, equal to T (tran true there; Codex C3-3); nguon_hi is b_n (omega_o: b)."""
     s03_run_ok(run)
     k_pts, k_tot = kiem_check(run)
     sw, scol = read_csv(s03_file(run, 'sweep.csv'))
@@ -880,7 +882,7 @@ def mien_rows(run):
                     raise Refused(f'{c} {fac}: b_n {bn} is not b = {b_} (omega_o has no extension)')
                 if hi > OMEGA_O_MAX or _f32(hi) > OMEGA_O_MAX:
                     raise Refused(f'{c} {fac}: hi {hi!r} > {OMEGA_O_MAX} (binary64 or float32)')
-                src = 'tran_omega_o' if hi == OMEGA_O_MAX else 'b'
+                src = 'b'                                                # S03 v8.6 §11 item 5 (c2), Codex C3-5
             else:
                 bn = (L.get('b_n') or '').strip()
                 if not bn:
@@ -889,8 +891,12 @@ def mien_rows(run):
                 if hi != bn_:                                            # S05 v3.48 §2.5: hi = b_n of levels.csv
                     raise Refused(f'{c} {fac}: highest grid point {hi} is not b_n = {bn_}')
                 if g_hi != min(b_, bn_):
-                    raise Refused(f'{c} {fac}: highest point of the original grid {g_hi} is not b = {b_} '
-                                  f'(b_n = {bn_} when the grid is cut below b)')
+                    # Codex C3-3 (S03 v8.6 §3.1): b within 1e-9 below the ceiling T became T in the cut and keeps
+                    # its part of the grid, so the original grid ends at T = b_n (sweep.csv tran true), not at b
+                    at_T = all((r.get('tran') or '').strip() == 'true' for r in pts[g_hi])
+                    if not (g_hi == bn_ and at_T and math.isclose(b_, g_hi, rel_tol=TRAN_RTOL)):
+                        raise Refused(f'{c} {fac}: highest point of the original grid {g_hi} is not b = {b_} '
+                                      f'(b_n = {bn_} when the grid is cut below b)')
                 src = 'b_n'
             if any(x <= b_ for x in noi):
                 raise Refused(f'{c} {fac}: an extension point (luoi noi) is not above b = {b_}')

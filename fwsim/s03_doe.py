@@ -77,8 +77,10 @@ S03 v8.5 K6 and v8.6 (Liam 21-22/11; partial: section 3.1b screening not in this
   * v8.6 section 3.1: the sweep grid is sweep_grid_n cut at the ceiling T of the gain in
     tools/gain_table.py (sweep_grid_cut): points above T are dropped; when a point was dropped,
     a remaining point within the relative error 1e-9 of T becomes T, else T is added. b_n is the
-    largest point after the cut (T when cut; else unchanged: the extension end, still None for
-    omega_o); sweep.csv adds tran (true at value == T); H_nguon 'trần bảng chặn' when H = T.
+    largest point after the cut (T when cut; else the extension end; for omega_o, which has no
+    extension, the end b of its grid: Codex C3-5); sweep.csv adds tran (true at value == T);
+    H_nguon 'trần bảng chặn' when H = T. A default the cut made T (within 1e-9 below T, the same
+    float32) is run at the grid point T, which stands for the default run (default_node, C3-4).
   * v8.6 section 3.2: a design point outside the LADRC triangle omega_c + 2 omega_o < 200 on an
     axis runs like any point and carries the column ngoai_tam_giac in design.csv and in
     sealed/runs.csv, sealed_test/runs_test.csv; before the main design the float32 of every
@@ -384,12 +386,12 @@ def cut_grid(grid, info, T):
     n_log keep their definitions (b may no longer be a grid point when the cut is inside the
     original grid); noi, n_noi, n_points describe the grid after the cut; n_bo is the number of
     points dropped (0 = not cut: the grid and every old info key exactly as sweep_grid_n gave
-    them); b_n is the largest point after the cut (= T when cut; else unchanged: the extension
-    end, and still None for omega_o, which has no extension and ends at b)."""
+    them, but b_n of omega_o); b_n is the largest point after the cut (= T when cut; else the
+    extension end; omega_o has no extension, so its b_n is the end of its grid, b: Codex C3-5)."""
     base = base_grid(grid, info)
     pts, n_bo, them = cut_at_ceiling(grid, T)
     if n_bo == 0:
-        return grid, dict(info, T=float(T), n_bo=0)
+        return grid, dict(info, T=float(T), n_bo=0, b_n=grid[-1] if info['b_n'] is None else info['b_n'])
     n_base = sum(1 for x in base if not x > T)          # a point made equal to T keeps its part of the grid
     if them and T < info['b']:
         n_base += 1                                     # the added T belongs to the original grid
@@ -399,13 +401,33 @@ def cut_grid(grid, info, T):
     return pts, dict(info, T=float(T), n_bo=n_bo, noi=noi, n_noi=len(noi), n_points=len(pts), b_n=pts[-1])
 
 
+def default_node(grid, info, default):
+    """The point of the cut grid that stands for the firmware default in the level rule, is_default
+    and luoi (S03 v8.6 section 3.1; Codex C3-4): the default itself when it is a grid point. When
+    rule (2) of the cut made the default, within TRAN_RTOL below the ceiling T, equal to T, the
+    point T stands for it if both are the same float32 (the firmware receives one value: the run
+    at T is the default-gain run). S03Stop otherwise: the default is above T (dropped), or T is
+    another float32."""
+    if default in grid:
+        return default
+    T = info.get('T')
+    if info.get('n_bo') and not default > T and math.isclose(default, T, rel_tol=TRAN_RTOL):
+        if float(np.float32(default)) == float(np.float32(T)):
+            return T
+        raise S03Stop(f'the default {default!r} became the ceiling {T!r} in the cut (within {TRAN_RTOL}) but is '
+                      f'another float32, {float(np.float32(default))!r} not {float(np.float32(T))!r} (S03 v8.6 3.1)')
+    raise S03Stop(f'the default {default!r} is not a point of the grid cut at the ceiling {T!r} (S03 v8.6 3.1)')
+
+
 def sweep_grid_cut(ctrl, name, default, lo, hi):
     """The sweep grid of S03 v8.6 section 3.1: sweep_grid_n cut at ceiling(ctrl, name); the
-    firmware default must still be a grid point (a default above its ceiling stops S03)."""
+    firmware default must still have its grid point (default_node: itself, or T when the cut made
+    it T and both are one float32; a default above its ceiling stops S03)."""
     grid, info = cut_grid(*sweep_grid_n(name, default, lo, hi), ceiling(ctrl, name))
-    if default not in grid:
-        raise S03Stop(f'{ctrl} {name}: the default {default!r} is not a point of the grid cut at the ceiling '
-                      f'{info["T"]!r} (S03 v8.6 3.1)')
+    try:
+        default_node(grid, info, default)
+    except S03Stop as exc:
+        raise S03Stop(f'{ctrl} {name}: {exc}') from None
     return grid, info
 
 
@@ -1356,18 +1378,19 @@ def main():
             for j, name in enumerate(FACTORS[ctrl]):
                 grid, ginfo = grids[(ctrl, name)]
                 base = base_grid(grid, ginfo)                  # S03 v8.4: the level rule runs on it only
+                d_node = default_node(grid, ginfo, dflt[name])   # C3-4: the default, or T standing for it
                 ok = []
                 for x in grid:
                     g = dict(dflt, **{name: x})
                     done = True
                     for v in SPEEDS:
-                        row, log = checked(ctrl, g, v, mu_mid, sweep=(name, x, x == dflt[name],
-                                                                      grid_label(x, dflt[name], ginfo['noi']),
+                        row, log = checked(ctrl, g, v, mu_mid, sweep=(name, x, x == d_node,
+                                                                      grid_label(x, d_node, ginfo['noi']),
                                                                       x == ginfo['T']))
-                        sweep_rows.append(dict(controller=ctrl, factor=name, value=x, is_default=x == dflt[name],
-                                               luoi=grid_label(x, dflt[name], ginfo['noi']), tran=(x == ginfo['T']),
+                        sweep_rows.append(dict(controller=ctrl, factor=name, value=x, is_default=x == d_node,
+                                               luoi=grid_label(x, d_node, ginfo['noi']), tran=(x == ginfo['T']),
                                                v=v, mu=mu_mid, **row))
-                        if x == dflt[name]:
+                        if x == d_node:
                             y3_ref[(ctrl, v)] = row['tv_duty']
                         if row['completed'] != 'true':          # sweep is public: its failed logs too (S3C-20)
                             save_log(os.path.join(a.out, 'logs_sweep'), f'{ctrl}_{name}_{x:.6g}_v{v}', log)
@@ -1376,7 +1399,7 @@ def main():
                     ok.append(done)
                     print(f'[sweep {ctrl}] {name} = {x:.4g}: completes at gate speeds = {done}', flush=True)
                 try:
-                    L, H = levels_from_sweep(base, dflt[name], ok[:len(base)])    # S03 v8.4: original grid only
+                    L, H = levels_from_sweep(base, d_node, ok[:len(base)])    # S03 v8.4: original grid only
                 except S03Stop as exc:
                     raise S03Stop(f'{ctrl} {name}: {exc}', case=exc.case) from None
                 sc, centre = scale_of(L, H)
@@ -1716,7 +1739,7 @@ temporary_bounds_for_the_grid: {json.dumps({m: tune_ga.BOUNDS[m] for m in a.cont
 thresholds: {json.dumps(THRESH)}   # S03 v8.6 section 5.2: tv_duty 0.4 s^-1 absolute, every speed and mu, worst and range (y3_reference below is reported beside it, not a base)
 y3_reference: {json.dumps({f'{c} v={v}': y for (c, v), y in y3_ref.items()})}
 o1: {json.dumps(dict(A=o1.A, a_r=o1.A_R, D=o1.D, D_d=o1.D, t_d=o1.T_D, t_late=o1.T_LATE, delta=o1.DELTA, v_d=o1.V_D, c_cens=o1.C_CENS))}
-grid: {json.dumps({f'{c} {n}': {k: v_ for k, v_ in i.items() if k != 'noi'} for (c, n), i in grid_info.items()})}   # S03 v8.3 section 3.1: a, b, r, K, b_n, points per gain; from v8.6 the grid is cut at the gain-table ceiling T: T, n_bo (points dropped), noi / n_noi / n_points after the cut, b_n = the largest point after the cut (T when cut, else the extension end; null for omega_o, whose grid ends at b)
+grid: {json.dumps({f'{c} {n}': {k: v_ for k, v_ in i.items() if k != 'noi'} for (c, n), i in grid_info.items()})}   # S03 v8.3 section 3.1: a, b, r, K, b_n, points per gain; from v8.6 the grid is cut at the gain-table ceiling T: T, n_bo (points dropped), noi / n_noi / n_points after the cut, b_n = the largest point after the cut (T when cut, else the extension end; for omega_o, which has no extension, the end b of its grid)
 kiem_ngoai_mien: {json.dumps(kiem_sum, ensure_ascii=False)}   # S03 v8.4 section 3.1: total per controller (đã kiểm đủ / kiểm dở / không kiểm), counts, flagged (co), inconclusive (chua_ket_luan) and bao_rieng points; detail in kiem_ngoai_mien.csv
 gate: {json.dumps(gate_meta())}   # S03 v8.2 section 7: G1-G5 per run (o1_gate.gate), U = 0 on fwsim
 evaluator_sha256: {json.dumps(EVAL_SHA_AT_IMPORT)}   # S03 v8.2 section 8 condition 8: S03 and S04 on the same evaluator; the files as hashed when the script was imported (S3G-1, S3G2-1)
@@ -1747,7 +1770,7 @@ interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THES
   - "v8.3 (agreed with CODE_C13 15/11): luoi of the default value is mac_dinh even when it is on a log point, the (default check) and (default) rows are mac_dinh; L_nguon 'hết lưới dưới' when L is the lowest grid point and L > 0; v8.4: H_nguon 'hết lưới' when H = b, 'trần ω_o' instead for omega_o when b = 48; levels.csv b_n: see v8.6"
   - "v8.4 out-of-range check: a run is comparable when it exists, completed 'true', status 'ok' and its e_perp_max and tv_duty are finite; a point below L is put against the run at L, above H against H; the Y2 threshold is 0.01 m and the Y3 threshold is the absolute 0.4 s^-1 of section 5.2 (v8.6; before: 20 % of the default-gain run), compared exactly as a decimal; the bounds are inclusive and compared exactly, with no tolerance, on the decimal of each number as written in the CSV (repr of the float) (S84-1, S84V2-1, S84V3-1: 0.03 - 0.02 is 0.01, not the binary64 0.009999999999999998; two identical responses never count as lower by a positive threshold; a point a few ULP past a bound is past it; the column nguong_tv holds the threshold as a float); bao_rieng = not flagged and, at one gate speed where both are comparable, e_perp_max lower by >= 0.01 m; buoc is the step of section 3.1 that matched"
   - "v8.4 out-of-range check totals: 'không kiểm' for every controller when S03 stopped at 3.1 (i) or (ii); 'đã kiểm đủ' when every factor of the controller has levels; else 'kiểm dở' (the sweep stopped part way): factors with levels are checked, every grid point (original and extension) of a factor without levels counts in n_chua_kiem, n_gain_chua_kiem counts those factors; every grid is computed before the first sweep run. v8.5 (K6): a flagged or inconclusive point does not stop S03, it is written in kiem_ngoai_mien.csv, printed and kept in meta.yaml kiem_ngoai_mien"
-  - "v8.6 section 3.1: the sweep grid is sweep_grid_n cut at the ceiling T of the gain in tools/gain_table.py (table {gain_table.TABLE_VERSION}; the factor names are the table's names): points above T are dropped; when a point was dropped, a remaining point within the relative error 1e-9 of T becomes T, else T is added, to the original grid when T < b and to the extension when T > b; sweep.csv tran is true at value == T; an added T has luoi log (original grid) or noi (extension); a, b, r, K keep their definitions; b_n is the largest point after the cut and stays empty for omega_o (no extension, its grid ends at b); H_nguon 'trần bảng chặn' when H = T is the end of the cut original grid (first over 'hết lưới'); a firmware default above its ceiling stops S03"
+  - "v8.6 section 3.1: the sweep grid is sweep_grid_n cut at the ceiling T of the gain in tools/gain_table.py (table {gain_table.TABLE_VERSION}; the factor names are the table's names): points above T are dropped; when a point was dropped, a remaining point within the relative error 1e-9 of T becomes T, else T is added, to the original grid when T < b and to the extension when T > b; sweep.csv tran is true at value == T; an added T has luoi log (original grid) or noi (extension); a, b, r, K keep their definitions; b_n is the largest point after the cut (omega_o has no extension: its b_n is the end b of its grid); H_nguon 'trần bảng chặn' when H = T is the end of the cut original grid (first over 'hết lưới'); a firmware default above its ceiling stops S03; a default the cut made T (within 1e-9 below T) is run at the grid point T when both are the same float32: that point stands for the default run (is_default true, luoi mac_dinh, tran true, the level rule starts from it; levels.csv default keeps the firmware value); another float32 stops S03"
   - "v8.6 section 5.2: tv_duty threshold 0.4 s^-1 absolute for every speed, mu, worst and range; y3_reference is only reported"
   - "v8.6 sections 3.1b item 4, 3.2: before the main design the float32 of every gain of every design point is also compared with the gain table (0 accepted where the lower bound is 0), a failure stops S03; a design point with omega_c + 2 omega_o >= 200 on an axis (binary64 sum of the float32 values) runs like any point and has ngoai_tam_giac true in design.csv, runs.csv, runs_test.csv (PID always false); the number of such points per controller is in sealed/notes.json (centre, outer, inner, axial) and sealed_test/notes.json (test points)"
   - "not in this script yet: S03 v8.5 section 3.1b (screening, sealed/levels_sangloc.csv, sealed/design.csv): the spec line above stays v8.4, design.csv is still at the root and the levels of the main design are the sweep levels; w_nodes and check_candidate are ready for that step"
@@ -1757,7 +1780,7 @@ file_sha256: {json.dumps(files)}
 files:
   - sweep.csv: "one line per sweep run (section 3.1) and default gains at the other mu levels; v8.3: luoi = log | mac_dinh | 0 | noi (the extension); v8.6: tran = true at the point of value T, the gain-table ceiling"
   - sweep_counts.csv: "section 5.3 for the sweep: runs not completed, inconclusive, saturated per factor, speed, mu"
-  - levels.csv: "L, H, centre, scale per factor (v8.4: on the original grid); v8.3: a, b (ends of the 11 log points), b_n (v8.6: the largest point of the grid after the cut at the gain-table ceiling, T when the grid is cut, else the end of the extension; empty for omega_o, whose grid ends at b; from v8.5 the upper end of campaign A's domain and of the reference box W), L_nguon, H_nguon (source of each level, S03 v8.4 section 3.1; v8.6: 'trần bảng chặn' when H = T ends the cut original grid)"
+  - levels.csv: "L, H, centre, scale per factor (v8.4: on the original grid); v8.3: a, b (ends of the 11 log points), b_n (v8.6: the largest point of the grid after the cut at the gain-table ceiling, T when the grid is cut, else the end of the extension; for omega_o, which has no extension, the end b of its grid; from v8.5 the upper end of campaign A's domain and of the reference box W), L_nguon, H_nguon (source of each level, S03 v8.4 section 3.1; v8.6: 'trần bảng chặn' when H = T ends the cut original grid)"
   - kiem_ngoai_mien.csv: "S03 v8.4 section 3.1: one row (dong diem) per original or extension point outside [L, H]: luoi, level compared (can L or H, can_value), ket_qua (không cờ / chưa kết luận / cờ), buoc, bao_rieng, per speed: in the gate, y1, status, e_perp_max, tv_duty of the point and of the level, Y3 threshold; one total row (dong tong) per controller: đã kiểm đủ / kiểm dở / không kiểm and counts"
   - design.csv: "371 rows per controller: centre, outer box, inner box, axial points, test points (all run, L41, L67); v8.6: ngoai_tam_giac (outside the LADRC triangle, runs anyway)"
   - logs_sweep/: "npz of the sweep runs not completed"

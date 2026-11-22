@@ -2176,7 +2176,7 @@ def test_v83_main_writes_levels_sources_luoi_and_grid_meta(tmp_path, monkeypatch
     assert grid_meta['PID kp_wz']['b_n'] == grid_meta['PID kp_wz']['T'] == 4.6
     assert grid_meta['PID kp_wz']['n_noi'] == 0
     assert grid_meta['PID ki_xy']['K'] == 4 and grid_meta['PID ki_xy']['n_bo'] == 0
-    assert grid_meta['ADRC omega_o_xy']['b_n'] is None
+    assert grid_meta['ADRC omega_o_xy']['b_n'] == 48.0 and lv[('ADRC', 'omega_o_xy')]['b_n'] == '48.0'   # Codex C3-5
     # v8.4: the check file, fixed header; with the fake every point outside [L, H] is 'không cờ'
     kiem = list(_csv.DictReader(open(out / 'kiem_ngoai_mien.csv', encoding='utf-8')))
     assert next(_csv.reader(open(out / 'kiem_ngoai_mien.csv', encoding='utf-8'))) == s3.KIEM_COLS
@@ -2433,10 +2433,13 @@ def test_v86_uncut_gains_keep_the_old_grid_bit_for_bit(ctrl, name):
     g0, i0 = s3.sweep_grid_n(name, d, lo, hi)
     g, i = s3.sweep_grid_cut(ctrl, name, d, lo, hi)
     assert [s3._bits(x) for x in g] == [s3._bits(x) for x in g0]
-    assert {k: v for k, v in i.items() if k not in ('T', 'n_bo')} == i0
     assert i['n_bo'] == 0 and i['T'] == HI_T[ctrl][name]
-    if name.startswith('omega_o'):
-        assert i['b_n'] is None
+    if name.startswith('omega_o'):                  # Codex C3-5: b_n of omega_o is the grid end b, not None
+        assert i0['b_n'] is None and i['b_n'] == i['b'] == 48.0 == g[-1]
+        assert {k: v for k, v in i.items() if k not in ('T', 'n_bo', 'b_n')} == \
+            {k: v for k, v in i0.items() if k != 'b_n'}
+    else:
+        assert {k: v for k, v in i.items() if k not in ('T', 'n_bo')} == i0
     if (ctrl, name) == ('PID', 'ki_xy'):
         want = V8_GRID_BITS[('ki_xy', 0.05, 0.0, 10.0)].split()
         assert [struct.pack('<d', x).hex() for x in g[:len(want)]] == want
@@ -2692,3 +2695,160 @@ def test_v86_main_gain_table_failure_stops_before_the_main_design(tmp_path, monk
     assert rows and {r['controller'] for r in rows} == {'PID'}
     runs = out / 'sealed' / 'runs.csv'
     assert not runs.exists() or len(list(_csv.DictReader(open(runs)))) == 0
+
+
+# ── Codex C3 round 1 (2026-11-22): C3-3 (the S03 side), C3-4, C3-5 ───────────────────────────────
+
+C34_D = 41.0 * (1 - 5e-10)        # Codex C3-4: PID kp_xy, T = 41, temporary bounds 0 .. 41
+
+
+def _bl(xs):
+    return [s3._bits(x) for x in xs]
+
+
+def test_c3_3_b_within_1e9_below_the_ceiling_is_the_end_of_the_original_grid():
+    """Codex C3-3, the S03 side (tools/tests/test_chep_luot_A.py c33_run holds the same numbers): PID
+    pos_kp with b = 199.9999999 within 1e-9 below T = 200 and the first extension point above T. The
+    extension is dropped, the point b becomes T and keeps its part of the grid: the original grid
+    ends at T (luoi log, tran true), info b keeps its definition, b_n = T, and H can be T > b."""
+    b, T = 199.9999999, 200.0
+    assert b < T and math.isclose(b, T, rel_tol=1e-9)
+    g0, i0 = s3.sweep_grid_n('pos_kp', 6.0, 0.0, b)
+    base0 = s3.base_grid(g0, i0)
+    assert i0['b'] == b == base0[-1] and i0['noi'][0] > T
+    grid, info = s3.sweep_grid_cut('PID', 'pos_kp', 6.0, 0.0, b)
+    assert s3.base_grid(grid, info) == grid and info['noi'] == [] and info['n_bo'] == i0['K']
+    assert _bl(grid) == _bl(base0[:-1] + [T])
+    assert (info['b'], info['b_n'], info['T']) == (b, T, T)
+    assert s3.grid_label(T, 6.0, info['noi']) == 'log' and [x == info['T'] for x in grid].count(True) == 1
+    L, H = s3.levels_from_sweep(grid, 6.0, [True] * len(grid))
+    assert H == T > info['b'] and s3.level_sources(grid, L, H, info, 'pos_kp') == ('0', 'trần bảng chặn')
+
+
+def test_c3_4_default_on_a_log_point_merged_into_the_ceiling():
+    """Codex C3-4 (kp_xy, T = 41, default 41 (1 - 5e-10), bounds 0 .. 41): the default is the 6th log
+    point and the only remaining point within 1e-9 of T, so the cut makes it T. Both are the float32
+    41.0: the point T stands for the default run (default_node) in the level rule and the labels,
+    and the W nodes are the log points below it plus T."""
+    d, T = C34_D, 41.0
+    assert d < T and math.isclose(d, T, rel_tol=1e-9) and _f32v(d) == _f32v(T) == 41.0
+    g0, i0 = s3.sweep_grid_n('kp_xy', d, 0.0, 41.0)
+    assert d in g0 and len(s3.base_grid(g0, i0)) == 12             # 0 and 11 log points, the default one of them
+    grid, info = s3.sweep_grid_cut('PID', 'kp_xy', d, 0.0, 41.0)   # S03Stop before the fix
+    assert _bl(grid) == _bl([x for x in g0 if x < d] + [T]) and d not in grid
+    assert info['b_n'] == T == grid[-1] and info['noi'] == [] and info['n_bo'] == len(g0) - len(grid)
+    assert s3.base_grid(grid, info) == grid
+    node = s3.default_node(grid, info, d)
+    assert s3._bits(node) == s3._bits(T)
+    L, H = s3.levels_from_sweep(grid, node, [True] * len(grid))
+    assert (L, H) == (0.0, T) and s3.level_sources(grid, L, H, info, 'kp_xy') == ('0', 'trần bảng chặn')
+    assert s3.levels_from_sweep(grid, node, [False] * (len(grid) - 1) + [True]) == (T, T)   # only the default run
+    with pytest.raises(s3.S03Stop) as e:                           # the default run (at T) does not complete
+        s3.levels_from_sweep(grid, node, [True] * (len(grid) - 1) + [False])
+    assert e.value.case == '(i)'
+    assert s3.grid_label(T, node, info['noi']) == 'mac_dinh'
+    nodes = s3.w_nodes('PID', 'kp_xy', d, 0.0, 41.0)
+    want, a, _ = _w_nodes_want('kp_xy', d, 0.0, 41.0, T)
+    assert _bl(nodes) == _bl(want) == _bl([x for x in grid if x != 0.0])
+    assert nodes[0] == a == d / 10.0 and nodes[-1] == T == info['b_n'] and len(nodes) == 6 and d not in nodes
+
+
+def test_c3_4_default_added_beside_the_log_points_merged_into_the_ceiling():
+    """Codex C3-4, the other case: PID kp_wz, T = 4.6, default 4.6 (1 - 5e-10), bounds 0 .. 100, so
+    b = 100 and the default is no log point but a point added on its own. The cut makes it T; the W
+    nodes (11 log points and the extension, cut, T appended) are the log points below T plus T."""
+    T = 4.6
+    d = 4.6 * (1 - 5e-10)
+    assert d < T and math.isclose(d, T, rel_tol=1e-9) and _f32v(d) == _f32v(T)
+    g0, i0 = s3.sweep_grid_n('kp_wz', d, 0.0, 100.0)
+    assert len(s3.base_grid(g0, i0)) == 13 and i0['b'] == 100.0    # 0, 11 log points, the default beside them
+    grid, info = s3.sweep_grid_cut('PID', 'kp_wz', d, 0.0, 100.0)  # S03Stop before the fix
+    assert _bl(grid) == _bl([x for x in g0 if x < d] + [T]) and d not in grid
+    assert info['b_n'] == T and info['noi'] == [] and s3.base_grid(grid, info) == grid
+    node = s3.default_node(grid, info, d)
+    assert s3._bits(node) == s3._bits(T)
+    assert s3.levels_from_sweep(grid, node, [True] * len(grid)) == (0.0, T)
+    assert s3.grid_label(T, node, info['noi']) == 'mac_dinh'
+    nodes = s3.w_nodes('PID', 'kp_wz', d, 0.0, 100.0)
+    want, a, _ = _w_nodes_want('kp_wz', d, 0.0, 100.0, T)
+    assert _bl(nodes) == _bl(want) == _bl([x for x in grid if x != 0.0])
+    assert nodes[0] == a and nodes[-1] == T and len(nodes) == 6 and d not in nodes
+
+
+def test_c3_4_default_node_boundaries():
+    """default_node at the edges: the default exactly T (its own point), at the edge of the 1e-9
+    tolerance (merged, inclusive as math.isclose), just outside it (its own point below the added
+    T), far from T (itself), and within 1e-9 ABOVE T (dropped like any point above: S03 stops)."""
+    T = 41.0
+    grid, info = s3.sweep_grid_cut('PID', 'kp_xy', T, 0.0, 41.0)
+    assert grid[-1] == T and s3._bits(s3.default_node(grid, info, T)) == s3._bits(T)
+    d = T * (1 - 1e-9)
+    assert math.isclose(d, T, rel_tol=1e-9) and _f32v(d) == 41.0
+    grid, info = s3.sweep_grid_cut('PID', 'kp_xy', d, 0.0, 41.0)
+    assert d not in grid and grid[-1] == T and s3.default_node(grid, info, d) == T
+    d = T * (1 - 2e-9)
+    assert not math.isclose(d, T, rel_tol=1e-9) and _f32v(d) == 41.0
+    grid, info = s3.sweep_grid_cut('PID', 'kp_xy', d, 0.0, 41.0)
+    assert grid[-2:] == [d, T] and s3._bits(s3.default_node(grid, info, d)) == s3._bits(d)
+    grid, info = s3.sweep_grid_cut('PID', 'kp_xy', 1.5, 0.0, 6.0)
+    assert s3.default_node(grid, info, 1.5) == 1.5
+    with pytest.raises(s3.S03Stop, match='ceiling'):
+        s3.sweep_grid_cut('PID', 'kp_xy', T * (1 + 5e-10), 0.0, 41.0)
+
+
+def test_c3_4_default_another_float32_than_the_ceiling_stops(monkeypatch):
+    """The point T stands for the default only when the firmware receives one value for both: a
+    default within 1e-9 below T that rounds to another float32 than T still stops S03."""
+    T = (4.0 + 2.0 ** -22) * (1 + 2e-10)          # just above the middle of two float32 neighbours
+    d = T * (1 - 5e-10)                           # just below it
+    assert d < T and math.isclose(d, T, rel_tol=1e-9)
+    assert _f32v(T) == 4.0 + 2.0 ** -21 and _f32v(d) == 4.0
+    g0, i0 = s3.sweep_grid_n('kp_wz', d, 0.0, 6.0)
+    pts, info = s3.cut_grid(g0, i0, T)
+    assert d not in pts and pts[-1] == T
+    with pytest.raises(s3.S03Stop, match='float32'):
+        s3.default_node(pts, info, d)
+    monkeypatch.setattr(s3, 'ceiling', lambda ctrl, name: T)
+    with pytest.raises(s3.S03Stop, match='PID kp_wz: .*float32'):
+        s3.sweep_grid_cut('PID', 'kp_wz', d, 0.0, 6.0)
+
+
+@pytest.mark.parametrize('name, d, lo, hi, want', [('omega_o_xy', 30.0, 5.0, 48.0, 48.0),
+                                                   ('omega_o_wz', 30.0, 5.0, 48.0, 48.0),
+                                                   ('omega_o_wz', 3.0, 1.0, 20.0, 30.0)])
+def test_c3_5_omega_o_b_n_is_the_largest_grid_point(name, d, lo, hi, want):
+    """Codex C3-5 (S03 v8.6 section 3.1: b_n is the largest point of the grid after the cut): omega_o
+    has no extension, so b_n of sweep_grid_cut is the end b of its grid (48 with the campaign
+    default); sweep_grid_n itself is unchanged (None)."""
+    g0, i0 = s3.sweep_grid_n(name, d, lo, hi)
+    assert i0['b_n'] is None
+    g, i = s3.sweep_grid_cut('ADRC', name, d, lo, hi)
+    assert _bl(g) == _bl(g0) and i['n_bo'] == 0 and i['noi'] == [] and i['n_noi'] == 0
+    assert s3._bits(i['b_n']) == s3._bits(want) and i['b_n'] == g[-1] == i['b']
+    assert {k: v for k, v in i.items() if k not in ('T', 'n_bo', 'b_n')} == {k: v for k, v in i0.items() if k != 'b_n'}
+
+
+@needs_dll
+def test_c3_4_main_runs_the_default_at_the_ceiling(tmp_path, monkeypatch, capsys):
+    """Codex C3-4 through main(): with the PID kp_xy default 41 (1 - 5e-10) S03 no longer stops in the
+    sweep; the grid point 41.0 is the default run (is_default, luoi mac_dinh, tran true), the level
+    rule starts from it, levels.csv keeps the firmware default."""
+    import csv as _csv
+    d = C34_D
+    monkeypatch.setitem(FAKE_DEFAULTS['PID'], 'kp_xy', d)
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys)
+    assert code == 0 and '[STOP]' not in console
+    sweep = [r for r in _csv.DictReader(open(out / 'sweep.csv', encoding='utf-8'))
+             if r['controller'] == 'PID' and r['factor'] == 'kp_xy']
+    top = [r for r in sweep if r['value'] == '41.0']
+    assert len(top) == len(s3.SPEEDS)
+    assert {(r['is_default'], r['luoi'], r['tran']) for r in top} == {('true', 'mac_dinh', 'true')}
+    rest = [r for r in sweep if r['value'] != '41.0']
+    assert rest and all(float(r['value']) < d for r in rest)
+    assert {(r['is_default'], r['tran']) for r in rest} == {('false', 'false')}
+    assert 'mac_dinh' not in {r['luoi'] for r in rest}
+    lv = {(r['controller'], r['factor']): r for r in _csv.DictReader(open(out / 'levels.csv', encoding='utf-8'))}
+    r = lv[('PID', 'kp_xy')]
+    assert (r['L'], r['H'], r['H_nguon'], r['b_n'], r['default']) == ('0.0', '41.0', 'trần bảng chặn', '41.0', repr(d))
+    assert float(r['b']) == 10.0 * d
+    assert max(calls) == 7                                          # the main design ran
