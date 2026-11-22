@@ -768,3 +768,48 @@ def test_da_session_cli_session_cham(places, tmp_path):
     ses.write_text(json.dumps(dict(kappa=HB / H, tag_h_m=HB, car_side_m=SIDE, plumb_xy_m=list(C))), encoding='utf-8')
     with pytest.raises(A.A6Error, match='camera'):                      # a session without camera: refused, not NaN
         A.set_up_of_session(A.read_session(str(ses)))
+
+
+def test_cli_do_corners_from_f15_when_frames_has_none(tmp_path, monkeypatch):
+    # CODE_C8B 22/11: the frames.csv of session 2 has no corner columns; the corners come from F15 khung.goc_m
+    # (KIEMCHEO, per-frame scoring camera). Same corners either way -> the same place result.
+    import c8_u_imu as cu
+    idx, t, P = _clip()
+    t = np.round(t, 6)
+    full, bare = tmp_path / 'full', tmp_path / 'bare'
+    full.mkdir()
+    bare.mkdir()
+    _write_frames(full / 'frames.csv', idx, t, P)
+    with open(bare / 'frames.csv', 'w', newline='', encoding='utf-8') as fh:
+        w = csv.writer(fh)
+        w.writerow(['idx', 't_s', 'valid'])
+        for k, tt in zip(idx, t):
+            w.writerow([int(k), f'{tt:.6f}', 1])
+    sp = tmp_path / 'session.json'
+    sp.write_text(json.dumps(dict(kappa=HB / H, tag_h_m=HB, car_side_m=SIDE, plumb_xy_m=list(C),
+                                  camera=dict(model='x', f=1, cx=0, cy=0, k=[], rvec=[0, 0, 0], tvec=[0, 0, 0]))),
+                  encoding='utf-8')
+    f = _f15(idx, t)
+    monkeypatch.setattr(A, 'camera_of', lambda ses: TopCam())
+    res = {}
+    for name, d in (('full', full), ('bare', bare)):
+        f15 = A.with_sha(dict(
+            schema=A.F15_FULL, trang_thai='dat', cho='goc', chieu='held_minus_full', bo_H32=True, truoc_le=True,
+            thu_tu_goc='ArUco 0..3 (c7_measure.car_corners_body)', clip_sha256='c' * 64,
+            nguon=[dict(vai_tro='frames', sha256=cu.sha256(d / 'frames.csv')), dict(vai_tro='session', sha256=cu.sha256(sp)),
+                   dict(vai_tro='track', sha256='d' * 64), dict(vai_tro='cua_so_v1', sha256='e' * 64)],
+            kappa=HB / H, Zc_m=H, h_m=HB, plumb_xy_m=list(C), mien_E=f['mien_E'],
+            ban_do=dict(H32_ids=[18, 19, 30], ca=[dict(ten=c, bo_ids=[int(x) for x in c[3:].split('-')],
+                                                     A3=dict(quy_max_deg=0.1)) for c in CASES]),
+            khung=[dict(frame_id=int(k), t_s=float(tt), goc_m=P[i].tolist(),
+                        du_m={c: v.tolist() for c, v in f['du'][int(k)].items()}) for i, (k, tt) in enumerate(zip(idx, t))]))
+        fp15 = d / 'f15.json'
+        fp15.write_text(json.dumps(f15), encoding='utf-8')
+        out = d / 'goc.json'
+        assert A.main(['do', '--frames', str(d / 'frames.csv'), '--session', str(sp), '--cho', 'goc', '--tam-id', 'T1',
+                       '--lan-lap-id', 'L1', '--luot-id-E', 'E_goc_1', '--f15', str(fp15), '--out', str(out)]) == 0
+        res[name] = json.loads(out.read_text(encoding='utf-8'))
+    assert res['bare']['goc_nguon'].startswith('f15') and res['full']['goc_nguon'] == 'frames.csv c0..c3'
+    assert res['bare']['trang_thai'] == res['full']['trang_thai'] == 'dat'
+    assert res['bare']['g_E'] == pytest.approx(res['full']['g_E'], abs=1e-9)
+    assert res['bare']['n_khung'] == res['full']['n_khung']

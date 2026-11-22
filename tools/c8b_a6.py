@@ -415,6 +415,39 @@ def read_e_frames(path):
     return idx, t, P, t_all
 
 
+def read_frame_times(path):
+    """{idx: t_s} of every row of a frames.csv (no corner columns needed)."""
+    cu.check_path(path)
+    with open(path, newline='', encoding='utf-8') as f:
+        rows = list(csv.DictReader(f))
+    if not rows or any(c not in rows[0] for c in ('idx', 't_s')):
+        raise A6Error(f'{path}: no idx/t_s columns')
+    t_all = {}
+    for r in rows:
+        k, tt = int(r['idx']), float(r['t_s'])
+        if k in t_all or not math.isfinite(tt):
+            raise A6Error(f'{path}: idx {k} repeated or t_s not finite')
+        t_all[k] = tt
+    return t_all
+
+
+def e_frames_from_f15(f15):
+    """idx, t, lifted corners P (n, 4, 2) of the E frames from the F15 of KIEMCHEO (khung[].goc_m: the 4 real corners
+    of the car tag through the PER-FRAME scoring camera of the track, lifted as car_pose; replayed against frames.csv
+    within TOL_REPLAY_M by meo_E). Used when the frames.csv has no corner columns (CAM did not write design v2 7b; the
+    frames of session 2 have none; CODE_C8B 22/11). The session camera alone is 3-6 mm off the scoring centre there
+    (per-frame mark shift), so the corners are not rebuilt here."""
+    g = f15.get('goc') or {}
+    if not g:
+        raise A6Error('F15 without goc_m: no corners for the E frames')
+    ids = sorted(g)
+    t = np.array([f15['t'][k] for k in ids])
+    P = np.array([g[k] for k in ids])
+    if np.any(np.diff(t) <= 0):
+        raise A6Error('F15 frame times not increasing')
+    return np.array(ids), t, P
+
+
 def read_session(path):
     """car_pose set-up of the session: C (plumb), H = Z_c = tag_h / kappa, hbar = tag_h, side; every number finite and
     in range (A6C1-8)."""
@@ -493,7 +526,7 @@ def read_f15(path, ses, frames_sha, t_all):
         raise A6Error(f'{path}: H32 ids {sorted(set(hid) - set().union(*map(set, bo)))} left out by no case (A6C1-2)')
     ca = [x.get('ten') for x in ca_l]
     a3_ca = {x.get('ten'): (x.get('A3') or {}).get('quy_max_deg') for x in ca_l if isinstance(x.get('A3'), dict)}
-    khung = []
+    khung, goc = [], {}
     for k in d.get('khung') or []:
         fid, ts = k.get('frame_id'), k.get('t_s')
         if isinstance(fid, bool) or not isinstance(fid, int) or fid not in t_all:
@@ -504,6 +537,7 @@ def read_f15(path, ses, frames_sha, t_all):
         gm = np.asarray(k.get('goc_m'), float)
         if gm.shape != (4, 2) or not np.all(np.isfinite(gm)):
             raise A6Error(f'{path}: frame {fid} goc_m not 4 x 2 finite')
+        goc[fid] = gm
         cases = {}
         for name, v in (k.get('du_m') or {}).items():
             a = np.asarray(v, float)
@@ -514,6 +548,7 @@ def read_f15(path, ses, frames_sha, t_all):
     out = _f15_obj(sch, d.get('trang_thai'), d.get('cho'), d.get('mien_E'), ca, khung, d.get('clip_sha256'),
                    d['sha256'], os.path.abspath(path), cu.sha256(path), d.get('ly_do') or [])
     out['A3_ca_deg'] = a3_ca or None             # KIEMCHEO 692462f: A3 per H32 case on the E session (information)
+    out['goc'] = goc                              # lifted corners per frame (KIEMCHEO: per-frame scoring camera)
     return out
 
 
@@ -1605,14 +1640,23 @@ def main(argv=None):
     try:
         if a.cmd == 'do':
             ses = read_session(a.session)
-            idx, t, P, t_all = read_e_frames(a.frames)
             fsha = cu.sha256(a.frames)
-            f15 = read_f15(a.f15, ses, fsha, t_all)
+            with open(a.frames, newline='', encoding='utf-8') as fh:
+                hdr = next(csv.reader(fh), [])
+            goc_f15 = not all(c in hdr for c in CORNER_COLS)
+            if goc_f15:                                   # CODE_C8B 22/11: corners from F15 goc_m (KIEMCHEO)
+                t_all = read_frame_times(a.frames)
+                f15 = read_f15(a.f15, ses, fsha, t_all)
+                idx, t, P = e_frames_from_f15(f15)
+            else:
+                idx, t, P, t_all = read_e_frames(a.frames)
+                f15 = read_f15(a.f15, ses, fsha, t_all)
             out = do_place(a.cho, idx, t, P, ses, f15, camera_of(ses), a.tam_id, a.lan_lap_id, a.luot_id_E)
             out.update(nguon=[dict(vai='frames', file=os.path.abspath(a.frames), sha256=fsha),
                               dict(vai='session', file=ses['file'], sha256=ses['sha256']),
                               dict(vai='f15', file=f15['file'], sha256=f15['sha256_file']),
                               dict(vai='clip_E', sha256=f15['clip_sha256'])],
+                       goc_nguon='f15 khung.goc_m (camera cham tung khung, KIEMCHEO)' if goc_f15 else 'frames.csv c0..c3',
                        script=script_state(), luc=datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
             _write(a.out, out)
             print(f'{a.cho}: g_E {out["g_E"]} SE {out["SE_E"]} U_meo {out["U_meo_E"]} n {out["n_khung"]}; '
