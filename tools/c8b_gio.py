@@ -101,6 +101,17 @@ STARTUP_E_PSI_DEG = 0.5    # [DE XUAT] O1 v11.36: allowed error of a camera angl
 PRE_S = (1.0, 0.1)         # s before t0: standing place from the frames in [t0 - 1.0, t0 - 0.1] (camera clock)
 CHANNELS = ('speed_cnt', 'wz_cnt', 'gyro_rx', 'rv_rx')
 LOWER, UPPER = ('speed_cnt', 'wz_cnt'), ('gyro_rx', 'rv_rx')
+# Channels judged per task, BY THE COMMAND OF THE TASK, not by the measured correlation (Liam 22/11 at CODE
+# local_bc7135f2, box choice "Can rong tu luot F (Recommended)", contract C8 log 22/11 toi (b); Fable review
+# 03_CODE/docs/review/2026-11-21_Fable_API_can_cu_nhom1/t5_c8/ket_luan_da_kiem.md (ii)(b) conditions 1-3): K1, K2
+# have no turn command (J v6 line 53, W_k = 0), so the three turn channels are matched and recorded but NOT judged;
+# L = D(speed_cnt). Fixed after seeing the T5 numbers of 22/11 (design v4 section 3 did not cover K).
+KENH_KHONG_QUAY = ('O1-K1', 'O1-K2')
+
+
+def kenh_theo_bai(task):
+    """Channels judged for the task (by its command)."""
+    return ('speed_cnt',) if task in KENH_KHONG_QUAY else CHANNELS
 
 
 class GioError(Exception):
@@ -509,7 +520,30 @@ def nodes(c, h, step=STEP_S):
         k += 1
 
 
-def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S, thao_tac=()):
+def u_tu_luot_f(files, controller):
+    """K upper bound from F runs of the SAME camera part (Liam 22/11, Fable (ii)(b) b3): the largest
+    U~ - D(speed_cnt) over the given clock files, each a c8b_gio_v1 file with ket_luan ok of an F task and of the same
+    controller as this run (the caller gives the F runs of the same part; the controller is the check of that).
+    Returns (delta_s, sources). An estimate with an assumption, not a proven bound."""
+    if not files:
+        return None, []
+    src = []
+    for p in files:
+        cu.check_path(p)
+        with open(p, encoding='utf-8') as f:
+            g = json.load(f)
+        if g.get('format') != FORMAT or g.get('ket_luan') != 'ok' or not str(g.get('task', '')).startswith('O1-F'):
+            raise GioError(f'{p}: not a c8b_gio_v1 file of an F run with ket_luan ok (--u-tu-luot-F)')
+        if g.get('controller') != controller:
+            raise GioError(f'{p}: controller {g.get("controller")!r} is not {controller!r} of this run: not the same '
+                           f'camera part (--u-tu-luot-F)')
+        d = g['U_s'] - g['kenh']['speed_cnt']['D_s']
+        src.append(dict(file=os.path.abspath(p), sha256=cu.sha256(p), task=g['task'], U_tru_D_speed_s=float(d)))
+    return max(x['U_tru_D_speed_s'] for x in src), src
+
+
+def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S, thao_tac=(), u_tu_f=None):
+    """u_tu_f: (delta_s, sources) of u_tu_luot_f, for a task without an IMU channel judged (K)."""
     F = read_frames(frames_path)
     rows, n_dup = read_log(log_path)
     tl = np.array([float(r['timestamp_us']) for r in rows]) * 1e-6
@@ -584,27 +618,56 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S, thao_ta
     except GioError as exc:
         raise GioError(f'coarse guess: {exc}')
     kenh = {}
+    xet = kenh_theo_bai(task)
     for ch in CHANNELS:
         try:
             kenh[ch] = match(F['t_s'], cam[ch], F['valid'], series[ch][0], series[ch][1], win, coarse)
         except GioError as exc:
             kenh[ch] = dict(D_s=None, ok=False, why=str(exc))
+        kenh[ch]['xet'] = ch in xet
+        if ch not in xet:
+            kenh[ch]['khong_xet'] = 'bai khong co lenh kich thich kenh nay (J v6 dong 53, W_k = 0; Liam 22/11)'
+            continue
         if not kenh[ch]['ok']:
             hong.append(f'{ch}: {kenh[ch]["why"]}')
             loai['kiem_gio_d1'].append(hong[-1])
     out = dict(format=FORMAT, task=task, t0_log_s=t0, window_log_s=list(win), coarse_s=coarse, kenh=kenh, kiem=kiem,
-               moc_mau=True, step_s=STEP_S, le=LE)
-    if any(kenh[c]['D_s'] is None for c in CHANNELS):
+               moc_mau=True, step_s=STEP_S, le=LE, kenh_xet=list(xet))
+    if any(kenh[c]['D_s'] is None for c in xet):
         out.update(ok=False, ly_do=hong + fails, ly_do_hong=hong, ly_do_chua=fails, nodes_s=[],
                    ket_luan='hong_he_do' if hong else 'chua_ket_luan')
         out.update(f11(out, kenh, kiem, loai, fails, khoa, None, thao_tac))
         return out, F, None
-    L_ch = max(LOWER, key=lambda c: kenh[c]['D_s'])
-    U_ch = min(UPPER, key=lambda c: kenh[c]['D_s'])
-    L, U = kenh[L_ch]['D_s'], kenh[U_ch]['D_s']
+    L_ch = max([c for c in LOWER if c in xet], key=lambda c: kenh[c]['D_s'])
+    up = [c for c in UPPER if c in xet]
+    if up:
+        U_ch = min(up, key=lambda c: kenh[c]['D_s'])
+        U = kenh[U_ch]['D_s']
+    elif u_tu_f is not None and u_tu_f[0] is not None:
+        # Liam 22/11 (b): U~ of K = D(speed_cnt) + the largest U~ - D(speed_cnt) of the F runs of the same part
+        # [estimate with an assumption: the body-wheel lag of K is not larger than in those F runs; not checked]
+        U_ch = 'uoc_luong_F'
+        U = kenh['speed_cnt']['D_s'] + u_tu_f[0]
+        out['uoc_luong_gia_dinh'] = dict(
+            dai_luong='U~ = D(speed_cnt) + max_F (U~ - D(speed_cnt)) cua cac luot F dat cung doan camera',
+            delta_s=float(u_tu_f[0]), nguon=u_tu_f[1],
+            gia_dinh='do tre than-banh o K khong lon hon o luot F cung doan (chua kiem, nhat la K1 chay ngang)',
+            quyet='Liam 22/11 phien CODE local_bc7135f2, hop chon "Can rong tu luot F (Recommended)"; Fable (ii)(b) b3',
+            gioi_han='U_t cua K o C8 la so chuyen tu bai khac; G1, G3 cua K co dieu kien')
+    else:
+        U_ch, U = None, None
+        fails.append('no upper clock bound: the task has no turn command (no IMU channel judged) and no F runs of '
+                     'the same part were given (--u-tu-luot-F)')
+    L = kenh[L_ch]['D_s']
+    if U is None:
+        out.update(L_s=L, U_s=None, L_kenh=L_ch, U_kenh=None, width_s=None, center_s=None, half_s=None, h_s=None,
+                   gyro_minus_rv_s=None, nodes_s=[], ok=False, ly_do=hong + fails, ly_do_hong=hong, ly_do_chua=fails,
+                   ket_luan='hong_he_do' if hong else 'chua_ket_luan')
+        out.update(f11(out, kenh, kiem, loai, fails, khoa, None, thao_tac))
+        return out, F, None
     c, h = 0.5 * (L + U), LE * 0.5 * (U - L)
     out.update(L_s=L, U_s=U, L_kenh=L_ch, U_kenh=U_ch, width_s=U - L, center_s=c, half_s=h, h_s=h,
-               gyro_minus_rv_s=kenh['gyro_rx']['D_s'] - kenh['rv_rx']['D_s'])
+               gyro_minus_rv_s=(kenh['gyro_rx']['D_s'] - kenh['rv_rx']['D_s']) if up else None)
     if L > U:
         hong.append(f'L {L * 1e3:.1f} ms > U~ {U * 1e3:.1f} ms')
         loai['kiem_gio_d1'].append(hong[-1])
@@ -612,13 +675,13 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S, thao_ta
     else:
         out['nodes_s'] = nodes(c, h)
     # matching window on the log clock: union over the four channels
-    wl = [kenh[ch]['window_log_s'] for ch in CHANNELS]
+    wl = [kenh[ch]['window_log_s'] for ch in xet]
     cw = [min(w[0] for w in wl), max(w[1] for w in wl)]
     td = t_deadline(task)
     out['t_deadline_s'] = td
     out['cua_so_ghep_log_s'] = cw
     out['troi_khoang_xa_s'] = max(abs(t0 + td - cw[0]), abs(cw[1] - t0))      # farthest pair of points
-    rates = [kenh[ch]['rate'] for ch in (L_ch, U_ch)]
+    rates = [kenh[ch]['rate'] for ch in (L_ch, U_ch) if ch in kenh]
     out['rate_luot'] = None if any(r is None for r in rates) else max(rates)
     # rolling shutter spans and frame period (camera clock: matching window and scoring domain, all nodes)
     nd = out['nodes_s'] or [c]
@@ -665,6 +728,8 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S, thao_ta
             fails.append(f'khoa file: no C8 range for {task}')
         else:
             for k_, v_ in (('width_s', out['width_s']), ('gyro_minus_rv_s', out['gyro_minus_rv_s'])):
+                if v_ is None:
+                    continue                       # K: no IMU channel judged (Liam 22/11); the c8b_u range: later (c)
                 lo_, hi_ = rg[k_]
                 inr = lo_ - 1e-12 <= v_ <= hi_ + 1e-12
                 kiem[f'{k_}_in_c8_range'] = inr
@@ -703,10 +768,11 @@ def f11(out, kenh, kiem, loai, fails, khoa, cw, thao_tac=()):
     L <= U~, every channel matched, and the C8 range of the level). ket_luan is kept for compatibility.
     M2 (J v6 section 5, item 12(e) approved, J5-9): a run with a firmware restart (boot) does not count as a failed
     clock check unless the check failed on log rows before the boot and its whole window lies before the boot."""
-    have_d = all(kenh[c].get('D_s') is not None for c in CHANNELS)
+    xet = out.get('kenh_xet') or CHANNELS                 # the channels judged for the task (Liam 22/11)
+    have_d = all(kenh[c].get('D_s') is not None for c in xet) and out.get('U_s', 0.0) is not None
     L, U = out.get('L_s'), out.get('U_s')
     l_le_u = None if L is None or U is None else bool(L <= U)
-    ghep_ok = all(bool(kenh[c].get('ok')) for c in CHANNELS)
+    ghep_ok = all(bool(kenh[c].get('ok')) for c in xet)
     keys = [k for k in ('width_s_in_c8_range', 'gyro_minus_rv_s_in_c8_range') if k in kiem]
     dai = None if khoa is None or len(keys) < 2 else all(kiem[k] for k in keys)
     if l_le_u is False or (have_d and not ghep_ok) or dai is False:
@@ -763,6 +829,10 @@ def main(argv=None):
     ap.add_argument('--out', required=True)
     ap.add_argument('--khoa', default=None, help='C8 lock file of c8b_u.py (drift rate, C8 ranges per level)')
     ap.add_argument('--startup-s', type=float, default=STARTUP_S)
+    ap.add_argument('--u-tu-luot-F', action='append', default=[],
+                    help='clock file (c8b_gio_v1, ket_luan ok) of an F run of the SAME camera part and controller: '
+                         'for K (no turn command) U~ = D(speed_cnt) + the largest U~ - D(speed_cnt) of these '
+                         '(Liam 22/11, estimate with an assumption)')
     ap.add_argument('--so-bo', default=None,
                     help='the preliminary clock file the reference window (cua_so_v1, F2) was built from; its SHA-256 is '
                          'written as luoi_so_bo_sha256 so that the window stays tied to this final file (CAM CT2-7)')
@@ -780,14 +850,17 @@ def main(argv=None):
         if a.so_bo and not a.score:
             raise GioError('the final clock file (--so-bo) needs --score: the operator kinds of the run come from the '
                            "scorer's score.json only (CODE 19/11)")
-        out, _, _ = analyse(a.frames, a.esp32, a.task, khoa, a.startup_s, thao)
-        out['thao_tac_nguon'] = tt_src
         ctrl, ev = controller_of(a.esp32)
+        if a.u_tu_luot_F and a.task not in KENH_KHONG_QUAY:
+            raise GioError(f'--u-tu-luot-F is only for the tasks without a turn command {KENH_KHONG_QUAY}')
+        u_tu_f = u_tu_luot_f(a.u_tu_luot_F, ctrl) if a.u_tu_luot_F else None
+        out, _, _ = analyse(a.frames, a.esp32, a.task, khoa, a.startup_s, thao, u_tu_f)
+        out['thao_tac_nguon'] = tt_src
         out['controller'] = ctrl
         # contract of c7_score --gio-c8b (CODE 17/11, VG1-1): the clock file names the log and frames of ITS run
         out['sha256'] = dict(esp32=cu.sha256(a.esp32), frames=cu.sha256(a.frames))
         out['nguon'] = [dict(file=os.path.basename(p), sha256=cu.sha256(p)) for p in (a.frames, a.esp32)
-                        + ((a.khoa,) if a.khoa else ()) + ((ev,) if ev else ())]
+                        + ((a.khoa,) if a.khoa else ()) + ((ev,) if ev else ()) + tuple(a.u_tu_luot_F)]
         # CAM CT2-7 (CODE 19/11): the final clock file names the preliminary grid and the window built from it
         out['luoi_so_bo_sha256'] = cu.sha256(a.so_bo) if a.so_bo else None
         out['cua_so_v1_sha256'] = cu.sha256(a.cua_so) if a.cua_so else None
