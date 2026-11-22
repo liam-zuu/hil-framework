@@ -1510,8 +1510,9 @@ def cmd_cua_so(a):
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + '\n')
     tj = json.load(open(a.track, encoding='utf-8'))
-    xo = json.load(open(a.xoay, encoding='utf-8')) if a.xoay else {}
-    xb = (xo.get('cho', {}).get(A['cho']) or xo) if xo else {}
+    # F4 (CODE 22/11): q, u_q only from the place block of a xoay_v1 file made on this A6; never the top level
+    xq, xu, x_why = (xoay_q(json.load(open(a.xoay, encoding='utf-8')), A['cho'], a.a6) if a.xoay
+                     else (None, None, 'chua co --xoay'))
     role_of = {k: lo for k, lo in roles if lo in ('ref_12b', 'dung_12b')}     # HCC2-7: not the E_dau alias
     nguon = [dict(vai_tro=k, duong_dan=os.path.abspath(v), sha256=sha256(v))
              for k, v in (('clip', a.clip), ('session', a.session), ('frames', a.frames), ('track', a.track),
@@ -1527,7 +1528,7 @@ def cmd_cua_so(a):
                 frames_sha256=sha256(a.frames), track_sha256=sha256(a.track), cua_so_v1_sha256=sha256(out),
                 esp32_sha256=sha256(A['log_path']), commit_hil=commit_hil(),
                 car_pose_cfg=dict(side_m=S.get('car_side_m'), h_m=S.get('tag_h_m'), tag_offset=tj.get('tag_offset'),
-                                  q_m=xb.get('q_tag_m'), du_m=xb.get('du_m')),
+                                  q_m=xq, du_m=xu, q_ly_do=x_why),
                 xoay_sha256=sha256(a.xoay) if a.xoay else None, a6_sha256=sha256(a.a6) if a.a6 else None,
                 chuoi=an['chuoi'], dets_sha256=sha256(a.dets) if a.dets else None, dets_fp=dets_fingerprint(a.dets),
                 nguon=nguon, doan=[])
@@ -1565,6 +1566,34 @@ def cmd_cua_so(a):
 def _block(j, cho):
     """The block of one place in a file of another session: j['cho'][cho] when present, else j."""
     return (j.get('cho') or {}).get(cho) or j
+
+
+def xoay_q(x, cho, a6_path):
+    """(q_tag_m, u_q_m, reason) of F4 xoay_v1 (C8B, contract C8 lines 23, 46; CODE 22/11) for one place: only a file of
+    version 'xoay_v1', only the block cho[<place>] with trang_thai 'dat', q_tag_m two finite numbers, u_q_m finite
+    >= 0, and a6_sha256 = the sha256 of the A6 file of this run (q is fitted on psi' after A6). Anything else ->
+    (None, None, reason); never the top level of the file (c8b_xoay_v1, the diagnostic q fitted on the tag heading
+    WITHOUT A6, is refused; K2, where HC has no E turn, has no block: q None)."""
+    if not isinstance(x, dict) or x.get('version') != 'xoay_v1':
+        v = x.get('version') if isinstance(x, dict) else None
+        return None, None, (f'xoay version {v!r} khong phai xoay_v1 (c8b_xoay_v1 la q chan doan khop tren huong ma '
+                            f'chua qua A6)')
+    b = (x.get('cho') or {}).get(cho) if isinstance(x.get('cho'), dict) else None
+    if not isinstance(b, dict):
+        return None, None, f'xoay_v1 khong co cho {cho!r}'
+    if b.get('trang_thai') != 'dat':
+        return None, None, f'xoay_v1 {cho}: trang_thai {b.get("trang_thai")!r}'
+    q, u = b.get('q_tag_m'), b.get('u_q_m')
+    fin = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)   # noqa: E731
+    if not (isinstance(q, (list, tuple)) and len(q) == 2 and all(fin(v) for v in q)):
+        return None, None, f'xoay_v1 {cho}: q_tag_m {q!r}'
+    if not (fin(u) and u >= 0):
+        return None, None, f'xoay_v1 {cho}: u_q_m {u!r}'
+    if not a6_path:
+        return None, None, f'xoay_v1 {cho}: can --a6 (q khop tren psi sau A6)'
+    if b.get('a6_sha256') != sha256(a6_path):
+        return None, None, f'xoay_v1 {cho}: a6_sha256 khac file --a6'
+    return [float(q[0]), float(q[1])], float(u), None
 
 
 _KHAC = object()
@@ -1984,9 +2013,9 @@ def cmd_tinh(a):
         nguon += [dict(vai_tro='e_hieu_m', duong_dan=os.path.abspath(a.e_hieu), sha256=sha256(a.e_hieu)),
                   dict(vai_tro='doan_12b_v1', duong_dan=os.path.abspath(dp), sha256=sha256(dp))]
     q = du = None
-    if a.xoay:
-        x = _block(json.load(open(a.xoay, encoding='utf-8')), a.cho)
-        q, du = x.get('q_tag_m'), x.get('du_m')
+    x_why = None
+    if a.xoay:                       # F4 (CODE 22/11): place block of xoay_v1 on this A6 only, never the top level
+        q, du, x_why = xoay_q(json.load(open(a.xoay, encoding='utf-8')), a.cho, a.a6)
         nguon.append(dict(vai_tro='xoay_v1', duong_dan=os.path.abspath(a.xoay), sha256=sha256(a.xoay)))
     if a.a6:
         nguon.append(dict(vai_tro='c8b_a6_v2', duong_dan=os.path.abspath(a.a6), sha256=sha256(a.a6)))
@@ -2064,6 +2093,10 @@ def cmd_tinh(a):
                      can_hai_dau=can_fn, p_ref_tag=p_ref_tag, khung=kg)
     for x in r['luot_thu']:
         x['session_sha256'] = att_ses.get(x['thu_id'])
+    if x_why:                                            # why the xoay_v1 file gave no q for this place
+        r['ly_do'].append(f'xoay: {x_why}')
+        if r['trang_thai'] == 'khoa':
+            r['trang_thai'] = 'chan_doan'
     r = dict(schema='truc_xe_v1', version=VERSION, commit_hil=commit_hil(), nguon=nguon,
              session_sha256=s_cap, session_sha256_luot=dict(sorted(att_ses.items())),
              mien_hieu_luc=dict(cho=a.cho, thu_id_cap=cap_id, lan_lap_id=ll_f5,
