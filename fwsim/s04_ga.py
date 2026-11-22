@@ -8,6 +8,9 @@ Section numbers below are those of S04 v5.
       S03 2.1 (s03_doe.sim_kwargs: kd = 0, limits, b0, out_limit from the firmware). Domain =
       the S03 levels [L, H] (levels.csv), not widened; a factor coded log in S03 is searched on
       log(gain). A chosen gain within 5 % of the coded width from a bound is flagged.
+      S04 v6.8: every candidate is checked against the range table of the campaign binary
+      (tools/gain_table.py, float32) before it runs; an ADRC candidate outside the triangle
+      omega_c + 2 omega_o < 200 is not run (penalty, status ngoai_bang).
   3   one candidate = every gate speed (v) x mu level of the evaluation: middle mu only when
       the mu rule holds on every S03 design point (centre, outer, inner box) and gate speed,
       else the three mu levels, worst of. f1 = max e_perp_max (m); f2 = max over mu of the
@@ -24,8 +27,8 @@ Section numbers below are those of S04 v5.
       quantity, flagged per run in evals.csv (pen_<quantity> = 1); history.csv has pen_f1 and
       n_pen_runs. G must be finite before pymoo sees it (else the run stops).
   4.2 GA seeds 1-5, plant seed 1 (s03_doe.SEED). Hypervolume per generation on the feasible
-      non-dominated set of that generation's population, reference (D, 10 x f2 of the default
-      gains at the middle mu), points on or beyond the reference counted, HV 0 when none.
+      non-dominated set of that generation's population, reference (D; 800 1/s) (v6.8),
+      points on or beyond the reference counted, HV 0 when none.
   4.3 --phase trial: one seed, full budget (pop 24, 20 generations); when
       (HV20 - HV15) / HV20 > 1 % or HV20 = 0 the same run goes on to 40 generations, and the
       main runs use 40; lock.yaml holds the domain, the mu decision, the budget, the seeds,
@@ -42,7 +45,9 @@ Section numbers below are those of S04 v5.
       and motor R x 0.8..1.2 (both, R only, plant parameters dumped before and after) with
       the 7 chosen gains, same speeds and mu as the GA, criterion of B0_SENS/2026-11-05_run01
       plus the tv_duty change in %; the three mu levels when the GA used the middle one only;
-      the report-only measures.
+      the report-only measures. S04 v6.8: the selected gains against the range table /
+      triangle before HIL; G1-G5 read from the gate state columns; --phase sens_after:
+      loop-delay variant (io_delay_ms), report only.
   7   K1, K2 are never run; nothing here runs on the car.
   8   outputs in --out (columns controller, ga_seed): history.csv, evals.csv (key controller,
       ga_seed, gen, cand_id, v, mu, attempt), hv.csv, pareto.csv (the non-dominated points of
@@ -59,6 +64,7 @@ never read), any budget and seeds, no preconditions.
       --preconditions <json> --out 05_DATA/results/S04/<date>_runNN
   python fwsim/s04_ga.py --phase main --controller PID --s03 <S03 run> --s03-unsealed --out <same dir>
   python fwsim/s04_ga.py --phase post --out <same dir>
+  python fwsim/s04_ga.py --phase sens_after --out <same dir> [--io-delay-ms <measured ms>]
   python fwsim/s04_ga.py --tool-check --phase trial --controller PID --s03 <S03 trial run> \\
       --pop 6 --gen-base 4 --gen-max 6 --out <dir>
 Interpretations of this script, not written in S04 v5, are in meta.yaml 'interpretations'.
@@ -86,18 +92,23 @@ import o1_gate as og         # noqa: E402  (THETA_MAX_DEG of G5)
 import o1_gate_eval as oge   # noqa: E402  (G4 e_bao_max; evaluate_v7 inside, unchanged)
 from plant_blob import git_blob, same_plant   # noqa: E402  (rpi5/ is on sys.path through fwsim)
 
+_TOOLS = os.path.join(HERE, '..', 'tools')
+if _TOOLS not in sys.path:
+    sys.path.insert(0, _TOOLS)
+import gain_table            # noqa: E402  (tools/: range table of the campaign binary, LADRC triangle)
+
 D = o1.D                      # m, O1 v7 (temporary)
 F1_TOL = 0.01                 # m, section 3 / 5 (convention, same as S03 5.2)
 MU_Y2_TOL = 0.01              # m, mu rule (section 3)
-MU_Y3_REL = 0.20              # of the S03 Y3 reference (section 3)
-HV_REF_MULT = 10.0            # section 4.2
+MU_Y3_TOL = 0.4               # 1/s, mu rule (section 3, v6.8): the absolute Y3 threshold of S03 5.2
+HV_REF_F2 = 800.0             # 1/s, section 4.2 (v6.8): upper bound of f2 on a log with one sample per 10 ms tick
 HV_EXT_REL = 0.01             # section 4.3
 GEN_BASE, GEN_MAX, POP = 20, 40, 24
 SEEDS = (1, 2, 3, 4, 5)
 PENALTY = 1e6                 # section 3: f1 = f2 = 1e6 for a run_error candidate
 SEED_ERR_LIMIT = 0.10         # section 3
 EDGE_FRAC = 0.05              # section 2
-SPEC = 'S04 v6.6 (06_SPECS/2026-11-05_Spec_S04_GA_chon_gain.md)'   # S83-2: one version line for every meta.yaml
+SPEC = 'S04 v6.6 with v6.7 section 9 item 7 and v6.8 section 9 item 9 (06_SPECS/2026-11-05_Spec_S04_GA_chon_gain.md)'   # S83-2: one version line for every meta.yaml
 B0_FACTORS = (0.7, 0.85, 1.0, 1.15, 1.3)
 R_FACTORS = (0.8, 0.9, 1.0, 1.1, 1.2)
 REL_LIMIT = 0.5               # B0_SENS criterion: e_perp_max change > 50 %
@@ -124,6 +135,16 @@ N_CONSTR = 5                  # g1 .. g5 (S04 v6.2)
 EVAL_COLS = ['controller', 'ga_seed', 'gen', 'cand_id', 'v', 'mu', 'attempt', 'status', 'completed', 'e_perp_max',
              'tv_duty', 'sat_frac', 't_end', 'e_theta_lane_max_deg', 'e_theta_cmd_max_deg', 'ds_absmax', 'e_trk_max',
              'e_bao_max'] + PEN_COLS + ['log_sha256', 'cause', 'error']
+GATE_STATE_COLS = [f'{c}_state' for c in og.CONDS]   # g1_state .. g5_state of the gate scorer (o1_gate.gate)
+MU_RULE_GATE = ('g3', 'g4', 'g5')                    # S04 v6.2 section 3: states that must not change with mu
+GA_IO_DELAY_MS = 0            # S04 v6.8 section 6 / S03 v8.6 section 8 condition 12: the GA condition
+GA_SLIP_OMEGA_S = 0.1
+SENS_AFTER_DIR = 'sens_after'  # S04 v6.8 section 6: sensitivity check after selection, its own folder
+DELAY_DEFAULT_MS = (1, 2)     # S04 v6.8 section 6: no measured bench loop delay yet
+DELAY_INT_TOL = 1e-9          # ms: a measured delay this close to a whole number of 1 ms steps is that number
+SENS_AFTER_COLS = ['tool_check', 'controller', 'variant', 'io_delay_ms', 'baseline', 'v', 'mu', 'status',
+                   'completed', 'e_perp_max', 'e_trk_max', 'e_bao_max', 'e_theta_cmd_max_deg'] + GATE_STATE_COLS + \
+    ['tv_duty']
 
 
 # ── small helpers ────────────────────────────────────────────────────────────────────
@@ -319,13 +340,27 @@ def edge_report(dom, x):
                 edge_limit=('vùng ngoài biên chưa khảo sát bằng GA: ' + ' '.join(lim)) if lim else '')
 
 
+def gate_state_of(r, c, where):
+    """State of gate condition c ('g3' ...) of one S03 sealed/runs.csv row, read from the gate's state column
+    <c>_state (o1_gate.gate: undefined frames counted; S03 v8.2 section 7), never derived from a maximum against
+    its threshold (S04 v6.7 section 9 item 7). A row that is not a run_error must hold one of o1_gate.STATES:
+    else the mu rule cannot be applied and the script stops."""
+    x = r.get(c + '_state')
+    if x in og.STATES:
+        return x
+    if r.get('status') == 'run_error':
+        return x or ''
+    sys.exit(f'{where}: {c}_state is {x!r}, not one of {og.STATES}: no gate state column of the S03 run '
+             f'(S03 v8.2 section 7; S04 v6.7 section 9 item 7)')
+
+
 def mu_rule(s03_dir, ctrl, gate, mu_levels):
     """Section 3: ('mid', report) when every S03 design point (the 257 points of the centre,
     outer and inner boxes; S03 v8 axial and test points are not used) at every gate
-    speed has the same Y1 at the three mu, |dY2| <= 0.01 m and |dY3| <= 20 % of the S03 Y3
-    reference versus the middle mu, no track error, no inconclusive; else ('all', report)."""
-    meta = open(os.path.join(s03_dir, 'meta.yaml'), encoding='utf-8').read()
-    y3_ref = meta_value(meta, 'y3_reference')
+    speed has the same Y1 at the three mu, the same G3, G4 and G5 state at the three mu
+    (gate state columns of sealed/runs.csv), |dY2| <= 0.01 m and |dY3| <= 0.4 1/s (S04 v6.8:
+    the absolute threshold of S03 5.2) versus the middle mu, no track error, no inconclusive;
+    else ('all', report)."""
     # S04 v6 section 9 item 4 (S03 v8 adds axial and test points): the mu rule uses only the
     # 257 points of the centre, outer and inner boxes, filtered by box in BOTH files before the
     # completeness and membership checks; the point_id list used is locked to 0..256
@@ -374,9 +409,13 @@ def mu_rule(s03_dir, ctrl, gate, mu_levels):
             if max(abs(y2[lo] - y2[mid]), abs(y2[hi] - y2[mid])) > MU_Y2_TOL + CMP_EPS:     # S4C-14
                 why.append('dY2 > 0.01 m')
             y3 = {m: float(r['tv_duty']) for m, r in rs.items()}
-            ref = y3_ref[f'{ctrl} v={v:g}']
-            if max(abs(y3[lo] - y3[mid]), abs(y3[hi] - y3[mid])) > MU_Y3_REL * ref * (1 + CMP_EPS):
-                why.append('dY3 > 20 % of the reference')
+            if max(abs(y3[lo] - y3[mid]), abs(y3[hi] - y3[mid])) > MU_Y3_TOL * (1 + CMP_EPS):
+                why.append('dY3 > 0.4 1/s')
+            for c in MU_RULE_GATE:
+                st = {gate_state_of(r, c, f'{s03_dir}/sealed/runs.csv: {ctrl} point {pid} ({box}) v = {v} mu = {m}')
+                      for m, r in rs.items()}
+                if len(st) > 1:
+                    why.append(f'{c} state differs over mu')
         if why:
             bad.append(dict(point_id=pid, box=box, v=v, why=why))
     # S04 v6 section 9 item 4: the point_id list actually used goes to lock.yaml (via mu_rule_report)
@@ -386,6 +425,24 @@ def mu_rule(s03_dir, ctrl, gate, mu_levels):
 
 
 # ── one candidate ────────────────────────────────────────────────────────────────────
+
+def gain_check(ctrl, g):
+    """S04 v6.8 section 2 (S03 v8.6 2.1, 3.1b item 4): one gain set against the range table of the campaign
+    binary and the LADRC triangle, on the float32 values the firmware gets. The check itself is
+    tools/gain_table.check (never recomputed here; its warnings are not violations). Returns (table, triangle):
+    the violations of one gain against its own bounds (texts '<gain>=...') and every other violation check()
+    reports (ADRC: omega_c + 2 omega_o of an axis not below 200). S03Stop for a gain set check() cannot read and
+    for a PID violation that is not a bound (PID has no triangle)."""
+    try:
+        violations, _ = gain_table.check(ctrl, dict(g))
+    except ValueError as e:
+        raise s3.S03Stop(f'{ctrl}: gain set {g!r} refused by gain_table.check ({e})') from None
+    table = [v for v in violations if any(v.startswith(n + '=') for n in gain_table.NAMES[ctrl])]
+    other = [v for v in violations if v not in table]
+    if other and ctrl != 'ADRC':
+        raise s3.S03Stop(f'{ctrl}: gain_table.check reports {other}: not a bound of one gain (tool error)')
+    return table, other
+
 
 class Evaluator:
     """Runs one candidate on every (mu, v) of the evaluation; keeps every run (evals.csv)."""
@@ -403,10 +460,18 @@ class Evaluator:
         return r
 
     def candidate(self, g, ga_seed, gen, cand):
+        table, tri = gain_check(self.ctrl, g)          # S04 v6.8 section 2: before any run of the candidate
+        if table:
+            raise s3.S03Stop(f'{self.ctrl} candidate (ga_seed {ga_seed}, gen {gen}, cand {cand}): gain outside '
+                             f'the range table of the campaign binary ({"; ".join(table)}): tool error, the GA '
+                             f'domain lies inside the table (S04 v6.8 section 2)')
+        if tri:
+            return score_ngoai_bang(len(self.mus) * len(self.speeds))
         rows, error = [], False
         for mu in self.mus:
             for v in self.speeds:
                 row, log = safe_run_gate(self.fw, self.path, self.ctrl, g, v, mu)
+                row = tv_duty_run_error(row)         # S04 v6.7 section 3: at the run level, before the row is kept
                 self._rec(ga_seed, gen, cand, v, mu, 1, row, log, **run_values(row)[1])
                 rows.append((mu, v, row))
                 if row['status'] == 'run_error':
@@ -431,8 +496,11 @@ def run_gate(fw, path, ctrl, g, v, mu):
     adds e_bao_max. Returns (row, log); raises on a DLL / NaN error, as run_one."""
     sch = o1.Schedule(v)
     p = fwsim.plant_params(argparse.Namespace(ground='traction', mu=mu))
+    if p.slip_omega_s != GA_SLIP_OMEGA_S:        # S04 v6.8 section 6 / S03 v8.6 section 8 condition 12
+        raise s3.S03Stop(f'plant slip_omega_s {p.slip_omega_s!r} is not {GA_SLIP_OMEGA_S}: the GA runs with '
+                         f'slip_omega_s = {GA_SLIP_OMEGA_S} and io_delay_ms = {GA_IO_DELAY_MS}')
     log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + o1.T_LATE, p, seed=s3.SEED, mode=ctrl, imu=dict(s3.IMU),
-                         **s3.sim_kwargs(fw, ctrl, g))
+                         io_delay_ms=GA_IO_DELAY_MS, **s3.sim_kwargs(fw, ctrl, g))
     for k in ('pose', 'v_true', 'duty', 'pwm'):
         if not np.all(np.isfinite(log[k])):
             raise FloatingPointError(f'non-finite {k} in the log')
@@ -478,8 +546,32 @@ def run_values(row):
     return vals, flags
 
 
+def tv_duty_run_error(row):
+    """S04 v6.7 section 3 (section 9 item 7): a run that is not a run_error but whose tv_duty is missing or not
+    finite counts as a run_error, at the run level: the same row with status 'run_error' and the reason in
+    'error' (the other fields are kept as scored)."""
+    if row.get('status') == 'run_error' or _finite(row.get('tv_duty')) is not None:
+        return row
+    return dict(row, status='run_error', error=f'tv_duty {row.get("tv_duty")!r} missing or not finite: counted as '
+                                               f'a run_error (S04 v6.7 section 3)')
+
+
+def score_ngoai_bang(n):
+    """S04 v6.8 section 2 (G-Q2): a candidate outside the LADRC triangle is not run; it gets the penalty of a
+    run_error candidate of section 3 (g1 = n, the number of runs of the evaluation mode; f1, f2 and the gate
+    quantities 1e6) with status 'ngoai_bang'. Same keys as score(); no run was made (n_runs 0, no evals row), so
+    it is in neither part of the seed error rate (CC1-3)."""
+    return dict(f1=PENALTY, f2=PENALTY, g1=float(n), g2=(PENALTY - D) / D, g3=(PENALTY - D) / D,
+                g4=(PENALTY - D) / D, g5=(PENALTY - THETA_MAX_DEG) / THETA_MAX_DEG, status='ngoai_bang', n_runs=0,
+                n_false=0, n_inconclusive=0, n_track_err=0, n_run_error=0, pen_f1=1, n_pen_runs=0)
+
+
 def score(rows, error):
     """f1, f2, g1 .. g5 and counts of one candidate from its [(mu, v, row)] (section 3, S04 v6.2)."""
+    # S04 v6.7 section 3: a run with tv_duty missing or not finite counts as a run_error also when the caller
+    # did not convert the row (Evaluator.candidate does, tv_duty_run_error)
+    error = bool(error) or any(r.get('status') != 'run_error' and _finite(r.get('tv_duty')) is None
+                               for _, _, r in rows)
     n = len(rows)
     counts = dict(n_runs=n, n_false=sum(r['completed'] == 'false' for _, _, r in rows),
                   n_inconclusive=sum(r['completed'] == 'inconclusive' for _, _, r in rows),
@@ -639,16 +731,28 @@ def summarise(ctrl, dom, finals):
 
 
 def seed_error_rates(evals, ctrl):
-    """Section 3 (v4, B8b-7): per seed, first-attempt runs inconclusive or run_error / first-attempt runs."""
+    """Section 3 (v4, B8b-7): per seed, first-attempt runs inconclusive or run_error / first-attempt runs.
+    S04 v6.8 section 2 (CC1-3): a row with status 'ngoai_bang' (should a tool write one) is in neither the
+    numerator nor the denominator."""
     out = {}
     for r in evals:
-        if r['controller'] != ctrl or int(r['attempt']) != 1:
+        if r['controller'] != ctrl or int(r['attempt']) != 1 or r.get('status') == 'ngoai_bang':
             continue
         c = out.setdefault(int(r['ga_seed']), [0, 0])
         c[1] += 1
         c[0] += r['completed'] == 'inconclusive' or r['status'] == 'run_error'
     return {s: dict(rate=a / n if n else 0.0, n=n, over_10pct=n > 0 and a / n > SEED_ERR_LIMIT)
             for s, (a, n) in sorted(out.items())}
+
+
+def ngoai_bang_counts(history, ctrl):
+    """S04 v6.8 section 2: {ga_seed: number of candidates with status 'ngoai_bang'} of one controller, for every
+    seed in history (0 when it has none)."""
+    out = {}
+    for h in history:
+        if h['controller'] == ctrl:
+            out[int(h['ga_seed'])] = out.get(int(h['ga_seed']), 0) + int(h.get('status') == 'ngoai_bang')
+    return dict(sorted(out.items()))
 
 
 POP_COLS = ['controller', 'ga_seed', 'gen', 'cand_id', 'feasible', 'nondominated_feasible', 'nondominated_in_group',
@@ -683,9 +787,9 @@ def pareto_rows(ctrl, finals):
 
 
 def default_f2(fw, dll, ctrl, speeds, mu_mid, work):
-    """f2 of the firmware default gains at the middle mu (HV reference, section 4.2). S4C-7: the
-    reference is only locked from a valid run (every run 'ok' or 'track_err' scored, no run_error,
-    f2 finite and > 0); otherwise the trial stops."""
+    """f2 of the firmware default gains at the middle mu. Until S04 v6.7 this gave the HV reference; since v6.8
+    the reference is (D; 800 1/s) (section 4.2) and the trial no longer calls this function (kept for the
+    record)."""
     ev = Evaluator(fw, dll, ctrl, speeds, [mu_mid], work)
     s = ev.candidate(s3.defaults(fw, ctrl), 0, 0, 0)
     ok = s['status'] == 'ok' and s['n_run_error'] == 0 and math.isfinite(s['f2']) and s['f2'] > 0
@@ -694,8 +798,20 @@ def default_f2(fw, dll, ctrl, speeds, mu_mid, work):
 
 # ── post checks (section 6) ──────────────────────────────────────────────────────────
 
-def run_custom(fw, path, ctrl, g, v, mu, b0_factor=1.0, r_factor=1.0):
-    """s03_doe.run_one with b0 (LADRC) and / or motor R scaled; returns (row, log, read-back, plant before/after)."""
+def gate_states(res, frames, sch):
+    """{g1_state .. g5_state} of one run from the gate scorer o1_gate.gate, called as s03_doe.run_one calls it
+    (U = 0 on fwsim, every condition deciding); the states count the undefined frames (S04 v6.7 9.7)."""
+    v_cmd_max, wz_cmd_max = s3.cmd_max(sch)
+    gt = og.gate(frames, res['completed'], v_cmd_max=v_cmd_max, wz_cmd_max=wz_cmd_max, u_t=s3.GATE_U_T,
+                 decide=og.DECIDE_ALL, status=res['status'], g1_fields=oge.g1_fields_v7(res))
+    return {f'{c}_state': gt[c]['state'] for c in og.CONDS}
+
+
+def run_custom(fw, path, ctrl, g, v, mu, b0_factor=1.0, r_factor=1.0, io_delay_ms=0):
+    """s03_doe.run_one with b0 (LADRC) and / or motor R scaled; io_delay_ms = pure delay on the duty in 1 ms
+    steps (fwsim.simulate). The row is the gate evaluator summary (o1_gate_eval.evaluate_fig8, evaluate_v7
+    unchanged inside) plus the g1_state .. g5_state of the gate scorer (gate_states, S04 v6.7 9.7). Returns
+    (row, log, read-back, plant before/after)."""
     sch = o1.Schedule(v)
     p = fwsim.plant_params(argparse.Namespace(ground='traction', mu=mu))
     before = plant_dump(p)
@@ -705,10 +821,12 @@ def run_custom(fw, path, ctrl, g, v, mu, b0_factor=1.0, r_factor=1.0):
     kw = s3.sim_kwargs(fw, ctrl, g)
     if ctrl == 'ADRC' and b0_factor != 1.0:
         kw['adrc'] = {i: (a, b, b0 * b0_factor, lim) for i, (a, b, b0, lim) in kw['adrc'].items()}
-    log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + o1.T_LATE, p, seed=s3.SEED, mode=ctrl, imu=dict(s3.IMU), **kw)
+    log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + o1.T_LATE, p, seed=s3.SEED, mode=ctrl, imu=dict(s3.IMU),
+                         io_delay_ms=io_delay_ms, **kw)
     back = [fw.get_adrc(i) for i in range(3)] if ctrl == 'ADRC' else [fw.get_pid(i) for i in range(3)]
     back.append(dict(pos=fwsim.pos_meta(fw, raw=True)))  # exact float32 pos_kp, pos_ki (S4C-8); k_psi has no getter (S3C-21)
-    res, _ = o1.evaluate_v7(log, path, sch, lsum=p.lx + p.ly)
+    res, _, frames = oge.evaluate_fig8(log, path, sch, lsum=p.lx + p.ly)   # evaluate_v7 unchanged inside
+    res.update(gate_states(res, frames, sch))
     return res, log, back, before, after
 
 
@@ -733,7 +851,8 @@ def plant_dump(p):
 
 
 def judge(rows, key):
-    """B0_SENS criterion (written before, B0_SENS/2026-11-05_run01) per (v, mu) against factor 1.0."""
+    """B0_SENS criterion (written before, B0_SENS/2026-11-05_run01) per (v, mu) against factor 1.0; the
+    G3, G4, G5 states are read from the gate state columns (S04 v6.2 section 6, v6.7 9.7)."""
     reasons = []
     for (v, mu) in sorted({(r['v'], r['mu']) for r in rows}):
         nom = next(r for r in rows if r['v'] == v and r['mu'] == mu and r[key] == 1.0)
@@ -747,15 +866,50 @@ def judge(rows, key):
                 reasons.append(f'{tag}: e_perp_max <= D changes')
             if abs(r['e_perp_max'] - nom['e_perp_max']) > REL_LIMIT * nom['e_perp_max']:
                 reasons.append(f'{tag}: e_perp_max {nom["e_perp_max"]:.4f} -> {r["e_perp_max"]:.4f}')
+            for c in MU_RULE_GATE:               # S04 v6.2 section 6: a G3, G4 or G5 state change is 'sensitive'
+                if r[f'{c}_state'] != nom[f'{c}_state']:
+                    reasons.append(f'{tag}: {c.upper()} state {nom[f"{c}_state"]} -> {r[f"{c}_state"]}')
     return bool(reasons), reasons
 
 
 def three_mu_findings(rows, ctrl):
-    """Runs of the three-mu check not passing the gate. S4C-9: a track_err / run_error run is not a
-    passed gate even with completed 'true'."""
-    return [f"v={r['v']} mu={r['mu']}: status {r.get('status')}, completed {r['completed']}, e_perp_max "
-            f"{r.get('e_perp_max')}" for r in rows if r['controller'] == ctrl and
-            (r.get('status') != 'ok' or r['completed'] != 'true' or float(r.get('e_perp_max') or 0) > D)]
+    """Runs of the three-mu check not passing the gate G1-G5 (S04 v6.2 section 6; v6.7 section 9 item 7). The
+    states are read from the gate's state columns g1_state .. g5_state (o1_gate.gate: undefined frames counted),
+    never derived from a maximum against its threshold. A run passes only with status 'ok' (S4C-9: a track_err /
+    run_error run is not a passed gate) and the five states 'dat'; a missing state is not a pass."""
+    out = []
+    for r in rows:
+        if r['controller'] != ctrl:
+            continue
+        st = {c: r.get(f'{c}_state') or 'missing' for c in og.CONDS}
+        if r.get('status') != 'ok' or any(s != 'dat' for s in st.values()):
+            out.append(f"v={r['v']} mu={r['mu']}: status {r.get('status')}, "
+                       + ', '.join(f'{c.upper()} {s}' for c, s in st.items())
+                       + f", completed {r.get('completed')}, e_perp_max {r.get('e_perp_max')}, e_trk_max "
+                         f"{r.get('e_trk_max')}, e_bao_max {r.get('e_bao_max')}, e_theta_cmd_max_deg "
+                         f"{r.get('e_theta_cmd_max_deg')}")
+    return out
+
+
+def submodel_spectral_radius(ctrl, g):
+    """S04 v6.8 section 6: spectral radius of the linear sub-model for the whole gain set (5 states for PID, 6 for
+    LADRC; one translation axis). TODO: not computed in this version (the sub-model module is written in another
+    task); returns None and the caller records that it was not computed."""
+    return None
+
+
+def pre_hil_check(ctrl, g):
+    """S04 v6.8 section 6, before the selected gains go to HIL: inside the range table of the campaign binary
+    (float32) and, for LADRC, inside the triangle of each axis (gain_check, i.e. tools/gain_table.check). A
+    failure is reported (tell Liam); the gains are never chosen again here."""
+    try:
+        table, tri = gain_check(ctrl, g)
+    except s3.S03Stop as e:
+        table, tri = [str(e)], []
+    return dict(ok=not table and not tri, in_table=not table, in_triangle=(not tri) if ctrl == 'ADRC' else None,
+                table_violations=table, triangle_violations=tri,
+                spectral_radius=submodel_spectral_radius(ctrl, g),
+                spectral_radius_note='TODO: not computed in this version (S04 v6.8 section 6)')
 
 
 def post(a):
@@ -776,6 +930,7 @@ def post(a):
     t0 = time.time()
     fw, path = fwsim.FirmwareSim(a.dll), o1.Path8()
     det, sens, mu3, notes, plant_full = [], [], [], {}, {}
+    pre_bad = 0
     for s in sel:
         ctrl = s['controller']
         if s.get('feasible') != 'true':
@@ -783,6 +938,8 @@ def post(a):
             continue
         L = lock['controllers'][ctrl]
         g = {n: float(s[n]) for n in s3.FACTORS[ctrl]}          # read back from the file (section 6)
+        notes[f'{ctrl} pre_hil'] = pre_hil_check(ctrl, g)       # S04 v6.8 section 6
+        pre_bad += not notes[f'{ctrl} pre_hil']['ok']
         mus, speeds = L['eval_mu'], L['speeds']
         key = (s['ga_seed'], s['gen'], s['cand_id'])
         ref = {(float(e['v']), float(e['mu'])): e['log_sha256'] for e in evals
@@ -803,6 +960,9 @@ def post(a):
                         rows.append(dict(tool_check=tc, controller=ctrl, check=kind, v=v, mu=mu, **{kind: k},
                                          completed=res_['completed'], status=res_['status'],
                                          e_perp_max=res_['e_perp_max'], tv_duty=res_['tv_duty'],
+                                         e_trk_max=res_['e_trk_max'], e_bao_max=res_['e_bao_max'],
+                                         e_theta_cmd_max_deg=res_['e_theta_cmd_max_deg'],
+                                         **{c: res_[c] for c in GATE_STATE_COLS},
                                          read_back=json.dumps(back), plant_changed=json.dumps(
                                              {x: (before[x], after[x]) for x in before if before[x] != after[x]})))
             for r in rows:
@@ -818,7 +978,7 @@ def post(a):
                 for v in speeds:
                     row, _ = s3.safe_run(fw, path, ctrl, g, v, mu)
                     mu3.append(dict(tool_check=tc, controller=ctrl, v=v, mu=mu,
-                                    **{k: row.get(k, '') for k in EVAL_COLS if k in row}))
+                                    **{k: row.get(k, '') for k in EVAL_COLS + GATE_STATE_COLS if k in row}))
             warn = three_mu_findings(mu3, ctrl)
             if len(set(levels)) < 3:            # S4C-10: never an empty list for a check that was not done
                 notes[f'{ctrl} three_mu'] = dict(
@@ -826,8 +986,8 @@ def post(a):
                                      'check of S04 6 was NOT done', findings=warn)
             else:
                 notes[f'{ctrl} three_mu'] = dict(done=True, findings=warn,
-                                                 note='findings: runs not passing the gate; empty = every run ok, '
-                                                      'completed and e_perp_max <= D')
+                                                 note='findings: runs not passing the gate; empty = every run has '
+                                                      'status ok and G1-G5 dat (gate state columns)')
     write_rows(os.path.join(pc, 'determinism.csv'), det)
     write_rows(os.path.join(pc, 'sensitivity.csv'), sens)
     write_rows(os.path.join(pc, 'three_mu.csv'), mu3)
@@ -842,14 +1002,89 @@ def post(a):
         json.dump(dict(tool_check=tc, determinism_all_equal=all(d['equal'] for d in det) if det else None, notes=notes,
                        script=s3.git_state(os.path.join(HERE, '..')), dll_sha256=s3.sha256_file(a.dll),
                        criterion='B0_SENS/2026-11-05_run01: sensitive if completed changes, e_perp_max <= D changes, '
-                                 'or e_perp_max changes by more than 50 % of the factor-1.0 value; tv_duty change '
-                                 'reported, not a criterion (S04 6, B8b-21); rank after the change not reported',
+                                 'a G3, G4 or G5 state changes (gate state columns, S04 v6.2), or e_perp_max changes '
+                                 'by more than 50 % of the factor-1.0 value; tv_duty change reported, not a criterion '
+                                 '(S04 6, B8b-21); rank after the change not reported',
                        r_factors=R_FACTORS, b0_factors=B0_FACTORS), f, indent=1, default=str)
     log_phase(out, dict(phase='post', elapsed_s=round(time.time() - t0)))
     write_root_meta(out, a.dll, lock)
     print(f'post checks -> {pc}; tool_check {tc}; determinism equal: {all(d["equal"] for d in det) if det else None}')
     for k, v in notes.items():
         print(f'  {k}: {v}')
+    if pre_bad:
+        print('TELL LIAM before HIL: selected gains outside the range table or the LADRC triangle (S04 v6.8 '
+              'section 6); no reselection')
+        return 2
+    return 0
+
+
+def delay_steps(measured_ms):
+    """S04 v6.8 section 6 (S03 v8.6 section 8 condition 12): (io_delay_ms values, rule text) of the loop-delay
+    variant, in whole 1 ms steps (fwsim.simulate takes whole steps). measured_ms None (no measured bench loop
+    delay yet): 1 and 2 ms. A measured delay within DELAY_INT_TOL of a whole number of ms: that number; else both
+    the rounding down and the rounding up. Not finite or negative: refused."""
+    if measured_ms is None:
+        return list(DELAY_DEFAULT_MS), 'no measured bench loop delay: 1 and 2 ms (S04 v6.8 section 6)'
+    x = float(measured_ms)
+    if not math.isfinite(x) or x < 0:
+        sys.exit(f'--io-delay-ms {measured_ms!r}: a finite delay >= 0 in ms')
+    n = round(x)
+    if abs(x - n) <= DELAY_INT_TOL:
+        return [int(n)], f'measured {x!r} ms is a whole number of 1 ms steps (within {DELAY_INT_TOL} ms): {int(n)} ms'
+    return [math.floor(x), math.ceil(x)], (f'measured {x!r} ms is not a whole number of 1 ms steps: both the rounding '
+                                           f'down ({math.floor(x)} ms) and up ({math.ceil(x)} ms)')
+
+
+def sens_after(a):
+    """S04 v6.1 / v6.8 section 6, sensitivity check after selection, REPORT ONLY (never used to change or choose
+    gains): the loop-delay variant. The send_to_HIL gains read back from selected.csv run at the GA speeds and mu
+    with io_delay_ms = 0 (the GA condition, baseline rows) and the values of delay_steps(--io-delay-ms). Reported
+    per run: completed, e_perp_max, the G3-G5 values and the G1-G5 states of the gate (gate state columns),
+    tv_duty. Output only in <out>/sens_after/ (delay.csv, notes.json): phases.json, meta.yaml, lock.yaml and
+    post_checks/ are not written, so the inputs the RSM comparison hashes (section 12) do not change. The three
+    plant variants of S04 v6.1 section 6 (R with J, b, T_c, T_s; R alone x 0.82; battery 11.1 V) are not in this
+    script."""
+    out = a.out
+    lock = json.load(open(os.path.join(out, 'lock.yaml'), encoding='utf-8'))
+    sel = [r for r in read_csv(os.path.join(out, 'selected.csv')) if r['kind'] == 'send_to_HIL']
+    d = os.path.join(out, SENS_AFTER_DIR)
+    if os.path.isdir(d) and os.listdir(d):
+        sys.exit(f'{d} already holds data')
+    common = lock.get('common')
+    if not common:
+        sys.exit(f'{out}/lock.yaml has no common block (written by this script version): run a new folder')
+    check_fingerprint(common, fingerprint(a.dll, common['s03_run'], unsealed=common.get('unsealed', False)),
+                      'sens_after')
+    measured = getattr(a, 'io_delay_ms', None)
+    steps, rule = delay_steps(measured)
+    tc = common['tool_check']
+    os.makedirs(d, exist_ok=True)
+    t0 = time.time()
+    fw, path = fwsim.FirmwareSim(a.dll), o1.Path8()
+    rows, notes = [], {}
+    for s in sel:
+        ctrl = s['controller']
+        if s.get('feasible') != 'true':
+            notes[ctrl] = 'no send_to_HIL gains: ' + s.get('note', '')
+            continue
+        L = lock['controllers'][ctrl]
+        g = {n: float(s[n]) for n in s3.FACTORS[ctrl]}          # read back from the file (section 6)
+        for mu in L['eval_mu']:
+            for v in L['speeds']:
+                for k in [GA_IO_DELAY_MS] + [x for x in steps if x != GA_IO_DELAY_MS]:
+                    res, _, _, _, _ = run_custom(fw, path, ctrl, g, v, mu, io_delay_ms=k)
+                    rows.append(dict(tool_check=tc, controller=ctrl, variant='io_delay_ms', io_delay_ms=k,
+                                     baseline=k == GA_IO_DELAY_MS, v=v, mu=mu,
+                                     **{c: res[c] for c in SENS_AFTER_COLS[7:]}))
+    write_rows(os.path.join(d, 'delay.csv'), rows, SENS_AFTER_COLS)
+    with open(os.path.join(d, 'notes.json'), 'w', encoding='utf-8') as f:
+        json.dump(dict(tool_check=tc, report_only=True, variant='io_delay_ms', measured_io_delay_ms=measured,
+                       io_delay_ms_run=steps, rule=rule, baseline_io_delay_ms=GA_IO_DELAY_MS,
+                       not_in_this_script='the three plant variants of S04 v6.1 section 6 (R x 0.8 / x 1.25 with J, '
+                                          'b, T_c, T_s; R x 0.82 alone; battery 11.1 V)',
+                       notes=notes, elapsed_s=round(time.time() - t0), script=s3.git_state(os.path.join(HERE, '..')),
+                       dll_sha256=s3.sha256_file(a.dll)), f, indent=1, default=str)
+    print(f'sensitivity after selection (report only) -> {d}; io_delay_ms {steps} ({rule}); tool_check {tc}')
     return 0
 
 
@@ -857,7 +1092,7 @@ def post(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--phase', required=True, choices=('trial', 'main', 'post'))
+    ap.add_argument('--phase', required=True, choices=('trial', 'main', 'post', 'sens_after'))
     ap.add_argument('--out', required=True)
     ap.add_argument('--controller', choices=s3.CONTROLLERS)
     ap.add_argument('--s03', help='S03 run folder (levels.csv, meta.yaml, sealed/runs.csv)')
@@ -872,9 +1107,17 @@ def main():
     ap.add_argument('--gen-base', type=int, default=GEN_BASE)
     ap.add_argument('--gen-max', type=int, default=GEN_MAX)
     ap.add_argument('--seeds', type=int, nargs='+', default=None, help='main phase GA seeds (default 1-5)')
+    ap.add_argument('--io-delay-ms', type=float, default=None,
+                    help='--phase sens_after only: measured loop delay of the HIL bench [ms] (S06); not a whole '
+                         'number: both the rounding down and up are run; not given: 1 and 2 ms (S04 v6.8 section 6)')
     a = ap.parse_args()
+    if a.io_delay_ms is not None and a.phase != 'sens_after':
+        sys.exit('--io-delay-ms only with --phase sens_after: the GA, its trial and the post checks run with '
+                 'io_delay_ms = 0 and slip_omega_s = 0.1 (S04 v6.8 section 6; S03 v8.6 section 8 condition 12)')
     if a.phase == 'post':
         return post(a)
+    if a.phase == 'sens_after':
+        return sens_after(a)
     if not a.controller or not a.s03:
         sys.exit('--controller and --s03 are needed for the trial and main phases')
     if not a.tool_check and (a.pop, a.gen_base, a.gen_max) != (POP, GEN_BASE, GEN_MAX):
@@ -958,13 +1201,7 @@ def main():
         write_root_meta(a.out, a.dll, dict(lock, controllers=dict(lock['controllers'], **{ctrl: L_new})),
                         running=f'trial {ctrl}')
         work = os.path.join(tdir, '_work')
-        f2_def, def_score, def_evals, def_ok = default_f2(fw, a.dll, ctrl, gate, mu_mid, work)
-        if not def_ok:                          # S4C-7: no HV reference from a penalty or a failed run
-            write_rows(os.path.join(tdir, 'evals.csv'), def_evals, EVAL_COLS)
-            sys.exit(f'STOP: the default gains of {ctrl} did not give a valid run at mu {mu_mid} '
-                     f'(status {def_score["status"]}, f2 {def_score["f2"]}): no HV reference (S04 4.2); tell Liam. '
-                     f'Runs in {tdir}/evals.csv')
-        ref = (D, HV_REF_MULT * f2_def)
+        ref = (D, HV_REF_F2)                    # S04 v6.8 section 4.2: fixed reference, the default gains do not run
         ev = Evaluator(fw, a.dll, ctrl, gate, eval_mu, work)
         history, hv_rows = [], []
         final, n_gen, extended = run_seed(ev, dom, SEEDS[0], a.pop, None, ref, history, hv_rows,
@@ -972,9 +1209,9 @@ def main():
         feasible_final = any(p['feasible'] for p in final)
         locked_gen = a.gen_max if extended else a.gen_base
         stop = (extended and not feasible_final)
-        check_eval_keys(def_evals + ev.evals)                                   # S4C-13
+        check_eval_keys(ev.evals)                                             # S4C-13
         write_rows(os.path.join(tdir, 'history.csv'), history)
-        write_rows(os.path.join(tdir, 'evals.csv'), def_evals + ev.evals, EVAL_COLS)
+        write_rows(os.path.join(tdir, 'evals.csv'), ev.evals, EVAL_COLS)
         write_rows(os.path.join(tdir, 'hv.csv'), hv_rows)
         write_rows(os.path.join(tdir, 'pareto.csv'), pareto_rows(ctrl, {SEEDS[0]: final}), POP_COLS)
         write_rows(os.path.join(tdir, 'final_population.csv'), population_rows(ctrl, {SEEDS[0]: final}), POP_COLS)
@@ -983,7 +1220,7 @@ def main():
             base=a.gen_base, max=a.gen_max, compared_with=gen_compare(a.gen_base),
             hv_base=hv_rows[a.gen_base - 1]['hv'] if len(hv_rows) >= a.gen_base else None,
             hv_compared=hv_rows[gen_compare(a.gen_base) - 1]['hv'] if len(hv_rows) >= a.gen_base else None,
-            extended=extended), hv_ref=list(ref), default_f2=f2_def, default_score=def_score,
+            extended=extended), hv_ref=list(ref),
             trial_elapsed_s=round(elapsed), trial_generations=n_gen, trial_feasible_final=feasible_final,
             stop=('no feasible point after the extended trial: tell Liam (S04 4.3)' if stop else None))
         lock['controllers'][ctrl] = L_new
@@ -993,7 +1230,8 @@ def main():
         write_meta(os.path.join(tdir, 'meta.yaml'), a, fw, ctrl, dict(
             phase='trial', elapsed_s=round(elapsed), generations=n_gen, extended=extended, locked_n_gen=locked_gen,
             mu_decision=decision, eval_mu=eval_mu, speeds=gate, pop=a.pop, seeds_locked=L_new['seeds'],
-            gen_rule=L_new['gen_rule'], hv_ref=list(ref), preconditions=pre), pymoo, eval_mu)
+            gen_rule=L_new['gen_rule'], hv_ref=list(ref), preconditions=pre,
+            n_ngoai_bang=ngoai_bang_counts(history, ctrl).get(SEEDS[0], 0)), pymoo, eval_mu)
         log_phase(a.out, dict(phase='trial', controller=ctrl, elapsed_s=round(elapsed)))
         write_root_meta(a.out, a.dll, lock)
         print(f'[{ctrl}] trial: {n_gen} generations, extended {extended}, feasible at the end {feasible_final}; '
@@ -1039,6 +1277,7 @@ def main():
         finals[seed], _, _ = run_seed(ev, dom, seed, L['pop'], L['n_gen'], ref, history, hv_rows)
     sel, stats = summarise(ctrl, dom, finals)
     errs = seed_error_rates(ev.evals, ctrl)
+    n_ngoai = ngoai_bang_counts(history, ctrl)
     check_eval_keys(ev.evals)                                                   # S4C-13
     for name, rows, cols in ((f'history_{ctrl}.csv', history, None), (f'evals_{ctrl}.csv', ev.evals, EVAL_COLS),
                              (f'hv_{ctrl}.csv', hv_rows, None), (f'pareto_{ctrl}.csv', pareto_rows(ctrl, finals), POP_COLS),
@@ -1049,7 +1288,7 @@ def main():
     elapsed = time.time() - t0
     write_meta(os.path.join(a.out, f'meta_{ctrl}.yaml'), a, fw, ctrl, dict(
         phase='main', elapsed_s=round(elapsed), seeds=seeds, n_gen=L['n_gen'], pop=L['pop'], eval_mu=L['eval_mu'],
-        speeds=L['speeds'], selection=stats, seed_error_rates=errs,
+        speeds=L['speeds'], selection=stats, seed_error_rates=errs, n_ngoai_bang_per_seed=n_ngoai,
         seeds_over_10pct=[s for s, e in errs.items() if e['over_10pct']]), pymoo, L['eval_mu'])
     log_phase(a.out, dict(phase='main', controller=ctrl, elapsed_s=round(elapsed), seeds=seeds))
     write_root_meta(a.out, a.dll, lock)
@@ -1061,6 +1300,7 @@ def main():
           f'send_to_HIL: {"f1 %.4f f2 %.3f" % (send["f1"], send["f2"]) if send["feasible"] else send["note"]}')
     if any(e['over_10pct'] for e in errs.values()):
         print('NOTE: a seed has more than 10 % inconclusive / run_error runs: CODE looks for a tool error (S04 3)')
+    print(f'[{ctrl}] ngoai_bang candidates (outside the LADRC triangle, not run) per seed: {n_ngoai}')
     return 0 if send['feasible'] else 2
 
 
@@ -1078,7 +1318,8 @@ def gen_compare(gen_base):
 SOURCES = ('fwsim/s04_ga.py', 'fwsim/s03_doe.py', 'fwsim/o1_feasibility.py', 'fwsim/fwsim.py', 'fwsim/tune_ga.py',
            'rpi5/trajectory_pub.py', 'rpi5/imu_model.py', 'rpi5/plant_blob.py', 'tools/run_validity.py',
            'rpi5/data/imu_noise_replay_20hz.csv', 'rpi5/data/imu_noise_replay_100hz.csv',   # IMN-7: replay data
-           'fwsim/o1_gate_eval.py', 'fwsim/o1_gate.py', 'tools/o1_lanes.py', 'rpi5/o1_tasks.py')   # g3-g5 (S04 v6.2)
+           'fwsim/o1_gate_eval.py', 'fwsim/o1_gate.py', 'tools/o1_lanes.py', 'rpi5/o1_tasks.py',   # g3-g5 (S04 v6.2)
+           'tools/gain_table.py')            # S04 v6.8 section 2: the candidate check
 PYMOO_FILES = ('core/individual.py', 'core/survival.py', 'algorithms/moo/nsga2.py')     # PYMOO_CV refers to these
 
 
@@ -1223,6 +1464,9 @@ def write_root_meta(out, dll, lock, running=None):
     phases = json.load(open(p, encoding='utf-8')) if os.path.isfile(p) else []
     pn = os.path.join(out, 'code_notes.json')
     code_notes = json.load(open(pn, encoding='utf-8')) if os.path.isfile(pn) else None
+    pp = os.path.join(out, 'post_checks', 'notes.json')
+    pre_hil = ({k: v for k, v in (json.load(open(pp, encoding='utf-8')).get('notes') or {}).items()
+                if k.endswith(' pre_hil')} if os.path.isfile(pp) else None)
     fw_info = json.load(open(os.path.join(os.path.dirname(dll), 'fwsim_build.json'), encoding='utf-8')) \
         if os.path.isfile(os.path.join(os.path.dirname(dll), 'fwsim_build.json')) else None
     import pymoo
@@ -1230,7 +1474,7 @@ def write_root_meta(out, dll, lock, running=None):
     ctrls = {}
     for c, L in lock.get('controllers', {}).items():
         ctrls[c] = {k: L.get(k) for k in ('tool_check', 'domain', 'speeds', 'eval_mu', 'mu_decision', 'mu_rule_report',
-                                          'pop', 'n_gen', 'gen_rule', 'seeds', 'hv_ref', 'default_f2', 'preconditions',
+                                          'pop', 'n_gen', 'gen_rule', 'seeds', 'hv_ref', 'preconditions',
                                           'stop')}
         ctrls[c]['plant_by_mu'] = {repr(m): json.loads(fwsim.plant_meta(fwsim.plant_params(
             argparse.Namespace(ground='traction', mu=m)))) for m in (L.get('eval_mu') or [])}
@@ -1245,7 +1489,7 @@ def write_root_meta(out, dll, lock, running=None):
                             recheck=pymoo.__version__ != PYMOO_CHECKED),
                  selection_rule=SELECTION_RULE, D=D, imu=s3.IMU, plant_seed=s3.SEED, controllers=ctrls,
                  phases=phases, elapsed_s=sum(int(x.get('elapsed_s', 0)) for x in phases),
-                 code_notes=code_notes, pymoo_files=pymoo_file_hashes(),
+                 code_notes=code_notes, pre_hil=pre_hil, pymoo_files=pymoo_file_hashes(),
                  files=('lock.yaml, phases.json, code_notes.json (CODE notes, optional), trial/<controller>/, '
                         'history/evals/hv/pareto/final_population/selected[_<controller>].csv, meta_<controller>.yaml, '
                         'post_checks/'))
@@ -1299,7 +1543,7 @@ plant_by_mu: {json.dumps(plant)}
 imu: {json.dumps(s3.IMU)}
 plant_seed: {s3.SEED}
 objectives: "f1 = max e_perp_max over the evaluation runs (m); f2 = max over mu of the mean over the gate speeds of tv_duty (1/s); minimised"
-constraints: "g1 = runs not completed, inconclusive or with a track error (all runs when a run_error); g2 = (f1 - D) / D, D = {D} m; g3 = (max e_trk_max - D) / D; g4 = (max e_bao_max - D) / D; g5 = (max e_theta_cmd_max_deg - {THETA_MAX_DEG}) / {THETA_MAX_DEG} (S04 v6.2); a run_error run, or a quantity missing or not finite, takes {PENALTY:g} with pen_<quantity> = 1 in evals.csv (S04 v6.3 RS2-8); pymoo G <= 0"
+constraints: "g1 = runs not completed, inconclusive or with a track error (all runs when a run_error); g2 = (f1 - D) / D, D = {D} m; g3 = (max e_trk_max - D) / D; g4 = (max e_bao_max - D) / D; g5 = (max e_theta_cmd_max_deg - {THETA_MAX_DEG}) / {THETA_MAX_DEG} (S04 v6.2); a run_error run, or a quantity missing or not finite, takes {PENALTY:g} with pen_<quantity> = 1 in evals.csv (S04 v6.3 RS2-8); a candidate outside the LADRC triangle (tools/gain_table.check) is not run: the same penalty as a run_error candidate, status ngoai_bang (S04 v6.8 section 2); pymoo G <= 0"
 pymoo: {json.dumps(dict(version=pymoo.__version__, checked_version=PYMOO_CHECKED, constraint_handling=PYMOO_CV,
                        recheck=pymoo.__version__ != PYMOO_CHECKED))}
 libraries: {json.dumps(fwsim.lib_versions())}
@@ -1307,17 +1551,20 @@ interpretations:   # of this script, not written in S04 v5; Liam or THESIS corre
   - "a new script fwsim/s04_ga.py (S04 9.1 names tune_ga.py): tune_ga.py keeps its velocity objective for the old runs, unchanged"
   - "S04 v6.4 (C14-2; Liam 15/11 CODE_FEAS 'Code ngay + Codex'): selected.csv keeps edge (the 5 % flag, formula unchanged) and adds edge_side (factor:L or :H), edge_src (factor:side:source of that bound from the S03 levels.csv L_nguon / H_nguon, ? when the S03 run has none) and edge_limit (the flagged factors whose bound is a grid end, 'het luoi noi' or 'het luoi duoi': the limit 'vung ngoai bien chua khao sat'); no flag, no limit; RSM candidates (section 12) are not in this script yet"
   - "S04 v6.6 (Liam 17/11 THESIS_SLIDE; script: Liam 17/11 CODE_FEAS 'Code + Codex 2 vong'): the GA domain is [L, H] of the original S03 grid (S03 v8.4: the extension only for the out-of-range check); levels of S03 v8.3 (H_nguon 'het luoi noi' or H above b) are refused; edge_limit names the grid ends 'het luoi', 'het luoi duoi' (limit 'vung ngoai bien chua khao sat bang GA') with the S03 kiem_ngoai_mien.csv result on that side (? without the file)"
-  - "mu rule: every S03 design point that ran (centre, outer, inner box: the inner box always runs since L41), every gate speed; status other than ok (track_err, run_error) or y1 inconclusive at any mu is 'not satisfied'"
-  - "HV: exact 2-D staircase on the feasible non-dominated points of the population after each generation's survival, strictly inside the reference; the trial rule compares generation gen_base with gen_base - 5 (15 and 20); with --tool-check and gen_base < 6 with generation 1"
+  - "mu rule: every S03 design point that ran (centre, outer, inner box: the inner box always runs since L41), every gate speed; status other than ok (track_err, run_error) or y1 inconclusive at any mu is 'not satisfied'; the G3, G4, G5 states must be the same at the three mu, read from the gate state columns g3_state, g4_state, g5_state of the S03 sealed/runs.csv (a row without them stops the rule; S04 v6.2, v6.7 9.7); a state that is the same at the three mu satisfies the rule whatever it is (S04 3 asks for the same state only); S04 v6.8: |dY3| <= 0.4 1/s (absolute, S03 5.2), the y3_reference of the S03 meta.yaml is not read"
+  - "HV: exact 2-D staircase on the feasible non-dominated points of the population after each generation's survival, strictly inside the reference (S04 v6.8 4.2: (D; 800 1/s), fixed; a point with f1 >= D or f2 >= 800 adds 0 and is counted in hv.csv n_nd_on_or_beyond_ref); the trial rule compares generation gen_base with gen_base - 5 (15 and 20); with --tool-check and gen_base < 6 with generation 1"
   - "pareto.csv: per seed's final population, the non-dominated points among the feasible points and, separately, among the infeasible points (column feasible; nondominated_feasible true only for the first group, nondominated_in_group true for both); always written with its header, also when empty; final_population.csv: every point of it with both flags (S04 8)"
-  - "the HV reference is locked only from a valid run of the default gains (no run_error, f2 finite and > 0); otherwise the trial stops"
+  - "S04 v6.8 4.2: the HV reference no longer comes from the default gains; the trial does not run them (no evals.csv row with ga_seed 0, no default_f2 in lock.yaml)"
   - "per seed set (section 5): the feasible non-dominated points of the final population (pymoo algorithm.pop after the last generation)"
   - "run_error: attempt 2 in a new process is recorded with 'cause' empty; the candidate is scored as the first attempt (S04 3); CODE fills 'cause' when it finds a tool error"
   - "R sensitivity: motor_R of the four wheels x 0.8, 0.9, 1.0, 1.1, 1.2 (S04 6 says +-20 %), every other plant parameter as params.py (J, b not rescaled)"
   - "gains stored as Python repr (17 significant digits) and as the float32 value the firmware receives (fwsim set_pid / set_adrc take c_float)"
-  - "evals.csv rows with ga_seed 0, gen 0 (trial folder): the firmware default gains at the middle mu, run once for the HV reference (section 4.2)"
   - "g3-g5 (S04 v6.2, R134 package): e_bao_max of o1_gate_eval.evaluate_fig8 (evaluate_v7 unchanged inside); the diagnosis attempt 2 of a run_error runs s03_doe's evaluator in a new process (diagnosis only; pen_e_bao_max = 1 when that s03_doe writes no e_bao_max); a candidate with a run_error takes 1e6 for every quantity as for f1"
-  - "not in this version (S04 v6.2-v6.3, open): the G3-G5 states in the mu rule (needs the S03 run with G1-G5, S03 v8.2) and G3-G5 in the section 6 post checks"
+  - "S04 v6.7 9.7: the post checks read G1-G5 from the gate state columns (o1_gate.gate called as s03_doe.run_one calls it: U = 0, every condition deciding): run_custom scores with o1_gate_eval.evaluate_fig8 and the gate; sensitive when a G3, G4 or G5 state changes; three_mu.csv and sensitivity.csv carry g1_state .. g5_state; a three-mu run passes only with status ok and the five states dat"
+  - "S04 v6.8 2: every candidate is checked by tools/gain_table.check before it runs (float32 values): a gain outside the range table stops the run (tool error); an ADRC candidate outside the triangle is not run: penalty of a run_error candidate, status ngoai_bang in history.csv, no evals.csv row (so in neither part of the seed error rate), n_runs 0, pen_f1 1; the number per seed is n_ngoai_bang_per_seed of meta_<controller>.yaml; what counts as a triangle violation is decided by gain_table.check alone (its warnings are not violations)"
+  - "S04 v6.7 3: a run that is not a run_error but has tv_duty missing or not finite is recorded with status run_error and the reason in error (its other fields kept), then treated as any run_error (diagnosis rerun, candidate penalty, seed error rate)"
+  - "S04 v6.8 6: before HIL (post) the selected gains are checked against the range table and the triangle (post_checks/notes.json '<controller> pre_hil', copied to meta.yaml pre_hil; a failure is reported with exit code 2, no reselection); the spectral radius of the sub-model is not computed in this version (TODO, null)"
+  - "S04 v6.8 6: --phase sens_after (sensitivity check after selection, report only) has only the loop-delay variant (io_delay_ms; --io-delay-ms is the measured bench delay: not whole -> rounding down and up, within 1e-9 ms of a whole number -> that number; not given -> 1 and 2 ms) plus io_delay_ms 0 as baseline rows; output in sens_after/ only (phases.json, meta.yaml, post_checks/ not written); the three plant variants of S04 v6.1 6 are not in this script; the GA, the trial and the post checks run with io_delay_ms = 0 and slip_omega_s = 0.1 (run_gate stops on another slip_omega_s)"
 """)
 
 

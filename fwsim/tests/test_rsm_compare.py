@@ -25,8 +25,9 @@ _DLL = os.path.join(fwsim.HERE, 'build', 'fwsim.dll')
 needs_dll = pytest.mark.skipif(not os.path.isfile(_DLL), reason='fwsim.dll not built')
 MU = (0.4, 0.5, 0.6)
 SPEEDS = (0.2, 0.5, 0.8)
-LEVELS = {c: {n: ((0.5, 8.0) if k % 2 == 0 else (1.0, 3.0)) for k, n in enumerate(s3.FACTORS[c])}
-          for c in s3.CONTROLLERS}
+# S04 v6.8: the synthetic levels lie inside the range table (kp_wz ceiling 4.6)
+LEVELS = {c: {n: (((0.5, 4.0) if n == 'kp_wz' else (0.5, 8.0)) if k % 2 == 0 else (1.0, 3.0))
+              for k, n in enumerate(s3.FACTORS[c])} for c in s3.CONTROLLERS}
 
 
 # ── synthetic truth ──────────────────────────────────────────────────────────────────
@@ -73,6 +74,31 @@ def encode(dom, g):
         else:
             out.append((x - (L + H) / 2.0) / ((H - L) / 2.0))
     return out
+
+
+# S04 v6.8 12.3: an ADRC domain the LADRC triangle cuts (corner 180 + 2 x 40 = 260), and responses pulled to it
+LEVELS_TRI = dict(LEVELS, ADRC=dict(zip(s3.FACTORS['ADRC'], [(20.0, 180.0), (10.0, 40.0), (0.5, 8.0), (1.0, 3.0),
+                                                             (0.5, 8.0), (1.0, 3.0), (0.5, 8.0)])))
+T_TRI = np.array([1.0, 1.0, 0.3, 0.3, 0.3, 0.3, 0.3])
+
+
+def q1_tri(c, mu=0.5, v=0.2):
+    c = np.asarray(c, dtype=float)
+    return 0.03 + 0.0005 * float(np.sum(c ** 2)) - 0.001 * float(c[0] + c[1])
+
+
+def q2_tri(c, mu=0.5, v=0.2):
+    c = np.asarray(c, dtype=float)
+    return 5.0 + 0.5 * float(np.sum((c - T_TRI) ** 2))
+
+
+def _dom(levels, ctrl):
+    return [dict(name=n, L=L, H=H, scale='log' if L > 0 and H / L >= 4 else 'lin')
+            for n, (L, H) in ((n, levels[n]) for n in s3.FACTORS[ctrl])]
+
+
+def _gains(dom, code):
+    return {d['name']: s3.decode(float(c), d['L'], d['H'], d['scale']) for d, c in zip(dom, code)}
 
 
 # ── synthetic folders ────────────────────────────────────────────────────────────────
@@ -261,7 +287,7 @@ def fake_eval(monkeypatch):
 
 
 def setup(tmp_path, dll, **kw):
-    s03_kw = {k: kw.pop(k) for k in list(kw) if k in ('q1', 'q2', 'mods', 'fake', 'test_mods')}
+    s03_kw = {k: kw.pop(k) for k in list(kw) if k in ('q1', 'q2', 'mods', 'fake', 'test_mods', 'levels')}
     repo = make_repo(tmp_path)
     s03 = make_s03(tmp_path, dll=dll, **s03_kw)
     q = {k: s03_kw[k] for k in ('q1', 'q2') if k in s03_kw}
@@ -659,6 +685,85 @@ def test_ga_points_labels(tmp_path, dummy_dll, fake_eval):
     assert float(summ['maxabs_f1']) < 1e-9 and float(pts[0]['X1']) == pytest.approx(0.2)
 
 
+def test_adrc_candidate_outside_the_triangle_is_dropped_before_m(tmp_path, dummy_dll, fake_eval, monkeypatch):
+    """S04 v6.8 12.3 (ii): the corner solution (xy sum 260, the smaller f2_hat) is dropped before M is counted;
+    the kept boundary solution is still ranked cand_id 1."""
+    import scipy.optimize as so
+    real = so.minimize
+
+    def fake_min(fun, x0, **kw):
+        r = real(fun, x0, **kw)
+        if len(kw.get('constraints') or []) == 4 and x0[0] > 0:      # step 2 of ADRC, part of the starts
+            r.x, r.success = T_TRI.copy(), True
+        return r
+    monkeypatch.setattr(so, 'minimize', fake_min)
+    repo, s03, s04 = setup(tmp_path, dummy_dll, ctrls=('ADRC',), levels=LEVELS_TRI, q1=q1_tri, q2=q2_tri)
+    rc.run_phase('fit', str(s04), dummy_dll)
+    rc.run_phase('opt', str(s04), dummy_dll)
+    cands = list(csv.DictReader(open(s04 / 'rsm' / 'opt' / 'candidates.csv')))
+    assert len(cands) == 1 and cands[0]['cand_id'] == '1'
+    row = cands[0]
+    assert 199.9 < float(row['omega_c_xy']) + 2 * float(row['omega_o_xy']) <= rc.TRI_MAX + 1e-6
+    assert s4.gain_check('ADRC', {n: float(row[n]) for n in s3.FACTORS['ADRC']}) == ([], [])
+    res = list(csv.DictReader(open(s04 / 'rsm' / 'confirm' / 'result.csv')))[0]
+    assert res['state'] == 'x_RSM' and res['M'] == '1' and res['n_ngoai_tam_giac'] == '1'
+    assert res['n_tried'] == '1' and res['ga_in_tri_band'] == 'false'
+    assert set(json.loads(res['ga_tri_sums'])) == {'xy', 'wz'}
+
+
+def test_adrc_every_candidate_outside_the_triangle_is_state_ii(tmp_path, dummy_dll, fake_eval, monkeypatch):
+    """S04 v6.8 12.3 (ii): M = 0 after the drop is failure state (ii): no evaluator call, no candidate row, the
+    axial sensitivity has no point; the GA point inside the band still reports ga_in_tri_band true."""
+    import scipy.optimize as so
+    real = so.minimize
+
+    def fake_min(fun, x0, **kw):
+        r = real(fun, x0, **kw)
+        if len(kw.get('constraints') or []) == 4:                    # step 2 of ADRC, every start
+            r.x, r.success = T_TRI.copy(), True
+        return r
+    monkeypatch.setattr(so, 'minimize', fake_min)
+    repo, s03, s04 = setup(tmp_path, dummy_dll, ctrls=('ADRC',), levels=LEVELS_TRI, q1=q1_tri, q2=q2_tri)
+    p = s04 / 'selected.csv'
+    sel = list(csv.DictReader(open(p, encoding='utf-8')))
+    row = next(r for r in sel if r['kind'] == 'send_to_HIL')
+    row['omega_c_xy'] = repr(199.995 - 2 * float(row['omega_o_xy']))   # x_GA inside the band (v6.8 12.3)
+    s3.write_csv(str(p), sel)
+    rc.run_phase('fit', str(s04), dummy_dll)
+    rc.run_phase('opt', str(s04), dummy_dll)
+    res = list(csv.DictReader(open(s04 / 'rsm' / 'confirm' / 'result.csv')))[0]
+    assert res['state'].startswith('R0 (ii)') and res['rsm_class'] == 'R0'
+    assert res['M'] == '0' and res['n_ngoai_tam_giac'] == '1' and res['n_tried'] == '0'
+    assert fake_eval['calls'] == 0
+    assert not list(csv.DictReader(open(s04 / 'rsm' / 'opt' / 'candidates.csv')))
+    ax = list(csv.DictReader(open(s04 / 'rsm' / 'check' / 'axial_sens.csv')))
+    assert ax[0]['at'] == 'none'
+    assert res['ga_in_tri_band'] == 'true'
+
+
+def test_pid_result_has_no_triangle_columns_filled(tmp_path, dummy_dll, fake_eval):
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    rc.run_phase('fit', str(s04), dummy_dll)
+    rc.run_phase('opt', str(s04), dummy_dll)
+    res = list(csv.DictReader(open(s04 / 'rsm' / 'confirm' / 'result.csv')))[0]
+    assert res['n_ngoai_tam_giac'] == '0' and res['ga_tri_sums'] == '' and res['ga_in_tri_band'] == ''
+    assert res['state'] == 'x_RSM'
+
+
+def test_ga_points_count_ngoai_bang_as_unlabelled(tmp_path, dummy_dll, fake_eval):
+    """S04 v6.8 2: a GA candidate with status ngoai_bang was not run (no evals row): unlabelled, its own reason."""
+    repo, s03, s04 = setup(tmp_path, dummy_dll, ctrls=('ADRC',))
+    p = s04 / 'history_ADRC.csv'
+    rows = list(csv.DictReader(open(p, encoding='utf-8')))
+    rows.append(dict(rows[0], cand_id='99', status='ngoai_bang'))
+    s3.write_csv(str(p), rows)
+    rc.run_phase('fit', str(s04), dummy_dll)
+    rc.run_phase('opt', str(s04), dummy_dll)
+    summ = next(r for r in csv.DictReader(open(s04 / 'rsm' / 'check' / 'ga_errors.csv')) if r['kind'] == 'summary')
+    assert json.loads(summ['unlabelled_by_reason']) == {'ngoai_bang (not run)': 1}
+    assert summ['n_unlabelled'] == '1' and summ['n_labelled'] == '2'
+
+
 # ── locks, attempts, no overwrite (12.7) ─────────────────────────────────────────────
 
 def test_order_and_no_overwrite(tmp_path, dummy_dll, fake_eval):
@@ -1019,6 +1124,77 @@ def test_candidate_filter_bounds_and_dedup():
     got = rc.candidates([dict(code=near, f1_hat=0.03, f2_hat=1.0), dict(code=at, f1_hat=0.03, f2_hat=1.0),
                          dict(code=a, f1_hat=0.03, f2_hat=1.0)], 0.03)
     assert [c['code'] for c in got] == [a, at]                                 # RSM2-7: input order reversed
+
+
+def test_triangle_constraints_pid_none_adrc_two_axes():
+    """S04 v6.8 12.3 (G-Q4): the SLSQP constraints omega_c + 2 omega_o <= 199.99 of each axis on the decoded real
+    values, the analytic Jacobian included (decode_slope: log/log on xy, log/lin on wz); () for PID."""
+    assert rc.TRI_MAX == 199.99
+    assert rc.triangle_constraints('PID', _dom(LEVELS['PID'], 'PID')) == ()
+    dom = _dom(LEVELS_TRI['ADRC'], 'ADRC')
+    cons = rc.triangle_constraints('ADRC', dom)
+    assert len(cons) == 2 and all(c['type'] == 'ineq' for c in cons)
+    c = np.array([0.4, -0.2, 0.1, 0.7, 0.0, 0.0, 0.0])
+    g = _gains(dom, c)
+    assert cons[0]['fun'](c) == pytest.approx(rc.TRI_MAX - (g['omega_c_xy'] + 2 * g['omega_o_xy']), abs=1e-12)
+    assert cons[1]['fun'](c) == pytest.approx(rc.TRI_MAX - (g['omega_c_wz'] + 2 * g['omega_o_wz']), abs=1e-12)
+    num = np.array([[(con['fun'](c + h) - con['fun'](c - h)) / 2e-6 for h in np.eye(7) * 1e-6] for con in cons])
+    assert np.allclose([con['jac'](c) for con in cons], num, atol=1e-5)
+    assert rc.triangle_sums('PID', {}) == {}
+    assert rc.triangle_sums('ADRC', dict(omega_c_xy=100.0, omega_o_xy=40.0, omega_c_wz=8.0,
+                                       omega_o_wz=3.0)) == {'xy': 180.0, 'wz': 14.0}
+    h = 1e-6
+    assert rc.decode_slope(0.3, 1.0, 3.0, 'lin') == pytest.approx(1.0)
+    assert rc.decode_slope(0.3, 0.5, 8.0, 'log') == pytest.approx(
+        (s3.decode(0.3 + h, 0.5, 8.0, 'log') - s3.decode(0.3 - h, 0.5, 8.0, 'log')) / (2 * h), rel=1e-6)
+    c2 = np.zeros(7)                                             # omega_c_xy = 119.99, omega_o_xy = 40: on the bound
+    c2[0] = 2 * math.log((rc.TRI_MAX - 80.0) / 60.0) / math.log(9.0)
+    c2[1] = 1.0
+    assert abs(cons[0]['fun'](c2)) < 1e-9
+
+
+def test_optimise_keeps_both_steps_inside_the_triangle():
+    """S04 v6.8 12.3: with the triangle constraints both SLSQP steps stay inside the band and the candidate sits
+    on the bound; without them the same problem ends at the corner 180 + 2 x 40 = 260."""
+    exp = rc.expected_codes()
+    C = np.array([exp[p][1] for p in rc.FIT_IDS])
+    dom = _dom(LEVELS_TRI['ADRC'], 'ADRC')
+    b1 = rc.fit_ls(C, [q1_tri(c) for c in C])[0]
+    b2 = rc.fit_ls(C, [q2_tri(c) for c in C])[0]
+    starts = [C[i] for i in range(0, len(C), 12)]
+    state, f1s, rows, cands = rc.optimise(b1, b2, starts, rc.triangle_constraints('ADRC', dom))
+    assert state is None and cands
+    assert {r['step'] for r in rows} == {1, 2}
+    for row in rows:
+        if row['converged']:
+            g = _gains(dom, json.loads(row['code']))
+            assert max(rc.triangle_sums('ADRC', g).values()) <= rc.TRI_MAX + 1e-6
+    g = _gains(dom, cands[0]['code'])
+    assert rc.triangle_sums('ADRC', g)['xy'] == pytest.approx(rc.TRI_MAX, abs=1e-4)
+    assert s4.gain_check('ADRC', g) == ([], [])
+    state2, _, _, cands2 = rc.optimise(b1, b2, starts)
+    assert cands2 and rc.triangle_sums('ADRC', _gains(dom, cands2[0]['code']))['xy'] > 200
+
+
+@pytest.mark.parametrize('lv,code,ok', [
+    (dict(kp_xy=(0.5, 41.0)), [1.0, 0, 0, 0, 0, 0, 0], True),           # exactly the ceiling
+    (dict(kp_xy=(0.5, 41.0000001)), [1.0, 0, 0, 0, 0, 0, 0], True),     # binary64 above 41, float32 exactly 41.0
+    (dict(kp_xy=(0.5, 41.00001)), [1.0, 0, 0, 0, 0, 0, 0], False),      # float32 above the ceiling
+    (dict(kp_wz=(0.5, 8.0)), [0, 0, 1.0, 0, 0, 0, 0], False),           # float32 8.0 above the ceiling 4.6
+    (dict(kp_wz=(0.5, 8.0)), [0.0] * 7, True),                         # inside the table
+])
+def test_to_gains_checks_the_range_table_on_float32(tmp_path, dummy_dll, lv, code, ok):
+    """S04 v6.8 12.3 (ii): to_gains compares the float32 gains with the range table (a binary64 just above the
+    ceiling can round down to an accepted float32)."""
+    levels = dict(LEVELS, PID=dict(LEVELS['PID'], **lv))
+    repo, s03, s04 = setup(tmp_path, dummy_dll, levels=levels)
+    inp = rc.Inputs(str(s04), dummy_dll)
+    if ok:
+        g, edge, dom = rc.to_gains(inp, 'PID', [float(x) for x in code])
+        assert s4.gain_check('PID', g) == ([], [])
+    else:
+        with pytest.raises(rc.Stop, match='range table'):
+            rc.to_gains(inp, 'PID', [float(x) for x in code])
 
 
 def test_edge_side_and_source_columns(tmp_path, dummy_dll, fake_eval):

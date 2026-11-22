@@ -11,7 +11,9 @@ runs and post checks) and the S03 run it used; writes <S04>/rsm/ (S04 section 8)
               lock.yaml); a middle-mu pair; variants no_flag, cens05 (f1 cut at 0.5 m),
               drop_axial_<point_id>; rsm/fit/ and rsm/fit/lock.yaml.
   opt   12.3  two SLSQP steps on the model from the 143 CCD points (min f1_hat; min f2_hat with
-              f1_hat <= f1_hat* + 0.01 m and f1_hat <= D), candidate list (eps 1e-6, duplicates
+              f1_hat <= f1_hat* + 0.01 m and f1_hat <= D, for ADRC both with omega_c + 2 omega_o
+              <= 199.99 per axis (v6.8); candidates outside the range table stop, outside the LADRC
+              triangle on float32 are dropped before M), candidate list (eps 1e-6, duplicates
               closer than 1e-4, order f2_hat, f1_hat, codes); 12.4 confirmation on fwsim of at most
               min(5, M) candidates with the GA evaluator (s04_ga.Evaluator: same runs, scoring,
               run_error rule), labels of every tried candidate; mu3 (x_RSM at the low and high mu
@@ -61,7 +63,7 @@ import fwsim                 # noqa: E402
 import s03_doe as s3         # noqa: E402
 import s04_ga as s4          # noqa: E402
 
-SPEC = 'S04 v6.4 section 12 (06_SPECS/2026-11-05_Spec_S04_GA_chon_gain.md)'
+SPEC = 'S04 v6.4 section 12 with the v6.8 triangle rule of 12.3 (06_SPECS/2026-11-05_Spec_S04_GA_chon_gain.md)'
 # settings of phases 1-2, constants of the script, locked by its commit before any data is read (12.7)
 SOLVER = dict(method='SLSQP', ftol=1e-9, maxiter=500)      # 12.3
 EPS = 1e-6                    # m, one tolerance everywhere in 12.3-12.4
@@ -69,6 +71,8 @@ DEDUP = 1e-4                  # Euclidean distance in code space: closer candida
 K = 5                         # at most min(K, M) candidates confirmed (12.4)
 CENS = 0.5                    # m, f1 cut of the cens05 sensitivity fit (12.2)
 F2_REL = 0.2                  # R2 tolerance on f2 (12.5)
+TRI_MAX = 199.99              # S04 v6.8 12.3 (G-Q4): omega_c + 2 omega_o <= 199.99 per axis, real values (margin 0.01)
+TRI_AXES = ('xy', 'wz')
 D = s4.D
 F1_TOL = s4.F1_TOL
 THETA_MAX_DEG = s4.THETA_MAX_DEG
@@ -156,6 +160,17 @@ INTERPRETATIONS = [
     'file SHA-256 in the locks and attempts.csv: of the bytes as written and of the bytes with CRLF -> LF '
     '(compared: the LF value, so a checkout with core.autocrlf keeps the lock valid)',
     'no x_GA (send_to_HIL infeasible in S04) stops the run: 12.5 does not define the classes without it',
+    'S04 v6.8 12.3 (G-Q4): for ADRC both SLSQP steps carry omega_c + 2 omega_o <= 199.99 per axis (xy, wz) on the '
+    'real values after s03_doe.decode, analytic Jacobian; no further tolerance is applied to this constraint when '
+    'the candidates are listed (the solver success flag decides); the float32 check of the next item is the hard one',
+    'code to gain (S04 v6.8 12.3 (ii)): after s03_doe.check_bounds the float32 gains go through s04_ga.gain_check '
+    '(tools/gain_table.check): a gain outside the range table stops the run; a candidate outside the LADRC triangle '
+    'on float32 is dropped before M is counted (result.csv n_ngoai_tam_giac), the kept candidates are ranked 1..M, '
+    'and M = 0 after the drop is state (ii); a GA candidate with status ngoai_bang (not run) is counted as '
+    'unlabelled in ga_errors.csv',
+    'S04 v6.8 12.3: result.csv ga_tri_sums = omega_c + 2 omega_o per axis of x_GA on its real values, '
+    'ga_in_tri_band = true when one is above 199.99 (the band below 200 that the RSM search does not cover); both '
+    'empty for PID',
 ]
 
 EVALUATOR = None              # tests replace it; None = s04_ga.Evaluator on fwsim.FirmwareSim(dll)
@@ -945,8 +960,46 @@ def load_coefs(inp):
     return {k: np.array([v[t] for t in TERMS]) for k, v in out.items()}
 
 
-def optimise(b1, b2, starts):
-    """12.3: (state, f1_star, start rows, candidates [dict code, f1h, f2h]). state None or 'i' / 'ii'."""
+def decode_slope(code, L, H, scale):
+    """d/d code of s03_doe.decode(code, L, H, scale)."""
+    if scale == 'log':
+        return s3.decode(code, L, H, scale) * math.log(H / L) / 2.0
+    return (H - L) / 2.0
+
+
+def triangle_sums(ctrl, g):
+    """S04 v6.8 12.3: {axis: omega_c + 2 omega_o} on the real (binary64) gains g; {} for PID."""
+    if ctrl != 'ADRC':
+        return {}
+    return {ax: g[f'omega_c_{ax}'] + 2.0 * g[f'omega_o_{ax}'] for ax in TRI_AXES}
+
+
+def triangle_constraints(ctrl, dom):
+    """S04 v6.8 12.3 (G-Q4): for LADRC the SLSQP constraints omega_c + 2 omega_o <= TRI_MAX of each axis, on the
+    real values after decoding (s03_doe.decode on the locked domain dom), with the analytic Jacobian; () for PID.
+    They go into BOTH steps of optimise."""
+    if ctrl != 'ADRC':
+        return ()
+    at = {d['name']: (k, d['L'], d['H'], d['scale']) for k, d in enumerate(dom)}
+    out = []
+    for ax in TRI_AXES:
+        (ic, *lc), (io, *lo) = at[f'omega_c_{ax}'], at[f'omega_o_{ax}']
+
+        def fun(c, ic=ic, io=io, lc=lc, lo=lo):
+            return TRI_MAX - (s3.decode(c[ic], *lc) + 2.0 * s3.decode(c[io], *lo))
+
+        def jac(c, ic=ic, io=io, lc=lc, lo=lo):
+            g = np.zeros(len(c))
+            g[ic] = -decode_slope(c[ic], *lc)
+            g[io] = -2.0 * decode_slope(c[io], *lo)
+            return g
+        out.append(dict(type='ineq', fun=fun, jac=jac))
+    return tuple(out)
+
+
+def optimise(b1, b2, starts, extra=()):
+    """12.3: (state, f1_star, start rows, candidates [dict code, f1h, f2h]). state None or 'i' / 'ii'.
+    extra: SLSQP constraints added to both steps (S04 v6.8 12.3: the LADRC triangle)."""
     from scipy.optimize import minimize
     bounds = [(-1.0, 1.0)] * 7
     opts = dict(ftol=SOLVER['ftol'], maxiter=SOLVER['maxiter'])
@@ -970,13 +1023,13 @@ def optimise(b1, b2, starts):
 
     f1 = (lambda c: predict(b1, c)), (lambda c: gradient(b1, c))
     f2 = (lambda c: predict(b2, c)), (lambda c: gradient(b2, c))
-    s1 = [one(1, k, x0, *f1) for k, x0 in enumerate(starts)]
+    s1 = [one(1, k, x0, *f1, cons=extra) for k, x0 in enumerate(starts)]
     conv1 = [x for ok, x in s1 if ok]
     if not conv1:
         return 'i', None, rows, []
     f1s = min(predict(b1, x) for x in conv1)
     cons = (dict(type='ineq', fun=lambda c: f1s + F1_TOL - f1[0](c), jac=lambda c: -f1[1](c)),
-            dict(type='ineq', fun=lambda c: D - f1[0](c), jac=lambda c: -f1[1](c)))
+            dict(type='ineq', fun=lambda c: D - f1[0](c), jac=lambda c: -f1[1](c))) + tuple(extra)
     s2 = [one(2, k, x0, *f2, cons=cons) for k, x0 in enumerate(starts)]
     conv2 = [x for ok, x in s2 if ok]
     if not conv2:
@@ -999,7 +1052,8 @@ def candidates(points, f1s):
 
 
 def to_gains(inp, ctrl, code):
-    """Code -> gains by s03_doe.decode on levels.csv, bounds by s03_doe.check_bounds (12.3 [v6])."""
+    """Code -> gains by s03_doe.decode on levels.csv, bounds by s03_doe.check_bounds (12.3 [v6]); S04 v6.8
+    12.3 (ii): the float32 gains then go through s04_ga.gain_check (the range table of the campaign binary)."""
     dom = inp.ctrl_lock(ctrl)['domain']
     lv = {d['name']: (d['L'], d['H'], d['scale']) for d in dom}
     names = [d['name'] for d in dom]
@@ -1010,9 +1064,17 @@ def to_gains(inp, ctrl, code):
         s3.check_bounds(ctrl, lv, [('rsm', 'rsm', tuple(code))], gains_at)
     except s3.S03Stop as e:
         raise Stop(f'{e}: tell THESIS (12.3)') from None
+    g = gains_at(code)
+    try:
+        table, _ = s4.gain_check(ctrl, g)               # S04 v6.8 12.3 (ii): float32 against the range table
+    except s3.S03Stop as e:
+        raise Stop(f'{e}: tell THESIS (12.3)') from None
+    if table:
+        raise Stop(f'{ctrl}: float32 gain outside the range table of the campaign binary ({"; ".join(table)}): '
+                   f'tell THESIS (S04 v6.8 12.3 (ii))')
     lo, hi = s4.ga_bounds(dom)
     xga = [a + (c + 1.0) / 2.0 * (b - a) for c, a, b in zip(code, lo, hi)]
-    return gains_at(code), s4.edge_report(dom, xga), dom
+    return g, s4.edge_report(dom, xga), dom
 
 
 def make_evaluator(inp, ctrl, mus, work, cache):
@@ -1206,6 +1268,9 @@ def ga_points(inp, ctrl, betas):
         p['err_f1'], p['err_f2'] = p['f1_hat'] - p['f1'], p['f2_hat'] - p['f2']
         seen[gains] = p
         pts.append(p)
+    for key, h in hist.items():                     # S04 v6.8 2: not run (outside the LADRC triangle): no label
+        if key not in groups and h.get('status') == 'ngoai_bang':
+            why_none['ngoai_bang (not run)'] = why_none.get('ngoai_bang (not run)', 0) + 1
     summ = dict(controller=ctrl, n_labelled=len(pts), n_unlabelled=sum(why_none.values()),
                 unlabelled_by_reason=json.dumps(why_none), n_dup_differing=len(dups), dup_differing=json.dumps(dups))
     for k in ('f1', 'f2'):
@@ -1299,15 +1364,26 @@ def run_opt(inp, ctx, log=print):
     for ctrl in inp.ctrls:
         b1, b2 = coefs[(ctrl, 'main', 'base', 'f1')], coefs[(ctrl, 'main', 'base', 'f2')]
         starts = [np.array([float(p[f'X{k}']) for k in range(1, 8)]) for p in sorted(fitp[ctrl], key=lambda p: int(p['point_id']))]
-        state, f1s, srows, cands = optimise(b1, b2, starts)
+        dom = inp.ctrl_lock(ctrl)['domain']
+        state, f1s, srows, cands = optimise(b1, b2, starts, triangle_constraints(ctrl, dom))
         starts_rows += [dict(controller=ctrl, **r) for r in srows]
-        for rank, c in enumerate(cands, 1):
+        kept, n_tri = [], 0
+        for c in cands:
             g, edge, dom = to_gains(inp, ctrl, c['code'])
+            if s4.gain_check(ctrl, g)[1]:           # S04 v6.8 12.3: outside the LADRC triangle on float32:
+                n_tri += 1                          # dropped before M is counted
+                continue
+            kept.append((c, g, edge))
+        for rank, (c, g, edge) in enumerate(kept, 1):
             cand_rows.append(dict(controller=ctrl, cand_id=rank, code=json.dumps([repr(v) for v in c['code']]),
                                   **{f'X{k + 1}': v for k, v in enumerate(c['code'])}, f1_hat=c['f1_hat'],
                                   f2_hat=c['f2_hat'], neg_f1_hat=c['f1_hat'] < 0, neg_f2_hat=c['f2_hat'] < 0,
                                   **edge, **s4.gain_cols(dom, dict(x=[g[d['name']] for d in dom]))))
-        per_ctrl[ctrl] = dict(state=state, f1_star=f1s, M=len(cands), b1=b1, b2=b2)
+        if state is None and not kept:
+            state = 'ii'                            # M = 0 after the drop is state (ii) of 12.4
+        if n_tri:
+            log(f'[{ctrl}] {n_tri} candidate(s) outside the LADRC triangle on float32 dropped before M (12.3)')
+        per_ctrl[ctrl] = dict(state=state, f1_star=f1s, M=len(kept), n_tri=n_tri, b1=b1, b2=b2)
     write_csv(os.path.join(inp.out, 'opt', 'starts.csv'), starts_rows)
     fixed = ['controller', 'cand_id', 'code'] + [f'X{k}' for k in range(1, 8)] + \
         ['f1_hat', 'f2_hat', 'neg_f1_hat', 'neg_f2_hat', 'edge', 'edge_side', 'edge_src', 'edge_limit']
@@ -1328,6 +1404,8 @@ def run_opt(inp, ctx, log=print):
         send = next(r for r in sel if r['kind'] == 'send_to_HIL' and r['controller'] == ctrl)
         x_ga = dict(f1=float(send['f1']), f2=float(send['f2']), x=[float(send[n]) for n in s3.FACTORS[ctrl]],
                     ga_seed=int(send['ga_seed']), who='GA')
+        ga_sums = triangle_sums(ctrl, dict(zip(s3.FACTORS[ctrl], x_ga['x'])))   # S04 v6.8 12.3: x_GA in the band
+                                                                              # the RSM search does not cover
         cls, mu_rsm, mu_ga, mu_src, per_rsm, per_ga = 'R0', '', '', '', '', ''
         lo_hi = [m for m in inp.mu_levels if not math.isclose(m, inp.mu_mid)]
         if x is not None:
@@ -1359,14 +1437,17 @@ def run_opt(inp, ctx, log=print):
             raise Stop(f'{ctrl}: the three label counts do not add up (12.4 (iii), internal check)')
         results.append(dict(controller=ctrl, state={'i': 'R0 (i) no convergence', 'ii': 'R0 (ii) no candidate',
                                                     'iii': 'R0 (iii) no candidate passed'}.get(pc['state'], 'x_RSM'),
-                            rsm_class=cls, M=pc['M'], f1_hat_star=pc['f1_star'] if pc['f1_star'] is not None else '',
+                            rsm_class=cls, M=pc['M'], n_ngoai_tam_giac=pc['n_tri'],
+                            f1_hat_star=pc['f1_star'] if pc['f1_star'] is not None else '',
                             n_tried=n_tried, n_violation_observed=counts['violation_observed'],
                             n_run_error_excluded=counts['run_error_excluded'], n_inconclusive=counts['inconclusive'],
                             x_rsm_cand_id=x['cand_id'] if x else '', f1_rsm=x['f1'] if x else '',
                             f2_rsm=x['f2'] if x else '', f1_ga=x_ga['f1'], f2_ga=x_ga['f2'],
                             mu_label_rsm=mu_rsm, mu_label_ga=mu_ga, mu_label_rsm_per_mu=per_rsm,
                             mu_label_ga_per_mu=per_ga, mu_label_ga_source=mu_src,
-                            n_run_error_runs=sum(r['status'] == 'run_error' and int(r['attempt']) == 1 for r in ev)))
+                            n_run_error_runs=sum(r['status'] == 'run_error' and int(r['attempt']) == 1 for r in ev),
+                            ga_tri_sums=json.dumps(ga_sums) if ga_sums else '',
+                            ga_in_tri_band=any(v > TRI_MAX for v in ga_sums.values()) if ga_sums else ''))
         # 12.6 GA points, axial sensitivity, cost
         pts, summ = ga_points(inp, ctrl, dict(f1=pc['b1'], f2=pc['b2']))
         ga_rows += [{k: v for k, v in p.items() if k != 'key'} for p in pts]
@@ -1392,7 +1473,8 @@ def run_opt(inp, ctx, log=print):
         cost += cost_rows(inp, ctrl, evals_rsm, times, dict(
             confirm=min(K, pc['M']) * runs_per, mu3=(len(lo_hi) * len(L['speeds']) if x is not None
                                                      and len(L['eval_mu']) == 1 and len(lo_hi) == 2 else 0)))
-        summary[ctrl] = dict(state=results[-1]['state'], rsm_class=cls, M=pc['M'], n_tried=n_tried)
+        summary[ctrl] = dict(state=results[-1]['state'], rsm_class=cls, M=pc['M'],
+                             n_ngoai_tam_giac=pc['n_tri'], n_tried=n_tried)
     cost += shared_cost_rows(inp)
     keys = [(r['controller'], r['phase'], r['cand_id'], r['v'], r['mu'], r['attempt']) for r in evals_rsm]
     if len(keys) != len(set(keys)):
