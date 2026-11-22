@@ -1,12 +1,15 @@
 """Tests of fwsim/s04_ga.py (spec S04 v5). Synthetic points and S03 folders with a known answer;
 the last test needs fwsim/build/fwsim.dll and runs the three phases end to end with a tiny
 budget (--tool-check). Run: python -m pytest fwsim/tests -q"""
+import argparse
+import collections
 import csv
 import json
 import math
 import os
 import re
 import sys
+import types
 
 import numpy as np
 import pytest
@@ -19,6 +22,14 @@ import s04_ga as s4  # noqa: E402
 
 _DLL = os.path.join(fwsim.HERE, 'build', 'fwsim.dll')
 needs_dll = pytest.mark.skipif(not os.path.isfile(_DLL), reason='fwsim.dll not built')
+
+# gain sets inside the range table of tools/gain_table.py (S04 v6.8 section 2: Evaluator.candidate checks them)
+G_PID = dict(kp_xy=1.5, ki_xy=0.05, kp_wz=1.0, ki_wz=0.05, pos_kp=6.0, pos_ki=3.0, k_psi=1.0)
+G_ADRC = dict(omega_c_xy=8.0, omega_o_xy=30.0, omega_c_wz=8.0, omega_o_wz=30.0, pos_kp=6.0, pos_ki=3.0, k_psi=1.0)
+DOM_PID7 = [dict(name=n, L=lo, H=hi, scale='lin') for n, (lo, hi) in zip(s3.FACTORS['PID'], [
+    (1.0, 2.0), (0.01, 0.1), (0.5, 2.0), (0.01, 0.1), (2.0, 8.0), (1.0, 4.0), (0.5, 2.0)])]
+DOM_ADRC7 = [dict(name=n, L=lo, H=hi, scale='lin') for n, (lo, hi) in zip(s3.FACTORS['ADRC'], [
+    (100.0, 190.0), (20.0, 48.0), (5.0, 10.0), (20.0, 30.0), (2.0, 8.0), (1.0, 4.0), (0.5, 2.0)])]
 
 
 def P(f1, f2, x=(1.0,), seed=1, feasible=True):
@@ -147,7 +158,8 @@ def _runs(mod=None):
         for mu in (0.4, 0.5, 0.6):
             for v in s3.SPEEDS:
                 r = dict(controller='PID', point_id=pid, box=box, mu=mu, v=v, status='ok', completed='true',
-                         e_perp_max=0.03, tv_duty=5.0)
+                         e_perp_max=0.03, tv_duty=5.0,
+                         g3_state='dat', g4_state='dat', g5_state='dat')   # v6.7 9.7: gate state columns
                 if mod:
                     mod(r)
                 out.append(r)
@@ -330,6 +342,62 @@ def test_v64_summarise_uses_the_ga_coordinate_on_a_log_axis(gains, side, limit):
         assert r['edge_limit'] == _limit(DOMLOG, limit), r['kind']
 
 
+_TABLE_LIMIT = 'vùng ngoài bảng chặn không thuộc thí nghiệm (DUT từ chối gain đó)'   # S04 v6.8 section 2, the spec text
+
+
+@pytest.mark.parametrize('x, limit, src', [
+    # Codex C3-7: flag + source 'trần bảng chặn' -> the table-ceiling limit, now with the message
+    ((4.55, 10.0, 1.5), 'TABLE:kp_wz:H', 'kp_wz:H:trần bảng chặn'),
+    ((2.0, 10.0, 1.5), '', ''),                                  # no flag, no limit whatever the source
+    ((0.65, 10.0, 1.5), 'vùng ngoài biên chưa khảo sát bằng GA: kp_wz:L [kiểm ngoài miền: 0 điểm]',
+     'kp_wz:L:hết lưới dưới'),                                   # the L side has another source: text as before
+    ((2.0, 19.0, 1.5), 'TABLE:b:H', 'b:H:trần bảng chặn'),       # exactly on the 5 % edge: 20 - 19 = 0.05 * 20
+    ((2.0, 19.0 - 2.0 ** -40, 1.5), '', ''),                     # just outside the 5 %
+    ((4.55, 10.0, 1.99), 'vùng ngoài biên chưa khảo sát bằng GA: c:H [kiểm ngoài miền: 1 điểm: không cờ 1, '
+     'chưa kết luận 0, cờ 0] | TABLE:kp_wz:H', 'kp_wz:H:trần bảng chặn | c:H:hết lưới'),   # both kinds
+    ((2.0, 10.0, 1.02), 'TABLE:c:L', 'c:L:trần bảng chặn'),      # the source decides, on the flagged side
+])
+def test_v68_edge_report_table_ceiling_limit(x, limit, src):
+    """S04 v6.8 section 2 (C3-7): a flagged bound whose source is 'trần bảng chặn' adds the limit
+    EDGE_LIMIT_TABLE to edge_limit; a grid end keeps the old text; the two kinds are joined by ' | ';
+    no flag, no limit."""
+    dom = [dict(name='kp_wz', L=0.6, H=4.6, scale='lin', L_src='hết lưới dưới', H_src='trần bảng chặn',
+                L_kiem='0 điểm'),
+           dict(name='b', L=0.0, H=20.0, scale='lin', L_src='0', H_src='trần bảng chặn'),
+           dict(name='c', L=1.0, H=2.0, scale='lin', L_src='trần bảng chặn', H_src='hết lưới',
+                H_kiem='1 điểm: không cờ 1, chưa kết luận 0, cờ 0')]
+    rep = s4.edge_report(dom, np.array(x))
+    assert rep['edge'] == ' '.join(s4.edge_flags(dom, np.array(x)))              # the old flag, unchanged
+    assert rep['edge_side'] == ' '.join(f'{n}:{s}' for n, s in s4.edge_sides(dom, np.array(x)))
+    assert rep['edge_src'] == src
+    assert rep['edge_limit'] == limit.replace('TABLE:', _TABLE_LIMIT + ': ')
+
+
+def test_v68_selected_rows_carry_the_table_ceiling_limit(tmp_path):
+    """S04 v6.8 section 2 (C3-7): through read_domain + summarise the table-ceiling limit reaches
+    selected.csv (edge_limit) for a selected point at the flagged bound."""
+    d = _s03_dir(tmp_path)
+    _edit_levels(d, L_nguon='0', H_nguon='trần bảng chặn', b='8.0')
+    dom = s4.read_domain(str(d), 'PID')
+    lo, hi = s4.ga_bounds(dom)
+    xga = (lo + hi) / 2
+    xga[0] = hi[0]                                              # the FIRST factor at its H bound
+    x = [s4.decode(dom, xga)[dd['name']] for dd in dom]
+    finals = {1: [P(0.020, 9.0, x=x, seed=1)], 2: [P(0.022, 4.0, x=x, seed=2)]}
+    for p in finals[1] + finals[2]:
+        p['xga'] = list(xga)
+    rows, _ = s4.summarise('PID', dom, finals)
+    for r in rows:
+        assert r['edge_side'] == f"{dom[0]['name']}:H" and \
+            r['edge_limit'] == _TABLE_LIMIT + f": {dom[0]['name']}:H", r['kind']
+
+
+def test_v68_table_ceiling_texts_are_those_of_the_spec():
+    """S04 v6.8 section 2 (C3-7): the source label of S03 v8.6 and the limit text of the spec, literally."""
+    assert s4.TABLE_CEILING_SOURCE == 'trần bảng chặn'
+    assert s4.EDGE_LIMIT_TABLE == _TABLE_LIMIT
+
+
 def test_mu_rule_mid_when_every_point_satisfies(tmp_path):
     d = _s03_dir(tmp_path, _runs())
     dec, rep = s4.mu_rule(str(d), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
@@ -344,6 +412,12 @@ def test_mu_rule_mid_when_every_point_satisfies(tmp_path):
     (lambda r: r.update(completed='false') if r['point_id'] == 0 and r['mu'] == 0.6 else None, 'differs'),
     (lambda r: r.update(e_perp_max=0.0411) if r['point_id'] == 1 and r['mu'] == 0.4 else None, 'dY2'),
     (lambda r: r.update(tv_duty=6.01) if r['point_id'] == 0 and r['mu'] == 0.6 else None, 'dY3'),
+    # v6.7 9.7: a G3, G4 or G5 gate state that changes over mu fails the rule
+    (lambda r: r.update(g3_state='khong_dat') if r['point_id'] == 1 and r['mu'] == 0.4 else None, 'g3 state differs'),
+    (lambda r: r.update(g4_state='chua_ket_luan') if r['point_id'] == 0 and r['mu'] == 0.6 else None,
+     'g4 state differs'),
+    (lambda r: r.update(g5_state='khong_dat') if r['point_id'] == 129 and r['mu'] == 0.5 else None,
+     'g5 state differs'),
 ])
 def test_mu_rule_all_when_one_point_fails(tmp_path, mod, why):
     """S04 3 (v4, B8b-4, B8b-5): one failing point of any box -> evaluate at the three mu."""
@@ -353,16 +427,56 @@ def test_mu_rule_all_when_one_point_fails(tmp_path, mod, why):
 
 
 @pytest.mark.parametrize('e, tv, dec', [
-    (0.04, 6.0, 'mid'),            # exactly on both bounds: 0.04 - 0.03 = 0.010000000000000002 in binary64 (S4C-14)
-    (0.02, 4.0, 'mid'),            # the bounds below the middle mu
+    # S04 v6.8: |dY3| <= 0.4 1/s absolute (no S03 y3_reference any more); same inclusive-bound convention
+    (0.04, 5.4, 'mid'),            # exactly on both bounds: 0.04 - 0.03 = 0.010000000000000002, 5.4 - 5.0 =
+                                   # 0.40000000000000036 in binary64 (S4C-14)
+    (0.02, 4.6, 'mid'),            # the bounds below the middle mu
     (0.0401, 5.0, 'all'),          # just outside dY2
-    (0.03, 6.001, 'all'),          # just outside dY3 (20 % of the reference 5.0)
+    (0.03, 5.4001, 'all'),         # just outside dY3
+    (0.03, 5.4 + 1e-9, 'all'),     # 1e-9 beyond the bound is outside: the tolerance covers rounding only
 ])
 def test_mu_rule_tolerances_are_inclusive_at_the_bound(tmp_path, e, tv, dec):
     def mod(r):
         if r['point_id'] == 1 and r['mu'] == 0.4:
             r.update(e_perp_max=e, tv_duty=tv)
     assert s4.mu_rule(str(_s03_dir(tmp_path, _runs(mod))), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])[0] == dec
+
+
+@pytest.mark.parametrize('key, mid, low, dec', [
+    ('tv_duty', 4.0, 4.4000000000002, 'all'),      # Codex C3-6: above 0.4, inside the old 0.4 * (1 + 1e-12)
+    ('tv_duty', 4.0, 4.4, 'mid'),                  # exactly on the bound (binary64 difference 0.40000000000000036)
+    ('tv_duty', 4.0, 4.3999999999998, 'mid'),      # just below
+    ('tv_duty', 4.0, 4.400000001, 'all'),          # 1e-9 above
+    ('tv_duty', 4.0, 3.6, 'mid'),                  # the bound below the middle mu
+    ('tv_duty', 4.0, 3.5999999999998, 'all'),
+    ('e_perp_max', 0.03, 0.0400000000005, 'all'),  # inside the old additive band 0.01 + 1e-12
+    ('e_perp_max', 0.03, 0.04, 'mid'),
+    ('e_perp_max', 0.03, 0.0399999999995, 'mid'),
+    ('e_perp_max', 0.03, 0.040000001, 'all'),
+    ('e_perp_max', 0.03, 0.02, 'mid'),
+    ('e_perp_max', 0.03, 0.0199999999995, 'all'),
+    ('tv_duty', 4.0, float('nan'), 'all'),         # not finite: not comparable
+    ('e_perp_max', 0.03, float('inf'), 'all'),
+])
+def test_mu_rule_bounds_use_the_s03_exact_convention(tmp_path, key, mid, low, dec):
+    """C3-6: the mu-rule Y2 / Y3 bounds are compared as S03 compares (s03_doe.not_above_by: inclusive,
+    exact on the decimal of each number as written in runs.csv, no tolerance of its own); a Y2 or Y3
+    that is not finite does not satisfy the rule. The mod changes point 1 at ONE speed (v == 0.5):
+    mu 0.5 and 0.6 at mid, mu 0.4 at low."""
+    def mod(r):
+        if r['point_id'] == 1 and r['v'] == 0.5:
+            r[key] = low if r['mu'] == 0.4 else mid
+    d = _s03_dir(tmp_path, _runs(mod))
+    decision, rep = s4.mu_rule(str(d), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
+    assert decision == dec
+    if dec == 'all':
+        assert rep['points_failing'] == 1
+        first = rep['first'][0]
+        assert first['point_id'] == '1' and first['v'] == 0.5
+        text = 'dY3 > 0.4 1/s' if key == 'tv_duty' else 'dY2 > 0.01 m'
+        assert (text if math.isfinite(low) else f'{key} not finite') in first['why']
+    # with the gate [0.2, 0.8] the changed speed 0.5 is not in the gate: 'mid' whatever the bound
+    assert s4.mu_rule(str(d), 'PID', [0.2, 0.8], [0.4, 0.5, 0.6])[0] == 'mid'
 
 
 def test_mu_rule_refuses_missing_or_duplicate_runs(tmp_path):
@@ -793,7 +907,7 @@ def test_default_gains_must_give_a_valid_reference(monkeypatch):
     rows = iter([(dict(status='run_error', completed='', error='x'), None)])
     monkeypatch.setattr(s4, 'safe_run_gate', lambda *a, **k: next(rows))
     monkeypatch.setattr(s3, 'run_in_new_process', lambda dll, jobs, work: [dict(row=dict(status='ok'), digest=None)])
-    monkeypatch.setattr(s3, 'defaults', lambda fw, c: {})
+    monkeypatch.setattr(s3, 'defaults', lambda fw, c: dict(G_PID))   # v6.8 2: candidate() checks the gain set
     assert s4.default_f2(None, 'x.dll', 'PID', [0.2], 0.5, 'w')[3] is False
     for tv in (0.0, -3.0, float('nan'), float('inf')):                 # f2 not finite or not > 0
         rows = iter([(dict(status='ok', completed='true', e_perp_max=0.02, tv_duty=tv), None)])
@@ -818,19 +932,21 @@ def test_run_error_retry_ok_keeps_the_first_attempt_penalty(monkeypatch):
     monkeypatch.setattr(s4, 'safe_run_gate', lambda *a, **k: next(calls))
     monkeypatch.setattr(s3, 'run_in_new_process', lambda dll, jobs, work: [dict(row=ok, digest=None)])
     ev = s4.Evaluator(None, 'x.dll', 'PID', [0.2, 0.5], [0.5], 'w')
-    s = ev.candidate({}, 1, 1, 0)
+    s = ev.candidate(G_PID, 1, 1, 0)
     assert (s['status'], s['f1'], s['g1']) == ('run_error', s4.PENALTY, 2.0)
     assert [(e['v'], e['attempt'], e['status']) for e in ev.evals] == [(0.2, 1, 'ok'), (0.5, 1, 'run_error'),
                                                                        (0.5, 2, 'ok')]
 
 
 def test_three_mu_findings_flag_track_err_even_when_completed():
-    """S4C-9."""
-    rows = [dict(controller='PID', v=0.2, mu=0.4, status='track_err', completed='true', e_perp_max=0.03),
-            dict(controller='PID', v=0.5, mu=0.4, status='ok', completed='true', e_perp_max=0.03),
-            dict(controller='PID', v=0.8, mu=0.6, status='ok', completed='true', e_perp_max=0.2)]
+    """S4C-9 (v6.7 9.7: the pass comes from the gate state columns, not the maximum)."""
+    dat = dict(g1_state='dat', g2_state='dat', g3_state='dat', g4_state='dat', g5_state='dat')
+    rows = [dict(controller='PID', v=0.2, mu=0.4, status='track_err', completed='true', e_perp_max=0.03, **dat),
+            dict(controller='PID', v=0.5, mu=0.4, status='ok', completed='true', e_perp_max=0.03, **dat),
+            dict(controller='PID', v=0.8, mu=0.6, status='ok', completed='true', e_perp_max=0.2,
+                 **dict(dat, g2_state='khong_dat'))]
     f = s4.three_mu_findings(rows, 'PID')
-    assert len(f) == 2 and 'track_err' in f[0] and 'v=0.8' in f[1]
+    assert len(f) == 2 and 'track_err' in f[0] and 'v=0.8' in f[1] and 'G2 khong_dat' in f[1]
 
 
 def test_plant_dump_keeps_nested_values():
@@ -863,11 +979,20 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
         L = lock['controllers'][ctrl]
         assert L['eval_mu'] == [0.5] and L['n_gen'] in (1, 2) and L['hv_ref'][0] == s4.D and L['tool_check']
         assert L['gen_rule']['compared_with'] == 1
+        # S04 v6.8 4.2: the fixed reference (D; 800 1/s), the default gains no longer run
+        assert L['hv_ref'] == [s4.D, 800.0] and 'default_f2' not in L
     assert lock['common']['tool_check'] is True
+    for ctrl in s3.CONTROLLERS:                                              # S04 v6.8 4.2: no default-gains run
+        tr = list(csv.DictReader(open(out / 'trial' / ctrl / 'evals.csv')))
+        assert tr and all(e['ga_seed'] != '0' for e in tr)
     for ctrl in s3.CONTROLLERS:
         monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'main', '--tool-check', '--controller', ctrl,
                                           '--s03', str(d), '--seeds', '1', '2', '--dll', _DLL, '--out', str(out)])
         s4.main()
+    m_adrc = yaml.safe_load(open(out / 'meta_ADRC.yaml', encoding='utf-8'))
+    # S04 v6.8 2: the outside-triangle count of every seed (0 here: the domain lies inside the triangle)
+    assert m_adrc['run']['n_ngoai_bang_per_seed'] == {'1': 0, '2': 0}
+    assert set(m_adrc['run']['seed_error_rates']) == {'1', '2'}                 # C3-10: one entry per seed run
     evals = list(csv.DictReader(open(out / 'evals.csv')))
     keys = [(e['controller'], e['ga_seed'], e['gen'], e['cand_id'], e['v'], e['mu'], e['attempt']) for e in evals]
     assert len(keys) == len(set(keys)) and {e['controller'] for e in evals} == set(s3.CONTROLLERS)   # S04 8
@@ -897,12 +1022,44 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
     assert any('r_factor=1.2' in k for k in full) and all(set(v) == {'before', 'after'} for v in full.values())
     notes = json.load(open(pc / 'notes.json'))
     assert notes['tool_check'] is True                                   # S4C-10
+    assert notes['cho_liam'] == [] and 'cho_liam_note' in notes               # C3-8 (one mu level: check not done)
     assert notes['notes']['PID three_mu']['done'] is False and 'NOT done' in notes['notes']['PID three_mu']['note']
+    for r in sens:                                                       # S04 v6.7 9.7: gate state columns
+        assert all(r[f'{c}_state'] in s4.og.STATES for c in s4.og.CONDS)
+        assert all(k in r for k in ('e_trk_max', 'e_bao_max', 'e_theta_cmd_max_deg'))
+    mu3 = list(csv.DictReader(open(pc / 'three_mu.csv')))
+    assert all(all(f'{c}_state' in r for c in s4.og.CONDS) for r in mu3)
+    for c in s3.CONTROLLERS:                                             # S04 v6.8 6: pre-HIL check ran
+        ph = notes['notes'][f'{c} pre_hil']
+        assert ph['ok'] is True and ph['spectral_radius'] is None
+    assert 'G3, G4 or G5 state' in notes['criterion']
+    assert set(yaml.safe_load(open(out / 'meta.yaml', encoding='utf-8'))['pre_hil']) == {
+        'PID pre_hil', 'ADRC pre_hil'}
     for p in [out / 'meta.yaml', out / 'meta_PID.yaml', out / 'meta_ADRC.yaml', out / 'trial' / 'PID' / 'meta.yaml',
               out / 'trial' / 'ADRC' / 'meta.yaml', out / 'lock.yaml']:
         m = yaml.safe_load(open(p, encoding='utf-8'))                    # S4C-11: valid YAML on Windows paths
         if p.name.startswith('meta'):
             assert m['spec'] == s4.SPEC and m['spec'].startswith('S04 v6.6 '), p   # S83-2: one version line
+
+    # S04 v6.8 6: --phase sens_after (report only) adds sens_after/ and changes no hashed input
+    hashed = [out / 'phases.json', out / 'meta.yaml', out / 'lock.yaml'] + sorted(pc.iterdir())
+    snap = {p: p.read_bytes() for p in hashed if p.is_file()}
+    assert s4.sens_after(argparse.Namespace(out=str(out), dll=_DLL, io_delay_ms=None)) == 0
+    rows = list(csv.DictReader(open(out / 'sens_after' / 'delay.csv')))
+    for c in s3.CONTROLLERS:
+        mine = [r for r in rows if r['controller'] == c]
+        assert len(mine) == 3 and [r['io_delay_ms'] for r in mine] == ['0', '1', '2']   # 1 speed x 1 mu
+        assert [r['baseline'] for r in mine] == ['true', 'false', 'false']
+        assert all(r[f'{c_}_state'] in s4.og.STATES for r in mine for c_ in s4.og.CONDS)
+        send = next(s for s in sel if s['controller'] == c and s['kind'] == 'send_to_HIL')
+        e = next(x for x in evals if (x['controller'], x['ga_seed'], x['gen'], x['cand_id'], x['attempt'])
+                 == (c, send['ga_seed'], send['gen'], send['cand_id'], '1'))
+        assert float(mine[0]['e_perp_max']) == float(e['e_perp_max'])    # io_delay_ms 0 = the GA condition
+    n = json.load(open(out / 'sens_after' / 'notes.json'))
+    assert n['report_only'] is True and n['io_delay_ms_run'] == [1, 2] and n['measured_io_delay_ms'] is None
+    assert all(p.read_bytes() == b for p, b in snap.items())             # report only: no hashed input changes
+    with pytest.raises(SystemExit, match='already holds data'):
+        s4.sens_after(argparse.Namespace(out=str(out), dll=_DLL, io_delay_ms=None))
 
 
 def s4_args(out):
@@ -961,7 +1118,7 @@ def test_evals_rows_carry_e_bao_and_the_flags(monkeypatch):
     calls = iter([(R(bao=float('nan')), None), (R(), None)])
     monkeypatch.setattr(s4, 'safe_run_gate', lambda *a, **k: next(calls))
     ev = s4.Evaluator(None, 'x.dll', 'PID', [0.2, 0.5], [0.5], 'w')
-    s = ev.candidate({}, 1, 1, 0)
+    s = ev.candidate(G_PID, 1, 1, 0)
     assert [e['pen_e_bao_max'] for e in ev.evals] == [1, 0] and s['g4'] == pytest.approx((s4.PENALTY - s4.D) / s4.D)
     assert all(set(s4.PEN_COLS) <= set(e) for e in ev.evals) and {'e_bao_max'} <= set(s4.EVAL_COLS)
 
@@ -1025,7 +1182,7 @@ def test_safe_run_gate_lets_s03stop_through(monkeypatch):
         s4.safe_run_gate(None, None, 'PID', {}, 0.5, 0.5)
     ev = s4.Evaluator(None, 'x.dll', 'PID', [0.2], [0.5], 'w')
     with pytest.raises(s3.S03Stop):
-        ev.candidate({}, 1, 1, 0)
+        ev.candidate(G_PID, 1, 1, 0)
     assert ev.evals == []
 
     def boom(*a, **k):
@@ -1098,8 +1255,565 @@ def test_each_constraint_through_the_real_evaluator(monkeypatch, bad, row_mod):
         return dict(R(), **row_mod), None
     monkeypatch.setattr(s4, 'safe_run_gate', fake_gate)
     ev = s4.Evaluator(None, 'x.dll', 'PID', [0.2, 0.5], [0.4, 0.6], 'w')
-    s = ev.candidate({}, 1, 1, 0)
+    s = ev.candidate(G_PID, 1, 1, 0)
     assert s[bad] > 0 and all(s[g] <= 0 for g in ('g1', 'g2', 'g3', 'g4', 'g5') if g != bad)
     assert len(ev.evals) == 4 and all(e['attempt'] == 1 for e in ev.evals)
-    pts, _, _ = s4.run_seed(ev, DOM2, 1, 4, 2, (s4.D, 50.0), [], [], log=lambda *_: None)
+    pts, _, _ = s4.run_seed(ev, DOM_PID7, 1, 4, 2, (s4.D, 50.0), [], [], log=lambda *_: None)  # v6.8: 7 names
     assert pts and not any(p['feasible'] for p in pts)
+
+
+# ── S04 v6.8: gain table, GA condition, pre-HIL check, sens_after ─────────────────────
+
+def test_gain_check_table_and_triangle():
+    """S04 v6.8 section 2: tools/gain_table.check on the float32 values the firmware gets; the range
+    violations start with '<gain>=', the ADRC triangle violation is the only other kind; the warnings
+    of check() are not violations."""
+    assert s4.gain_check('PID', G_PID) == ([], [])
+    assert s4.gain_check('PID', dict(G_PID, kp_xy=41.0)) == ([], [])          # the bound is allowed
+    assert s4.gain_check('PID', dict(G_PID, kp_xy=41.0000001)) == ([], [])    # float32 is exactly 41.0
+    t, tri = s4.gain_check('PID', dict(G_PID, kp_xy=41.00001))
+    assert len(t) == 1 and t[0].startswith('kp_xy=') and tri == []
+    assert s4.gain_check('PID', dict(G_PID, kp_wz=-0.1))[0]
+    t, _ = s4.gain_check('PID', dict(G_PID, ki_xy=float('nan')))
+    assert len(t) == 1 and 'is not finite' in t[0]
+    assert s4.gain_check('ADRC', G_ADRC) == ([], [])
+    t, tri = s4.gain_check('ADRC', dict(G_ADRC, omega_c_xy=150.0, omega_o_xy=48.0))
+    assert t == [] and len(tri) == 1 and 'omega_c_xy' in tri[0]
+    # binary64 sum 199.999999999 < 200, but the float32 value of 104.0 - 1e-9 is 104.0: sum 200 -> outside
+    assert s4.gain_check('ADRC', dict(G_ADRC, omega_c_xy=104.0 - 1e-9, omega_o_xy=48.0))[1]
+    assert s4.gain_check('ADRC', dict(G_ADRC, omega_c_xy=103.9, omega_o_xy=48.0)) == ([], [])
+    for bad in ({k: v for k, v in G_PID.items() if k != 'k_psi'}, {}):        # check() cannot read it
+        with pytest.raises(s3.S03Stop):
+            s4.gain_check('PID', bad)
+    assert 'tools/gain_table.py' in s4.SOURCES and 'tools/gain_table.py' in s4.SIM_SOURCES
+
+
+_Verdict = collections.namedtuple('Verdict', 'trong_bang trong_tam_giac vi_pham_bang vi_pham_tam_giac')
+
+
+def _fake_classify(ctrl, gains):
+    """C3a gain_table.classify interface (the Verdict NamedTuple), with deliberately different wording:
+    the texts check() writes are NOT what gain_check reports — the Verdict fields decide."""
+    gt = s4.gain_table
+    g = gt._gains(ctrl, gains)                 # float32 values; ValueError on a malformed set
+    bang = [f'ngoai bang: {n} ({g[n]!r})' for i, n in enumerate(gt.NAMES[ctrl])
+            if not (math.isfinite(g[n]) and gt._f32(gt.LO[ctrl][i]) <= g[n] <= gt._f32(gt.HI[ctrl][i]))]
+    tam, ok = [], True
+    if ctrl == 'ADRC':
+        for ax in ('xy', 'wz'):
+            c, o = g[f'omega_c_{ax}'], g[f'omega_o_{ax}']
+            if not (math.isfinite(c) and math.isfinite(o)):
+                ok = False
+            elif not c + 2.0 * o < 200.0:      # binary64 sum of the float32 values, both axes hard
+                tam.append(f'ngoai tam giac truc {ax}')
+                ok = False
+    return _Verdict(not bang, ok, tuple(bang), tuple(tam))
+
+
+def test_gain_check_uses_classify_when_the_table_has_it(monkeypatch):
+    """C3-11: when tools/gain_table.py has classify(), its Verdict fields decide what a table or a
+    triangle violation is, never the wording of a message; the code still runs without it (the table
+    of this worktree has none)."""
+    monkeypatch.setattr(s4.gain_table, 'classify', _fake_classify, raising=False)
+    assert s4.gain_check('PID', G_PID) == ([], [])
+    assert s4.gain_check('ADRC', G_ADRC) == ([], [])
+    t, tri = s4.gain_check('PID', dict(G_PID, kp_xy=41.00001))
+    assert len(t) == 1 and t[0].startswith('ngoai bang: kp_xy') and tri == []
+    assert s4.gain_check('PID', dict(G_PID, kp_xy=41.0000001)) == ([], [])    # float32 is exactly 41.0
+    # Codex: 150 + 2 x 25 = 200 must block (the fake writes its own text for it)
+    assert s4.gain_check('ADRC', dict(G_ADRC, omega_c_wz=150.0, omega_o_wz=25.0)) == \
+        ([], ['ngoai tam giac truc wz'])
+    # Codex's distinguishing float32 case: binary64 sum 199.99999237060547 < 200
+    assert s4.gain_check('ADRC', dict(G_ADRC, omega_c_xy=103.99999237060547, omega_o_xy=48.0)) == ([], [])
+    t, tri = s4.gain_check('ADRC', dict(G_ADRC, omega_c_xy=float('nan')))
+    assert len(t) == 1 and tri == []
+    with pytest.raises(s3.S03Stop):                        # a malformed set (a key missing)
+        s4.gain_check('PID', {k: v for k, v in G_PID.items() if k != 'k_psi'})
+    # the flags decide without texts: empty violation tuples still give one text each
+    monkeypatch.setattr(s4.gain_table, 'classify', lambda c, g: _Verdict(True, False, (), ()))
+    t, tri = s4.gain_check('ADRC', G_ADRC)
+    assert t == [] and len(tri) == 1
+    monkeypatch.setattr(s4.gain_table, 'classify', lambda c, g: _Verdict(False, True, (), ()))
+    t, tri = s4.gain_check('ADRC', G_ADRC)
+    assert len(t) == 1 and tri == []
+    monkeypatch.setattr(s4.gain_table, 'classify', _fake_classify)             # back to the fake
+    # through the callers (with _fake_classify)
+    calls = []
+    monkeypatch.setattr(s4, 'safe_run_gate', lambda *a, **k: calls.append(a))
+    ev = s4.Evaluator(None, 'x.dll', 'ADRC', [0.2, 0.5], [0.5], 'w')
+    s = ev.candidate(dict(G_ADRC, omega_c_wz=150.0, omega_o_wz=25.0), 1, 1, 0)
+    assert s['status'] == 'ngoai_bang' and calls == [] and ev.evals == []
+    ph = s4.pre_hil_check('ADRC', dict(G_ADRC, omega_c_wz=150.0, omega_o_wz=25.0))
+    assert (ph['ok'], ph['in_table'], ph['in_triangle']) == (False, True, False)
+    with pytest.raises(s3.S03Stop, match='range table'):
+        s4.Evaluator(None, 'x.dll', 'PID', [0.2, 0.5], [0.5], 'w').candidate(dict(G_PID, kp_wz=5.0), 1, 1, 0)
+
+
+def test_gain_check_without_classify_keeps_the_text_classification(monkeypatch):
+    """C3-11: a tools/gain_table without classify() (stand-in exposing only check and NAMES; the module
+    of this worktree has none either) keeps the text classification of check(), as before this change."""
+    real = s4.gain_table
+    monkeypatch.setattr(s4, 'gain_table', types.SimpleNamespace(check=real.check, NAMES=real.NAMES))
+    assert not hasattr(s4.gain_table, 'classify')
+    t, tri = s4.gain_check('PID', dict(G_PID, kp_xy=41.00001))
+    assert t[0].startswith('kp_xy=') and tri == []
+    t, tri = s4.gain_check('ADRC', dict(G_ADRC, omega_c_xy=150.0, omega_o_xy=48.0))
+    assert t == [] and len(tri) == 1
+    with pytest.raises(s3.S03Stop):
+        s4.gain_check('PID', {})
+
+
+def test_candidate_outside_the_table_stops_before_any_run(monkeypatch):
+    """S04 v6.8 section 2: a gain outside the range table of the campaign binary is a tool error, so
+    the GA domain lies inside the table: the run stops before any simulation of the candidate."""
+    calls = []
+    monkeypatch.setattr(s4, 'safe_run_gate', lambda *a, **k: calls.append(a))
+    ev = s4.Evaluator(None, 'x.dll', 'PID', [0.2, 0.5], [0.5], 'w')
+    with pytest.raises(s3.S03Stop, match='range table'):
+        ev.candidate(dict(G_PID, kp_wz=5.0), 1, 1, 0)
+    assert calls == [] and ev.evals == []
+
+
+@pytest.mark.parametrize('c', [150.0, 104.0 - 1e-9])
+def test_candidate_outside_the_triangle_is_not_run(monkeypatch, c):
+    """S04 v6.8 section 2 (G-Q2): an ADRC candidate outside the triangle is not run; it gets the
+    penalty of a run_error candidate of section 3 with status ngoai_bang and no evals row."""
+    calls = []
+    monkeypatch.setattr(s4, 'safe_run_gate', lambda *a, **k: calls.append(a))
+    ev = s4.Evaluator(None, 'x.dll', 'ADRC', [0.2, 0.5], [0.4, 0.5, 0.6], 'w')
+    s = ev.candidate(dict(G_ADRC, omega_c_xy=c, omega_o_xy=48.0), 1, 1, 0)
+    assert s['status'] == 'ngoai_bang' and calls == [] and ev.evals == []
+    assert (s['g1'], s['n_runs'], s['n_run_error']) == (6.0, 0, 0)            # g1 = the expected runs
+    ref = s4.score([(m, v, dict(status='run_error', completed=''))
+                    for m in (0.4, 0.5, 0.6) for v in (0.2, 0.5)], True)
+    assert all(s[k] == ref[k] for k in ('f1', 'f2', 'g1', 'g2', 'g3', 'g4', 'g5')) and set(s) == set(ref)
+    assert all(math.isfinite(s[g]) for g in ('g1', 'g2', 'g3', 'g4', 'g5'))
+    # the pass side of the same check: inside the triangle the candidate runs
+    calls.clear()
+    monkeypatch.setattr(s4, 'safe_run_gate', lambda *a, **k: (calls.append(a), (R(), None))[1])
+    s = ev.candidate(dict(G_ADRC, omega_c_xy=103.9, omega_o_xy=48.0), 1, 2, 0)
+    assert s['status'] == 'ok' and len(calls) == 6 and len(ev.evals) == 6
+
+
+def test_run_seed_with_candidates_outside_the_triangle(monkeypatch):
+    """S04 v6.8 section 2: through run_seed an outside-triangle candidate writes a history.csv row
+    with status ngoai_bang and no evals.csv row, is never feasible, and is in neither part of the
+    seed error rate (CC1-3)."""
+    monkeypatch.setattr(s4, 'safe_run_gate', lambda *a, **k: (R(), None))
+    ev = s4.Evaluator(None, 'x.dll', 'ADRC', [0.2, 0.5], [0.4, 0.6], 'w')
+    hist, hv = [], []
+    pts, _, _ = s4.run_seed(ev, DOM_ADRC7, 1, 12, 2, (s4.D, s4.HV_REF_F2), hist, hv, log=lambda *_: None)
+    out = [h for h in hist if h['status'] == 'ngoai_bang']
+    ok = [h for h in hist if h['status'] != 'ngoai_bang']
+    for h in hist:
+        g = {d['name']: h[d['name']] for d in DOM_ADRC7}
+        assert (h['status'] == 'ngoai_bang') == bool(s4.gain_check('ADRC', g)[1])
+    assert out and ok
+    assert all(h['f1'] == s4.PENALTY and h['g1'] == 4.0 for h in out)         # 2 mu x 2 speeds expected
+    assert {(e['gen'], e['cand_id']) for e in ev.evals} == {(h['gen'], h['cand_id']) for h in ok}
+    assert s4.ngoai_bang_counts(hist, 'ADRC') == {1: len(out)}
+    r = s4.seed_error_rates(ev.evals, 'ADRC')[1]
+    assert r['n'] == 4 * len(ok) and r['rate'] == 0.0
+    assert all(not p['feasible'] for p in pts if p['f1'] == s4.PENALTY)
+
+
+def test_seed_error_rate_ignores_ngoai_bang_rows():
+    """S04 v6.8 section 2 (CC1-3): a ngoai_bang row is in neither the numerator nor the denominator."""
+    ev = [dict(controller='PID', ga_seed=1, attempt=a, completed=c, status=st)
+          for a, c, st in [(1, 'true', 'ok')] * 9 + [(1, '', 'run_error'), (2, 'true', 'ok'),
+                                                     (1, 'inconclusive', 'track_err')]]
+    ev += [dict(controller='PID', ga_seed=1, attempt=1, completed='', status='ngoai_bang')] * 5
+    r = s4.seed_error_rates(ev, 'PID')[1]
+    assert r['n'] == 11 and r['rate'] == pytest.approx(2 / 11)
+    hist = [dict(controller='ADRC', ga_seed=1, status='ok'),
+            dict(controller='ADRC', ga_seed=1, status='ngoai_bang'),
+            dict(controller='ADRC', ga_seed=2, status='ok'),
+            dict(controller='PID', ga_seed=1, status='ngoai_bang')]
+    assert s4.ngoai_bang_counts(hist, 'ADRC') == {1: 1, 2: 0}
+
+
+def test_seed_error_rate_reports_a_seed_without_runs():
+    """C3-10: a seed of the locked list with no first-attempt run (every candidate ngoai_bang, not
+    run) is reported with n = 0 and rate None (JSON null), not left out."""
+    ev = [dict(controller='ADRC', ga_seed=1, attempt=1, completed='true', status='ok')] * 10
+    ev += [dict(controller='ADRC', ga_seed=1, attempt=1, completed='', status='run_error'),
+           dict(controller='ADRC', ga_seed=1, attempt=2, completed='true', status='ok')]
+    ev += [dict(controller='ADRC', ga_seed=3, attempt=1, completed='', status='ngoai_bang')] * 4
+    r = s4.seed_error_rates(ev, 'ADRC', seeds=[1, 2, 3])
+    assert list(r) == [1, 2, 3]
+    assert r[2] == r[3] == dict(rate=None, n=0, over_10pct=False)
+    assert r[1]['n'] == 11 and r[1]['rate'] == pytest.approx(1 / 11)
+    assert json.loads(json.dumps(r))['2']['rate'] is None
+    assert list(s4.seed_error_rates(ev, 'ADRC', seeds=[2])) == [1, 2]   # a seed in evals is still reported
+    assert set(s4.seed_error_rates(ev, 'ADRC')) == {1}                  # without seeds: as before
+
+
+def test_seed_with_only_ngoai_bang_candidates_is_reported(monkeypatch):
+    """C3-10: a seed whose candidates are all outside the LADRC triangle runs nothing (no evals.csv
+    row, ngoai_bang in history); seed_error_rates(evals, ctrl, [seed]) still reports it, n = 0."""
+    calls = []
+    monkeypatch.setattr(s4, 'safe_run_gate', lambda *a, **k: calls.append(a))
+    ev = s4.Evaluator(None, 'x.dll', 'ADRC', [0.2, 0.5], [0.4, 0.6], 'w')
+    dom = [dict(d) for d in DOM_ADRC7]
+    dom[0]['L'], dom[0]['H'] = 150.0, 190.0                    # omega_c_xy: every candidate has xy sum >= 230
+    dom[1]['L'], dom[1]['H'] = 40.0, 48.0                      # omega_o_xy
+    hist, hv = [], []
+    s4.run_seed(ev, dom, 1, 8, 2, (s4.D, s4.HV_REF_F2), hist, hv, log=lambda *_: None)
+    assert calls == [] and ev.evals == []
+    assert hist and all(h['status'] == 'ngoai_bang' for h in hist)
+    assert s4.ngoai_bang_counts(hist, 'ADRC') == {1: len(hist)}
+    assert s4.seed_error_rates(ev.evals, 'ADRC') == {}
+    assert s4.seed_error_rates(ev.evals, 'ADRC', [1]) == {1: dict(rate=None, n=0, over_10pct=False)}
+
+
+@pytest.mark.parametrize('bad', [None, '', float('nan'), float('inf'), 'x'])
+def test_tv_duty_missing_or_not_finite_is_a_run_error_row(monkeypatch, bad):
+    """S04 v6.7 section 3 (9.7): a run that is not a run_error but whose tv_duty is missing or not
+    finite is recorded with status run_error at the run level (the other fields kept), before the
+    diagnosis rerun decision, and then treated as any run_error."""
+    bad_row = R()
+    if bad is None:
+        del bad_row['tv_duty']
+    else:
+        bad_row['tv_duty'] = bad
+    calls = iter([(R(), None), (bad_row, None)])
+    monkeypatch.setattr(s4, 'safe_run_gate', lambda *a, **k: next(calls))
+    monkeypatch.setattr(s3, 'run_in_new_process', lambda dll, jobs, work: [dict(row=R(), digest=None)])
+    ev = s4.Evaluator(None, 'x.dll', 'PID', [0.2, 0.5], [0.5], 'w')
+    s = ev.candidate(G_PID, 1, 1, 0)
+    assert [(e['v'], e['attempt'], e['status']) for e in ev.evals] == [(0.2, 1, 'ok'), (0.5, 1, 'run_error'),
+                                                                       (0.5, 2, 'ok')]   # diagnosis ran
+    conv = ev.evals[1]
+    assert 'tv_duty' in conv['error'] and conv['completed'] == 'true'
+    assert all(conv['pen_' + k] == 1 for k in s4.PEN_KEYS)
+    assert (s['status'], s['f1'], s['f2'], s['g1']) == ('run_error', s4.PENALTY, s4.PENALTY, 2.0)
+    r = s4.seed_error_rates(ev.evals, 'PID')[1]
+    assert r['n'] == 2 and r['rate'] == 0.5
+
+
+def test_score_counts_a_missing_tv_duty_as_run_error():
+    """S04 v6.7 section 3: score() counts a missing / not finite tv_duty as a run_error also when the
+    caller did not convert the row."""
+    row = R()
+    del row['tv_duty']
+    s = s4.score([(0.5, 0.2, R()), (0.5, 0.5, row)], False)
+    assert (s['status'], s['f1'], s['f2'], s['g1']) == ('run_error', s4.PENALTY, s4.PENALTY, 2.0)
+    s = s4.score([(0.5, 0.2, R()), (0.5, 0.5, R(tv=float('nan')))], False)
+    assert (s['status'], s['f1'], s['f2'], s['g1']) == ('run_error', s4.PENALTY, s4.PENALTY, 2.0)
+
+
+@pytest.mark.parametrize('bad', [None, '', float('nan'), float('inf'), float('-inf'), 'x'])
+def test_score_fallback_uses_the_converted_row(bad):
+    """C3-9: score() converts every row itself (tv_duty_run_error): the SAME converted row gives the
+    score, the penalty flags and the counts, also when the caller did not convert (the fallback path)."""
+    bad_row = R()
+    if bad is None:
+        del bad_row['tv_duty']
+    else:
+        bad_row['tv_duty'] = bad
+    raw = [(0.5, 0.2, R()), (0.5, 0.5, bad_row)]
+    s = s4.score(raw, False)
+    ref = s4.score([(mu, v, s4.tv_duty_run_error(r)) for mu, v, r in raw], True)
+    assert s == ref
+    assert (s['status'], s['f1'], s['f2'], s['g1']) == ('run_error', s4.PENALTY, s4.PENALTY, 2.0)
+    assert s['n_run_error'] == 1 and s['n_pen_runs'] == 1 and s['pen_f1'] == 1   # old code: 0, 0
+    assert s['g3'] == s['g4'] == (s4.PENALTY - s4.D) / s4.D
+    assert bad_row.get('status') == 'ok'                                       # the input row not mutated
+
+
+@pytest.mark.parametrize('bad', ['', float('nan'), float('inf'), float('-inf')])
+def test_tv_duty_error_then_successful_diagnosis_keeps_the_penalty(monkeypatch, bad):
+    """S04 v6.7 section 3 / C3-9: a run whose tv_duty is missing or not finite is a run_error at the
+    run level; the diagnosis rerun may succeed, but the candidate keeps the penalty, and the fallback
+    path of score (the row not converted) agrees with the converted main path."""
+    bad_row = R(tv=bad)
+    calls = iter([(R(), None), (bad_row, None)])
+    monkeypatch.setattr(s4, 'safe_run_gate', lambda *a, **k: next(calls))
+    monkeypatch.setattr(s3, 'run_in_new_process', lambda dll, jobs, work: [dict(row=R(), digest=None)])
+    ev = s4.Evaluator(None, 'x.dll', 'PID', [0.2, 0.5], [0.5], 'w')
+    s = ev.candidate(G_PID, 1, 1, 0)
+    assert [(e['v'], e['attempt'], e['status']) for e in ev.evals] == [(0.2, 1, 'ok'), (0.5, 1, 'run_error'),
+                                                                       (0.5, 2, 'ok')]
+    assert (s['status'], s['n_run_error'], s['n_pen_runs'], s['pen_f1'], s['g1']) == \
+        ('run_error', 1, 1, 1, 2.0)
+    # the main path (candidate converts the row) and the fallback path (score converts it) agree
+    assert s == s4.score([(0.5, 0.2, R()), (0.5, 0.5, bad_row)], False)
+
+
+def test_hypervolume_reference_d_800():
+    """S04 v6.8 section 4.2: the reference is fixed at (D; 800 1/s); a point on or beyond it adds 0
+    and is counted in n_nd_on_or_beyond_ref."""
+    assert s4.HV_REF_F2 == 800.0
+    ref = (s4.D, s4.HV_REF_F2)
+    assert s4.hypervolume([P(s4.D, 1.0)], ref) == (0.0, 1)                 # f1 = D exactly adds 0, counted
+    assert s4.hypervolume([P(0.05, 800.0)], ref) == (0.0, 1)
+    hv, out = s4.hypervolume([P(0.05, 800.0 - 1e-9)], ref)
+    assert out == 0 and hv > 0
+    hv, out = s4.hypervolume([P(s4.D - 1e-12, 5.0)], ref)
+    assert out == 0 and hv > 0
+    hv, out = s4.hypervolume([P(0.02, 100.0), P(s4.D, 50.0), P(0.01, 800.0)], ref)
+    assert hv == pytest.approx((s4.D - 0.02) * 700.0) and out == 2
+
+
+def test_mu_rule_reads_the_gate_state_columns(tmp_path):
+    """S04 v6.7 9.7: the mu rule compares the gate state columns g3_state .. g5_state of
+    sealed/runs.csv; a state that is the same at the three mu satisfies the rule whatever it is; a
+    non-run_error row without a state column stops the script. S04 v6.8: no S03 y3_reference read."""
+    for name, st in (('a', dict(g4_state='khong_dat')), ('b', dict(g5_state='chua_ket_luan'))):
+        def mod(r, st=st):
+            if r['point_id'] == 1:
+                r.update(st)
+        d = _s03_dir(tmp_path / name, _runs(mod))
+        dec, _ = s4.mu_rule(str(d), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
+        assert dec == 'mid', name                                   # the same state at the three mu passes
+
+    def mod(r):                                                     # (c) no g5_state column at all
+        r.pop('g5_state')
+    d = _s03_dir(tmp_path / 'c', _runs(mod))
+    with pytest.raises(SystemExit, match='g5_state'):
+        s4.mu_rule(str(d), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
+
+    def mod(r):                                                     # (d) a state text that is not a state
+        if r['point_id'] == 1 and r['mu'] == 0.5:
+            r.update(g3_state='x')
+    d = _s03_dir(tmp_path / 'd', _runs(mod))
+    with pytest.raises(SystemExit, match='g3_state'):
+        s4.mu_rule(str(d), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
+    d = _s03_dir(tmp_path / 'e', _runs())                           # (e) meta.yaml without y3_reference
+    mt = d / 'meta.yaml'
+    mt.write_text('\n'.join(l for l in mt.read_text(encoding='utf-8').splitlines()
+                            if not l.startswith('y3_reference:')) + '\n', encoding='utf-8')
+    dec, _ = s4.mu_rule(str(d), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
+    assert dec == 'mid'
+
+
+def test_judge_reads_the_gate_state_columns():
+    """S04 v6.2 section 6 (v6.7 9.7): a change of the G3, G4 or G5 gate state against factor 1.0
+    makes the sensitivity row 'sensitive'."""
+    def J(k, **kw):
+        return dict(dict(v=0.2, mu=0.5, r_factor=k, completed='true', e_perp_max=0.03,
+                         g3_state='dat', g4_state='dat', g5_state='dat'), **kw)
+    assert s4.judge([J(1.0), J(0.8), J(1.2)], 'r_factor') == (False, [])
+    for c, st in (('g3', 'khong_dat'), ('g4', 'chua_ket_luan'), ('g5', 'khong_dat')):
+        sens, why = s4.judge([J(1.0), J(0.8, **{f'{c}_state': st})], 'r_factor')
+        assert sens is True and any(f'{c.upper()} state dat -> {st}' in w for w in why)
+    row = J(0.8)
+    del row['g5_state']
+    with pytest.raises(KeyError):
+        s4.judge([J(1.0), row], 'r_factor')
+
+
+def test_three_mu_findings_read_states_not_maxima():
+    """S04 v6.2 section 6 (v6.7 9.7): a three-mu run passes only with status ok and the five gate
+    states dat, read from the state columns — a maximum above its threshold with states dat passes,
+    a state not dat with every maximum below does not."""
+    def T(**kw):
+        return dict(dict(controller='PID', v=0.2, mu=0.4, status='ok', completed='true', e_perp_max=0.03,
+                         e_trk_max=0.03, e_bao_max=0.03, e_theta_cmd_max_deg=2.0, g1_state='dat',
+                         g2_state='dat', g3_state='dat', g4_state='dat', g5_state='dat'), **kw)
+    assert s4.three_mu_findings([T()], 'PID') == []
+    f = s4.three_mu_findings([T(g3_state='chua_ket_luan')], 'PID')
+    assert len(f) == 1 and 'G3 chua_ket_luan' in f[0]
+    assert s4.three_mu_findings([T(e_perp_max=0.2)], 'PID') == []    # the state column decides, not the max
+    row = T()
+    del row['g5_state']
+    f = s4.three_mu_findings([row], 'PID')
+    assert len(f) == 1 and 'G5 missing' in f[0]
+    assert len(s4.three_mu_findings([T(status='run_error')], 'PID')) == 1
+    assert s4.three_mu_findings([dict(T(), controller='ADRC')], 'PID') == []
+
+
+def _fake_post(tmp_path, monkeypatch, gains=G_PID, eval_mu=(0.5,), levels=(0.4, 0.5, 0.6), tool_check=False,
+               mu3_mod=None):
+    """The real s4.post without a DLL: GA outputs (lock.yaml, selected.csv with one PID send_to_HIL row,
+    evals.csv attempt-1 rows) are written; every sim call is stubbed; write_root_meta and log_phase run
+    for real. mu3_mod(row, v, mu) modifies a three-mu run row. Returns (return code, notes.json, out,
+    selected.csv bytes before post)."""
+    out = tmp_path / 'run'
+    out.mkdir(parents=True)
+    dll = tmp_path / 'fake.dll'
+    dll.write_bytes(b'fake dll')
+    speeds = [0.2, 0.5]
+    lock = dict(common=dict(tool_check=tool_check, s03_run=str(tmp_path), fingerprint={}, unsealed=False),
+                s03_mu_levels=list(levels),
+                controllers=dict(PID=dict(eval_mu=list(eval_mu), speeds=speeds)))
+    (out / 'lock.yaml').write_text(json.dumps(lock), encoding='utf-8')
+    s3.write_csv(str(out / 'selected.csv'),
+                 [dict(kind='send_to_HIL', controller='PID', ga_seed=1, feasible='true', gen=1, cand_id=0,
+                       f1=0.03, f2=5.0, **{n: repr(float(v)) for n, v in gains.items()})])
+    s3.write_csv(str(out / 'evals.csv'),
+                 [dict(controller='PID', ga_seed=1, gen=1, cand_id=0, v=v, mu=mu, attempt=1, log_sha256='')
+                  for mu in eval_mu for v in speeds])
+
+    def row(**kw):
+        return dict(dict(status='ok', completed='true', e_perp_max=0.03, tv_duty=5.0, e_trk_max=0.03,
+                         e_bao_max=0.03, e_theta_cmd_max_deg=2.0,
+                         **{f'{c}_state': 'dat' for c in s4.og.CONDS}), **kw)
+
+    def fake_safe(fw, path, ctrl, g, v, mu):
+        r = row()
+        if mu3_mod:
+            mu3_mod(r, v, mu)
+        return r, None
+
+    monkeypatch.setattr(s4, 'fingerprint', lambda *a, **k: {})
+    monkeypatch.setattr(fwsim, 'FirmwareSim', lambda dll_: None)
+    monkeypatch.setattr(s3, 'run_in_new_process',
+                        lambda dll_, jobs, work: [dict(row=row(), digest=None) for _ in jobs])
+    monkeypatch.setattr(s4, 'run_custom', lambda fw, path, ctrl, g, v, mu, **kw: (
+        row(), None, {}, dict(motor_R=1.0), dict(motor_R=1.0)))
+    monkeypatch.setattr(s3, 'safe_run', fake_safe)
+    sel = (out / 'selected.csv').read_bytes()
+    rc = s4.post(argparse.Namespace(out=str(out), dll=str(dll)))
+    notes = json.load(open(out / 'post_checks' / 'notes.json', encoding='utf-8'))
+    return rc, notes, out, sel
+
+
+@pytest.mark.parametrize('case', 'abcdefg')
+def test_post_three_mu_findings_wait_for_liam(tmp_path, monkeypatch, case):
+    """C3-8: a run of the three-mu check not passing G1-G5 (three mu levels, check done) is listed in
+    post_checks/notes.json cho_liam with the pre-HIL failures, and post returns 2 (no reselection:
+    the selected gains are kept, never chosen again here)."""
+    if case == 'a':
+        rc, notes, out, sel = _fake_post(
+            tmp_path / 'a', monkeypatch,
+            mu3_mod=lambda r, v, mu: r.update(g4_state='khong_dat') if (mu, v) == (0.4, 0.2) else None)
+        assert rc == 2                                                  # Codex C3-8 (old code: 0)
+        assert notes['cho_liam'] == [dict(controller='PID', check='three_mu',
+                                        reasons=notes['notes']['PID three_mu']['findings'])]
+        assert len(notes['cho_liam'][0]['reasons']) == 1
+        assert 'mu=0.4' in notes['cho_liam'][0]['reasons'][0]
+        assert 'G4 khong_dat' in notes['cho_liam'][0]['reasons'][0]
+        assert notes['notes']['PID three_mu']['done'] is True
+        assert notes['notes']['PID pre_hil']['ok'] is True
+        assert 'cho_liam_note' in notes
+        assert (out / 'selected.csv').read_bytes() == sel               # no reselection
+    elif case == 'b':
+        rc, notes, _, _ = _fake_post(tmp_path / 'b', monkeypatch)
+        assert rc == 0 and notes['cho_liam'] == []
+    elif case == 'c':
+        rc, notes, _, _ = _fake_post(
+            tmp_path / 'c', monkeypatch,
+            mu3_mod=lambda r, v, mu: r.update(g5_state='chua_ket_luan') if mu == 0.6 else None)
+        assert rc == 2
+        cl = [c for c in notes['cho_liam'] if c['check'] == 'three_mu']
+        assert len(cl) == 1 and cl[0]['reasons']
+    elif case == 'd':
+        rc, notes, _, _ = _fake_post(
+            tmp_path / 'd', monkeypatch,
+            mu3_mod=lambda r, v, mu: r.update(status='track_err') if (mu, v) == (0.6, 0.5) else None)
+        assert rc == 2
+        assert any(c['check'] == 'three_mu' for c in notes['cho_liam'])
+    elif case == 'e':
+        # the GA already evaluated three mu: no three-mu check at all
+        rc, notes, _, _ = _fake_post(
+            tmp_path / 'e', monkeypatch, eval_mu=(0.4, 0.5, 0.6),
+            mu3_mod=lambda r, v, mu: r.update(g4_state='khong_dat') if (mu, v) == (0.4, 0.2) else None)
+        assert rc == 0 and notes['cho_liam'] == []
+        assert 'PID three_mu' not in notes['notes']
+    elif case == 'f':
+        # a tool check on an S03 run with one mu level: the check was NOT done (unchanged path)
+        rc, notes, _, _ = _fake_post(
+            tmp_path / 'f', monkeypatch, levels=(0.5,), tool_check=True,
+            mu3_mod=lambda r, v, mu: r.update(g4_state='khong_dat'))
+        assert rc == 0 and notes['cho_liam'] == []
+        assert notes['notes']['PID three_mu']['done'] is False
+    else:  # g: the selected gains outside the range table (kp_wz 5.0 > the ceiling 4.6)
+        rc, notes, _, _ = _fake_post(tmp_path / 'g', monkeypatch, gains=dict(G_PID, kp_wz=5.0))
+        assert rc == 2                                                  # as before this change
+        cl = notes['cho_liam']
+        assert len(cl) == 1 and cl[0]['check'] == 'pre_hil' and cl[0]['reasons']
+
+
+def test_pre_hil_check():
+    """S04 v6.8 section 6: range table and (LADRC) triangle on the float32 values before HIL; the
+    spectral radius is TODO (None)."""
+    ph = s4.pre_hil_check('PID', G_PID)
+    assert ph['ok'] is True and ph['in_table'] is True and ph['in_triangle'] is None
+    assert ph['spectral_radius'] is None and 'TODO' in ph['spectral_radius_note']
+    ph = s4.pre_hil_check('PID', dict(G_PID, kp_wz=5.0))
+    assert ph['ok'] is False and ph['in_table'] is False and ph['table_violations']
+    ph = s4.pre_hil_check('ADRC', dict(G_ADRC, omega_c_xy=150.0, omega_o_xy=48.0))
+    assert ph['ok'] is False and ph['in_table'] is True and ph['in_triangle'] is False
+    ph = s4.pre_hil_check('ADRC', G_ADRC)
+    assert ph['ok'] is True and ph['in_triangle'] is True
+    assert s4.submodel_spectral_radius('PID', G_PID) is None
+
+
+def test_delay_steps():
+    """S04 v6.8 section 6: the io_delay_ms values of the loop-delay variant and their rule text."""
+    assert s4.delay_steps(None)[0] == [1, 2]
+    assert s4.delay_steps(2.0)[0] == [2]
+    assert s4.delay_steps(1.9999999995)[0] == [2]                    # within 1e-9 ms of a whole number
+    assert s4.delay_steps(2.0000000005)[0] == [2]
+    assert s4.delay_steps(1.4)[0] == [1, 2]                          # rounding down and up
+    assert s4.delay_steps(0.3)[0] == [0, 1]
+    assert s4.delay_steps(2.000001)[0] == [2, 3]
+    assert s4.delay_steps(0)[0] == [0]
+    for bad in (float('nan'), float('inf'), -1.0):
+        with pytest.raises(SystemExit, match='io-delay-ms'):
+            s4.delay_steps(bad)
+    for x in (None, 2.0, 1.4, 0.3, 0):
+        steps, rule = s4.delay_steps(x)
+        assert steps and isinstance(rule, str) and rule
+
+
+@pytest.mark.parametrize('ph', ('trial', 'main', 'post'))
+def test_io_delay_only_with_sens_after(tmp_path, monkeypatch, ph):
+    """S04 v6.8 section 6: --io-delay-ms belongs to --phase sens_after only."""
+    monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', ph, '--out', str(tmp_path / 'o'),
+                                      '--io-delay-ms', '1.4'])
+    with pytest.raises(SystemExit, match='io-delay-ms only with --phase sens_after'):
+        s4.main()
+
+
+def test_run_gate_stops_on_another_slip_omega_s(monkeypatch):
+    """S04 v6.8 section 6 / S03 v8.6 section 8 condition 12: the GA condition is slip_omega_s 0.1
+    and io_delay_ms 0; another plant slip_omega_s stops as a tool error, also through safe_run_gate."""
+    assert (s4.GA_IO_DELAY_MS, s4.GA_SLIP_OMEGA_S) == (0, 0.1)
+    monkeypatch.setattr(s4.fwsim, 'plant_params',
+                        lambda a: types.SimpleNamespace(slip_omega_s=0.2, lx=0.1, ly=0.1))
+    with pytest.raises(s3.S03Stop, match='slip_omega_s'):
+        s4.run_gate(None, None, 'PID', G_PID, 0.2, 0.5)
+    with pytest.raises(s3.S03Stop, match='slip_omega_s'):
+        s4.safe_run_gate(None, None, 'PID', G_PID, 0.2, 0.5)
+
+
+@needs_dll
+def test_run_gate_runs_the_ga_condition(monkeypatch):
+    """S04 v6.8 section 6: run_gate simulates with io_delay_ms = 0 and slip_omega_s = 0.1 (the GA
+    condition), explicit in the fwsim.simulate call."""
+    fw = fwsim.FirmwareSim(_DLL)
+    if not fw.pos_cols:
+        pytest.skip('DLL without pos_ctrl.c')
+    import o1_feasibility as o1
+    seen = []
+    real = s4.fwsim.simulate
+
+    def spy(fw_, sp, dur, params=None, **kw):
+        seen.append((kw.get('io_delay_ms'), params.slip_omega_s))
+        return real(fw_, sp, dur, params=params, **kw)
+    monkeypatch.setattr(s4.fwsim, 'simulate', spy)
+    s4.run_gate(fw, o1.Path8(), 'PID', s3.defaults(fw, 'PID'), 0.2, 0.436)
+    assert seen == [(0, 0.1)]
+
+
+@needs_dll
+def test_run_custom_gate_states_and_io_delay():
+    """S04 v6.7 9.7 / v6.8 6: run_custom io_delay_ms = 0 gives the same log as s03_doe.run_one and
+    the gate state columns of o1_gate.gate; io_delay_ms = 2 gives another log with valid states."""
+    fw = fwsim.FirmwareSim(_DLL)
+    if not fw.pos_cols:
+        pytest.skip('DLL without pos_ctrl.c')
+    import o1_feasibility as o1
+    path, g = o1.Path8(), s3.defaults(fw, 'PID')
+    a, la = s3.run_one(fw, path, 'PID', g, 0.2, 0.436)
+    res, log, back, before, after = s4.run_custom(fw, path, 'PID', g, 0.2, 0.436)
+    assert s3.log_digest(log) == s3.log_digest(la)
+    assert all(res[f'{c}_state'] == a[f'{c}_state'] for c in s4.og.CONDS)
+    assert (res['e_perp_max'], res['tv_duty'], res['e_bao_max']) == (a['e_perp_max'], a['tv_duty'],
+                                                                   a['e_bao_max'])
+    assert before == after                                          # no plant variant asked for
+    res2, log2, *_ = s4.run_custom(fw, path, 'PID', g, 0.2, 0.436, io_delay_ms=2)
+    assert s3.log_digest(log2) != s3.log_digest(log)
+    assert all(res2[f'{c}_state'] in s4.og.STATES for c in s4.og.CONDS)
