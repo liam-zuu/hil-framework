@@ -1106,7 +1106,17 @@ def test_dong_huong_too_few_runs_or_no_imu_is_thieu(imu_patch):
     r = A.yaw_run(g, ses, L, D + 100.0)                              # the clock offset far off: no IMU yaw
     assert r['n_ok'] == 0
     with pytest.raises(A.A6Error):
-        A.dong_huong_build(dict(runs, r9=r), 'T1', KHOA)
+        A.dong_huong_build(dict(r1=runs['r1'], r9=r), 'T1', KHOA)   # one run with usable frames only
+    # a run without a usable frame gives nothing to the others and is still a target (its bound from the others)
+    r4 = _runs_huong(('r1', 'r2', 'r3', 'r4'), gk, gm)
+    d9 = A.dong_huong_build(dict(r4, r9=r), 'T1', KHOA)
+    assert d9['luot_khong_khung_dung'] == ['r9'] and d9['n_khung_dung_luot']['r9'] == 0
+    e9 = d9['luot']['r9']['dai']['a']
+    assert e9['trang_thai'] == 'dat' and e9['luot_co_khung'] == ['r1', 'r2', 'r3', 'r4']
+    assert e9['g_bar'] == pytest.approx(gk, abs=3e-4)
+    e1 = d9['luot']['r1']['dai']['a']
+    assert 'r9' in d9['luot']['r1']['bo_luot'] and e1['luot_co_khung'] == ['r2', 'r3', 'r4'] and e1['trang_thai'] == 'dat'
+    assert A.kiem_dong(A.with_sha(d9), 'T1', gk, KHOA)[1] == []
     with pytest.raises(A.A6Error):
         A.yaw_run(dict(g, session_sha256='6' * 64), ses, L, D)
 

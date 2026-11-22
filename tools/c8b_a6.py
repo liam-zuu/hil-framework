@@ -1869,8 +1869,10 @@ def yaw_run(g, ses, L, D):
     if ok.any():
         e0 = e[np.flatnonzero(ok)[0]]
         e = e0 + _wrap(e - e0)
+    tb = S.get('t_break', math.inf)
     return dict(t=t, e=e, pim=pim, w=w, a=a, u=u, ok=ok, n=int(len(t)), n_ok=int(ok.sum()),
-                n_late=S.get('n_late'), C=C, H=H, hb=hb, side=side)
+                n_late=S.get('n_late'), n_imu=int(np.isfinite(pim).sum()),
+                t_break_log_s=float(tb) if math.isfinite(tb) else None, C=C, H=H, hb=hb, side=side)
 
 
 def _yaw_fit_runs(blocks):
@@ -1901,7 +1903,8 @@ def dong_huong_build(runs, tam_id, khoa_sha, log=None):
     frames of EVERY OTHER run in the band; SE of the two slopes by the jackknife over those runs (leave one run out);
     dat when the band has at least N_MIN frames from at least DONG_H_MIN_RUNS other runs and the main fit and every
     jackknife fit are well conditioned (cond <= sqrt(COND_MAX), as kiem_imu). No omega limit: the bound must cover
-    every scored frame. g_bar is compared with g_b in gop (kiem_dong): |g_bar - g_b| + 2 |SE|."""
+    every scored frame. g_bar is compared with g_b in gop (kiem_dong): |g_bar - g_b| + 2 |SE|. A run without a usable
+    frame is listed in luot_khong_khung_dung: it gives nothing to the fits and is still a target."""
     if not khoa_sha:
         raise A6Error('dong_huong: the lock (--khoa-truoc) is needed: the file is written after it')
     if len(runs) < 2:
@@ -1911,8 +1914,10 @@ def dong_huong_build(runs, tam_id, khoa_sha, log=None):
         if abs(r['H'] - r0['H']) > TOL_SETUP or abs(r['hb'] - r0['hb']) > TOL_SETUP \
                 or abs(r['side'] - r0['side']) > TOL_SETUP or np.max(np.abs(r['C'] - r0['C'])) > TOL_SETUP:
             raise A6Error(f'dong_huong {lid}: another car_pose set-up (L125)')
-        if r['n_ok'] < 1:
-            raise A6Error(f'dong_huong {lid}: no frame with an IMU yaw, omega and acceleration')
+    # a run without a usable frame (its IMU yaw not usable: c8_u_imu t_break, a hole) gives no frame to the other
+    # runs; it is still a target and takes its bound from the others (the locked rule: the frames of every other run)
+    if sum(1 for r in runs.values() if r['n_ok'] > 0) < 2:
+        raise A6Error('dong_huong: fewer than two runs with a usable frame (IMU yaw, omega, acceleration)')
     a_all = np.concatenate([r['a'][r['ok']] for r in runs.values()])
     a_max, a_tv = float(np.max(a_all)), float(np.median(a_all))
     if not 0.0 < a_tv < a_max:
@@ -1965,7 +1970,8 @@ def dong_huong_build(runs, tam_id, khoa_sha, log=None):
                      'hoi quy tren moi luot [1, t - tb, omega] va chung [yaw IMU - tb luot (thang), u_y/2, -u_x/2]; '
                      'SE: jackknife bo tung luot; khung dung duoc: co yaw IMU, omega, gia toc huu han; khong loc omega',
                 n_khung_luot={k: v['n'] for k, v in runs.items()},
-                n_khung_dung_luot={k: v['n_ok'] for k, v in runs.items()}, truoc_le=True)
+                n_khung_dung_luot={k: v['n_ok'] for k, v in runs.items()},
+                luot_khong_khung_dung=[k for k, v in runs.items() if v['n_ok'] < 1], truoc_le=True)
 
 
 # ── readers ──────────────────────────────────────────────────────────────────────────────────────
@@ -2476,7 +2482,8 @@ def main(argv=None):
                 lsha = cu.sha256(lp)
                 D, half = read_gio_offset(op, g['frames_sha256'], lsha)
                 runs[lid] = yaw_run(g, ses, cu.load_log(lp), D)
-                gio[lid] = dict(D_s=D, half_s=half, n_late=runs[lid]['n_late'])
+                gio[lid] = dict(D_s=D, half_s=half, n_late=runs[lid]['n_late'], n_khung_co_yaw=runs[lid]['n_imu'],
+                                t_break_log_s=runs[lid]['t_break_log_s'])
                 nguon += [dict(vai=f'goc {lid}', file=os.path.abspath(gp), sha256=cu.sha256(gp)),
                           dict(vai=f'log {lid}', file=os.path.abspath(lp), sha256=lsha),
                           dict(vai=f'gio {lid}', file=os.path.abspath(op), sha256=cu.sha256(op))]
