@@ -1488,12 +1488,13 @@ def khac_session(ctx, wa, wb):
 
 
 KGS_PHYS = ('du_xoay_rad', 'du_thang', 'du_bien_dang_rad', 'xoay_bien_thien_rad')
-# v4 14 (CODE_KHUNG 21/11 sec 5): the apparent tag edge changes between camera segments (+0.56 / -0.29 / -0.85 mm on the
-# marks), so a cross-session tag scale (and the Dh / delta_c_B correction built on it) is biased beyond doi_s. Until the
-# chain chooses a way (CODE asks Liam: no scale comparison across sessions / phi apart from the plate check / edge
-# correction / new 12b per camera mount), the cross-session scale and c_B comparisons are khong_xac_dinh and a
-# cross-session delta_c_B chua_ket_luan (no dat from an uncorrected bias).
-VIEN_MA_KHAC_SESSION_CHAN = True
+# v4 14 (CODE_KHUNG 21/11 sec 5; measured on track33_cuoi 23/11: tag scale between camera segments -121 .. +79 e-4,
+# doi_s 5e-4): the apparent tag edge changes between camera segments, so a cross-session tag scale (and the Dh built on
+# it) is biased. Liam 23/11 (CODE_NHACTAM, "Bo so co ma khac doan (Recommended)", way (i)): across sessions the scale is
+# NOT compared (khong_so, out of tong_doi), c_B is compared RAW (no Dh correction) within the phys band, theta within its
+# band; a cross-session delta_c_B is the raw one with the Dh part of U = 0 under the stated assumption that the plate was
+# glued once and not removed (Liam 22/11 at CODE_C8B); the plate height between segments is not checked (limit).
+KHAC_SESSION_BO_THANG = True
 
 
 def u_kgs(e, chos, L_AB, side, c_B=None):
@@ -1788,6 +1789,8 @@ GIOI_HAN_V4 = [
     'LLC1-16: cua so mat ma chi du doan neo tu cua so gan nhat cung clip; khong du doan -> cua so hong (an toan).',
     'v4 13 (CODE chot tam 19/11, phuong an b): beta_cam_replay doi diem neo hai dau voi G, h da khoa; u_beta_cam khong '
     'gom phan sai ban do di qua khop lai hinh neo (G, h).',
+    'v4 14 (Liam 23/11, cach i): khac session thang ma khong so, c_B so ban tho; delta_c_B khac session la ban tho, '
+    'phan U do Dh = 0 theo gia dinh tam dan mot lan khong thao; do cao tam giua hai doan camera khong kiem duoc.',
     'v4 14 (CODE chot 20/11, chuoi da session): moi diem cua mot session lech toi da du_m so voi session kia (file CAM '
     'c7_khung_giua_session_v1); goc qua do dai L lech toi da asin(2 du / L); khong gia dinh truong lech tron (cach an '
     'toan, co the lon hon sai that); cung session: hang 0.',
@@ -2127,16 +2130,21 @@ def so_sanh(wa, wb, ctx, g_b, nguong, cmap=None):
         return d
     th = cb = sc = None
     uk, ly = dict(theta_deg=0.0, c_B_m=0.0, s=0.0), dict(theta=None, c_B=None, s=None)
+    bo_s = False
     if wa is not None and wb is not None:
+        khac, e = khac_session(cmap, wa, wb) if cmap is not None else (False, None)
+        bo_s = bool(khac and KHAC_SESSION_BO_THANG)
         if wa.get('theta') is not None and wb.get('theta') is not None:
             th = abs(math.degrees(wrap(wb['theta'] - wa['theta'])))
         if g_b is not None:
             try:
-                dcb, _, dh = delta_c_B(wa, wb, ctx, g_b)
-                cb, sc = float(np.linalg.norm(dcb)), abs(dh) / (wb['H'] - ctx.tag_h)
+                dcb, raw, dh = delta_c_B(wa, wb, ctx, g_b)
+                if bo_s:                      # Liam 23/11 (i): raw c_B across sessions, no scale
+                    cb = float(np.linalg.norm(raw))
+                else:
+                    cb, sc = float(np.linalg.norm(dcb)), abs(dh) / (wb['H'] - ctx.tag_h)
             except ValueError:
                 pass
-        khac, e = khac_session(cmap, wa, wb) if cmap is not None else (False, None)
         if khac and e is None:
             uk = dict(theta_deg=math.inf, c_B_m=math.inf, s=math.inf)
             ly = dict.fromkeys(ly, 'thieu_khung_giua_session')
@@ -2148,13 +2156,11 @@ def so_sanh(wa, wb, ctx, g_b, nguong, cmap=None):
             uk = u_kgs(e, {_cho_of(wa), _cho_of(wb)}, cmap.L_AB, ctx.side, c_t)
             if g_b is not None and c_t is None:
                 uk['c_B_m'] = math.inf
-            if VIEN_MA_KHAC_SESSION_CHAN:          # tag edge bias differs between sessions: scale, Dh not comparable
-                uk['c_B_m'] = uk['s'] = math.inf
-                ly.update(c_B='vien_ma_khac_session', s='vien_ma_khac_session')
             if not math.isfinite(uk['theta_deg']):
                 ly['theta'] = uk['cach']
+    s_st = dict(gia_tri=None, nguong=nguong['s'], trang_thai='khong_so', ly_do='khac_session_bo_so_thang') if bo_s         else st(sc, nguong['s'], uk['s'], ly['s'])
     return dict(theta=st(th, nguong['theta'], uk['theta_deg'], ly['theta']),
-                c_B=st(cb, nguong['c_B'], uk['c_B_m'], ly['c_B']), s=st(sc, nguong['s'], uk['s'], ly['s']))
+                c_B=st(cb, nguong['c_B'], uk['c_B_m'], ly['c_B']), s=s_st)
 
 
 def tong_doi(ss):
@@ -2775,7 +2781,12 @@ def _mot_luot(lid, d, so, env):
     except ValueError as e:
         lc.append(f'mien_so: {e}')
         return r
-    r['delta_c_B_m'], r['delta_c_B_tho_m'], r['delta_h_uoc_m'] = dcb.tolist(), raw.tolist(), dh
+    bo = bool(khac and KHAC_SESSION_BO_THANG)                   # Liam 23/11 (i): raw across sessions, Dh not measured
+    if bo:
+        dcb, dh = raw, 0.0
+        r['gia_dinh_khac_doan'] = ('Dh = 0: tam dan mot lan, khong thao (Liam 22/11 o CODE_C8B); thang ma khac doan '
+                                  'khong so (Liam 23/11, cach i); do cao tam giua hai doan khong kiem duoc')
+    r['delta_c_B_m'], r['delta_c_B_tho_m'], r['delta_h_uoc_m'] = dcb.tolist(), raw.tolist(), None if bo else dh
     n12 = 0 if tr is None else tr['n']
     if n12 < cfg['min_12b']:
         lc.append('thieu_12b_cung_lan_lap')
@@ -2790,14 +2801,15 @@ def _mot_luot(lid, d, so, env):
             u, parts, u_dh = u_delta_c_B(sw, dc, ctx, g_b, env['eps_g'], tr['c_B'],
                                          tr['s'] + (uc['s'] if uc else 0.0), e_pos,          # v4 14: ratio, cross session
                                          env['du_giu'] if math.isfinite(env['du_giu']) else 0.0)
+            if bo:                                                  # Liam 23/11 (i): no Dh correction, Dh = 0 assumed
+                parts['dh'] = parts['lech_cho'] = 0.0
+                u, u_dh = float(sum(parts.values())), None
             if uc is not None:                                      # v4 14: frame difference of the two sessions
                 parts['khung_giua_session'] = uc['c_B_m']
                 u += uc['c_B_m']
             r['u_delta_c_B_m'], r['u_delta_c_B_phan'], r['u_delta_h_m'] = u, parts, u_dh
         except ValueError as e:
             lc.append(f'mien_so: {e}')
-    if khac and VIEN_MA_KHAC_SESSION_CHAN:                      # v4 14: Dh from the scale ratio of two sessions
-        lc.append('vien_ma_khac_session')
     if abs(dh) > cfg['dh_max_m']:
         lc.append('dh_vuot_ngoi_chot')
     if len(env['giu_vt']) < cfg['min_giu_vi_tri']:
