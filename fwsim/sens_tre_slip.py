@@ -20,9 +20,40 @@ Outputs in --out (CSV: s03_doe.write_csv / fmt):
   bang.csv                  one row per run
   tom_tat_theo_dieu_kien.csv  per run x response: value, reference value, hieu = value - ref
   tom_tat.csv               per controller x combo x response over the 9 conditions
-  meta.json
+  meta.json                 incl. command_full, the DLL path/sha256/fwsim_build and warnings
 
-  python fwsim/sens_tre_slip.py --out ket_qua_c2 --dll ket_qua_c2/build/fwsim.dll --workers 8
+Run (default --dll = fwsim/build/fwsim.dll, the output of python fwsim/build_fwsim.py;
+meta.json records command_full with every option and absolute paths, the DLL sha256, its
+fwsim_build.json, and a WARNING when that file is missing or the build is dirty):
+  python fwsim/build_fwsim.py
+  python fwsim/sens_tre_slip.py --out <new folder> --workers 8 [--ctrl ADRC] [--dll <dll>]
+--out must be a new folder (an existing bang.csv is refused).
+
+Rerun of SENS_TRE_SLIP/2026-11-22_run01 (its meta.yaml line 18 'lenh' has no --dll: at hil
+53f0e2f the default was ket_qua_c2/build/fwsim.dll relative to the cwd = repo root):
+  python fwsim/sens_tre_slip.py --out <new folder> --dll ket_qua_c2/build/fwsim.dll --workers 8
+  DLL sha256 4675ff9e79933703567d6c902a1a7610d1867798c595e76fce5544551683bae7,
+  AGV_MECANUM 5bde4c5 dirty false, gcc MinGW-W64 13.2.0 -std=gnu11 -O2 -ffp-contract=off
+  (run01 meta.yaml lines 14, 16; ket_qua_c2/build/fwsim_build.json). If that DLL is gone:
+  python fwsim/build_fwsim.py --fw <AGV_FIRMWARE clean at 5bde4c5> --out <folder>, then
+  --dll <folder>/fwsim.dll, and use the numbers only if meta.json dll.sha256 equals the one
+  above (a byte-identical rebuild is not checked).
+
+Confirmation run when an input changes (S03 v8.6 section 8 condition 12): if the S03 main
+run differs from run01 in rpi5/plant_step.py, rpi5/params.py, rpi5/imu_model.py, the DLL
+(beyond the limits table, L142), the mu levels, the speed set, the replayed IMU noise data,
+the scoring (s03_doe.py, O1 gate), fwsim/fwsim.py or this file: run the same grid on the new
+inputs before S03 main:
+  python fwsim/build_fwsim.py
+  python fwsim/sens_tre_slip.py --out <new folder> --workers 8
+New mu levels / speeds are an edit of MU_LEVELS, MU_SOURCE (SPEEDS = s03_doe.SPEEDS) first.
+Thresholds must be the S03 section 5.2 ones locked at run time (THRESH_C2). The spec rules
+(a run_error is run once more; still failing or a missing pair = inconclusive, report to
+Liam) are applied by hand: this script does not compare with run01.
+
+LADRC run after S06 (condition 12 (ii)): when the measured HIL loop delay is >= 2 ms, the
+same grid for LADRC only (3 delays x 3 omega_s x 9 conditions = 81 runs):
+  python fwsim/sens_tre_slip.py --out <new folder> --workers 8 --ctrl ADRC
 """
 from __future__ import annotations
 
@@ -32,6 +63,7 @@ import json
 import math
 import multiprocessing as mp
 import os
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -54,6 +86,7 @@ MU_SOURCE = ('05_DATA/results/S03/2026-11-10_run02/meta.yaml line 18 mu_levels '
              '(MU_FLOOR/2026-11-09_run02 min/mean/max)')
 SEED = s03.SEED                                         # plant seed and IMU noise seed (s03.IMU)
 RESPONSES = s03.RESPONSES                               # e_perp_max, e_perp_max_cens, tv_duty, sat_frac
+DEFAULT_DLL = os.path.join(HERE, 'build', 'fwsim.dll')  # output of fwsim/build_fwsim.py
 THRESH_C2 = {'e_perp_max': 0.01, 'e_perp_max_cens': 0.01, 'sat_frac': 0.01, 'tv_duty': 0.4}
 TEN_C2 = {'e_perp_max': 'Y1', 'e_perp_max_cens': 'Y1 (cens)', 'sat_frac': 'Y2', 'tv_duty': 'Y3'}
 TEN_S03 = {'e_perp_max': 'Y2', 'e_perp_max_cens': 'Y2 (cens)', 'tv_duty': 'Y3', 'sat_frac': 'Y4'}
@@ -184,12 +217,12 @@ def per_condition_rows(rows, refs):
     return out
 
 
-def summary_rows(rows, refs):
+def summary_rows(rows, refs, controllers=CONTROLLERS):
     """tom_tat.csv: one row per controller x combo (incl. the reference) x response."""
     by_key = {(r['controller'], r['io_delay_ms'], r['slip_omega_s'], r['mu'], r['v']): r
               for r in rows}
     out = []
-    for ctrl in CONTROLLERS:
+    for ctrl in controllers:
         for delay in DELAYS:
             for w in OMEGAS:
                 rs = [by_key[(ctrl, delay, w, mu, v)] for mu in MU_LEVELS for v in SPEEDS]
@@ -224,12 +257,79 @@ def summary_rows(rows, refs):
     return out
 
 
-def main(argv=None):
+# ── command line and DLL provenance ─────────────────────────────────────────────────
+
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--out', default='ket_qua_c2')
-    ap.add_argument('--dll', default=os.path.join('ket_qua_c2', 'build', 'fwsim.dll'))
+    ap.add_argument('--dll', default=DEFAULT_DLL)
     ap.add_argument('--workers', type=int, default=8)
-    args = ap.parse_args(argv)
+    ap.add_argument('--ctrl', nargs='+', choices=CONTROLLERS, default=list(CONTROLLERS),
+                    help='controllers to run (default both); --ctrl ADRC = LADRC only, 81 runs')
+    return ap
+
+
+def select_controllers(ctrl):
+    """--ctrl value -> tuple in CONTROLLERS order, duplicates removed."""
+    return tuple(c for c in CONTROLLERS if c in ctrl)
+
+
+def make_jobs(ctrls):
+    """(controller, io_delay_ms, slip_omega_s, mu, v) of the grid for the selected ctrls."""
+    return [(c, d, w, mu, v) for c in ctrls for d in DELAYS for w in OMEGAS
+            for mu in MU_LEVELS for v in SPEEDS]
+
+
+def full_command(args, ctrls):
+    """The command of this run with every option explicit and absolute paths (meta.json
+    command_full_argv): a rerun needs only to copy it."""
+    return [sys.executable, os.path.abspath(__file__),
+            '--out', os.path.abspath(args.out), '--dll', os.path.abspath(args.dll),
+            '--workers', str(args.workers), '--ctrl', *ctrls]
+
+
+def dll_info(dll):
+    """Provenance of --dll: absolute path, sha256, the fwsim_build.json next to it and
+    warnings; never exits (a sensitivity trial continues on an unknown or dirty build)."""
+    path = os.path.abspath(dll)
+    sha = s03.sha256_file(dll)
+    build_json = os.path.join(os.path.dirname(path), 'fwsim_build.json')
+    build, warnings = None, []
+    if os.path.isfile(build_json):
+        with open(build_json, encoding='utf-8') as f:
+            build = json.load(f)
+    else:
+        warnings.append('no fwsim_build.json next to the DLL: the origin of the DLL is '
+                        'unknown; sensitivity trial, run continues')
+    esp32_dirty = None
+    if build is not None:
+        esp32 = build.get('esp32') or {}
+        if 'dirty' not in esp32:
+            warnings.append('fwsim_build.json has no esp32.dirty: the dirty state of the '
+                            'firmware tree at build time is unknown; sensitivity trial, '
+                            'run continues')
+        else:
+            esp32_dirty = esp32['dirty']
+            if esp32_dirty:
+                warnings.append('fwsim.dll was built from a dirty firmware tree '
+                                '(esp32.dirty = true); sensitivity trial, run continues')
+        hil = build.get('hil_framework') or {}
+        if hil.get('dirty'):
+            warnings.append('the hil_framework repo was dirty at build time '
+                            f"(modified: {', '.join(hil.get('modified') or ['?'])}); "
+                            'sensitivity trial, run continues')
+        recorded = build.get('dll_sha256')
+        if recorded and recorded != sha:
+            warnings.append('fwsim_build.json dll_sha256 differs from the DLL on disk: '
+                            'fwsim_build.json does not describe this DLL; sensitivity '
+                            'trial, run continues')
+    return dict(path=path, sha256=sha, fwsim_build_json=build_json, fwsim_build=build,
+                esp32_dirty=esp32_dirty, warnings=warnings)
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    ctrls = select_controllers(args.ctrl)
     bang = os.path.join(args.out, 'bang.csv')
     if os.path.exists(bang):
         sys.exit(f'{bang} exists: refusing to overwrite')
@@ -239,10 +339,12 @@ def main(argv=None):
     fw0 = fwsim.FirmwareSim(args.dll)
     if not fw0.pos_cols:
         sys.exit('fwsim.dll has no pos_ctrl.c: C2 needs the campaign firmware')
-    gains = {c: s03.defaults(fw0, c) for c in CONTROLLERS}
+    info = dll_info(args.dll)
+    for w in info['warnings']:
+        print(f'WARNING: {w}', flush=True)
+    gains = {c: s03.defaults(fw0, c) for c in ctrls}
 
-    jobs = [(c, d, w, mu, v) for c in CONTROLLERS for d in DELAYS for w in OMEGAS
-            for mu in MU_LEVELS for v in SPEEDS]
+    jobs = make_jobs(ctrls)
     rows = []
     n_workers = min(args.workers, 8)
     with mp.Pool(processes=n_workers, initializer=_init, initargs=(args.dll,)) as pool:
@@ -254,24 +356,24 @@ def main(argv=None):
     rows.sort(key=lambda r: (CONTROLLERS.index(r['controller']), r['io_delay_ms'],
                              r['slip_omega_s'], r['mu'], r['v']))
     refs = {(r['controller'], r['mu'], r['v']): r for r in rows if r['la_moc']}
-    assert len(refs) == len(CONTROLLERS) * len(MU_LEVELS) * len(SPEEDS), 'missing reference runs'
+    assert len(refs) == len(ctrls) * len(MU_LEVELS) * len(SPEEDS), 'missing reference runs'
 
     s03.write_csv(bang, rows, BANG_COLS)
     s03.write_csv(os.path.join(args.out, 'tom_tat_theo_dieu_kien.csv'),
                   per_condition_rows(rows, refs), DK_COLS)
-    s03.write_csv(os.path.join(args.out, 'tom_tat.csv'), summary_rows(rows, refs), TT_COLS)
+    s03.write_csv(os.path.join(args.out, 'tom_tat.csv'), summary_rows(rows, refs, ctrls), TT_COLS)
 
     root = os.path.join(HERE, '..')
-    build_json = os.path.join(os.path.dirname(os.path.abspath(args.dll)), 'fwsim_build.json')
-    with open(build_json, encoding='utf-8') as f:
-        build = json.load(f)
+    cmd_full = full_command(args, ctrls)
     meta = dict(
-        command=' '.join(sys.argv), started=t_iso, ended=time.strftime('%Y-%m-%dT%H:%M:%S'),
+        command=' '.join(sys.argv), command_full=subprocess.list2cmdline(cmd_full),
+        command_full_argv=cmd_full, cwd=os.getcwd(), controllers=list(ctrls),
+        started=t_iso, ended=time.strftime('%Y-%m-%dT%H:%M:%S'),
         elapsed_s=time.time() - t0, n_runs=len(rows), n_workers=n_workers,
         cpu_count=os.cpu_count(),
-        dll=dict(path=os.path.abspath(args.dll), sha256=s03.sha256_file(args.dll)),
-        fwsim_build_json=build_json, fwsim_build=build,
-        esp32_dirty=fw0.build_info.get('esp32', {}).get('dirty'),
+        dll=info,
+        fwsim_build_json=info['fwsim_build_json'], fwsim_build=info['fwsim_build'],
+        esp32_dirty=info['esp32_dirty'], warnings=info['warnings'],
         gains=gains,
         seeds=dict(plant=SEED, imu_noise=s03.IMU['noise_seed'],
                    note='no other random source'),
@@ -286,6 +388,8 @@ def main(argv=None):
     )
     with open(os.path.join(args.out, 'meta.json'), 'w', encoding='utf-8') as f:
         json.dump(meta, f, indent=2, ensure_ascii=False, default=str)
+    for w in info['warnings']:
+        print(f'WARNING: {w}', flush=True)
     print(f'done: {len(rows)} runs in {time.time() - t0:.0f} s -> {args.out}', flush=True)
 
 
