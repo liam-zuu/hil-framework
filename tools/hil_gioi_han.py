@@ -28,6 +28,15 @@ ESP32 (pwm -> duty MISO) khi có log phía Pi.
     bộ chấm xét). JSON phải khớp log (frame_log cùng tên, frames_scored = n - k0), không thì
     ValueError -> mã 2. Không có kết quả chấm -> win_ht_src 'khong_co_ket_qua_cham', cột *_ht
     rỗng; số 1 s cuối là số mô tả riêng ở cột *_last1s.
+    C3-28 (khoá kết quả chấm): JSON chấm phải có khối 'e2_khoa_cham' (LOCK_KEY) do --cham ghi:
+    frame_log_sha256 = SHA-256 của chính file --frame-log, task = --task (và trường 'task' của
+    bộ chấm = --task), cờ allow_final_set / allow_pre_b81_15 (bool), scorer = blob git (nội dung
+    CRLF -> LF) của tools/hil_o1_score.py và các module chấm SCORER_MODULES; cùng esp_log,
+    esp_log_sha256 của log ESP32 đưa cho bộ chấm (chỉ ghi, không đối chiếu). JSON thô của
+    hil_o1_score.py --out không có khối này -> mã 2. Thêm: frame_log bắt buộc; t0_step, T_cmd,
+    t_deadline phải hữu hạn; completed 'true' cần t_end hữu hạn; t_end có mặt mà không hữu hạn
+    -> mã 2. win_ht_src = 'hil_o1_score:<t0_src>:completed=<..>:allow_final_set=<0|1>:
+    allow_pre_b81_15=<0|1>:scorer_blob=<blob hil_o1_score>'.
 
 (b) Băng mù theo bánh (đề xuất v6 C3(b)): blind_band(omega32) -> (n,4) bool, a = |omega32|
     float32, (a > 0) & (a <= float32(0.3)): H7 không phát xung encoder khi
@@ -99,11 +108,16 @@ ESP32 (pwm -> duty MISO) khi có log phía Pi.
       k_vao_dai, t_vao_dai_ms = (t_f[k] - t0)/1000; không có -> censored ("> khoảng giữ",
       KHÔNG bỏ), cens_ms = (min(t_end, t_f[-1]) - t0)/1000, cat = 'doi_lenh' (lệnh đổi mức
       trước frame cuối của log) hay 'het_log' (log frame hết trước). n_khong_bc = số frame
-      không valid + số chỗ cắt mất mẫu trong khoảng đã quét [k_first; lần vào dải] (hay tới
-      k_last): > 0 thì lần vào dải thật có thể sớm hơn số báo (frame không quan sát được).
-      moc_t0 'udp_envelope'; bat_dinh_ms = sync_resid_max_us/1000 (± của đường khớp), cộng
-      độ lệch MỘT PHÍA chưa đo: trễ UDP nhỏ nhất làm t0 suy ra trễ hơn thật, nên t_vao_dai_ms
-      có thể NGẮN hơn thật tới chừng đó (vd. mốc trễ 4 ms: đáp ứng 4 ms ghi thành 0 ms).
+      không valid trong khoảng đã quét [k_first; lần vào dải] (hay tới k_last) + số khoảng
+      mất mẫu (t_f[k-1]; t_f[k]) giao cửa sổ quan sát [t0; t_f[k_vao_dai]] (hay [t0; t_end)),
+      C3-31: kể cả khoảng vắt qua t0 (mẫu trước t0, mẫu kế sau t0) hay vắt qua t_end
+      (n_gaps_in): > 0 thì lần vào dải thật có thể sớm hơn số báo (frame không quan sát
+      được). duty_first = duty của frame k_first, để trống khi frame đó không valid (rỗng,
+      sai CRC; C3-31). moc_t0 'udp_envelope'; bat_dinh_ms = sync_resid_max_us/1000 (± của
+      đường khớp, chỉ phần dư); cột riêng lech_udp = 'chua_do' (C3-31, KHÔNG gộp vào
+      bat_dinh_ms): độ lệch MỘT PHÍA chưa đo, trễ UDP nhỏ nhất làm t0 suy ra trễ hơn thật,
+      nên t_vao_dai_ms có thể NGẮN hơn thật tới chừng đó (vd. mốc trễ 4 ms: đáp ứng 4 ms ghi
+      thành 0 ms).
     - Sự kiện 'tat_motor' (dừng motor cuối lượt; firmware AGV src/main.c: vòng
       vTaskDelay(pdMS_TO_TICKS(10)) :387; tick đầu motor-off gọi motor_stop_all() và
       push_run_end() :641-644; dòng idle 10 Hz pwm 0 chỉ được đẩy ~10 tick sau :646-650, nên
@@ -127,8 +141,8 @@ ESP32 (pwm -> duty MISO) khi có log phía Pi.
       cột A11_STAT với hậu tố _doi_<T>, T in (0,1). Các cột mọi-sự-kiện (hậu tố _<T>) vẫn giữ.
       A11_STAT: n_ev, n_vao_dai, n_cens, t_vao_dai_med/p95/max_ms, cens_max_ms,
       n_cat_doi_lenh, n_cat_het_log, n_ev_mat_mau (sự kiện có n_khong_bc > 0).
-    - CSV sự kiện: loai ('lenh' / 'tat_motor'), pwm_prev, moc_t0, bat_dinh_ms, k_vao_dai,
-      t_vao_dai_ms, vao_dai, n_lien_vao_dai, n_khong_bc, cat.
+    - CSV sự kiện: loai ('lenh' / 'tat_motor'), pwm_prev, moc_t0, bat_dinh_ms, lech_udp,
+      k_first, duty_first, k_vao_dai, t_vao_dai_ms, vao_dai, n_lien_vao_dai, n_khong_bc, cat.
     - 9 npz của 2026-11-08_run08/run09/run11 (w1, w2, w3) không có log ESP32 phía Pi (chỉ
       esp32_COM5.txt serial không giờ Pi) -> chỉ phần MISO, esp_part 'khong_co_log_ESP32'.
 
@@ -142,8 +156,10 @@ Chạy theo lô:
   python tools/hil_gioi_han.py --batch-from-s1 ket_qua_s1.csv --root CLOSED_LOOP --out DIR [--cham]
   --cham: dòng có task 'O1-*' được chấm bằng hil_o1_score.score(npz, task,
   allow_final_set=True, esp_log=<log ESP32 nếu có>, allow_pre_b81_15=True) (log phát triển
-  trước kiểm B81-15), JSON ghi DIR/cham/<run>__<ten>_score.json, mặt nạ *_ht lấy từ đó;
-  bộ chấm lỗi -> win_ht_src 'loi_cham: ...', cột *_ht rỗng, lô chạy tiếp.
+  trước kiểm B81-15), JSON ghi DIR/cham/<run>__<ten>_score.json kèm khối 'e2_khoa_cham'
+  (C3-28: SHA-256 NPZ băm trước khi chấm, task, bộ cờ, blob bộ chấm; mục a), mặt nạ *_ht lấy
+  từ đó sau khi kiểm khoá (băm lại NPZ); bộ chấm lỗi -> win_ht_src 'loi_cham: ...', cột *_ht
+  rỗng, lô chạy tiếp; kết quả chấm không qua kiểm khoá / mốc -> dòng lỗi (cột 'error').
   Mỗi dòng s1: frame log = root/run/frames/npz, log ESP32 = root/run/pi/<ten>.csv nếu có,
   task = cột 'task' của s1 (nhận diện của dem_s1 từ meta.yaml, đã kiểm). Ghi ket_qua_e2.csv
   (một dòng/npz, cột run, npz, name, task đứng đầu), su_kien/<run>__<ten>_su_kien_a11.csv,
@@ -162,6 +178,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import hashlib
 import json
 import math
 import os
@@ -195,11 +212,21 @@ CLOCK_BIN_US = 1e6                  # s06_t6_check.py CLOCK_BIN_US (bin chặn d
 ESP_NEED = ('timestamp_us', 'log_seq') + tuple('pwm_' + w for w in WHEELS)
 SEG_MARK_COLS = ['row', 'log_seq', 'timestamp_us', 'segment', 'status']   # <log>.segments.csv
 PWM_COLS = tuple('pwm_' + w for w in WHEELS)
-GAP_FACTOR = 1.5                    # [ĐỀ XUẤT] bước t_send > 1,5 chu kỳ = khoảng mất mẫu (C3-14)
+# bước t_send > GAP_FACTOR chu kỳ = khoảng mất mẫu (C3-14). QUY ƯỚC, căn cứ (đề F-E2, số đo của
+# CODE trên 158 log CLOSED_LOOP, chưa kiểm lại ở đây): bước t_send lớn nhất khi không mất mẫu
+# khoảng 1,07 chu kỳ, mất một mẫu khoảng 2 chu kỳ, nên mọi ngưỡng trong (1,07; 2) chu kỳ cho
+# cùng kết quả trên các log đó; 1,5 nằm giữa khoảng.
+GAP_FACTOR = 1.5
 KIND_INVALID = 3                    # loại của frame MISO không valid trong phân đoạn dung sai
 # thống kê A11 (C3-15: thời gian tới lần đầu quan sát vào dải, không phải "theo kịp" T6)
 A11_STAT = ('n_ev', 'n_vao_dai', 'n_cens', 't_vao_dai_med_ms', 't_vao_dai_p95_ms',
             't_vao_dai_max_ms', 'cens_max_ms', 'n_cat_doi_lenh', 'n_cat_het_log', 'n_ev_mat_mau')
+LECH_UDP = 'chua_do'                # C3-31 cột lech_udp: lệch một phía do trễ UDP nhỏ nhất, chưa đo
+# C3-28: khoá kết quả chấm (khối LOCK_KEY trong JSON chấm do --cham ghi)
+LOCK_KEY = 'e2_khoa_cham'
+CHAM_FLAGS = dict(allow_final_set=True, allow_pre_b81_15=True)   # cờ chấm của lô --cham
+SCORER_MODULES = ('hil_o1_score', 'o1_gate_eval', 'o1_gate', 'o1_feasibility', 'o1_lanes',
+                  'o1_tasks', 'hil_edge_map')                    # nguồn của bộ chấm (blob git)
 
 
 def a11_cols(sfx):
@@ -237,8 +264,9 @@ for _t in (0, 1):
     ROW_COLS += a11_cols(f'doi_{_t}')
 
 EVENT_COLS = ['loai', 'wheel', 'target', 'log_seq', 'pwm_prev', 't_esp_us', 't_pi_us',
-              'moc_t0', 'bat_dinh_ms', 'k_first', 'duty_first', 'k_vao_dai', 't_vao_dai_ms',
-              'vao_dai', 'n_lien_vao_dai', 'n_khong_bc', 'cat', 'cens_ms', 'cmd_level_ms']
+              'moc_t0', 'bat_dinh_ms', 'lech_udp', 'k_first', 'duty_first', 'k_vao_dai',
+              't_vao_dai_ms', 'vao_dai', 'n_lien_vao_dai', 'n_khong_bc', 'cat', 'cens_ms',
+              'cmd_level_ms']
 SEG_OUT_COLS = ['wheel', 'kind', 'k_start', 'len_frames', 'len_ms']
 
 CMP_SAME = ['n_frames', 'k0', 'n_run', 'win_kind', 'win_n', 'n_vband_win', 'n_vband_last1s',
@@ -343,29 +371,104 @@ def frame_validity(mosi, miso, t_send_ns, period_us):
     return chk == protocol.MISO_OK, chk == protocol.MISO_CRC_BAD, cut
 
 
-def score_window(score, npz_name, n, period):
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for b in iter(lambda: f.read(1 << 20), b''):
+            h.update(b)
+    return h.hexdigest()
+
+
+def git_blob(path):
+    """SHA-1 blob git của file nguồn (nội dung đổi CRLF -> LF như git hash-object khi
+    core.autocrlf=true)."""
+    with open(path, 'rb') as f:
+        data = f.read().replace(b'\r\n', b'\n')
+    return hashlib.sha1(b'blob %d\0' % len(data) + data).hexdigest()
+
+
+def score_lock(npz_path, task, esp_path):
+    """C3-28: khối LOCK_KEY ghi vào JSON chấm của --cham: SHA-256 NPZ, task, bộ cờ chấm
+    CHAM_FLAGS, log ESP32 đưa cho bộ chấm (tên, SHA-256) và blob git các nguồn SCORER_MODULES."""
+    return dict(frame_log=os.path.basename(npz_path), frame_log_sha256=sha256_file(npz_path),
+                task=task, **CHAM_FLAGS,
+                esp_log=os.path.basename(esp_path) if esp_path else None,
+                esp_log_sha256=sha256_file(esp_path) if esp_path else None,
+                scorer={m: git_blob(sys.modules[m].__file__) for m in SCORER_MODULES})
+
+
+def check_score_lock(score, npz_path, task):
+    """C3-28: kết quả chấm phải mang khối LOCK_KEY của đúng NPZ (SHA-256) và đúng task, đủ bộ
+    cờ và blob bộ chấm; trường 'task' của bộ chấm cũng phải là task. Sai -> ValueError."""
+    lock = score.get(LOCK_KEY)
+    if not isinstance(lock, dict):
+        raise ValueError(f'ket qua cham khong co khoa {LOCK_KEY} (SHA-256 NPZ + task)')
+    sha = sha256_file(npz_path)
+    if lock.get('frame_log_sha256') != sha:
+        raise ValueError(f"ket qua cham cua NPZ sha256={lock.get('frame_log_sha256')!r}, "
+                         f'frame log co sha256={sha}')
+    if lock.get('task') != task or score.get('task') != task:
+        raise ValueError(f"ket qua cham cua task {lock.get('task')!r}/{score.get('task')!r}, "
+                         f'khong phai {task!r}')
+    for c in CHAM_FLAGS:
+        if not isinstance(lock.get(c), bool):
+            raise ValueError(f'khoa cham thieu co {c}')
+    sc = lock.get('scorer')
+    blob = sc.get('hil_o1_score') if isinstance(sc, dict) else None
+    if not (isinstance(blob, str) and re.fullmatch(r'[0-9a-f]{40}', blob)):
+        raise ValueError('khoa cham thieu blob git cua hil_o1_score')
+    return lock
+
+
+def score_window(score, npz_name, n, period, lock=None):
     """C3-17: mặt nạ cửa sổ hoàn thành (n,) bool từ kết quả hil_o1_score.score (docstring mục
-    a) -> (mask, t_ht0, t_ht1, src). JSON không khớp log -> ValueError."""
+    a) -> (mask, t_ht0, t_ht1, src). JSON không khớp log -> ValueError. C3-28: frame_log bắt
+    buộc; k0, t0_step, T_cmd, t_deadline phải hữu hạn; completed 'true' cần t_end hữu hạn;
+    t_end có mặt mà không hữu hạn -> ValueError. lock (check_score_lock): bộ cờ và blob bộ
+    chấm ghi vào src."""
     try:
         k0s, a = int(score['k0']), float(score['t0_step'])
         t_cmd, t_dl = float(score['T_cmd']), float(score['t_deadline'])
         fs = int(score['frames_scored'])
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f'ket qua cham thieu/sai truong: {exc}') from None
+    if not all(math.isfinite(v) for v in (a, t_cmd, t_dl)):
+        raise ValueError(f'ket qua cham co moc khong huu han: t0_step={a}, T_cmd={t_cmd}, '
+                         f't_deadline={t_dl}')
     fl = score.get('frame_log')
-    if fl is not None and fl != npz_name:
+    if fl != npz_name:
         raise ValueError(f'ket qua cham cua {fl!r}, khong phai {npz_name!r}')
     if fs != n - k0s:
         raise ValueError(f'ket qua cham frames_scored={fs}, log co {n} frame, k0={k0s}')
+    t_end = score.get('t_end')
+    if t_end is not None:
+        try:
+            t_end = float(t_end)
+        except (TypeError, ValueError):
+            raise ValueError(f'ket qua cham t_end={t_end!r} khong phai so') from None
+        if not math.isfinite(t_end):
+            raise ValueError(f'ket qua cham t_end={t_end} khong huu han')
+    if score.get('completed') == 'true' and t_end is None:
+        raise ValueError("ket qua cham completed='true' ma khong co t_end huu han")
     t = (np.arange(n) - a) * period
     m = (np.arange(n) >= k0s) & (t >= t_cmd - 1e-9) & (t < t_dl - 1e-9)
-    t_end = score.get('t_end')
     t1 = t_dl
-    if t_end is not None and math.isfinite(float(t_end)):
-        m &= t <= float(t_end) + 1e-9
-        t1 = min(t_dl, float(t_end))
+    if t_end is not None:
+        m &= t <= t_end + 1e-9
+        t1 = min(t_dl, t_end)
     src = f"hil_o1_score:{score.get('t0_src', '')}:completed={score.get('completed', '')}"
+    if lock is not None:
+        src += ''.join(f':{c}={int(lock[c])}' for c in CHAM_FLAGS)
+        src += f":scorer_blob={lock['scorer']['hil_o1_score']}"
     return m, t_cmd, t1, src
+
+
+def n_gaps_in(t_f, cut, t_lo, t_hi):
+    """C3-31: số khoảng mất mẫu (t_f[k-1]; t_f[k]) (cut[k], k >= 1) giao cửa sổ [t_lo; t_hi):
+    t_f[k] > t_lo và t_f[k-1] < t_hi (khoảng vắt qua t_lo hay t_hi cũng tính; khoảng kết thúc
+    đúng tại t_lo thì mẫu mất đều trước t_lo, không tính)."""
+    k = np.nonzero(np.asarray(cut, dtype=bool)[1:])[0] + 1
+    return int(((t_f[k] > t_lo) & (t_f[k - 1] < t_hi)).sum())
 
 
 def _pearson(a, b):
@@ -566,7 +669,8 @@ def count_run(npz_path, task, score=None):
     )
     # C3-17: cửa sổ hoàn thành của bộ chấm (mặt nạ trên mọi frame của log)
     if score is not None:
-        ht, t_ht0, t_ht1, src = score_window(score, os.path.basename(npz_path), n, period)
+        lock = check_score_lock(score, npz_path, task)                   # C3-28
+        ht, t_ht0, t_ht1, src = score_window(score, os.path.basename(npz_path), n, period, lock)
         row.update(win_ht_src=src, t_ht0_s=round(t_ht0, 6), t_ht1_s=round(t_ht1, 6),
                    win_ht_n=int(ht.sum()),
                    n_vband_ht=int((in_speed_band(np.hypot(state[:, 7], state[:, 8])) & ht).sum()),
@@ -656,7 +760,10 @@ def esp_measure(esp_path, aux):
         kf = int(next_hit[(w, d_t)][k_first]) if k_first < n else n
         inb = kf < k_last
         k_stop = kf + 1 if inb else min(k_last, n)
-        n_kbc = int((~valid[k_first:k_stop]).sum() + cut[k_first + 1:k_stop].sum())
+        # C3-31: khoảng mất mẫu giao cửa sổ quan sát [t0; t_f[kf]] hay [t0; t_end), kể cả vắt
+        # qua t0 hay t_end
+        n_kbc = (int((~valid[k_first:k_stop]).sum())
+                 + n_gaps_in(t_f, cut, t0, t_f[kf] if inb else t_end))
         n_lien = 0
         if inb:
             k = kf
@@ -667,8 +774,9 @@ def esp_measure(esp_path, aux):
         cat = '' if inb else ('doi_lenh' if t_end <= t_f[-1] else 'het_log')
         return dict(
             loai=loai, wheel=nm, target=int(d_t), t_pi_us=round(t0, 3), moc_t0=moc,
-            bat_dinh_ms=round(bat_dinh, 6), k_first=k_first,
-            duty_first=round(float(duty[k_first, w]), 6) if k_first < n else '',
+            bat_dinh_ms=round(bat_dinh, 6), lech_udp=LECH_UDP, k_first=k_first,
+            duty_first=(round(float(duty[k_first, w]), 6)        # C3-31: không valid -> trống
+                        if k_first < n and valid[k_first] else ''),
             k_vao_dai=kf if inb else '',
             t_vao_dai_ms=round((t_f[kf] - t0) / 1000.0, 6) if inb else '',
             vao_dai=inb, n_lien_vao_dai=n_lien, n_khong_bc=n_kbc, cat=cat,
@@ -835,10 +943,13 @@ def batch(a):
         esp = esp if os.path.isfile(esp) else None
         score, cham_err = None, ''
         if a.cham and task.startswith('O1-'):
-            # C3-17: mặt nạ cửa sổ hoàn thành từ chính bộ chấm (docstring "Chạy theo lô")
+            # C3-17: mặt nạ cửa sổ hoàn thành từ chính bộ chấm (docstring "Chạy theo lô");
+            # C3-28: khoá SHA-256 NPZ + task, bộ cờ, blob bộ chấm ghi cùng kết quả
             try:
-                score = hil_o1_score._json_safe(hil_o1_score.score(
-                    fl, task, allow_final_set=True, esp_log=esp, allow_pre_b81_15=True))
+                lock = score_lock(fl, task, esp)
+                score = hil_o1_score._json_safe(hil_o1_score.score(fl, task, esp_log=esp,
+                                                                   **CHAM_FLAGS))
+                score[LOCK_KEY] = lock
                 with open(os.path.join(a.out, 'cham', f'{run}__{name}_score.json'), 'w',
                           encoding='utf-8') as f:
                     json.dump(score, f, ensure_ascii=False, indent=1)
@@ -877,8 +988,9 @@ def main(argv=None):
     ap.add_argument('--out', required=True)
     ap.add_argument('--batch-from-s1', help='ket_qua_s1.csv của dem_s1.py')
     ap.add_argument('--root', help='thư mục CLOSED_LOOP (cho --batch-from-s1)')
-    ap.add_argument('--score-json', help='kết quả hil_o1_score.py --out của cùng lượt '
-                    '(mặt nạ cửa sổ hoàn thành, cột *_ht)')
+    ap.add_argument('--score-json', help='kết quả chấm của cùng lượt do --cham ghi '
+                    '(cham/<run>__<ten>_score.json, có khoá SHA-256 NPZ + task): mặt nạ cửa sổ '
+                    'hoàn thành, cột *_ht')
     ap.add_argument('--cham', action='store_true',
                     help='lô: chấm dòng O1-* bằng hil_o1_score.score, mặt nạ *_ht từ kết quả')
     a = ap.parse_args(argv)

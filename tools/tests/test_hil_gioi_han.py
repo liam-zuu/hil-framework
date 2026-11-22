@@ -9,6 +9,7 @@ MISO -> censored. All data synthetic under tmp_path. Run: python -m pytest <this
 import base64
 import binascii
 import csv
+import hashlib
 import json
 import math
 import os
@@ -628,10 +629,30 @@ def test_c3_15_censored_by_log_end(tmp_path):
 
 # ---- C3-17: band count on the completion window of the scorer ----
 
-def _score(**kw):
+BLOB = '0123456789abcdef0123456789abcdef01234567'
+
+
+def _sha256(path):
+    with open(path, 'rb') as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def _lock(npz, task='O1-F08', **kw):
+    """The 'e2_khoa_cham' block (C3-28) as --cham writes it, for a hand-made scorer JSON."""
+    d = dict(frame_log=os.path.basename(npz), frame_log_sha256=_sha256(npz), task=task,
+             allow_final_set=True, allow_pre_b81_15=True, esp_log=None, esp_log_sha256=None,
+             scorer={'hil_o1_score': BLOB})
+    d.update(kw)
+    return d
+
+
+def _score(npz=None, **kw):
+    """Hand-made scorer result; with npz it carries the C3-28 lock of that file (task O1-F08)."""
     s = dict(k0=100, t0_step=100.0, T_cmd=10.0, t_deadline=12.0, t_end=10.5,
              completed='true', frames_scored=12100, frame_log='o_frames.npz',
-             t0_src='lifecycle_RUN')
+             t0_src='lifecycle_RUN', task='O1-F08')
+    if npz is not None:
+        s['e2_khoa_cham'] = _lock(npz)
     s.update(kw)
     return s
 
@@ -649,10 +670,10 @@ def test_c3_17_score_window(tmp_path):
     t_end but before the deadline are in the nominal window (compat n_vband_win) but not in
     the completion window of the scorer (n_vband_ht)."""
     npz = _speed_npz(tmp_path)
-    cases = [(_score(), 501),                              # t = 10.000 .. 10.500 inclusive
-             (_score(t_end=10.5 - 5e-10), 501),            # within 1e-9 of a frame
-             (_score(t_end=10.4995), 500),
-             (_score(t_end=None, completed='false'), 2000)]    # [10, 12): deadline strict
+    cases = [(_score(npz), 501),                           # t = 10.000 .. 10.500 inclusive
+             (_score(npz, t_end=10.5 - 5e-10), 501),       # within 1e-9 of a frame
+             (_score(npz, t_end=10.4995), 500),
+             (_score(npz, t_end=None, completed='false'), 2000)]   # [10, 12): deadline strict
     for i, (sc, n_ht) in enumerate(cases):
         sj = tmp_path / f's{i}.json'
         sj.write_text(json.dumps(sc), encoding='utf-8')
@@ -675,8 +696,9 @@ def test_c3_17_score_window(tmp_path):
 
 def test_c3_17_score_json_mismatch(tmp_path):
     npz = _speed_npz(tmp_path)
-    for i, sc in enumerate([_score(frames_scored=12099), _score(frame_log='z_frames.npz'),
-                            {k: v for k, v in _score().items() if k != 'T_cmd'}]):
+    for i, sc in enumerate([_score(npz, frames_scored=12099),
+                            _score(npz, frame_log='z_frames.npz'),
+                            {k: v for k, v in _score(npz).items() if k != 'T_cmd'}]):
         sj = tmp_path / f'm{i}.json'
         sj.write_text(json.dumps(sc), encoding='utf-8')
         assert hg.main(['--frame-log', npz, '--task', 'O1-F08', '--score-json', str(sj),
@@ -723,3 +745,259 @@ def test_c3_17_batch_cham(tmp_path, capsys, monkeypatch):
     assert json.load(open(out / 'cham' / 'runA__o_score.json'))['t_end'] == 10.5
     assert not (out / 'cham' / 'runB__o_score.json').exists()
     assert read_rows(out / 'so_khop_s1.csv') == []
+
+
+# ---- C3-31: sample gaps that intersect the A11 window, invalid first frame, UDP offset ----
+
+GAP_K = 1201      # first frame after the gap: frame 1200 at +1200 ms, frame 1201 at +1210 ms
+
+
+def _gap_run(tmp_path, name, bad_first=False):
+    """fl 0 -> 200 (line 50), 200 -> 0 at log line 120: t0 ~ +1202.7 ms after T0 (line time
+    + 700 us latency). t_send jumps 9 ms more before frame GAP_K (a sample gap from +1200 to
+    +1210 ms, across t0); the duty of fl is 0 (in band) from frame GAP_K on. bad_first: frame
+    GAP_K also has a bad CRC."""
+    def post(mosi, miso, t):
+        t[GAP_K:] += 9_000_000
+        if bad_first:
+            miso[GAP_K][P.OFS_MISO_CRC] ^= 0xFF
+
+    def wrap(k, d):
+        if k >= GAP_K:
+            d[0] = 0.0
+        return d
+    return build_run(tmp_path, name=name, changes={50: [(0, 200)], 120: [(0, 0)]}, post=post,
+                     duty_wrap=wrap)
+
+
+def test_c3_31_gap_across_t0(tmp_path, capsys):
+    """Codex C3-31 counterexample: a sample before t0, the command at t0, the next sample after
+    t0 already in band. The gap crosses t0 and must count in n_khong_bc (the entry may be
+    earlier than reported). The unmeasured UDP offset is its own column next to bat_dinh_ms."""
+    npz, esp = _gap_run(tmp_path, 'g')
+    out = tmp_path / 'o'
+    code, last = run_cli(capsys, ['--frame-log', npz, '--esp-log', esp, '--out', str(out)])
+    assert code == 0 and last == '#ket_qua,ma=0'
+    row = read_one(out / 'g_gioi_han.csv')
+    assert int(row['n_mat_mau_run']) == 1 and int(row['n_khong_bc_run']) == 0
+    ev = read_rows(out / 'g_su_kien_a11.csv')
+    assert len(ev) == 1
+    e = ev[0]
+    assert e['wheel'] == 'fl' and e['target'] == '0' and e['vao_dai'] == 'True'
+    assert int(e['k_first']) == GAP_K and int(e['k_vao_dai']) == GAP_K
+    assert float(e['duty_first']) == 0.0
+    assert 6.0 <= float(e['t_vao_dai_ms']) <= 8.5          # +1210 ms - t0 (~ +1202.7 ms)
+    assert e['n_khong_bc'] == '1'
+    with open(out / 'g_su_kien_a11.csv', newline='', encoding='utf-8') as f:
+        head = next(csv.reader(f))
+    assert head.index('lech_udp') == head.index('bat_dinh_ms') + 1
+    assert e['lech_udp'] == 'chua_do'
+    assert float(e['bat_dinh_ms']) == pytest.approx(float(row['sync_resid_max_us']) / 1e3,
+                                                    abs=1e-6)
+    assert int(row['n_ev_mat_mau_0']) == 1
+
+
+def test_c3_31_invalid_first_frame(tmp_path):
+    """The first frame at or after t0 has a bad CRC: duty_first (evidence) is empty; the first
+    observed entry is the next frame; n_khong_bc = the invalid frame + the gap across t0."""
+    npz, esp = _gap_run(tmp_path, 'b', bad_first=True)
+    out = tmp_path / 'o'
+    assert hg.main(['--frame-log', npz, '--esp-log', esp, '--out', str(out)]) == 0
+    e = read_one(out / 'b_su_kien_a11.csv')
+    assert int(e['k_first']) == GAP_K and e['duty_first'] == ''
+    assert int(e['k_vao_dai']) == GAP_K + 1 and e['n_khong_bc'] == '2'
+    assert int(read_one(out / 'b_gioi_han.csv')['n_miso_crc_bad_run']) == 1
+
+
+def test_c3_31_gap_across_t_end(tmp_path):
+    """Censored event: fl 200 -> 0 at line 120, 0 -> 300 at line 125 (t_end ~ +1252.7 ms) inside
+    the 50 ms hold, so no frame of the window is in band (cat 'doi_lenh'). A gap from +1250 ms
+    to +1260 ms crosses t_end: the frames missing in [1250, t_end) count in n_khong_bc."""
+    def post(mosi, miso, t):
+        t[1251:] += 9_000_000
+    npz, esp = build_run(tmp_path, name='t', changes={50: [(0, 200)], 120: [(0, 0)],
+                                                      125: [(0, 300)]}, post=post)
+    out = tmp_path / 'o'
+    assert hg.main(['--frame-log', npz, '--esp-log', esp, '--out', str(out)]) == 0
+    e = read_one(out / 't_su_kien_a11.csv')
+    assert e['vao_dai'] == 'False' and e['cat'] == 'doi_lenh' and e['k_vao_dai'] == ''
+    assert 49.0 <= float(e['cmd_level_ms']) <= 51.0
+    assert e['n_khong_bc'] == '1' and e['lech_udp'] == 'chua_do'
+
+
+def test_c3_31_gaps_in_bounds():
+    """n_gaps_in: a gap (t_f[k-1]; t_f[k]) counts when t_f[k] > t_lo and t_f[k-1] < t_hi; a gap
+    that ends exactly at t_lo, or starts exactly at t_hi, holds no sample of the window."""
+    t_f = np.array([0.0, 1.0, 2.0, 10.0, 11.0, 20.0])
+    cut = np.array([False, False, False, True, False, True])     # gaps (2;10) and (11;20)
+    assert hg.n_gaps_in(t_f, cut, 10.0, 15.0) == 1                # (2;10) ends at t_lo
+    assert hg.n_gaps_in(t_f, cut, 10.0 - 1e-9, 15.0) == 2         # (2;10) crosses t_lo
+    assert hg.n_gaps_in(t_f, cut, 3.0, 11.0) == 1                 # (11;20) starts at t_hi
+    assert hg.n_gaps_in(t_f, cut, 3.0, 11.0 + 1e-9) == 2          # (11;20) crosses t_hi
+    assert hg.n_gaps_in(t_f, cut, 12.0, math.inf) == 1
+    assert hg.n_gaps_in(t_f, cut, 0.0, 1.0) == 0
+    assert hg.n_gaps_in(t_f, np.zeros(6, dtype=bool), 0.0, math.inf) == 0
+
+
+# ---- C3-28: the scorer result is locked to the NPZ (SHA-256) and the task; real scorer ----
+
+SCORER_MODULES = ('hil_o1_score', 'o1_gate_eval', 'o1_gate', 'o1_feasibility', 'o1_lanes',
+                  'o1_tasks', 'hil_edge_map')
+
+
+def _git_blob(path):
+    with open(path, 'rb') as f:
+        data = f.read().replace(b'\r\n', b'\n')
+    return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+
+
+def _fig8_npz(path, tmap, task='O1-F08', k0=400):
+    """Frame log of an O1 figure-8 run as run_hil.py writes it (as test_hil_o1_score.py
+    write_frame_log_tmap): plant at 0 during ARM (RUN at k0), then the exact figure 8 at plant
+    time tmap(t), logged to T_cmd + T_LATE + 0.5 s; MISO all zero (the scorer reads no duty
+    here)."""
+    from o1_feasibility import Schedule, path_point, HEAD0, T_LATE
+    sch = Schedule(hg.hil_o1_score.FIG8[task])
+    t = np.arange(int((sch.Tcmd + T_LATE + 0.5) / 1e-3)) * 1e-3
+    c, s = math.cos(HEAD0), math.sin(HEAD0)
+    pose = []
+    for tk in t:
+        fx, fy, head = path_point(sch.tau(tmap(tk))[0])
+        pose.append((c * fx + s * fy, -s * fx + c * fy,
+                     (head - HEAD0 + math.pi) % (2 * math.pi) - math.pi))
+    pose = np.vstack([np.zeros((k0, 3)), np.asarray(pose)])
+    vel = np.gradient(pose[:, :2], 1e-3, axis=0)
+    wz = np.gradient(np.unwrap(pose[:, 2]), 1e-3)
+    n = len(pose)
+    mosi = np.zeros((n, P.FRAME_SIZE), dtype=np.uint8)
+    for k in range(n):
+        st = [0.0] * 4 + [pose[k, 0], pose[k, 1], pose[k, 2], vel[k, 0], vel[k, 1], wz[k]]
+        on = k >= k0 + 3
+        mosi[k] = np.frombuffer(P.encode_state(st, traj_ref=(0.3, 0.0, 0.1) if on else None,
+                                               traj_flags=P.TRAJ_VALID if on else 0, seq=k),
+                                dtype=np.uint8)
+    manifest = dict(period_us=1000, steps=n, plant='MecanumPlant',
+                    miso_check=dict(crc_bad=0, empty=0), state_out_of_range=None,
+                    lifecycle=dict(outcome='completed',
+                                   transitions=[dict(step=0, t=0, phase='ARM'),
+                                                dict(step=k0, t=0.4, phase='RUN')]))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.savez(path, manifest=np.array(json.dumps(manifest)), mosi=mosi,
+             miso=np.zeros((n, P.FRAME_SIZE), dtype=np.uint8))
+
+
+@pytest.fixture(scope='module')
+def real_cham(tmp_path_factory):
+    """--cham batch with the real scorer on two O1-F08 runs of the same length and file name:
+    runA follows the figure 8 and stops at the end (completed early, before the deadline),
+    runB stops at plant time 5 s on the path (never completes: window to the deadline)."""
+    base = tmp_path_factory.mktemp('cham')
+    root = base / 'root'
+    npz = {'runA': root / 'runA' / 'frames' / 'o_frames.npz',
+           'runB': root / 'runB' / 'frames' / 'o_frames.npz'}
+    _fig8_npz(str(npz['runA']), lambda t: t)
+    _fig8_npz(str(npz['runB']), lambda t: min(t, 5.0))
+    s1 = base / 'ket_qua_s1.csv'
+    with open(s1, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=['run', 'npz', 'name', 'task'])
+        w.writeheader()
+        for run in npz:
+            w.writerow(dict(run=run, npz='o_frames.npz', name='o', task='O1-F08'))
+    out = base / 'e2'
+    code = hg.main(['--batch-from-s1', str(s1), '--root', str(root), '--out', str(out),
+                    '--cham'])
+    rows = {r['run']: r for r in read_rows(out / 'ket_qua_e2.csv')}
+    js = {run: json.load(open(out / 'cham' / f'{run}__o_score.json', encoding='utf-8'))
+          for run in npz}
+    return dict(code=code, rows=rows, js=js, npz={k: str(v) for k, v in npz.items()},
+                out=out, base=base)
+
+
+def test_c3_28_batch_real_scorer(real_cham):
+    """The JSON of --cham carries the lock (SHA-256 of the NPZ, task, the two flags, the git
+    blobs of the scorer sources) and win_ht_src names the flags and the scorer blob. Early
+    completion: the window ends at t_end; deadline case: it runs to the last frame before the
+    deadline."""
+    assert real_cham['code'] == 3                        # no ESP32 log: thieu_bang_chung
+    blob = _git_blob(os.path.join(ROOT, 'tools', 'hil_o1_score.py'))
+    for run in ('runA', 'runB'):
+        js, row = real_cham['js'][run], real_cham['rows'][run]
+        assert row['error'] == ''
+        lk = js['e2_khoa_cham']
+        assert lk['frame_log'] == 'o_frames.npz'
+        assert lk['frame_log_sha256'] == _sha256(real_cham['npz'][run])
+        assert lk['task'] == js['task'] == 'O1-F08'
+        assert lk['allow_final_set'] is True and lk['allow_pre_b81_15'] is True
+        assert lk['esp_log'] is None and lk['esp_log_sha256'] is None
+        assert set(lk['scorer']) == set(SCORER_MODULES) and lk['scorer']['hil_o1_score'] == blob
+        assert row['win_ht_src'] == (f"hil_o1_score:lifecycle_RUN:completed={js['completed']}"
+                                     f':allow_final_set=1:allow_pre_b81_15=1:scorer_blob={blob}')
+        assert float(row['t_ht0_s']) == pytest.approx(js['T_cmd'], abs=1e-6)
+        assert int(row['win_n']) == 2000
+    a, ra = real_cham['js']['runA'], real_cham['rows']['runA']
+    assert a['completed'] == 'true' and a['t_end'] < a['t_deadline'] - 0.5
+    assert float(ra['t_ht1_s']) == pytest.approx(a['t_end'], abs=1e-6)
+    # grid frames t = j ms (k0 = t0_step = 400) with T_cmd <= t <= t_end; t_end is a frame time
+    n_a = int(round(a['t_end'] * 1000)) - math.ceil(a['T_cmd'] * 1000 - 1e-6) + 1
+    assert int(ra['win_ht_n']) == n_a < 2000
+    b, rb = real_cham['js']['runB'], real_cham['rows']['runB']
+    assert b['completed'] != 'true'
+    assert b['t_deadline'] - 1e-3 - 1e-9 <= b['t_end'] < b['t_deadline']
+    assert float(rb['t_ht1_s']) == pytest.approx(b['t_end'], abs=1e-6)
+    assert int(rb['win_ht_n']) == 2000
+
+
+def test_c3_28_score_json_locked_to_npz_and_task(real_cham, tmp_path):
+    """Codex C3-28 counterexample: the JSON of another run with the same NPZ name and the same
+    frame count is refused (SHA-256 differs); so is the right run under another task."""
+    ja, jb = (str(real_cham['out'] / 'cham' / f'{r}__o_score.json') for r in ('runA', 'runB'))
+    npz_a, npz_b = real_cham['npz']['runA'], real_cham['npz']['runB']
+    js = real_cham['js']
+    assert js['runA']['frame_log'] == js['runB']['frame_log'] == 'o_frames.npz'
+    assert js['runA']['frames_scored'] == js['runB']['frames_scored']
+    for i, (sj, fl, task, code) in enumerate([(ja, npz_a, 'O1-F08', 3), (jb, npz_b, 'O1-F08', 3),
+                                              (ja, npz_b, 'O1-F08', 2), (jb, npz_a, 'O1-F08', 2),
+                                              (ja, npz_a, 'O1-F05', 2), (ja, npz_a, '', 2)]):
+        out = tmp_path / f'o{i}'
+        assert hg.main(['--frame-log', fl, '--task', task, '--score-json', sj,
+                        '--out', str(out)]) == code, i
+        if code == 3:
+            run = 'runA' if sj == ja else 'runB'
+            row, brow = read_one(out / 'o_gioi_han.csv'), real_cham['rows'][run]
+            assert row['win_ht_n'] == brow['win_ht_n'] and row['win_ht_src'] == brow['win_ht_src']
+
+
+def test_c3_28_score_json_fields(tmp_path):
+    """--score-json refuses (code 2): no lock (raw hil_o1_score.py --out), lock of another file
+    or task, a flag or the scorer blob missing, frame_log missing, completed 'true' without a
+    finite t_end, a non-finite time. completed 'false' with no t_end is still read (deadline)."""
+    npz = _speed_npz(tmp_path)
+    other = _speed_npz(tmp_path, name='z', n=12201)
+    nolock = _score()
+    no_fl = {k: v for k, v in _score(npz).items() if k != 'frame_log'}
+    no_flag = _score(npz)
+    del no_flag['e2_khoa_cham']['allow_pre_b81_15']
+    cases = [(_score(npz), 3),
+             (_score(npz, t_end=None, completed='false'), 3),
+             (nolock, 2),
+             (_score(npz, e2_khoa_cham=_lock(other)), 2),
+             (_score(npz, e2_khoa_cham=_lock(npz, task='O1-F05')), 2),
+             (_score(npz, task='O1-F05'), 2),
+             (no_flag, 2),
+             (_score(npz, e2_khoa_cham=_lock(npz, allow_final_set=1)), 2),
+             (_score(npz, e2_khoa_cham=_lock(npz, scorer={'hil_o1_score': 'abc'})), 2),
+             (no_fl, 2),
+             (_score(npz, t_end=None), 2),                         # completed 'true'
+             (_score(npz, t_end=float('inf')), 2),
+             (_score(npz, t_end=float('nan'), completed='false'), 2),
+             (_score(npz, T_cmd=float('nan')), 2),
+             (_score(npz, t_deadline=float('inf')), 2),
+             (_score(npz, t0_step=float('-inf')), 2)]
+    for i, (sc, code) in enumerate(cases):
+        sj = tmp_path / f'f{i}.json'
+        sj.write_text(json.dumps(sc), encoding='utf-8')
+        assert hg.main(['--frame-log', npz, '--task', 'O1-F08', '--score-json', str(sj),
+                        '--out', str(tmp_path / f'o{i}')]) == code, i
+    row = read_one(tmp_path / 'o0' / 'o_gioi_han.csv')
+    assert row['win_ht_src'] == ('hil_o1_score:lifecycle_RUN:completed=true:allow_final_set=1:'
+                                 f'allow_pre_b81_15=1:scorer_blob={BLOB}')
