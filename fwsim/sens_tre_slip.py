@@ -20,6 +20,7 @@ Outputs in --out (CSV: s03_doe.write_csv / fmt):
   bang.csv                  one row per run
   tom_tat_theo_dieu_kien.csv  per run x response: value, reference value, hieu = value - ref
   tom_tat.csv               per controller x combo x response over the 9 conditions
+  chay_lai.csv              both attempts of every run_error rerun (attempt 1, 2)
   meta.json                 incl. command_full, the DLL path/sha256/fwsim_build and warnings
 
 Run (default --dll = fwsim/build/fwsim.dll, the output of python fwsim/build_fwsim.py;
@@ -47,9 +48,16 @@ inputs before S03 main:
   python fwsim/build_fwsim.py
   python fwsim/sens_tre_slip.py --out <new folder> --workers 8
 New mu levels / speeds are an edit of MU_LEVELS, MU_SOURCE (SPEEDS = s03_doe.SPEEDS) first.
-Thresholds must be the S03 section 5.2 ones locked at run time (THRESH_C2). The spec rules
-(a run_error is run once more; still failing or a missing pair = inconclusive, report to
-Liam) are applied by hand: this script does not compare with run01.
+Thresholds are the S03 section 5.2 ones locked at run time, read from s03_doe.THRESH (the
+same source as S03; thresholds(), recorded in meta.json thresholds; C3-21): no tv_duty entry
+there = refused. Condition 12 rules (C3-19): a run_error is run once more in a new pool,
+both attempts go to chay_lai.csv, a success after an error replaces the row in bang.csv and
+is listed in meta.json loi_chua_ro_nguyen_nhan; every grid key, reference run and pair is
+checked (completeness(), meta.json kiem_cap): still failing, missing or duplicated =
+ket_luan 'chưa kết luận' (report to Liam). The build origin is verified only when
+fwsim_build.json dll_sha256 equals the DLL sha256 (C3-20, meta.json dll.nguon_build); an
+unverified build or an inconclusive grid is not a confirmation run before S03 main
+(meta.json dung_lam_luot_xac_nhan). This script does not compare with run01.
 
 LADRC run after S06 (condition 12 (ii)): when the measured HIL loop delay is >= 2 ms, the
 same grid for LADRC only (3 delays x 3 omega_s x 9 conditions = 81 runs):
@@ -87,7 +95,7 @@ MU_SOURCE = ('05_DATA/results/S03/2026-11-10_run02/meta.yaml line 18 mu_levels '
 SEED = s03.SEED                                         # plant seed and IMU noise seed (s03.IMU)
 RESPONSES = s03.RESPONSES                               # e_perp_max, e_perp_max_cens, tv_duty, sat_frac
 DEFAULT_DLL = os.path.join(HERE, 'build', 'fwsim.dll')  # output of fwsim/build_fwsim.py
-THRESH_C2 = {'e_perp_max': 0.01, 'e_perp_max_cens': 0.01, 'sat_frac': 0.01, 'tv_duty': 0.4}
+THRESH_SOURCE = 'fwsim/s03_doe.py THRESH (S03 section 5.2, read at run time)'
 TEN_C2 = {'e_perp_max': 'Y1', 'e_perp_max_cens': 'Y1 (cens)', 'sat_frac': 'Y2', 'tv_duty': 'Y3'}
 TEN_S03 = {'e_perp_max': 'Y2', 'e_perp_max_cens': 'Y2 (cens)', 'tv_duty': 'Y3', 'sat_frac': 'Y4'}
 DON_VI = {'e_perp_max': 'm', 'e_perp_max_cens': 'm', 'tv_duty': '1/s',
@@ -196,37 +204,117 @@ def _dk(mu, v):
     return f'mu={mu};v={v}'
 
 
-def per_condition_rows(rows, refs):
-    """tom_tat_theo_dieu_kien.csv: one row per run x response."""
+def thresholds():
+    """S03 section 5.2 thresholds locked at run time, read from s03_doe.THRESH (the same source
+    as S03, C3-21), one per response. SystemExit when s03_doe holds none for a response (e.g.
+    no absolute tv_duty threshold of S03 v8.6): no private copy is used instead."""
+    missing = [r for r in RESPONSES if r not in s03.THRESH]
+    if missing:
+        sys.exit(f's03_doe.THRESH has no threshold for {", ".join(missing)} (S03 section 5.2): '
+                 'the locked S03 thresholds are not in this tree; refusing')
+    return {r: float(s03.THRESH[r]) for r in RESPONSES}
+
+
+def key_of(r):
+    """Grid key of a row or job: (controller, io_delay_ms, slip_omega_s, mu, v)."""
+    return (r['controller'], r['io_delay_ms'], r['slip_omega_s'], r['mu'], r['v'])
+
+
+def _ks(k):
+    return f'{k[0]};io_delay_ms={k[1]};slip_omega_s={k[2]};mu={k[3]};v={k[4]}'
+
+
+def completeness(rows, ctrls):
+    """S03 section 8 condition 12 check of the final rows (C3-19): every key of make_jobs(ctrls)
+    exactly once, no key outside the grid, no run_error left, every reference run and every pair
+    (comparison run + reference run of the same controller, mu, v) present without run_error.
+    Any failure: ket_luan 'chưa kết luận'."""
+    want = [tuple(j) for j in make_jobs(ctrls)]
+    wset = set(want)
+    cnt = Counter(key_of(r) for r in rows)
+    got = {key_of(r): r for r in rows}
+
+    def ok(k):
+        return cnt[k] == 1 and got[k].get('status') != 'run_error'
+
+    ref = [k for k in want if (k[1], k[2]) == REF]
+    so = [k for k in want if (k[1], k[2]) != REF]
+    thieu = [k for k in want if cnt[k] == 0]
+    trung = [k for k in want if cnt[k] > 1]
+    la = [k for k in cnt if k not in wset]
+    loi = [k for k in want if cnt[k] and got[k].get('status') == 'run_error']
+    moc_thieu = [k for k in ref if not ok(k)]
+    cap_thieu = [k for k in so if not (ok(k) and ok((k[0], REF[0], REF[1], k[3], k[4])))]
+    bad = thieu or trung or la or loi or moc_thieu or cap_thieu
+    return dict(ket_luan='chưa kết luận' if bad else 'đủ cặp',
+                n_khoa_can=len(want), n_khoa_co=len(want) - len(thieu),
+                n_moc_can=len(ref), n_moc_thieu=len(moc_thieu),
+                n_cap_can=len(so), n_cap_du=len(so) - len(cap_thieu), n_cap_thieu=len(cap_thieu),
+                khoa_thieu=[_ks(k) for k in thieu], khoa_trung=[_ks(k) for k in trung],
+                khoa_la=[_ks(k) for k in la], khoa_run_error=[_ks(k) for k in loi],
+                moc_thieu=[_ks(k) for k in moc_thieu], cap_thieu=[_ks(k) for k in cap_thieu])
+
+
+def merge_retries(rows, retry_rows):
+    """Rows of the first pass with each run_error row replaced by its rerun (same key) when the
+    rerun returned. Returns (rows, attempts, loi_chua_ro): attempts = both attempts of every
+    rerun key (attempt 1, 2; S03 section 8 condition 12 'báo cả hai lần'), loi_chua_ro = keys
+    whose rerun succeeded after a run_error ('lỗi chưa rõ nguyên nhân')."""
+    retry = {key_of(r): r for r in retry_rows}
+    out, attempts, loi_chua_ro = [], [], []
+    for r in rows:
+        k = key_of(r)
+        if r.get('status') != 'run_error' or k not in retry:
+            out.append(r)
+            continue
+        r2 = retry[k]
+        out.append(r2)
+        attempts += [dict(r, attempt=1), dict(r2, attempt=2)]
+        if r2.get('status') != 'run_error':
+            loi_chua_ro.append(dict(khoa=_ks(k), error_lan_1=r.get('error', ''),
+                                    status_lan_2=r2.get('status', ''),
+                                    ghi_chu='lỗi chưa rõ nguyên nhân'))
+    return out, attempts, loi_chua_ro
+
+
+def per_condition_rows(rows, refs, thr=None):
+    """tom_tat_theo_dieu_kien.csv: one row per run x response (a missing reference run gives
+    empty hieu: C3-19). thr: thresholds() by default."""
+    thr = thresholds() if thr is None else thr
     out = []
     for r in rows:
-        rm = refs[(r['controller'], r['mu'], r['v'])]
+        rm = refs.get((r['controller'], r['mu'], r['v']), {})
         for resp in RESPONSES:
             g, gm = r.get(resp, ''), rm.get(resp, '')
             h = _hieu(g, gm)
             rel = _rel(h, gm)
-            vuot = '' if h is None or not math.isfinite(h) else abs(h) > THRESH_C2[resp]
+            vuot = '' if h is None or not math.isfinite(h) else abs(h) > thr[resp]
             out.append(dict(controller=r['controller'], io_delay_ms=r['io_delay_ms'],
                             slip_omega_s=r['slip_omega_s'], la_moc=r['la_moc'], mu=r['mu'], v=r['v'],
                             dap_ung=resp, ten_c2=TEN_C2[resp], ten_s03=TEN_S03[resp],
                             don_vi=DON_VI[resp], gia_tri_moc=gm, gia_tri=g,
                             hieu='' if h is None else h, hieu_tuong_doi='' if rel is None else rel,
-                            nguong=THRESH_C2[resp], vuot_nguong=vuot,
+                            nguong=thr[resp], vuot_nguong=vuot,
                             completed_moc=rm.get('completed', ''), completed=r.get('completed', ''),
                             status_moc=rm.get('status', ''), status=r.get('status', '')))
     return out
 
 
-def summary_rows(rows, refs, controllers=CONTROLLERS):
-    """tom_tat.csv: one row per controller x combo (incl. the reference) x response."""
+def summary_rows(rows, refs, controllers=CONTROLLERS, thr=None):
+    """tom_tat.csv: one row per controller x combo (incl. the reference) x response. Only the
+    conditions where both the run and its reference run exist enter (a missing one is reported
+    by completeness(), not raised: C3-19). thr: thresholds() by default."""
+    thr = thresholds() if thr is None else thr
     by_key = {(r['controller'], r['io_delay_ms'], r['slip_omega_s'], r['mu'], r['v']): r
               for r in rows}
     out = []
     for ctrl in controllers:
         for delay in DELAYS:
             for w in OMEGAS:
-                rs = [by_key[(ctrl, delay, w, mu, v)] for mu in MU_LEVELS for v in SPEEDS]
-                ms = [refs[(ctrl, mu, v)] for mu in MU_LEVELS for v in SPEEDS]
+                pairs = [(by_key.get((ctrl, delay, w, mu, v)), refs.get((ctrl, mu, v)))
+                         for mu in MU_LEVELS for v in SPEEDS]
+                pairs = [(r, rm) for r, rm in pairs if r is not None and rm is not None]
+                rs, ms = [r for r, _ in pairs], [rm for _, rm in pairs]
                 for resp in RESPONSES:
                     per = [(r['mu'], r['v'], _hieu(r.get(resp, ''), rm.get(resp, '')),
                             _rel(_hieu(r.get(resp, ''), rm.get(resp, '')), rm.get(resp, '')))
@@ -234,13 +322,13 @@ def summary_rows(rows, refs, controllers=CONTROLLERS):
                     hs = [(mu, v, h) for mu, v, h, _ in per if h is not None and math.isfinite(h)]
                     rels = [x for *_, x in per if x is not None and math.isfinite(x)]
                     vuot = [(mu, v) for mu, v, h, _ in per
-                            if h is not None and math.isfinite(h) and abs(h) > THRESH_C2[resp]]
+                            if h is not None and math.isfinite(h) and abs(h) > thr[resp]]
                     imax = max(hs, key=lambda t: abs(t[2])) if hs else None
                     out.append(dict(
                         controller=ctrl, io_delay_ms=delay, slip_omega_s=w,
                         la_moc=(delay == REF[0] and w == REF[1]), dap_ung=resp,
                         ten_c2=TEN_C2[resp], ten_s03=TEN_S03[resp], don_vi=DON_VI[resp],
-                        nguong=THRESH_C2[resp], n_dieu_kien=len(hs),
+                        nguong=thr[resp], n_dieu_kien=len(hs),
                         hieu_tb='' if not hs else sum(h for _, _, h in hs) / len(hs),
                         hieu_max='' if imax is None else imax[2],
                         dk_max='' if imax is None else _dk(imax[0], imax[1]),
@@ -290,7 +378,10 @@ def full_command(args, ctrls):
 
 def dll_info(dll):
     """Provenance of --dll: absolute path, sha256, the fwsim_build.json next to it and
-    warnings; never exits (a sensitivity trial continues on an unknown or dirty build)."""
+    warnings; never exits (a sensitivity trial continues on an unknown or dirty build).
+    The build origin is verified (build_verified, nguon_build 'đã xác minh') only when the
+    json's dll_sha256 equals the sha256 of this DLL (C3-20); otherwise 'chưa xác minh' and
+    esp32_dirty is None (the json's fields stay in fwsim_build, as read, not as a result)."""
     path = os.path.abspath(dll)
     sha = s03.sha256_file(dll)
     build_json = os.path.join(os.path.dirname(path), 'fwsim_build.json')
@@ -323,8 +414,16 @@ def dll_info(dll):
             warnings.append('fwsim_build.json dll_sha256 differs from the DLL on disk: '
                             'fwsim_build.json does not describe this DLL; sensitivity '
                             'trial, run continues')
+        elif not recorded:
+            warnings.append('fwsim_build.json has no dll_sha256: it cannot be tied to this '
+                            'DLL, the build origin is unverified; sensitivity trial, run '
+                            'continues')
+    verified = build is not None and build.get('dll_sha256') == sha
+    if not verified:
+        esp32_dirty = None
     return dict(path=path, sha256=sha, fwsim_build_json=build_json, fwsim_build=build,
-                esp32_dirty=esp32_dirty, warnings=warnings)
+                esp32_dirty=esp32_dirty, build_verified=verified,
+                nguon_build='đã xác minh' if verified else 'chưa xác minh', warnings=warnings)
 
 
 def main(argv=None):
@@ -333,6 +432,7 @@ def main(argv=None):
     bang = os.path.join(args.out, 'bang.csv')
     if os.path.exists(bang):
         sys.exit(f'{bang} exists: refusing to overwrite')
+    thr = thresholds()
     os.makedirs(args.out, exist_ok=True)
     t0, t_iso = time.time(), time.strftime('%Y-%m-%dT%H:%M:%S')
 
@@ -345,23 +445,36 @@ def main(argv=None):
     gains = {c: s03.defaults(fw0, c) for c in ctrls}
 
     jobs = make_jobs(ctrls)
-    rows = []
     n_workers = min(args.workers, 8)
-    with mp.Pool(processes=n_workers, initializer=_init, initargs=(args.dll,)) as pool:
-        for i, row in enumerate(pool.imap_unordered(_job, jobs), 1):
-            rows.append(row)
-            print(f"[{i}/{len(jobs)}] {row['controller']} delay={row['io_delay_ms']} "
-                  f"omega_s={row['slip_omega_s']} mu={row['mu']} v={row['v']} "
-                  f"status={row['status']} t={row['t_chay_s']:.1f}s", flush=True)
+
+    def run_pool(js, tag=''):
+        out = []
+        with mp.Pool(processes=n_workers, initializer=_init, initargs=(args.dll,)) as pool:
+            for i, row in enumerate(pool.imap_unordered(_job, js), 1):
+                out.append(row)
+                print(f"{tag}[{i}/{len(js)}] {row['controller']} delay={row['io_delay_ms']} "
+                      f"omega_s={row['slip_omega_s']} mu={row['mu']} v={row['v']} "
+                      f"status={row['status']} t={row['t_chay_s']:.1f}s", flush=True)
+        return out
+
+    rows = run_pool(jobs)
+    # S03 section 8 condition 12: a run_error is run once more, in a new pool (new processes)
+    retry_jobs = [key_of(r) for r in rows if r.get('status') == 'run_error']
+    retry_rows = run_pool(retry_jobs, 'rerun ') if retry_jobs else []
+    rows, attempts, loi_chua_ro = merge_retries(rows, retry_rows)
     rows.sort(key=lambda r: (CONTROLLERS.index(r['controller']), r['io_delay_ms'],
                              r['slip_omega_s'], r['mu'], r['v']))
     refs = {(r['controller'], r['mu'], r['v']): r for r in rows if r['la_moc']}
-    assert len(refs) == len(ctrls) * len(MU_LEVELS) * len(SPEEDS), 'missing reference runs'
+    kiem_cap = completeness(rows, ctrls)
 
     s03.write_csv(bang, rows, BANG_COLS)
     s03.write_csv(os.path.join(args.out, 'tom_tat_theo_dieu_kien.csv'),
-                  per_condition_rows(rows, refs), DK_COLS)
-    s03.write_csv(os.path.join(args.out, 'tom_tat.csv'), summary_rows(rows, refs, ctrls), TT_COLS)
+                  per_condition_rows(rows, refs, thr), DK_COLS)
+    s03.write_csv(os.path.join(args.out, 'tom_tat.csv'), summary_rows(rows, refs, ctrls, thr),
+                  TT_COLS)
+    s03.write_csv(os.path.join(args.out, 'chay_lai.csv'), attempts, BANG_COLS + ['attempt'])
+    ly_do = ([] if info['build_verified'] else ['nguon build chua xac minh (C3-20)']) + \
+        ([] if kiem_cap['ket_luan'] == 'đủ cặp' else ['chua ket luan: thieu cap hay loi (C3-19)'])
 
     root = os.path.join(HERE, '..')
     cmd_full = full_command(args, ctrls)
@@ -374,13 +487,17 @@ def main(argv=None):
         dll=info,
         fwsim_build_json=info['fwsim_build_json'], fwsim_build=info['fwsim_build'],
         esp32_dirty=info['esp32_dirty'], warnings=info['warnings'],
+        nguon_build=info['nguon_build'],
+        kiem_cap=kiem_cap, n_run_error_lan_1=len(retry_jobs),
+        loi_chua_ro_nguyen_nhan=loi_chua_ro, chay_lai_csv='chay_lai.csv',
+        dung_lam_luot_xac_nhan=not ly_do, ly_do_khong_dung=ly_do,
         gains=gains,
         seeds=dict(plant=SEED, imu_noise=s03.IMU['noise_seed'],
                    note='no other random source'),
         imu=dict(s03.IMU),
         mu_levels=list(MU_LEVELS), mu_source=MU_SOURCE,
         speeds=list(SPEEDS), delays=list(DELAYS), omegas=list(OMEGAS), ref=list(REF),
-        thresholds=THRESH_C2, ten_c2=TEN_C2, ten_s03=TEN_S03, don_vi=DON_VI,
+        thresholds=thr, thresholds_source=THRESH_SOURCE, ten_c2=TEN_C2, ten_s03=TEN_S03, don_vi=DON_VI,
         plant_src=fwsim.PLANT_SRC, libraries=fwsim.lib_versions(),
         sha256={p: s03.sha256_file(os.path.join(root, p)) for p in SHA_FILES},
         counts=dict(status=dict(Counter(str(r.get('status', '')) for r in rows)),
@@ -390,6 +507,14 @@ def main(argv=None):
         json.dump(meta, f, indent=2, ensure_ascii=False, default=str)
     for w in info['warnings']:
         print(f'WARNING: {w}', flush=True)
+    if kiem_cap['ket_luan'] != 'đủ cặp':
+        print(f"WARNING: inconclusive (S03 section 8 condition 12): {kiem_cap['n_cap_thieu']} of "
+              f"{kiem_cap['n_cap_can']} pairs missing, {len(kiem_cap['khoa_thieu'])} keys missing, "
+              f"{len(kiem_cap['khoa_run_error'])} run_error left; see meta.json kiem_cap; "
+              'report to Liam', flush=True)
+    if loi_chua_ro:
+        print(f'WARNING: {len(loi_chua_ro)} run_error rerun ok (cause unknown): rerun values used, '
+              'both attempts in chay_lai.csv', flush=True)
     print(f'done: {len(rows)} runs in {time.time() - t0:.0f} s -> {args.out}', flush=True)
 
 

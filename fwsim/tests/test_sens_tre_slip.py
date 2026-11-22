@@ -198,11 +198,13 @@ def test_dll_info_clean(tmp_path):
 
 
 def test_dll_info_esp32_dirty(tmp_path):
-    """esp32.dirty true: a warning, esp32_dirty True."""
+    """esp32.dirty true in a json tied to this DLL (dll_sha256 matches): a warning, esp32_dirty
+    True. (C3-20: the json carries dll_sha256 now; without it esp32_dirty is None.)"""
     dll, _ = _mk_dll(tmp_path, build=dict(esp32=dict(dirty=True),
-                                          hil_framework=dict(dirty=False)))
+                                          hil_framework=dict(dirty=False),
+                                          dll_sha256=hashlib.sha256(b'fake-dll').hexdigest()))
     info = sens.dll_info(dll)
-    assert info['esp32_dirty'] is True
+    assert info['esp32_dirty'] is True and info['build_verified'] is True
     assert any('dirty' in w for w in info['warnings'])
     assert all('sensitivity trial' in w for w in info['warnings'])
 
@@ -297,6 +299,7 @@ def test_main_ctrl_and_meta(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(sens.s03, 'defaults', lambda fw, c: {'g': c})
     monkeypatch.setattr(sens.mp, 'Pool', _FakePool)
     monkeypatch.setattr(sens, '_job', _fake_job)
+    monkeypatch.setitem(sens.s03.THRESH, 'tv_duty', 0.4)   # C3-21: main reads s03_doe.THRESH
 
     dll = tmp_path / 'fwsim.dll'
     dll.write_bytes(b'fake-dll')
@@ -338,3 +341,228 @@ def test_main_ctrl_and_meta(tmp_path, monkeypatch, capsys):
     # an existing bang.csv is still refused
     with pytest.raises(SystemExit):
         sens.main(['--out', str(out), '--dll', str(dll), '--ctrl', 'ADRC'])
+
+
+# ── review round 1 (C3-19, C3-20, C3-21) ────────────────────────────────────────────
+
+X_SO = ('ADRC', 1, 0.05, 0.413, 0.2)          # a comparison key of the --ctrl ADRC grid
+X_MOC = ('ADRC', 0, 0.1, 0.436, 0.5)          # a reference key
+
+
+def _err_row(job):
+    ctrl, delay, omega_s, mu, v = job
+    return dict(controller=ctrl, io_delay_ms=delay, slip_omega_s=omega_s,
+                la_moc=(delay == sens.REF[0] and omega_s == sens.REF[1]), mu=mu, v=v,
+                status='run_error', completed='', error='RuntimeError: boom', t_chay_s=0.0)
+
+
+def _drop_pool(drop):
+    """_FakePool that never returns the jobs in drop (a missing key)."""
+    class P(_FakePool):
+        def imap_unordered(self, func, jobs):
+            return (func(j) for j in jobs if tuple(j) not in drop)
+    return P
+
+
+def _main_fakes(monkeypatch, tmp_path, job=_fake_job, pool=_FakePool, build='match'):
+    """main with fakes, --ctrl ADRC; build: 'match' (json with the DLL sha256), 'nosha'
+    ({"esp32": {"dirty": false}}) or 'badsha'. Returns the out folder."""
+    monkeypatch.setattr(sens.fwsim, 'FirmwareSim', _FakeFW)
+    monkeypatch.setattr(sens.s03, 'defaults', lambda fw, c: {'g': c})
+    monkeypatch.setattr(sens.mp, 'Pool', pool)
+    monkeypatch.setattr(sens, '_job', job)
+    monkeypatch.setitem(sens.s03.THRESH, 'tv_duty', 0.4)
+    b = dict(esp32=dict(dirty=False))
+    if build == 'match':
+        b['dll_sha256'] = hashlib.sha256(b'fake-dll').hexdigest()
+    elif build == 'badsha':
+        b['dll_sha256'] = '0' * 64
+    dll, _ = _mk_dll(tmp_path, build=b)
+    out = tmp_path / 'out'
+    sens.main(['--out', str(out), '--dll', dll, '--ctrl', 'ADRC', '--workers', '1'])
+    return out
+
+
+def _meta(out):
+    return json.loads((out / 'meta.json').read_text(encoding='utf-8'))
+
+
+def test_c3_19_missing_pair_no_crash(tmp_path, monkeypatch):
+    """C3-19 (Codex): a comparison run missing, every reference present. Old code: KeyError in
+    summary_rows after bang.csv was written, no meta.json. Now every file is written and
+    meta.json kiem_cap says 'chưa kết luận' with the missing key and pair."""
+    out = _main_fakes(monkeypatch, tmp_path, pool=_drop_pool({X_SO}))
+    meta = _meta(out)
+    kc = meta['kiem_cap']
+    assert kc['ket_luan'] == 'chưa kết luận'
+    assert kc['n_cap_can'] == 72 and kc['n_cap_thieu'] == 1 and kc['n_cap_du'] == 71
+    assert kc['khoa_thieu'] == [sens._ks(X_SO)] and kc['cap_thieu'] == [sens._ks(X_SO)]
+    assert kc['n_moc_thieu'] == 0 and kc['n_khoa_can'] == 81 and kc['n_khoa_co'] == 80
+    assert meta['dung_lam_luot_xac_nhan'] is False
+    assert len(_read_csv(out / 'bang.csv')) == 80
+    tt = [r for r in _read_csv(out / 'tom_tat.csv')
+          if (r['io_delay_ms'], r['slip_omega_s'], r['dap_ung']) == ('1', '0.05', 'e_perp_max')]
+    assert len(tt) == 1 and tt[0]['n_dieu_kien'] == '8'
+    assert len(_read_csv(out / 'tom_tat_theo_dieu_kien.csv')) == 80 * len(sens.RESPONSES)
+
+
+def test_c3_19_missing_reference(tmp_path, monkeypatch):
+    """A reference run missing: the 8 pairs of its condition are missing; still no crash
+    (old code: assert 'missing reference runs', nothing written)."""
+    out = _main_fakes(monkeypatch, tmp_path, pool=_drop_pool({X_MOC}))
+    kc = _meta(out)['kiem_cap']
+    assert kc['ket_luan'] == 'chưa kết luận'
+    assert kc['moc_thieu'] == [sens._ks(X_MOC)] and kc['n_cap_thieu'] == 8
+    assert all(';mu=0.436;v=0.5' in k for k in kc['cap_thieu'])
+    dk = _read_csv(out / 'tom_tat_theo_dieu_kien.csv')
+    miss = [r for r in dk if (r['mu'], r['v']) == ('0.436', '0.5')]
+    assert miss and all(r['hieu'] == '' and r['gia_tri_moc'] == '' for r in miss)
+
+
+def test_c3_19_run_error_rerun_ok(tmp_path, monkeypatch):
+    """A run_error is run once more; the rerun succeeds: bang.csv holds the rerun row,
+    chay_lai.csv both attempts, meta.json 'lỗi chưa rõ nguyên nhân', grid complete.
+    Old code: no rerun (81 calls), the run_error row stays, no kiem_cap."""
+    calls = []
+
+    def job(j):
+        calls.append(tuple(j))
+        return _err_row(j) if tuple(j) == X_SO and calls.count(X_SO) == 1 else _fake_job(j)
+
+    out = _main_fakes(monkeypatch, tmp_path, job=job)
+    assert len(calls) == 82 and calls.count(X_SO) == 2
+    meta = _meta(out)
+    assert meta['kiem_cap']['ket_luan'] == 'đủ cặp' and meta['kiem_cap']['n_cap_thieu'] == 0
+    assert meta['n_run_error_lan_1'] == 1
+    assert meta['loi_chua_ro_nguyen_nhan'] == [dict(
+        khoa=sens._ks(X_SO), error_lan_1='RuntimeError: boom', status_lan_2='ok',
+        ghi_chu='lỗi chưa rõ nguyên nhân')]
+    assert meta['dung_lam_luot_xac_nhan'] is True and meta['ly_do_khong_dung'] == []
+    bang = _read_csv(out / 'bang.csv')
+    assert len(bang) == 81 and all(r['status'] == 'ok' for r in bang)
+    cl = _read_csv(out / 'chay_lai.csv')
+    assert [(r['attempt'], r['status']) for r in cl] == [('1', 'run_error'), ('2', 'ok')]
+    assert all((r['io_delay_ms'], r['slip_omega_s'], r['mu'], r['v']) == ('1', '0.05', '0.413', '0.2')
+               for r in cl)
+
+
+def test_c3_19_run_error_twice(tmp_path, monkeypatch):
+    """A reference run fails twice: rerun exactly once, the row stays run_error, the 8 pairs
+    of its condition are missing, 'chưa kết luận'; old code: no kiem_cap."""
+    calls = []
+
+    def job(j):
+        calls.append(tuple(j))
+        return _err_row(j) if tuple(j) == X_MOC else _fake_job(j)
+
+    out = _main_fakes(monkeypatch, tmp_path, job=job)
+    assert calls.count(X_MOC) == 2 and len(calls) == 82
+    meta = _meta(out)
+    kc = meta['kiem_cap']
+    assert kc['ket_luan'] == 'chưa kết luận'
+    assert kc['khoa_run_error'] == [sens._ks(X_MOC)] and kc['moc_thieu'] == [sens._ks(X_MOC)]
+    assert kc['n_cap_thieu'] == 8 and kc['khoa_thieu'] == []
+    assert meta['loi_chua_ro_nguyen_nhan'] == [] and meta['dung_lam_luot_xac_nhan'] is False
+    cl = _read_csv(out / 'chay_lai.csv')
+    assert [(r['attempt'], r['status']) for r in cl] == [('1', 'run_error'), ('2', 'run_error')]
+
+
+def test_c3_19_completeness_dup_and_foreign():
+    """completeness: full grid 'đủ cặp'; a duplicated key or a key outside the grid is
+    'chưa kết luận' even when every pair exists."""
+    full = [_fake_job(j) for j in sens.make_jobs(('ADRC',))]
+    kc = sens.completeness(full, ('ADRC',))
+    assert kc['ket_luan'] == 'đủ cặp' and (kc['n_cap_can'], kc['n_moc_can']) == (72, 9)
+    kc = sens.completeness(full + [dict(full[5])], ('ADRC',))
+    assert kc['ket_luan'] == 'chưa kết luận' and kc['khoa_trung'] == [sens._ks(sens.key_of(full[5]))]
+    kc = sens.completeness(full + [_fake_job(('ADRC', 3, 0.1, 0.413, 0.2))], ('ADRC',))
+    assert kc['ket_luan'] == 'chưa kết luận' and len(kc['khoa_la']) == 1
+
+
+def test_c3_20_sidecar_without_sha(tmp_path):
+    """C3-20 (Codex): {"esp32": {"dirty": false}} with no dll_sha256 is not tied to the DLL:
+    unverified, esp32_dirty None, a warning (old code: esp32_dirty False, no warning)."""
+    dll, _ = _mk_dll(tmp_path, build=dict(esp32=dict(dirty=False)))
+    info = sens.dll_info(dll)
+    assert info['esp32_dirty'] is None
+    assert any('no dll_sha256' in w for w in info['warnings'])
+    assert info['build_verified'] is False and info['nguon_build'] == 'chưa xác minh'
+    assert info['fwsim_build'] == dict(esp32=dict(dirty=False))       # recorded as read
+
+
+def test_c3_20_sidecar_wrong_sha(tmp_path):
+    """C3-20 (Codex): a sidecar whose dll_sha256 differs: unverified, its esp32.dirty is not
+    a result (old code: esp32_dirty False taken from that json)."""
+    dll, _ = _mk_dll(tmp_path, build=dict(esp32=dict(dirty=False), dll_sha256='0' * 64))
+    info = sens.dll_info(dll)
+    assert info['esp32_dirty'] is None
+    assert info['build_verified'] is False and info['nguon_build'] == 'chưa xác minh'
+    (tmp_path / 'ok').mkdir()
+    dll2, _ = _mk_dll(tmp_path / 'ok', build=dict(
+        esp32=dict(dirty=False), dll_sha256=hashlib.sha256(b'fake-dll').hexdigest()))
+    info2 = sens.dll_info(dll2)
+    assert info2['build_verified'] is True and info2['nguon_build'] == 'đã xác minh'
+    assert info2['esp32_dirty'] is False
+
+
+@pytest.mark.parametrize('build', ('nosha', 'badsha'))
+def test_c3_20_main_unverified_not_confirmation(build, tmp_path, monkeypatch):
+    """main on an unverified build: meta.json nguon_build 'chưa xác minh', esp32_dirty None,
+    the run is not a confirmation run before S03 main even with every pair present."""
+    meta = _meta(_main_fakes(monkeypatch, tmp_path, build=build))
+    assert meta['esp32_dirty'] is None
+    assert meta['nguon_build'] == 'chưa xác minh' and meta['dll']['build_verified'] is False
+    assert meta['kiem_cap']['ket_luan'] == 'đủ cặp'
+    assert meta['dung_lam_luot_xac_nhan'] is False
+    assert meta['ly_do_khong_dung'] == ['nguon build chua xac minh (C3-20)']
+
+
+def _pair_rows(g):
+    """One reference row (e_perp_max 0.0) and one comparison row (e_perp_max g), same cond."""
+    base = dict(controller='ADRC', mu=0.413, v=0.2, status='ok', completed='true',
+                e_perp_max_cens=0.0, tv_duty=1.0, sat_frac=0.0)
+    ref = dict(base, io_delay_ms=0, slip_omega_s=0.1, la_moc=True, e_perp_max=0.0)
+    so = dict(base, io_delay_ms=1, slip_omega_s=0.05, la_moc=False, e_perp_max=g)
+    return [ref, so], {('ADRC', 0.413, 0.2): ref}
+
+
+@pytest.mark.parametrize('g, want', [(0.009, True), (0.008, False), (0.008 + 1e-9, True),
+                                     (0.007, False)])
+def test_c3_21_threshold_from_s03(g, want, monkeypatch):
+    """C3-21 (Codex): the threshold is s03_doe.THRESH at run time. With the Y2 threshold
+    locked at 0.008 a 0.009 m difference exceeds it (old code: THRESH_C2 copy 0.01, False);
+    equal to the threshold does not exceed, 1e-9 above does."""
+    monkeypatch.setitem(sens.s03.THRESH, 'e_perp_max', 0.008)
+    monkeypatch.setitem(sens.s03.THRESH, 'tv_duty', 0.4)
+    rows, refs = _pair_rows(g)
+    dk = [r for r in sens.per_condition_rows(rows, refs)
+          if r['dap_ung'] == 'e_perp_max' and not r['la_moc']]
+    assert len(dk) == 1 and dk[0]['vuot_nguong'] is want
+    assert dk[0]['nguong'] == 0.008
+    tt = [r for r in sens.summary_rows(rows, refs, ('ADRC',))
+          if r['dap_ung'] == 'e_perp_max' and (r['io_delay_ms'], r['slip_omega_s']) == (1, 0.05)]
+    assert len(tt) == 1 and tt[0]['vuot_nguong'] is want and tt[0]['nguong'] == 0.008
+    assert sens.thresholds()['e_perp_max'] == 0.008
+
+
+def test_c3_21_meta_records_thresholds(tmp_path, monkeypatch):
+    """meta.json thresholds = the values used (read from s03_doe.THRESH), with the source."""
+    monkeypatch.setitem(sens.s03.THRESH, 'e_perp_max', 0.008)
+    meta = _meta(_main_fakes(monkeypatch, tmp_path))
+    assert meta['thresholds'] == {'e_perp_max': 0.008, 'e_perp_max_cens': 0.01,
+                                  'tv_duty': 0.4, 'sat_frac': 0.01}
+    assert 's03_doe.py THRESH' in meta['thresholds_source']
+    tt = _read_csv(tmp_path / 'out' / 'tom_tat.csv')
+    assert {r['nguong'] for r in tt if r['dap_ung'] == 'e_perp_max'} == {'0.008'}
+
+
+def test_c3_21_refuse_without_tv_threshold(tmp_path, monkeypatch):
+    """s03_doe.THRESH without tv_duty (no locked absolute Y3 threshold): main refuses before
+    any run or output folder; no private copy is used."""
+    monkeypatch.delitem(sens.s03.THRESH, 'tv_duty', raising=False)
+    with pytest.raises(SystemExit, match='tv_duty'):
+        sens.thresholds()
+    out = tmp_path / 'out'
+    with pytest.raises(SystemExit, match='tv_duty'):
+        sens.main(['--out', str(out), '--dll', str(tmp_path / 'fwsim.dll'), '--ctrl', 'ADRC'])
+    assert not out.exists()
