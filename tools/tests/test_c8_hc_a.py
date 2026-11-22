@@ -1788,3 +1788,160 @@ def test_tinh_refuses_f5_of_other_session(tmp_path, capsys):
     assert 'F5 session_sha256 khac session' in capsys.readouterr().out
 
 
+# ------------------------------------------------------------------ F4 read strictly (CODE 22/11, session 2 chain)
+def _x_v1(a6_sha, **cho):
+    """F4 xoay_v1 per place (contract C8 line 46): q after A6, u_q_m, a6_sha256, trang_thai."""
+    blk = lambda **kw: dict(dict(q_tag_m=[-0.0004, 0.0002], u_q_m=0.0003, a6_sha256=a6_sha, trang_thai='dat'), **kw)  # noqa
+    return dict(version='xoay_v1', cho={c: blk(**v) for c, v in cho.items()})
+
+
+def _x_c8b_v1():
+    """The diagnostic file c8b_xoay_v1 C8B wrote on session 2 (q on the tag heading without A6, top level only)."""
+    return dict(version='c8b_xoay_v1', q_tag_m=[-0.00045, 0.00024], du_m=0.0015,
+                cho=dict(goc=dict(doan=[]), K1=dict(doan=[])))
+
+
+def test_xoay_q_only_place_block_of_xoay_v1(tmp_path):
+    a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2', tam_id='T1'))
+    s6 = ca.sha256(a6)
+    # (1) c8b_xoay_v1 refused at every place, its top-level q never used
+    for c in ('goc', 'K1', 'K2'):
+        q, u, why = ca.xoay_q(_x_c8b_v1(), c, a6)
+        assert q is None and u is None and 'c8b_xoay_v1' in why, c
+    # (2) xoay_v1 without the place (K2: no E turn), even with a top-level q: None
+    x = dict(_x_v1(s6, goc={}, K1={}), q_tag_m=[0.1, 0.1], u_q_m=0.1)
+    q, u, why = ca.xoay_q(x, 'K2', a6)
+    assert q is None and 'khong co cho' in why
+    # (3) xoay_v1 with the place, dat, made on this A6: q and u_q_m
+    assert ca.xoay_q(x, 'goc', a6) == ([-0.0004, 0.0002], 0.0003, None)
+    bad = [(_x_v1(s6, goc=dict(trang_thai='chua_ket_luan')), 'trang_thai'),
+           (_x_v1('0' * 64, goc={}), 'a6_sha256'),
+           (_x_v1(s6, goc=dict(q_tag_m=[0.1])), 'q_tag_m'),
+           (_x_v1(s6, goc=dict(q_tag_m=[0.1, float('nan')])), 'q_tag_m'),
+           (_x_v1(s6, goc=dict(u_q_m=-1e-4)), 'u_q_m'),
+           (_x_v1(s6, goc=dict(u_q_m=True)), 'u_q_m'),
+           (dict(version='xoay_v1', cho='x'), 'khong co cho'),
+           ('not a dict', 'xoay_v1')]
+    for xx, want in bad:
+        q, u, why = ca.xoay_q(xx, 'goc', a6)
+        assert q is None and u is None and want in why, (xx, why)
+    q, u, why = ca.xoay_q(_x_v1(s6, goc={}), 'goc', None)
+    assert q is None and '--a6' in why
+
+
+def test_tinh_cua_so_use_only_xoay_v1_of_the_place(tmp_path):
+    """tinh and cua_so with the diagnostic file: no q (reason in F7 ly_do, F5 car_pose_cfg.q_ly_do); with xoay_v1 of
+    the place made on the A6 of the run: q from that block."""
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+    a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2', tam_id='T1'))
+    xd = write_json(str(tmp_path / 'xd.json'), _x_c8b_v1())
+    xv = write_json(str(tmp_path / 'xv.json'), _x_v1(ca.sha256(a6), goc={}, K1={}))
+    out = str(tmp_path / 'd.json')
+    assert ca.main(tinh_args(d, 'goc', '--xoay', xd, '--a6', a6, '--out', out)) in (0, 1)
+    r = json.load(open(out, encoding='utf-8'))
+    assert 'thieu q, du_m (xoay_v1)' in r['ly_do'] and any('c8b_xoay_v1' in w for w in r['ly_do'])
+    assert r['trang_thai'] != 'khoa'
+    out = str(tmp_path / 'v.json')
+    assert ca.main(tinh_args(d, 'goc', '--xoay', xv, '--a6', a6, '--out', out)) in (0, 1)
+    r = json.load(open(out, encoding='utf-8'))
+    assert 'thieu q, du_m (xoay_v1)' not in r['ly_do'] and not any(w.startswith('xoay:') for w in r['ly_do'])
+    base = ['cua_so', d, '--frames', os.path.join(d, 'frames.csv'), '--track', os.path.join(d, 'track.json'),
+            '--a6', a6]
+    assert ca.main(base + ['--xoay', xd, '--ra', str(tmp_path / 'r_d')]) == 0
+    cfg = json.load(open(tmp_path / 'r_d' / 'doan_12b_v1.json', encoding='utf-8'))['car_pose_cfg']
+    assert cfg['q_m'] is None and cfg['du_m'] is None and 'c8b_xoay_v1' in cfg['q_ly_do']
+    assert ca.main(base + ['--xoay', xv, '--ra', str(tmp_path / 'r_v')]) == 0
+    cfg = json.load(open(tmp_path / 'r_v' / 'doan_12b_v1.json', encoding='utf-8'))['car_pose_cfg']
+    assert cfg['q_m'] == [-0.0004, 0.0002] and cfg['du_m'] == 0.0003 and cfg['q_ly_do'] is None
+    xc = write_json(str(tmp_path / 'xc.json'), _x_v1(ca.sha256(a6), goc=dict(trang_thai='chua_ket_luan')))
+    assert ca.main(base + ['--xoay', xc, '--ra', str(tmp_path / 'r_c')]) == 0      # a place block not dat: no q
+    cfg = json.load(open(tmp_path / 'r_c' / 'doan_12b_v1.json', encoding='utf-8'))['car_pose_cfg']
+    assert cfg['q_m'] is None and 'trang_thai' in cfg['q_ly_do']
+
+
+# ------------------------------------------------------------------ K2 q from a place with E, same mounting (option A)
+def _f5_file(tmp_path, name, cho, thu, ll, xoay, a6, **kw):
+    import hashlib
+    d = dict(schema='c8_hc_doan_12b_v1', thu_id=thu, cho=cho, lan_lap_id=ll, xoay_sha256=ca.sha256(xoay),
+             a6_sha256=ca.sha256(a6), doan=[])
+    d.update(kw)
+    d['sha256'] = hashlib.sha256(json.dumps(d, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+    return write_json(str(tmp_path / f'{name}.json'), d)
+
+
+def _k2_setup(tmp_path):
+    a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2', tam_id='T1'))
+    xv = write_json(str(tmp_path / 'xv.json'), _x_v1(ca.sha256(a6), goc=dict(q_tag_m=[0.0011, 0.0]),
+                                                     K1=dict(q_tag_m=[-0.0004, 0.0002], u_q_m=0.0003)))
+    return a6, xv, json.load(open(xv, encoding='utf-8'))
+
+
+def test_q_of_k2_from_place_with_e_same_mounting(tmp_path):
+    """CODE 22/11 option A: K2 takes q, u_q of K1 (or goc) when lan_lap_id of F5 K2 = lan_lap_id of F5 K1 (F8 run 1);
+    another mounting, an unverified one (no F8: null) or no --q-tu: no q."""
+    a6, xv, x = _k2_setup(tmp_path)
+    k1 = _f5_file(tmp_path, 'f5_k1', 'K1', 'HC_K1_2', 'L2', xv, a6)
+    q, u, why, ng = ca.q_cua_cho(x, 'K2', a6, xv, 'L2', k1)                       # same mounting: q of K1
+    assert (q, u, why) == ([-0.0004, 0.0002], 0.0003, None)
+    assert ng['cho'] == 'K1' and ng['thu_id'] == 'HC_K1_2' and ng['lan_lap_id'] == 'L2'
+    assert ng['xoay_sha256'] == ca.sha256(xv) and ng['doan_12b_file_sha256'] == ca.sha256(k1)
+    assert ng['doan_12b_sha256'] == json.load(open(k1, encoding='utf-8'))['sha256']
+    g = _f5_file(tmp_path, 'f5_goc', 'goc', 'HC_goc_2', 'L2', xv, a6)             # goc works the same way
+    assert ca.q_cua_cho(x, 'K2', a6, xv, 'L2', g)[0] == [0.0011, 0.0]
+    q, u, why, ng = ca.q_cua_cho(x, 'K2', a6, xv, 'L3', k1)                       # another mounting
+    assert q is None and ng is None and 'khac lan lap' in why
+    for ll_k2, ll_k1 in ((None, 'L2'), ('L2', None), ('', 'L2')):                 # not verified (no F8 / null)
+        k1n = _f5_file(tmp_path, f'f5_k1_{ll_k1}', 'K1', 'HC_K1_2', ll_k1, xv, a6)
+        q, u, why, ng = ca.q_cua_cho(x, 'K2', a6, xv, ll_k2, k1n)
+        assert q is None and 'chua xac minh' in why, (ll_k2, ll_k1)
+    q, u, why, ng = ca.q_cua_cho(x, 'K2', a6, xv, 'L2', None)                     # no --q-tu
+    assert q is None and '--q-tu' in why
+    other_x = write_json(str(tmp_path / 'xo.json'), dict(x, note=1))
+    k1x = _f5_file(tmp_path, 'f5_k1_x', 'K1', 'HC_K1_2', 'L2', other_x, a6)       # F5 K1 made from another xoay
+    assert 'xoay / A6 khac' in ca.q_cua_cho(x, 'K2', a6, xv, 'L2', k1x)[2]
+    xbad = dict(x, cho=dict(x['cho'], K1=dict(x['cho']['K1'], trang_thai='chua_ket_luan')))
+    assert 'cung lan lap' in ca.q_cua_cho(xbad, 'K2', a6, xv, 'L2', k1)[2]       # the E place itself not dat
+
+
+def test_q_of_place_with_own_block_never_borrows(tmp_path):
+    a6, xv, x = _k2_setup(tmp_path)
+    k1 = _f5_file(tmp_path, 'f5_k1', 'K1', 'HC_K1_2', 'L2', xv, a6)
+    g = _f5_file(tmp_path, 'f5_goc', 'goc', 'HC_goc_2', 'L2', xv, a6)
+    q, u, why, ng = ca.q_cua_cho(x, 'K1', a6, xv, 'L2', g)                        # own block wins
+    assert q == [-0.0004, 0.0002] and ng['cho'] == 'K1' and ng['cach'] == 'khoi F4 cua chinh cho'
+    xbad = dict(x, cho=dict(x['cho'], K1=dict(x['cho']['K1'], trang_thai='chua_ket_luan')))
+    q, u, why, ng = ca.q_cua_cho(xbad, 'K1', a6, xv, 'L2', g)                     # a bad own block is not replaced
+    assert q is None and 'trang_thai' in why
+    assert ca.q_cua_cho(_x_c8b_v1(), 'K2', a6, xv, 'L2', k1)[0] is None           # c8b_xoay_v1: never
+    with pytest.raises(ca.AError):
+        ca.q_cua_cho(x, 'K2', a6, xv, 'L2', _f5_file(tmp_path, 'f5_k2', 'K2', 'HC_K2_1', 'L2', xv, a6))
+    edited = json.load(open(k1, encoding='utf-8'))
+    edited['lan_lap_id'] = 'L9'
+    with pytest.raises(ca.AError):                                                # an edited F5 (content sha)
+        ca.q_cua_cho(x, 'K2', a6, xv, 'L9', write_json(str(tmp_path / 'ed.json'), edited))
+
+
+def test_tinh_and_cua_so_k2_q_from_k1(tmp_path):
+    """tinh --cho K2 --q-tu F5_K1: q from K1 when the F5 of the issued K2 attempt has the same lan_lap_id, recorded in
+    F7 q_nguon; cua_so of K2 without F8 (lan_lap_id null): no q, reason in F5 car_pose_cfg.q_ly_do."""
+    a6, xv, x = _k2_setup(tmp_path)
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    k1 = _f5_file(tmp_path, 'f5_k1', 'K1', 'HC_K1_2', 'L2', xv, a6)
+    own = _f5_file(tmp_path, 'f5_k2_own', 'K2', 'HC_K2_1', 'L2', xv, a6)
+    out = str(tmp_path / 'f7.json')
+    assert ca.main(tinh_args(d, 'K2', '--xoay', xv, '--a6', a6, '--q-tu', k1, '--doan', own, '--out', out)) in (0, 1)
+    r = json.load(open(out, encoding='utf-8'))
+    assert 'thieu q, du_m (xoay_v1)' not in r['ly_do'] and r['q_nguon']['cho'] == 'K1'
+    assert r['q_nguon']['lan_lap_id'] == 'L2' and any(n['vai_tro'] == 'q_tu_doan_12b_v1' for n in r['nguon'])
+    own3 = _f5_file(tmp_path, 'f5_k2_L3', 'K2', 'HC_K2_1', 'L3', xv, a6)
+    out = str(tmp_path / 'f7b.json')
+    assert ca.main(tinh_args(d, 'K2', '--xoay', xv, '--a6', a6, '--q-tu', k1, '--doan', own3, '--out', out)) in (0, 1)
+    r = json.load(open(out, encoding='utf-8'))
+    assert 'thieu q, du_m (xoay_v1)' in r['ly_do'] and r['q_nguon'] is None
+    assert any('khac lan lap' in w for w in r['ly_do']) and r['trang_thai'] != 'khoa'
+    assert ca.main(['cua_so', d, '--frames', os.path.join(d, 'frames.csv'), '--track', os.path.join(d, 'track.json'),
+                    '--a6', a6, '--xoay', xv, '--q-tu', k1, '--ra', str(tmp_path / 'r_k2')]) == 0
+    cfg = json.load(open(tmp_path / 'r_k2' / 'doan_12b_v1.json', encoding='utf-8'))['car_pose_cfg']
+    assert cfg['q_m'] is None and cfg['q_nguon'] is None and 'chua xac minh' in cfg['q_ly_do']
+
+

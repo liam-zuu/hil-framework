@@ -1478,6 +1478,10 @@ def cmd_cua_so(a):
     if lan_lap:
         ll_id, ll_why, ll_sha = read_lan_lap(lan_lap, A['thu_id'], A['cho'], a.a6, clip_sha, sha256(a.frames),
                                              ses_sha=ses_sha)
+    # F4 (CODE 22/11): q, u_q from the place block of a xoay_v1 file made on this A6, never the top level; a place
+    # without E (K2) from a place with E on the same mounting (--q-tu, option A); read before any file is written
+    xq, xu, x_why, x_ng = (q_cua_cho(json.load(open(a.xoay, encoding='utf-8')), A['cho'], a.a6, a.xoay, ll_id,
+                                     getattr(a, 'q_tu', None)) if a.xoay else (None, None, 'chua co --xoay', None))
     ra = ra_dir or a.dir                     # run 2 (with --a6 --xoay --lan-lap) writes to a new folder (mode x)
     if ra_dir:
         os.makedirs(ra, exist_ok=True)
@@ -1510,8 +1514,6 @@ def cmd_cua_so(a):
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + '\n')
     tj = json.load(open(a.track, encoding='utf-8'))
-    xo = json.load(open(a.xoay, encoding='utf-8')) if a.xoay else {}
-    xb = (xo.get('cho', {}).get(A['cho']) or xo) if xo else {}
     role_of = {k: lo for k, lo in roles if lo in ('ref_12b', 'dung_12b')}     # HCC2-7: not the E_dau alias
     nguon = [dict(vai_tro=k, duong_dan=os.path.abspath(v), sha256=sha256(v))
              for k, v in (('clip', a.clip), ('session', a.session), ('frames', a.frames), ('track', a.track),
@@ -1527,7 +1529,7 @@ def cmd_cua_so(a):
                 frames_sha256=sha256(a.frames), track_sha256=sha256(a.track), cua_so_v1_sha256=sha256(out),
                 esp32_sha256=sha256(A['log_path']), commit_hil=commit_hil(),
                 car_pose_cfg=dict(side_m=S.get('car_side_m'), h_m=S.get('tag_h_m'), tag_offset=tj.get('tag_offset'),
-                                  q_m=xb.get('q_tag_m'), du_m=xb.get('du_m')),
+                                  q_m=xq, du_m=xu, q_ly_do=x_why, q_nguon=x_ng),
                 xoay_sha256=sha256(a.xoay) if a.xoay else None, a6_sha256=sha256(a.a6) if a.a6 else None,
                 chuoi=an['chuoi'], dets_sha256=sha256(a.dets) if a.dets else None, dets_fp=dets_fingerprint(a.dets),
                 nguon=nguon, doan=[])
@@ -1565,6 +1567,81 @@ def cmd_cua_so(a):
 def _block(j, cho):
     """The block of one place in a file of another session: j['cho'][cho] when present, else j."""
     return (j.get('cho') or {}).get(cho) or j
+
+
+def xoay_q(x, cho, a6_path):
+    """(q_tag_m, u_q_m, reason) of F4 xoay_v1 (C8B, contract C8 lines 23, 46; CODE 22/11) for one place: only a file of
+    version 'xoay_v1', only the block cho[<place>] with trang_thai 'dat', q_tag_m two finite numbers, u_q_m finite
+    >= 0, and a6_sha256 = the sha256 of the A6 file of this run (q is fitted on psi' after A6). Anything else ->
+    (None, None, reason); never the top level of the file (c8b_xoay_v1, the diagnostic q fitted on the tag heading
+    WITHOUT A6, is refused; K2, where HC has no E turn, has no block: q None)."""
+    if not isinstance(x, dict) or x.get('version') != 'xoay_v1':
+        v = x.get('version') if isinstance(x, dict) else None
+        return None, None, (f'xoay version {v!r} khong phai xoay_v1 (c8b_xoay_v1 la q chan doan khop tren huong ma '
+                            f'chua qua A6)')
+    b = (x.get('cho') or {}).get(cho) if isinstance(x.get('cho'), dict) else None
+    if not isinstance(b, dict):
+        return None, None, f'xoay_v1 khong co cho {cho!r}'
+    if b.get('trang_thai') != 'dat':
+        return None, None, f'xoay_v1 {cho}: trang_thai {b.get("trang_thai")!r}'
+    q, u = b.get('q_tag_m'), b.get('u_q_m')
+    fin = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)   # noqa: E731
+    if not (isinstance(q, (list, tuple)) and len(q) == 2 and all(fin(v) for v in q)):
+        return None, None, f'xoay_v1 {cho}: q_tag_m {q!r}'
+    if not (fin(u) and u >= 0):
+        return None, None, f'xoay_v1 {cho}: u_q_m {u!r}'
+    if not a6_path:
+        return None, None, f'xoay_v1 {cho}: can --a6 (q khop tren psi sau A6)'
+    if b.get('a6_sha256') != sha256(a6_path):
+        return None, None, f'xoay_v1 {cho}: a6_sha256 khac file --a6'
+    return [float(q[0]), float(q[1])], float(u), None
+
+
+def _f5_checked(path):
+    """F5 doan_12b_v1 after the content-sha check (the file was not edited)."""
+    d = json.load(open(path, encoding='utf-8'))
+    body = {k: v for k, v in d.items() if k != 'sha256'} if isinstance(d, dict) else None
+    if body is None or d.get('schema') != 'c8_hc_doan_12b_v1' or d.get('sha256') != hashlib.sha256(
+            json.dumps(body, ensure_ascii=False, sort_keys=True).encode()).hexdigest():
+        raise AError(f'{path}: khong phai F5 doan_12b_v1 nguyen ven (schema, sha256 noi dung)')
+    return d
+
+
+def q_cua_cho(x, cho, a6_path, xoay_path, ll_id, q_tu=None):
+    """(q_tag_m, u_q_m, reason, q_nguon) for a place. Own place block of xoay_v1 first (xoay_q). A place without one
+    (K2: HC has no E turn there) takes, CODE 22/11 option (A) (contract C8), the block of a place WITH E (K1 or goc) on
+    the SAME mounting of the plate: q is the tag centre seen from the turning centre of the car, fixed while the plate
+    is not taken off, and the bound uses only |q| and u_q. q_tu = the F5 (doan_12b_v1) of that place, run 2 of
+    cua_so on the same A6 and xoay files; the mounting is verified by lan_lap_id of this F5 (ll_id) = lan_lap_id of
+    q_tu, both from F8 run 1 and not null. Another mounting, a null lan_lap_id (not verified, no F8) or no q_tu ->
+    (None, None, reason, None): u_q missing, the place chua_ket_luan / chan_doan. A malformed q_tu, or the F5 of
+    this very place: AError (code 2)."""
+    q, u, why = xoay_q(x, cho, a6_path)
+    if q is not None:
+        return q, u, None, dict(cho=cho, xoay_sha256=sha256(xoay_path), lan_lap_id=ll_id, cach='khoi F4 cua chinh cho')
+    has_block = isinstance(x, dict) and isinstance(x.get('cho'), dict) and isinstance(x['cho'].get(cho), dict)
+    if has_block or not isinstance(x, dict) or x.get('version') != 'xoay_v1':
+        return None, None, why, None                      # this place has a block (bad) or the file is not xoay_v1
+    if not q_tu:
+        return None, None, f'{why}; khong co --q-tu (F5 cua cho co E cung lan lap tam)', None
+    o = _f5_checked(q_tu)
+    cho_o = o.get('cho')
+    if cho_o == cho:
+        raise AError(f'{q_tu}: --q-tu la F5 cua chinh cho {cho}')
+    if o.get('xoay_sha256') != sha256(xoay_path) or o.get('a6_sha256') != (sha256(a6_path) if a6_path else None):
+        return None, None, f'F5 {o.get("thu_id")} ({cho_o}) lam tu file xoay / A6 khac', None
+    ll_o = o.get('lan_lap_id')
+    if not (isinstance(ll_id, str) and ll_id and isinstance(ll_o, str) and ll_o):
+        return None, None, (f'chua xac minh cung lan lap tam voi {cho_o} (lan_lap_id {cho} {ll_id!r}, '
+                            f'{cho_o} {ll_o!r}; F8 luot 1)'), None
+    if ll_id != ll_o:
+        return None, None, f'khac lan lap tam: {cho} {ll_id!r}, {cho_o} {ll_o!r}', None
+    q, u, why_o = xoay_q(x, cho_o, a6_path)
+    if q is None:
+        return None, None, f'cho {cho_o} cung lan lap: {why_o}', None
+    return q, u, None, dict(cho=cho_o, thu_id=o.get('thu_id'), xoay_sha256=sha256(xoay_path), lan_lap_id=ll_id,
+                            doan_12b_sha256=o.get('sha256'), doan_12b_file_sha256=sha256(q_tu),
+                            cach='khoi F4 cua cho co E cung lan lap tam (CODE 22/11 phuong an A)')
 
 
 _KHAC = object()
@@ -1984,10 +2061,20 @@ def cmd_tinh(a):
         nguon += [dict(vai_tro='e_hieu_m', duong_dan=os.path.abspath(a.e_hieu), sha256=sha256(a.e_hieu)),
                   dict(vai_tro='doan_12b_v1', duong_dan=os.path.abspath(dp), sha256=sha256(dp))]
     q = du = None
-    if a.xoay:
-        x = _block(json.load(open(a.xoay, encoding='utf-8')), a.cho)
-        q, du = x.get('q_tag_m'), x.get('du_m')
+    x_why = x_ng = None
+    if a.xoay:                       # F4 (CODE 22/11): place block of xoay_v1 on this A6 only, never the top level
+        ll_q, q_tu = ll_f5, getattr(a, 'q_tu', None)
+        if q_tu and ll_q is None:    # option A: the mounting of the issued attempt from its F5 (run 2 of cua_so)
+            dp_q = a.doan or os.path.join(a.cap, 'doan_12b_v1.json')
+            if os.path.isfile(dp_q):
+                f5q = _f5_checked(dp_q)
+                if f5q.get('thu_id') != cap_id or f5q.get('cho') != a.cho:
+                    raise AError(f'{dp_q}: F5 cua {f5q.get("thu_id")} ({f5q.get("cho")}), khong phai luot cap')
+                ll_q = f5q.get('lan_lap_id')
+        q, du, x_why, x_ng = q_cua_cho(json.load(open(a.xoay, encoding='utf-8')), a.cho, a.a6, a.xoay, ll_q, q_tu)
         nguon.append(dict(vai_tro='xoay_v1', duong_dan=os.path.abspath(a.xoay), sha256=sha256(a.xoay)))
+        if q_tu:
+            nguon.append(dict(vai_tro='q_tu_doan_12b_v1', duong_dan=os.path.abspath(q_tu), sha256=sha256(q_tu)))
     if a.a6:
         nguon.append(dict(vai_tro='c8b_a6_v2', duong_dan=os.path.abspath(a.a6), sha256=sha256(a.a6)))
     neo = None
@@ -2064,8 +2151,12 @@ def cmd_tinh(a):
                      can_hai_dau=can_fn, p_ref_tag=p_ref_tag, khung=kg)
     for x in r['luot_thu']:
         x['session_sha256'] = att_ses.get(x['thu_id'])
+    if x_why:                                            # why the xoay_v1 file gave no q for this place
+        r['ly_do'].append(f'xoay: {x_why}')
+        if r['trang_thai'] == 'khoa':
+            r['trang_thai'] = 'chan_doan'
     r = dict(schema='truc_xe_v1', version=VERSION, commit_hil=commit_hil(), nguon=nguon,
-             session_sha256=s_cap, session_sha256_luot=dict(sorted(att_ses.items())),
+             session_sha256=s_cap, session_sha256_luot=dict(sorted(att_ses.items())), q_nguon=x_ng,
              mien_hieu_luc=dict(cho=a.cho, thu_id_cap=cap_id, lan_lap_id=ll_f5,
                                 ghi_chu='cung buoi, cung lan lap tam' + (
                                     ' (lan_lap_id cua F5, tu F8 lan_lap_v1 luot 1 cua NHACTAM)' if ll_f5 else
@@ -2173,6 +2264,8 @@ def main(argv=None):
     c.add_argument('--lan-lap', default=None, help='lan_lap.json of NHACTAM (F8, run 1): lan_lap_id of this 12b; '
                                                    'needs --a6 with tam_id')
     c.add_argument('--ra', default=None, help='output folder (default DIR); run 2 with --lan-lap: a new folder')
+    c.add_argument('--q-tu', default=None, help='F5 doan_12b_v1 (run 2) of a place WITH E on the same mounting of the '
+                                                'plate: q of a place without E (K2), CODE 22/11 option A')
     t = sub.add_parser('tinh')
     t.add_argument('--cho', required=True, choices=sorted(hs.PLACES))
     t.add_argument('--cap', required=True, help='attempt folder whose a is issued')
@@ -2193,6 +2286,8 @@ def main(argv=None):
     t.add_argument('--d-vet-mm', type=float, default=20.0, help='tag centre to body box centre bound [de xuat]')
     t.add_argument('--session', nargs='*', default=None, help='session JSON files of the camera segments (da session); '
                                                               'each attempt track session must be one of them')
+    t.add_argument('--q-tu', default=None, help='F5 doan_12b_v1 (run 2) of a place WITH E on the same mounting of the '
+                                                'plate: q of a place without E (K2), CODE 22/11 option A')
     t.add_argument('--khung-giua-session', nargs='*', default=None,
                    help='c7_khung_giua_session_v1 files of CAM (one per session pair; needed when an attempt of the '
                         'place was filmed in another session than the issued one)')
