@@ -135,19 +135,26 @@ def _test_points(n=100, seed=7):
 
 def make_s03(tmp_path, q1=q1_convex, q2=q2_convex, mods=None, fake=True, dll=None, levels=None, gate=SPEEDS,
              test_mods=None, trial=False):
-    """S03 v8 folder: levels, design (centre, outer, inner, axial, test), sealed/runs.csv for every box but
-    test, sealed_test/runs_test.csv; mods(row) changes a sealed row; rsm_fake: true unless fake=False."""
+    """S03 v8.5 folder (S04 v6.7 9.6): public levels.csv and meta.yaml; sealed/design.csv (centre, outer, inner,
+    axial, test), sealed/levels_sangloc.csv (levels + nguon_mien/ly_do), sealed/runs.csv for every box but
+    test, sealed_test/runs_test.csv; mods(row) changes a sealed row; rsm_fake: true unless fake=False.
+    No public design.csv: the script reads only the sealed one."""
     d = tmp_path / 's03'
     (d / 'sealed').mkdir(parents=True)
+    (d / 'sealed' / 'sangloc').mkdir()
+    (d / 'sealed' / 'sangloc_thu').mkdir()
     (d / 'sealed_test').mkdir()
     lv = levels or LEVELS
-    with open(d / 'levels.csv', 'w', newline='') as f:
-        w = csv.writer(f)
-        w.writerow(['controller', 'factor', 'L', 'H', 'centre', 'scale', 'default', 'rule_note'])
-        for c in s3.CONTROLLERS:
-            for n in s3.FACTORS[c]:
-                L, H = lv[c][n]
-                w.writerow([c, n, repr(L), repr(H), '', 'log' if L > 0 and H / L >= 4 else 'lin', '', ''])
+    for name, extra in (('levels.csv', []), (os.path.join('sealed', 'levels_sangloc.csv'),
+                                             ['L_nguon', 'H_nguon', 'b', 'b_n', 'nguon_mien', 'ly_do'])):
+        with open(d / name, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['controller', 'factor', 'L', 'H', 'centre', 'scale', 'default', 'rule_note'] + extra)
+            for c in s3.CONTROLLERS:
+                for n in s3.FACTORS[c]:
+                    L, H = lv[c][n]
+                    w.writerow([c, n, repr(L), repr(H), '', 'log' if L > 0 and H / L >= 4 else 'lin', '', '']
+                               + (['', '', '', '', 'sang_loc', ''] if extra else []))
     pts = ([(0, 'centre', (0.0,) * 7)] + [(p, 'outer', c) for p, c in s3.design_points(1.0, 1)] +
            [(p, 'inner', c) for p, c in s3.design_points(0.5, 129)] + [(p, 'axial', c) for p, c in s3.axial_points()] +
            [(p, 'test', c) for p, c in _test_points()])
@@ -171,10 +178,12 @@ def make_s03(tmp_path, q1=q1_convex, q2=q2_convex, mods=None, fake=True, dll=Non
                         if mods:
                             mods(r)
                         runs.append(r)
-    s3.write_csv(str(d / 'design.csv'), design)
+    s3.write_csv(str(d / 'sealed' / 'design.csv'), design)
     s3.write_csv(str(d / 'sealed' / 'runs.csv'), runs)
     s3.write_csv(str(d / 'sealed_test' / 'runs_test.csv'), trows)
     (d / 'sealed' / 'notes.json').write_text(json.dumps(dict(elapsed_s_main_design=123, run_error_reruns=[])))
+    (d / 'sealed' / 'sangloc' / 'ket_qua.json').write_text('{}')
+    (d / 'sealed' / 'sangloc_thu' / 'so_dem.json').write_text('{}')
     (d / 'sealed_test' / 'notes.json').write_text(json.dumps(dict(elapsed_s_test=45, run_error_reruns=[])))
     dll_sha = s3.sha256_file(dll) if dll and os.path.isfile(dll) else 'no dll'
     y3 = {f'{c} v={v:g}': 5.0 for c in s3.CONTROLLERS for v in SPEEDS}
@@ -410,7 +419,7 @@ def test_fit_phase_recovers_truth_and_commits_only_its_paths(tmp_path, dummy_dll
         names = git_out(repo, 'show', '--name-only', '--format=', rev).split()
         assert names and all(n.startswith('05_DATA/results/S04/run01/rsm/') for n in names)
     assert 'other.txt' in git_out(repo, 'diff', '--cached', '--name-only')            # left staged, not taken
-    lock = json.load(open(s04 / 'rsm' / 'fit' / 'lock.yaml'))
+    lock = json.load(open(s04 / 'rsm' / 'fit' / 'lock.yaml', encoding='utf-8'))
     assert set(lock['files']) == {'fit/fit_points.csv', 'fit/coefs.csv', 'fit/fit_diag.yaml'}
     assert lock['solver'] == rc.SOLVER and lock['eps'] == rc.EPS and lock['K'] == 5
 
@@ -436,11 +445,12 @@ def test_fit_input_checks_stop_and_close_the_attempt(tmp_path, dummy_dll, mod, m
 
 def test_fit_design_codes_and_missing_point(tmp_path, dummy_dll):
     repo, s03, s04 = setup(tmp_path, dummy_dll)
-    rows = list(csv.DictReader(open(s03 / 'design.csv')))
+    p = s03 / 'sealed' / 'design.csv'
+    rows = list(csv.DictReader(open(p, encoding='utf-8')))
     for r in rows:
         if r['point_id'] == '262':
             r['X3'] = '0.5'
-    s3.write_csv(str(s03 / 'design.csv'), rows)
+    s3.write_csv(str(p), rows)
     with pytest.raises(rc.Stop):                     # the S03 file differs from the S04 fingerprint first
         rc.run_phase('fit', str(s04), dummy_dll)
     d = rc.read_design(str(s03), 'PID')
@@ -556,7 +566,7 @@ def test_opt_confirm_classify_default(tmp_path, dummy_dll, fake_eval):
     assert fake_eval['seen'][0] == tuple(sorted(g.items()))
     tried = list(csv.DictReader(open(s04 / 'rsm' / 'check' / 'candidates_tried.csv')))
     assert [(t['cand_id'], t['label']) for t in tried] == [('1', 'pass')]
-    lock = json.load(open(s04 / 'rsm' / 'opt_lock.yaml'))
+    lock = json.load(open(s04 / 'rsm' / 'opt_lock.yaml', encoding='utf-8'))
     assert all(p.split('/')[0] in ('opt', 'confirm', 'check') for p in lock['files'])
     cost = list(csv.DictReader(open(s04 / 'rsm' / 'check' / 'cost.csv')))
     assert {r['part'] for r in cost} == {'a', 'b', 'c', 'mixed'} and not any('test' in r['item'] for r in cost)
@@ -829,6 +839,80 @@ def test_pid_result_has_no_triangle_columns_filled(tmp_path, dummy_dll, fake_eva
     assert res['state'] == 'x_RSM'
 
 
+def test_triangle_constraints_use_the_solver_margin():
+    """C3-32 (Liam 23/11 "Dung le 1e-6"): the SLSQP constraint is TRI_MAX - TRI_SOLVER_MARGIN - sum; the
+    independent binary64 check keeps the exact TRI_MAX; SOLVER records the margin and its basis."""
+    dom = _dom(LEVELS_TRI['ADRC'], 'ADRC')
+    cons = rc.triangle_constraints('ADRC', dom)
+    assert len(cons) == 2 and rc.TRI_AXES == ('xy', 'wz')
+    f = cons[0]['fun']                                                # xy
+    code = _code_at_sum(dom, 199.5)
+    assert f(code) == pytest.approx(rc.TRI_MAX - rc.TRI_SOLVER_MARGIN - 199.5, abs=1e-9)
+    over = _code_at_sum(dom, rc.TRI_MAX - rc.TRI_SOLVER_MARGIN / 2)   # refused for the solver, exact-ok
+    assert f(over) < 0
+    assert rc.triangle_check('ADRC', dom)(over)['xy'] <= rc.TRI_MAX
+    assert rc.triangle_constraints('PID', _dom(LEVELS['PID'], 'PID')) == ()
+    assert rc.triangle_check('PID', _dom(LEVELS['PID'], 'PID')) is None
+    assert rc.SOLVER['tri_max'] == rc.TRI_MAX and rc.SOLVER['tri_margin'] == rc.TRI_SOLVER_MARGIN == 1e-6
+    assert '1e-6' in rc.SOLVER['tri_margin_basis']
+
+
+def test_solver_margin_recorded_in_meta_and_lock(tmp_path, dummy_dll, fake_eval):
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    rc.run_phase('fit', str(s04), dummy_dll)
+    rc.run_phase('opt', str(s04), dummy_dll)
+    meta = (s04 / 'rsm' / 'meta.yaml').read_text(encoding='utf-8')
+    assert 'tri_margin' in meta and 'tri_margin_basis' in meta
+    lock = json.load(open(s04 / 'rsm' / 'fit' / 'lock.yaml', encoding='utf-8'))
+    assert lock['solver'] == rc.SOLVER and lock['solver']['tri_margin'] == 1e-6
+
+
+def test_read_design_sealed_missing_stops(tmp_path, dummy_dll):
+    """S04 v6.7 9.6: read_design reads sealed/design.csv only: missing -> Stop; a public design.csv is not
+    a substitute (the fixture has none)."""
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    assert not (s03 / 'design.csv').exists()                       # no public design.csv: still works
+    d = rc.read_design(str(s03), 'PID')
+    assert d and d[0][0] == 'centre'
+    rc.run_phase('fit', str(s04), dummy_dll)
+    os.remove(s03 / 'sealed' / 'design.csv')
+    with pytest.raises(rc.Stop):
+        rc.read_design(str(s03), 'PID')
+    with pytest.raises(rc.Stop):                                 # fingerprint sees the change first
+        rc.run_phase('opt', str(s04), dummy_dll)
+
+
+def test_real_slsqp_respects_the_triangle(tmp_path, dummy_dll, fake_eval):
+    """C3-11: REAL SLSQP (no mock) on LEVELS_TRI: every solver result that counts as converged passes the
+    exact binary64 check (sum <= TRI_MAX, no delta), and every candidate is inside the triangle."""
+    repo, s03, s04 = setup(tmp_path, dummy_dll, ctrls=('ADRC',), levels=LEVELS_TRI, q1=q1_tri, q2=q2_tri)
+    rc.run_phase('fit', str(s04), dummy_dll)
+    rc.run_phase('opt', str(s04), dummy_dll)
+    st = list(csv.DictReader(open(s04 / 'rsm' / 'opt' / 'starts.csv')))
+    conv = [r for r in st if r['converged'] == 'true']
+    assert conv
+    for r in conv:
+        sums = json.loads(r['tri_sums'])
+        assert r['tri_ok'] == 'true' and all(v <= rc.TRI_MAX for v in sums.values()), r['tri_sums']
+    cands = list(csv.DictReader(open(s04 / 'rsm' / 'opt' / 'candidates.csv')))
+    assert cands
+    for r in cands:
+        assert float(r['omega_c_xy']) + 2 * float(r['omega_o_xy']) <= rc.TRI_MAX
+        assert float(r['omega_c_wz']) + 2 * float(r['omega_o_wz']) <= rc.TRI_MAX
+    res = list(csv.DictReader(open(s04 / 'rsm' / 'confirm' / 'result.csv')))[0]
+    assert res['state'] == 'x_RSM'                                 # state None: candidates found
+
+
+def test_run_opt_stops_without_classify(tmp_path, dummy_dll, fake_eval, monkeypatch):
+    """C3-25: run_opt needs gain_table.classify (S03Stop -> Stop) before any simulation."""
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    rc.run_phase('fit', str(s04), dummy_dll)
+    monkeypatch.delattr(s4.gain_table, 'classify')
+    with pytest.raises(rc.Stop, match='classify'):
+        rc.run_phase('opt', str(s04), dummy_dll)
+    assert fake_eval['calls'] == 0
+
+
 def test_ga_points_count_ngoai_bang_as_unlabelled(tmp_path, dummy_dll, fake_eval):
     """S04 v6.8 2: a GA candidate with status ngoai_bang was not run (no evals row): unlabelled, its own reason."""
     repo, s03, s04 = setup(tmp_path, dummy_dll, ctrls=('ADRC',))
@@ -1069,7 +1153,7 @@ def test_lock_edited_and_recommitted_stops(tmp_path, dummy_dll, fake_eval):
     rc.run_phase('opt', str(s04), dummy_dll)
     fit = s04 / 'rsm' / 'fit'
     (fit / 'coefs.csv').write_text((fit / 'coefs.csv').read_text().replace('0.03', '0.031', 1))
-    lk = json.load(open(fit / 'lock.yaml'))
+    lk = json.load(open(fit / 'lock.yaml', encoding='utf-8'))
     lk['files']['fit/coefs.csv'] = dict(zip(('sha256', 'sha256_lf'), rc.file_sha(str(fit / 'coefs.csv'))))
     (fit / 'lock.yaml').write_text(json.dumps(lk))
     _commit_all(repo, fit, 'edit')
@@ -1215,8 +1299,10 @@ def test_triangle_constraints_pid_none_adrc_two_axes():
     assert len(cons) == 2 and all(c['type'] == 'ineq' for c in cons)
     c = np.array([0.4, -0.2, 0.1, 0.7, 0.0, 0.0, 0.0])
     g = _gains(dom, c)
-    assert cons[0]['fun'](c) == pytest.approx(rc.TRI_MAX - (g['omega_c_xy'] + 2 * g['omega_o_xy']), abs=1e-12)
-    assert cons[1]['fun'](c) == pytest.approx(rc.TRI_MAX - (g['omega_c_wz'] + 2 * g['omega_o_wz']), abs=1e-12)
+    assert cons[0]['fun'](c) == pytest.approx(
+        rc.TRI_MAX - rc.TRI_SOLVER_MARGIN - (g['omega_c_xy'] + 2 * g['omega_o_xy']), abs=1e-12)
+    assert cons[1]['fun'](c) == pytest.approx(
+        rc.TRI_MAX - rc.TRI_SOLVER_MARGIN - (g['omega_c_wz'] + 2 * g['omega_o_wz']), abs=1e-12)
     num = np.array([[(con['fun'](c + h) - con['fun'](c - h)) / 2e-6 for h in np.eye(7) * 1e-6] for con in cons])
     assert np.allclose([con['jac'](c) for con in cons], num, atol=1e-5)
     assert rc.triangle_sums('PID', {}) == {}
@@ -1229,7 +1315,7 @@ def test_triangle_constraints_pid_none_adrc_two_axes():
     c2 = np.zeros(7)                                             # omega_c_xy = 119.99, omega_o_xy = 40: on the bound
     c2[0] = 2 * math.log((rc.TRI_MAX - 80.0) / 60.0) / math.log(9.0)
     c2[1] = 1.0
-    assert abs(cons[0]['fun'](c2)) < 1e-9
+    assert cons[0]['fun'](c2) == pytest.approx(-rc.TRI_SOLVER_MARGIN, abs=1e-9)   # solver margin, exact bound
 
 
 def test_optimise_keeps_both_steps_inside_the_triangle():
@@ -1362,7 +1448,7 @@ def _main_mode(tmp_path, dummy_dll, monkeypatch):
     repo = make_repo(tmp_path)
     s03 = make_s03(tmp_path, dll=dummy_dll, fake=False)
     s04 = make_s04(repo, s03, dummy_dll)
-    lk = json.load(open(s04 / 'lock.yaml'))
+    lk = json.load(open(s04 / 'lock.yaml', encoding='utf-8'))
     lk['common'].update(tool_check=False, unsealed=True, fingerprint=s4.fingerprint(dummy_dll, str(s03), unsealed=True))
     for c in lk['controllers'].values():
         c['tool_check'] = False
@@ -1526,7 +1612,7 @@ def test_two_commits_bringing_the_same_done_row_stop(tmp_path, dummy_dll, fake_e
     git_out(repo, 'checkout', f_commit, '--', rel_rsm + '/attempts.csv', rel_rsm + '/fit', rel_rsm + '/meta.yaml')
     fit = s04 / 'rsm' / 'fit'
     (fit / 'coefs.csv').write_text((fit / 'coefs.csv').read_text().replace('0.03', '0.031', 1))
-    lk = json.load(open(fit / 'lock.yaml'))
+    lk = json.load(open(fit / 'lock.yaml', encoding='utf-8'))
     lk['files']['fit/coefs.csv'] = dict(zip(('sha256', 'sha256_lf'), rc.file_sha(str(fit / 'coefs.csv'))))
     (fit / 'lock.yaml').write_text(json.dumps(lk))
     git_out(repo, 'add', '--', rel_rsm)
@@ -1569,10 +1655,11 @@ def test_edge_source_and_limit(tmp_path, dummy_dll, fake_eval):
     the candidate has factors on both sides, so the H branch is checked with a non-empty edge_limit."""
     repo = make_repo(tmp_path)
     s03 = make_s03(tmp_path, q1=q1_flat, q2=q2_mixed, dll=dummy_dll)
-    rows = list(csv.DictReader(open(s03 / 'levels.csv')))
+    p = s03 / 'sealed' / 'levels_sangloc.csv'                        # v6.7 9.6: the sources live in the sealed file
+    rows = list(csv.DictReader(open(p, encoding='utf-8')))
     for r in rows:
         r['L_nguon'], r['H_nguon'] = '0', 'hết lưới'
-    s3.write_csv(str(s03 / 'levels.csv'), rows)
+    s3.write_csv(str(p), rows)
     s04 = make_s04(repo, s03, dummy_dll, q1=q1_flat, q2=q2_mixed)
     rc.run_phase('fit', str(s04), dummy_dll)
     rc.run_phase('opt', str(s04), dummy_dll)
@@ -1590,11 +1677,12 @@ def test_edge_limit_names_the_table_ceiling(tmp_path, dummy_dll, fake_eval):
     after the grid-end limits, and ki_xy:H appears in edge_limit only there."""
     repo = make_repo(tmp_path)
     s03 = make_s03(tmp_path, q1=q1_flat, q2=q2_mixed, dll=dummy_dll)
-    rows = list(csv.DictReader(open(s03 / 'levels.csv', encoding='utf-8')))
+    p = s03 / 'sealed' / 'levels_sangloc.csv'                        # v6.7 9.6: the sources live in the sealed file
+    rows = list(csv.DictReader(open(p, encoding='utf-8')))
     for r in rows:
         r['L_nguon'] = '0'
         r['H_nguon'] = 'trần bảng chặn' if r['factor'] == 'ki_xy' else 'hết lưới'
-    s3.write_csv(str(s03 / 'levels.csv'), rows)
+    s3.write_csv(str(p), rows)
     s04 = make_s04(repo, s03, dummy_dll, q1=q1_flat, q2=q2_mixed)
     rc.run_phase('fit', str(s04), dummy_dll)
     rc.run_phase('opt', str(s04), dummy_dll)
@@ -1749,7 +1837,7 @@ def test_end_to_end_with_a_real_s04_tool_check(tmp_path, monkeypatch, capsys):
     -> rsm fit, opt (real confirmation), test. Never main numbers (L82)."""
     repo = make_repo(tmp_path)
     lv = _levels_near_defaults()
-    s03 = make_s03(tmp_path, dll=_DLL, levels=lv, gate=(0.2,))
+    s03 = make_s03(tmp_path, dll=_DLL, levels=lv, gate=(0.2,), trial=True)   # v6.7 8: --tool-check needs an S03 --trial
     out = repo / '05_DATA' / 'results' / 'S04' / 'run01'
     common = ['--tool-check', '--controller', 'PID', '--s03', str(s03), '--pop', '4', '--gen-base', '1',
               '--gen-max', '1', '--dll', _DLL, '--out', str(out)]

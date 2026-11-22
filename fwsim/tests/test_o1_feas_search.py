@@ -539,24 +539,51 @@ def test_recheck_refuses_tool_check_stopped_or_changed_source(fake, tmp_path):
     assert code not in (0, None)
 
 
+def _s03_levels(s03, lo=1e-9, hi=1e9):
+    """Write the sealed levels file of a v8.5 S03 run (S04 v6.7 9.6: inbox reads this, never the public
+    levels.csv)."""
+    (s03 / 'sealed').mkdir(parents=True, exist_ok=True)
+    with open(s03 / 'sealed' / 'levels_sangloc.csv', 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['controller', 'factor', 'L', 'H', 'centre', 'scale', 'default', 'rule_note',
+                    'L_src', 'H_src', 'L_kiem', 'H_kiem', 'nguon_mien', 'ly_do'])
+        for c in F.CONTROLLERS:
+            for n in F.s3.FACTORS[c]:
+                w.writerow([c, n, lo, hi, 1, 'log', 1, '', '', '', '', '', 'sang_loc', ''])
+
+
 def test_inbox(fake, tmp_path):
     out = tmp_path / 'run'
     _search(fake, out)
     s03 = tmp_path / 'S03 run'                                         # a space and a backslash path below
     s03.mkdir()
+    _s03_levels(s03)
+    # a public levels.csv with different numbers is ignored (S04 v6.7 9.6)
     with open(s03 / 'levels.csv', 'w', newline='', encoding='utf-8') as f:
-        w = csv.writer(f)
-        w.writerow(['controller', 'factor', 'L', 'H', 'centre', 'scale', 'default', 'rule_note'])
-        for c in F.CONTROLLERS:
-            for n in F.s3.FACTORS[c]:
-                w.writerow([c, n, 1e-9, 1e9, 1, 'log', 1, ''])
+        f.write('controller,factor,L,H\nPID,pos_kp,-1e9,-1e-9\n')
     code, text = _main(['inbox', '--from', str(out), '--out', str(tmp_path / 'ib'), '--s03', str(s03)])
     assert code == 0 and text.strip() == 'inbox written (sealed)'
     meta = yaml.safe_load((tmp_path / 'ib' / 'meta.yaml').read_text(encoding='utf-8'))   # Windows paths (C12-11)
     assert meta['s03_run'] == str(s03) and meta['source_run'] == str(out)
+    assert meta['s03_levels_file'] == 'sealed/levels_sangloc.csv'
+    assert meta['s03_levels_sha256'] == F.s3.sha256_file(s03 / 'sealed' / 'levels_sangloc.csv')
+    assert meta['s03_levels_sha256'] != F.s3.sha256_file(s03 / 'levels.csv')
     assert set(meta['sealed_sha256']) == {'manifest.json'}
     rows = _csv(tmp_path / 'ib' / 'sealed' / 'inbox.csv')
     assert rows and all(r['inside'] == 'true' for r in rows)
+
+
+def test_inbox_missing_sealed_levels(fake, tmp_path):
+    """No sealed/levels_sangloc.csv (an S03 run before v8.5): FeasStop -> exit 2, nothing written."""
+    out = tmp_path / 'run'
+    _search(fake, out)
+    s03 = tmp_path / 'S03'
+    s03.mkdir()
+    with open(s03 / 'levels.csv', 'w', newline='', encoding='utf-8') as f:
+        f.write('controller,factor,L,H\nPID,pos_kp,1e-9,1e9\n')
+    code, text = _main(['inbox', '--from', str(out), '--out', str(tmp_path / 'ib'), '--s03', str(s03)])
+    assert code == 2 and 'levels_sangloc.csv' in text
+    assert not (tmp_path / 'ib' / 'meta.yaml').exists()
 
 
 def test_child_failure_prints_one_fixed_sentence(tmp_path):

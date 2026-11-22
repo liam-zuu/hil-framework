@@ -736,5 +736,66 @@ def _bang():
     return out
 
 
+# -- ban_kinh_pho_va_trang_thai: radius + state + kept states in one dict (S04 v6.8 section 6) --
+
+def test_ban_kinh_pho_va_trang_thai_bang_ban_kinh_pho():
+    """The combined helper gives the same radius as ban_kinh_pho for several gain sets and model params."""
+    cases = [
+        ('PID', {}, {}), ('ADRC', {}, {}),
+        ('PID', dict(pos_kp=0.0, pos_ki=3.0), {}),
+        ('PID', dict(ki_xy=0.0, pos_ki=0.0), dict(G=1.127, tau=0.0823)),
+        ('ADRC', dict(pos_ki=0.0, omega_c_xy=40.0, omega_o_xy=20.0), dict(G=0.9, tau=0.197)),
+    ]
+    for ctrl, kw, model in cases:
+        g = bo(ctrl, **kw)
+        m = mh.ban_kinh_pho_va_trang_thai(ctrl, g, **model)
+        assert m['ban_kinh_pho'] == mh.ban_kinh_pho(ctrl, g, **model)
+        assert m['trang_thai'] == mh.trang_thai(m['ban_kinh_pho'])
+
+
+def test_ban_kinh_pho_va_trang_thai_khoa_va_hang_so():
+    """Keys, TEN order, model constants."""
+    m = mh.ban_kinh_pho_va_trang_thai('PID', PID0)
+    assert set(m) == {'ban_kinh_pho', 'trang_thai', 'bien_trang_thai', 'bien_bo', 'so_trang_thai',
+                      'G', 'tau', 'T', 'b0'}
+    assert m['bien_trang_thai'] == list(mh.TEN['PID']) and m['bien_bo'] == [] and m['so_trang_thai'] == 5
+    assert m['G'] == mh.G_MAC_DINH and m['tau'] == mh.TAU and m['T'] == mh.T_TICK and m['b0'] is None
+    m = mh.ban_kinh_pho_va_trang_thai('ADRC', ADRC0, G=1.127, tau=0.197)
+    assert m['bien_trang_thai'] == list(mh.TEN['ADRC']) and m['so_trang_thai'] == 6
+    assert m['G'] == 1.127 and m['tau'] == 0.197 and m['b0'] == mh.B0_XY
+
+
+@pytest.mark.parametrize('ctrl,kw,giu,bo_', [
+    ('PID', dict(pos_ki=0.0), ('x', 'v', 'i_vel', 'u'), ('i_pos',)),
+    ('PID', dict(ki_xy=0.0), ('x', 'v', 'i_pos', 'u'), ('i_vel',)),
+    ('PID', dict(pos_kp=0.0, pos_ki=0.0), ('v', 'i_vel', 'u'), ('x', 'i_pos')),
+    ('ADRC', dict(pos_ki=0.0), ('x', 'v', 'z1', 'z2', 'u'), ('i_pos',)),
+    ('ADRC', dict(pos_kp=0.0, pos_ki=0.0), ('v', 'z1', 'z2', 'u'), ('x', 'i_pos')),
+])
+def test_ban_kinh_pho_va_trang_thai_bien_giu_bo(ctrl, kw, giu, bo_):
+    """bien_trang_thai in TEN order, bien_bo the states of TEN[ctrl] left out."""
+    m = mh.ban_kinh_pho_va_trang_thai(ctrl, bo(ctrl, **kw))
+    assert m['bien_trang_thai'] == list(giu) and m['bien_bo'] == list(bo_)
+    assert m['so_trang_thai'] == len(giu)
+
+
+def test_ban_kinh_pho_va_trang_thai_nguong_1():
+    """rho == 1 exactly (omega_o_xy = 0: a unit row) is khong_on_dinh."""
+    m = mh.ban_kinh_pho_va_trang_thai('ADRC', bo('ADRC', omega_o_xy=0.0, **TAT_VI_TRI))
+    assert m['ban_kinh_pho'] == 1.0 and m['trang_thai'] == mh.KHONG_ON_DINH
+
+
+@pytest.mark.parametrize('ctrl,gains', [
+    ('PID', {k: v for k, v in PID0.items() if k != 'k_psi'}),       # a name missing
+    ('PID', dict(PID0, pos_kp='abc')),                              # not a number
+    ('ADRC', dict(ADRC0, omega_c_xy=float('nan'))),                 # not finite
+    ('LADRC', ADRC0),                                               # bad controller
+])
+def test_ban_kinh_pho_va_trang_thai_tu_choi(ctrl, gains):
+    """A malformed set raises ValueError as ma_tran."""
+    with pytest.raises(ValueError):
+        mh.ban_kinh_pho_va_trang_thai(ctrl, gains)
+
+
 if __name__ == '__main__':
     print('\n'.join(_bang()))

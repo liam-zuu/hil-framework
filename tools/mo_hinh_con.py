@@ -170,6 +170,25 @@ def trang_thai(rho) -> str:
     return KHONG_ON_DINH if rho >= 1.0 else ON_DINH
 
 
+def ban_kinh_pho_va_trang_thai(ctrl, gains, *, G=G_MAC_DINH, tau=TAU) -> dict:
+    """S04 v6.8 section 6: the spectral radius of the sub-model of one gain set AND its state in one dict
+    (Codex C3 round-1 note (a): the kept-state list is written beside the spectral radius). Same matrix as
+    ban_kinh_pho (ma_tran + _ban_kinh), so the same value; ValueError as ma_tran. Keys:
+      ban_kinh_pho     float, largest |eigenvalue|
+      trang_thai       trang_thai(rho): 'on_dinh' | 'khong_on_dinh'
+      bien_trang_thai  the states kept, in TEN order
+      bien_bo          the states of TEN[ctrl] left out (integrators with gain 0)
+      so_trang_thai    len(bien_trang_thai)
+      G, tau, T        the model parameters (T = T_TICK)
+      b0               B0_XY for ADRC, None for PID"""
+    A, ten = ma_tran(ctrl, gains, G=G, tau=tau)
+    rho = _ban_kinh(A)
+    giu = set(ten)
+    return dict(ban_kinh_pho=rho, trang_thai=trang_thai(rho), bien_trang_thai=list(ten),
+                bien_bo=[n for n in TEN[ctrl] if n not in giu], so_trang_thai=len(ten),
+                G=float(G), tau=float(tau), T=T_TICK, b0=B0_XY if ctrl == 'ADRC' else None)
+
+
 def _doc_gains(text):
     """(ctrl | None, gains dict) of one --gains argument: JSON text (first non-blank '{'), else a path.
 

@@ -4,6 +4,7 @@ budget (--tool-check). Run: python -m pytest fwsim/tests -q"""
 import argparse
 import collections
 import csv
+import hashlib
 import json
 import math
 import os
@@ -118,13 +119,19 @@ _V8_EXTRA = [(i, 'axial') for i in range(257, 271)] + [(i, 'test') for i in rang
 
 
 def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None, plant_src=None, o1c=None,
-             script=None, imu=None, gate=None):
-    """levels: {controller: {factor: (L, H)}}; default a synthetic domain. plant_src, o1c, imu, script:
-    the S03 source record (S4C-2); default the source of this checkout (HEAD, clean). gate: the gate
-    speeds (default s03_doe.SPEEDS); the real GA trials use 0.2 only, where the default gains meet
-    g3-g5 on fwsim (at 0.8 the PID default heading error is above 7.5 deg; R134 package)."""
+             script=None, imu=None, gate=None, nguon_mien='sang_loc', ly_do='', sealed_levels=True,
+             sealed_design=True, sangloc_files=True, screen_u=True, number=b'so goc\n'):
+    """S03 v8.5 layout: public meta.yaml + levels.csv (old column set: read_domain / mu_rule never open
+    them), sealed/levels_sangloc.csv (levels + L_nguon, H_nguon, b, b_n, nguon_mien, ly_do),
+    sealed/design.csv, sealed/sangloc/ket_qua.json, sealed/sangloc_thu/so_dem.json, and a root number
+    file recorded in meta.yaml under 'screen_u' (S04 v6.7 section 8). levels: {controller:
+    {factor: (L, H)}}; default a synthetic domain. plant_src, o1c, imu, script: the S03 source record
+    (S4C-2); default the source of this checkout (HEAD, clean). gate: the gate speeds (default
+    s03_doe.SPEEDS); the real GA trials use 0.2 only, where the default gains meet g3-g5 on fwsim (at
+    0.8 the PID default heading error is above 7.5 deg; R134 package)."""
     d = tmp_path / 's03'
-    (d / 'sealed').mkdir(parents=True)
+    (d / 'sealed' / 'sangloc').mkdir(parents=True)
+    (d / 'sealed' / 'sangloc_thu').mkdir(parents=True)
     with open(d / 'levels.csv', 'w', newline='') as f:
         w = csv.writer(f)
         w.writerow(['controller', 'factor', 'L', 'H', 'centre', 'scale', 'default', 'rule_note'])
@@ -132,16 +139,35 @@ def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None, 
             for k, n in enumerate(s3.FACTORS[c]):
                 L, H = levels[c][n] if levels else ((0.5, 8.0) if k % 2 == 0 else (1.0, 3.0))
                 w.writerow([c, n, L, H, '', 'log' if L > 0 and H / L >= 4 else 'lin', '', ''])
-    with open(d / 'design.csv', 'w', newline='') as f:
-        w = csv.writer(f)
-        w.writerow(['controller', 'point_id', 'box'])
-        for c in s3.CONTROLLERS:
-            for pid, box in _POINTS + _V8_EXTRA:
-                w.writerow([c, pid, box])
+    if sealed_levels:
+        with open(d / 'sealed' / 'levels_sangloc.csv', 'w', newline='', encoding='utf-8') as f:
+            w = csv.writer(f)
+            w.writerow(['controller', 'factor', 'L', 'H', 'centre', 'scale', 'default', 'rule_note',
+                        'L_nguon', 'H_nguon', 'b', 'b_n', 'nguon_mien', 'ly_do'])
+            for c in s3.CONTROLLERS:
+                for k, n in enumerate(s3.FACTORS[c]):
+                    L, H = levels[c][n] if levels else ((0.5, 8.0) if k % 2 == 0 else (1.0, 3.0))
+                    w.writerow([c, n, L, H, '', 'log' if L > 0 and H / L >= 4 else 'lin', '', '',
+                                '', '', '', '', nguon_mien, ly_do])
+    if sealed_design:
+        with open(d / 'sealed' / 'design.csv', 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['controller', 'point_id', 'box'])
+            for c in s3.CONTROLLERS:
+                for pid, box in _POINTS + _V8_EXTRA:
+                    w.writerow([c, pid, box])
+    if sangloc_files:
+        (d / 'sealed' / 'sangloc' / 'ket_qua.json').write_text('{}')
+        (d / 'sealed' / 'sangloc_thu' / 'so_dem.json').write_text('{}')
+    num = tmp_path / 'so_goc.txt'
+    num.write_bytes(number)
     y3 = {f'{c} v={v:g}': 5.0 for c in s3.CONTROLLERS for v in s3.SPEEDS}
     dll_sha = s3.sha256_file(_DLL) if os.path.isfile(_DLL) else 'no dll'
+    su = ('screen_u: ' + json.dumps(dict(file=str(num), sha256=hashlib.sha256(number).hexdigest())) + '\n'
+          if screen_u else '')
     (d / 'meta.yaml').write_text(
         f'trial: {str(trial).lower()}     # x\nstatus: "ran to the end"\nmu_levels: {json.dumps(list(mu))}\n'
+        f'{su}'
         f'script: {json.dumps(script if script is not None else dict(commit=_head(), dirty=False))}\n'
         f'firmware:\n  dll_sha256: {dll_sha}\n'
         f'plant: {json.dumps(dict(motor_model="dc", src=plant_src or fwsim.PLANT_SRC))}\n'
@@ -150,6 +176,19 @@ def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None, 
     if runs is not None:
         s3.write_csv(str(d / 'sealed' / 'runs.csv'), runs)
     return d
+
+
+@pytest.fixture(autouse=True)
+def _self_blobs(monkeypatch):
+    """fwsim/s04_ga.py is uncommitted (it is the file under test) and fwsim/s03_sangloc.py is written in
+    parallel: their working-tree and S03-commit git blobs are one fixed fake value here (other paths
+    real); tests of the new comparison override this."""
+    real_w, real_b = s4.work_blob, s4.blob_at
+    fake = 'f' * 40
+    monkeypatch.setattr(s4, 'work_blob',
+                        lambda p: fake if p in ('fwsim/s04_ga.py', s4.S03_SCREEN_SCRIPT) else real_w(p))
+    monkeypatch.setattr(s4, 'blob_at',
+                        lambda c, p: fake if p in ('fwsim/s04_ga.py', s4.S03_SCREEN_SCRIPT) else real_b(c, p))
 
 
 def _runs(mod=None):
@@ -182,12 +221,16 @@ def test_domain_and_log_coding(tmp_path):
 
 # ── S04 v6.4 (C14-2): edge side and level source (design 03_CODE/docs/2026-11-15_Thiet_ke_S03_v83_luoi_noi_v1.md 6)
 
-def _edit_levels(d, **upd):
+def _edit_levels(d, mod=None, **upd):
+    """Edit every row of sealed/levels_sangloc.csv (mod(row) per row first, then row.update(upd))."""
     import csv as _csv
-    rows = list(_csv.DictReader(open(d / 'levels.csv', encoding='utf-8')))
+    p = d / 'sealed' / 'levels_sangloc.csv'
+    rows = list(_csv.DictReader(open(p, encoding='utf-8')))
     for r in rows:
+        if mod:
+            mod(r)
         r.update(upd)
-    with open(d / 'levels.csv', 'w', newline='', encoding='utf-8') as f:
+    with open(p, 'w', newline='', encoding='utf-8') as f:
         w = _csv.DictWriter(f, fieldnames=list(rows[0]))
         w.writeheader()
         w.writerows(rows)
@@ -203,11 +246,28 @@ def test_v64_read_domain_reads_the_level_sources(tmp_path):
 
 @pytest.mark.parametrize('upd', [dict(H_nguon='hết lưới nối'), dict(b='2.0')])
 def test_v66_read_domain_refuses_levels_on_the_extension(tmp_path, upd):
-    """S04 v6.6: the GA domain is [L, H] of the original grid; S03 v8.3 levels (H on the extension) are refused."""
-    d = _s03_dir(tmp_path)
+    """S04 v6.6 + v6.7 9.6: the v6.6 original-grid refusal applies to nguon_mien 'du_phong' levels only;
+    S03 v8.3 levels (H on the extension) are refused."""
+    d = _s03_dir(tmp_path, nguon_mien='du_phong')
     _edit_levels(d, L_nguon='0', **upd)
     with pytest.raises(SystemExit, match='extension'):
         s4.read_domain(str(d), 'PID')
+
+
+@pytest.mark.parametrize('upd', [dict(H_nguon='hết lưới nối'), dict(b='2.0')])
+def test_v67_sang_loc_levels_on_the_extension_are_accepted(tmp_path, upd):
+    """S04 v6.7 section 9 item 6: nguon_mien 'sang_loc' drops the v6.6 refusal (H may exceed b, up to b_n)."""
+    d = _s03_dir(tmp_path)
+    _edit_levels(d, L_nguon='0', **upd)
+    dom = s4.read_domain(str(d), 'PID')
+    assert dom and all(x['L_src'] == '0' for x in dom)
+
+
+def test_v67_du_phong_h_equal_b_is_accepted(tmp_path):
+    """du_phong levels whose H is still on the original grid (H == b) are accepted."""
+    d = _s03_dir(tmp_path, nguon_mien='du_phong')
+    _edit_levels(d, H_nguon='hết lưới', mod=lambda r: r.update(b=r['H']))
+    assert s4.read_domain(str(d), 'PID')
 
 
 def test_v66_read_domain_reads_the_out_of_range_check(tmp_path):
@@ -233,7 +293,7 @@ def test_v66_fingerprint_locks_the_check_file(tmp_path):
     """S84-2: read_domain reads kiem_ngoai_mien.csv, so the fingerprint of trial / main / post holds its SHA-256
     (None for an S03 run without it); any byte changed after the trial changes the fingerprint."""
     d = _s03_dir(tmp_path)
-    dll = str(d / 'design.csv')                                   # any file: only its hash is taken
+    dll = str(d / 'levels.csv')                                   # any file: only its hash is taken
     f0 = s4.fingerprint(dll, str(d))
     assert f0['s03_files']['kiem_ngoai_mien.csv'] is None
     k = d / 'kiem_ngoai_mien.csv'
@@ -264,7 +324,7 @@ def test_v66_check_file_alias_refused_before_it_is_opened(tmp_path, monkeypatch)
     with pytest.raises(SystemExit, match='one name'):
         s4.read_domain(str(d), 'PID')
     with pytest.raises(SystemExit, match='one name'):
-        s4.fingerprint(str(d / 'design.csv'), str(d))
+        s4.fingerprint(str(d / 'levels.csv'), str(d))
     monkeypatch.setattr(builtins, 'open', real_open)
     assert 'kiem_ngoai_mien.csv' not in opened and 'runs_test.csv' not in opened
     os.remove(str(k))
@@ -489,7 +549,7 @@ def test_mu_rule_refuses_missing_or_duplicate_runs(tmp_path):
     with pytest.raises(SystemExit, match='duplicate'):
         s4.mu_rule(str(_s03_dir(tmp_path / 'b', runs)), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
     runs = _runs() + [dict(r, point_id=999) for r in _runs() if r['point_id'] == 1]
-    with pytest.raises(SystemExit, match='not in design.csv'):
+    with pytest.raises(SystemExit, match='not in sealed/design.csv'):
         s4.mu_rule(str(_s03_dir(tmp_path / 'c', runs)), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
 
 
@@ -502,8 +562,9 @@ def test_mu_rule_ignores_v8_axial_and_test_points(tmp_path):
     dec, rep = s4.mu_rule(str(_s03_dir(tmp_path / 'a', _runs() + axial)), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
     assert dec == 'mid' and rep['points_checked'] == 257 * 3
     d = _s03_dir(tmp_path / 'b', _runs())
-    rows = (d / 'design.csv').read_text().splitlines()
-    (d / 'design.csv').write_text('\n'.join(r for r in rows if r != 'PID,200,inner') + '\n')
+    dz = d / 'sealed' / 'design.csv'
+    rows = dz.read_text().splitlines()
+    dz.write_text('\n'.join(r for r in rows if r != 'PID,200,inner') + '\n')
     with pytest.raises(SystemExit, match='point_id 0..256'):
         s4.mu_rule(str(d), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
 
@@ -665,6 +726,22 @@ def test_guard_one_mode_and_one_source_per_folder(tmp_path, monkeypatch):
         s4.main()
 
 
+@needs_dll
+def test_main_stops_when_the_domain_source_differs(tmp_path, monkeypatch):
+    """S04 v6.7 9.6: nguon_mien and ly_do are locked at the trial and copied into meta.yaml; a main
+    run whose lock records another domain source than the sealed levels stops (S04 7)."""
+    d = _s03_dir(tmp_path, _runs())
+    out = tmp_path / 'o'
+    _lock(out, d, False)
+    lock = json.loads((out / 'lock.yaml').read_text(encoding='utf-8'))
+    lock['controllers']['PID'].update(nguon_mien='du_phong', ly_do='')   # sealed file says sang_loc
+    (out / 'lock.yaml').write_text(json.dumps(lock), encoding='utf-8')
+    monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'main', '--controller', 'PID', '--s03', str(d),
+                                    '--s03-unsealed', '--dll', _DLL, '--out', str(out)])
+    with pytest.raises(SystemExit, match='source'):
+        s4.main()
+
+
 def _levels_near_defaults():
     fw = fwsim.FirmwareSim(_DLL)                  # a domain around the firmware defaults: both controllers feasible
     return {c: {n: ((v * 0.8, v * 1.25) if v > 0 else (0.0, 0.1)) for n, v in s3.defaults(fw, c).items()}
@@ -674,8 +751,9 @@ def _levels_near_defaults():
 @needs_dll
 def test_lock_from_a_real_trial_catches_changed_sources(tmp_path, monkeypatch):
     """S4C-2, S4C-16: the lock is written by a real trial; one changed byte in a real S03 file
-    (levels.csv) stops main, and with the file restored main runs; one changed byte in design.csv
-    stops post, and with it restored post runs; a trial whose S03 meta.yaml records another DLL
+    (levels.csv) stops main, and with the file restored main runs; one changed byte in
+    sealed/design.csv stops post, and with it restored post runs; a trial whose S03 meta.yaml
+    records another DLL
     SHA-256 stops (the S03 record is changed here, not the DLL file). The other S03 source checks
     of the first trial: test_first_trial_refuses_a_source_s03_did_not_use."""
     d = _s03_dir(tmp_path, trial=True, mu=(0.5,), levels=_levels_near_defaults(), gate=(0.2,))
@@ -692,7 +770,7 @@ def test_lock_from_a_real_trial_catches_changed_sources(tmp_path, monkeypatch):
         s4.main()
     lv.write_bytes(orig)
     s4.main()                                                          # unchanged sources: main runs
-    dz = d / 'design.csv'
+    dz = d / 'sealed' / 'design.csv'
     dorig = dz.read_bytes()
     dz.write_bytes(dorig + b'\n')
     with pytest.raises(SystemExit, match='s03_files'):
@@ -766,8 +844,8 @@ def test_sources_compared_by_class_with_the_s03_commit(tmp_path, monkeypatch, ca
     (real git history, no mock): a main trial stops before any lock, a --tool-check only warns and
     returns the difference. A source that differs only through a mocked blob is caught too, and an
     S03 meta.yaml without the plant line is refused."""
-    assert set(s4.SIM_SOURCES) == set(s4.SOURCES) - {'fwsim/s04_ga.py'}
-    assert s4.source_diff(_head()) == []
+    assert set(s4.SIM_SOURCES) == set(s4.SOURCES) | {s4.S03_SCREEN_SCRIPT}   # v6.7 9.6: this script + the
+    assert s4.source_diff(_head()) == []                                   # screening script compared too
     old = s4.source_diff(S03_COMMIT_OLD_FWSIM)
     assert 'fwsim/fwsim.py' in [n for n, _, _ in old] and all(now != then for _, now, then in old)
     d = _s03_dir(tmp_path, _runs(), script=dict(commit=S03_COMMIT_OLD_FWSIM, dirty=False))
@@ -978,6 +1056,7 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
     for ctrl in s3.CONTROLLERS:
         L = lock['controllers'][ctrl]
         assert L['eval_mu'] == [0.5] and L['n_gen'] in (1, 2) and L['hv_ref'][0] == s4.D and L['tool_check']
+        assert L['nguon_mien'] == 'sang_loc' and 'ly_do' in L            # S04 v6.7 9.6: locked source
         assert L['gen_rule']['compared_with'] == 1
         # S04 v6.8 4.2: the fixed reference (D; 800 1/s), the default gains no longer run
         assert L['hv_ref'] == [s4.D, 800.0] and 'default_f2' not in L
@@ -996,6 +1075,13 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
     evals = list(csv.DictReader(open(out / 'evals.csv')))
     keys = [(e['controller'], e['ga_seed'], e['gen'], e['cand_id'], e['v'], e['mu'], e['attempt']) for e in evals]
     assert len(keys) == len(set(keys)) and {e['controller'] for e in evals} == set(s3.CONTROLLERS)   # S04 8
+    for e in evals:                                                    # S03 v8.6 11.6: KEP columns, ADRC empty
+        for k in s4.KEP_FRAC_COLS + ['kep_note']:
+            assert k in e
+        if e['controller'] == 'ADRC':
+            assert all(e[k] == '' for k in s4.KEP_FRAC_COLS + ['kep_note'])
+        else:
+            assert all(e[k] == '' or math.isfinite(float(e[k])) for k in s4.KEP_FRAC_COLS)
     sel = list(csv.DictReader(open(out / 'selected.csv')))
     hist = list(csv.DictReader(open(out / 'history.csv')))
     for send in (r for r in sel if r['kind'] == 'send_to_HIL'):
@@ -1009,7 +1095,7 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
     assert all(r['nondominated_feasible'] == r['feasible'] for r in par)
     assert sum(r['nondominated_in_group'] == 'true' for r in pop) == len(par)
     monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'post', '--dll', _DLL, '--out', str(out)])
-    assert s4.post(s4_args(out)) == 0
+    rc = s4.post(s4_args(out))
     pc = out / 'post_checks'
     det = list(csv.DictReader(open(pc / 'determinism.csv')))
     assert det and all(r['equal'] == 'true' and r['tool_check'] == 'true' for r in det)
@@ -1022,19 +1108,31 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
     assert any('r_factor=1.2' in k for k in full) and all(set(v) == {'before', 'after'} for v in full.values())
     notes = json.load(open(pc / 'notes.json'))
     assert notes['tool_check'] is True                                   # S4C-10
-    assert notes['cho_liam'] == [] and 'cho_liam_note' in notes               # C3-8 (one mu level: check not done)
+    assert rc == (2 if notes['cho_liam'] else 0) and 'cho_liam_note' in notes  # a cho_liam finding -> rc 2
+    assert all(c['check'] in ('pre_hil', 'three_mu', 'spectral_radius', 'b0_factor', 'r_factor')
+               for c in notes['cho_liam'])
     assert notes['notes']['PID three_mu']['done'] is False and 'NOT done' in notes['notes']['PID three_mu']['note']
     for r in sens:                                                       # S04 v6.7 9.7: gate state columns
         assert all(r[f'{c}_state'] in s4.og.STATES for c in s4.og.CONDS)
         assert all(k in r for k in ('e_trk_max', 'e_bao_max', 'e_theta_cmd_max_deg'))
     mu3 = list(csv.DictReader(open(pc / 'three_mu.csv')))
     assert all(all(f'{c}_state' in r for c in s4.og.CONDS) for r in mu3)
+    mh = s4.mo_hinh_con
     for c in s3.CONTROLLERS:                                             # S04 v6.8 6: pre-HIL check ran
         ph = notes['notes'][f'{c} pre_hil']
-        assert ph['ok'] is True and ph['spectral_radius'] is None
+        assert ph['ok'] is True and isinstance(ph['spectral_radius'], float)
+        send = next(s for s in sel if s['controller'] == c and s['kind'] == 'send_to_HIL')
+        gains = {n: float(send[n]) for n in s3.FACTORS[c]}
+        assert ph['spectral_radius'] == mh.ban_kinh_pho(c, gains)
+        assert ph['spectral_radius_states'] == list(mh.TEN[c]) or ph['spectral_radius_dropped']
+        assert ph['spectral_radius_state'] in ('on_dinh', 'khong_on_dinh')
+        assert ph['spectral_radius_model']['module'] == 'tools/mo_hinh_con.py'
     assert 'G3, G4 or G5 state' in notes['criterion']
-    assert set(yaml.safe_load(open(out / 'meta.yaml', encoding='utf-8'))['pre_hil']) == {
-        'PID pre_hil', 'ADRC pre_hil'}
+    root_meta = yaml.safe_load(open(out / 'meta.yaml', encoding='utf-8'))
+    assert set(root_meta['pre_hil']) == {'PID pre_hil', 'ADRC pre_hil'}
+    for c in s3.CONTROLLERS:                                             # S04 v6.7 9.6: in meta.yaml too
+        assert root_meta['controllers'][c]['nguon_mien'] == 'sang_loc'
+        assert 'ly_do' in root_meta['controllers'][c]
     for p in [out / 'meta.yaml', out / 'meta_PID.yaml', out / 'meta_ADRC.yaml', out / 'trial' / 'PID' / 'meta.yaml',
               out / 'trial' / 'ADRC' / 'meta.yaml', out / 'lock.yaml']:
         m = yaml.safe_load(open(p, encoding='utf-8'))                    # S4C-11: valid YAML on Windows paths
@@ -1057,6 +1155,38 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
         assert float(mine[0]['e_perp_max']) == float(e['e_perp_max'])    # io_delay_ms 0 = the GA condition
     n = json.load(open(out / 'sens_after' / 'notes.json'))
     assert n['report_only'] is True and n['io_delay_ms_run'] == [1, 2] and n['measured_io_delay_ms'] is None
+    assert 'not_in_this_script' not in n                                 # C3 note: key dropped
+    assert n['variants'] == ['io_delay_ms'] + list(s4.PLANT_VARIANTS)    # S04 v6.1 6, RB-1
+    assert set(n['plant_variants']) == set(s4.PLANT_VARIANTS) and 's01_identify' in n['plant_basis']
+    assert 'seal is opened' in n['when']
+    # S04 v6.1 6, RB-1: plant.csv = 1 baseline + one row per variant per (controller, v, mu)
+    pl = list(csv.DictReader(open(out / 'sens_after' / 'plant.csv')))
+    assert list(pl[0].keys()) == s4.PLANT_SENS_COLS
+    for c in s3.CONTROLLERS:
+        mine = [r for r in pl if r['controller'] == c]
+        assert len(mine) == 1 + len(s4.PLANT_VARIANTS)                   # 1 speed x 1 mu x (base + 4)
+        assert mine[0]['variant'] == 'baseline' and mine[0]['baseline'] == 'true'
+        assert mine[0]['plant_changed'] == '[]' and mine[0]['tv_duty'] != ''
+        assert [r['variant'] for r in mine[1:]] == list(s4.PLANT_VARIANTS)
+        assert all(r['baseline'] == 'false' and r['tv_duty'] != '' for r in mine[1:])
+        assert all(r[f'{c_}_state'] in s4.og.STATES for r in mine for c_ in s4.og.CONDS)
+        send = next(s for s in sel if s['controller'] == c and s['kind'] == 'send_to_HIL')
+        e = next(x for x in evals if (x['controller'], x['ga_seed'], x['gen'], x['cand_id'], x['attempt'])
+                 == (c, send['ga_seed'], send['gen'], send['cand_id'], '1'))
+        assert float(mine[0]['e_perp_max']) == float(e['e_perp_max'])    # baseline = the GA condition
+        changed = {r['variant']: json.loads(r['plant_changed']) for r in mine[1:]}
+        assert changed['R0.82_only'] == ['motor_R'] and changed['Vbatt11.1'] == ['V_batt']
+        for vn in ('R0.8_JbTcTs', 'R1.25_JbTcTs'):
+            assert 'motor_R' in changed[vn] and 'motor_K' not in changed[vn]
+    pp = json.load(open(out / 'sens_after' / 'plant_params.json'))
+    assert set(pp) >= {'note', 'definitions', 'entries'} and set(pp['definitions']) == set(s4.PLANT_VARIANTS)
+    assert {k.split(' ', 1)[1].rsplit(' mu=', 1)[0] for k in pp['entries']} == set(s4.PLANT_VARIANTS)
+    for k, ent in pp['entries'].items():
+        vn = k.split(' ', 1)[1].rsplit(' mu=', 1)[0]
+        assert set(ent['changed']) == set(ent['expected']) | set(ent['derived'])
+        assert len(ent['slip_nsub']) == 2 and all(isinstance(x, int) for x in ent['slip_nsub'])  # [before, after]
+        if vn in ('R0.8_JbTcTs', 'R1.25_JbTcTs'):
+            assert 'motor_K' not in ent['changed'] and 'motor_u0' not in ent['changed']
     assert all(p.read_bytes() == b for p, b in snap.items())             # report only: no hashed input changes
     with pytest.raises(SystemExit, match='already holds data'):
         s4.sens_after(argparse.Namespace(out=str(out), dll=_DLL, io_delay_ms=None))
@@ -1140,16 +1270,18 @@ GATE_FIELD = re.compile(r'^(e_bao_max|gate_[a-z_]+|g[1-5]_[a-z_]+)$')     # G1-G
 
 
 def _same_fields(a, b):
-    """run_gate row b against s03_doe.run_one row a: b adds e_bao_max; every field of b keeps the value of a; a field
-    of a that b has not is a G1-G5 field of an s03_doe that writes them (hil feat/s03-gate, S3G-5; CODE 15/11), and
-    an e_bao_max in a equals the one of b bit for bit."""
-    assert 'e_bao_max' in b and set(b) - set(a) <= {'e_bao_max'}
+    """run_gate row b against s03_doe.run_one row a: b adds e_bao_max and the kep report fields
+    (S03 v8.6 11.6); every field of b keeps the value of a; a field of a that b has not is a G1-G5 field
+    of an s03_doe that writes them (hil feat/s03-gate, S3G-5; CODE 15/11), and an e_bao_max in a equals
+    the one of b bit for bit."""
+    added = {'e_bao_max'} | set(s4.KEP_FRAC_COLS) | {'kep_note'}
+    assert 'e_bao_max' in b and set(b) - set(a) <= added
     # the gate columns s03_doe writes (v8.2 GATE_RUN_COLS, B81-3 G1_RUN_COLS 15/11): by name, not a pattern (the
     # pattern missed g1_t1, g1_t_done_1)
     gate_cols = set(getattr(s3, 'GATE_RUN_COLS', ())) | set(getattr(s3, 'G1_RUN_COLS', ()))
     assert set(a) - set(b) <= gate_cols and all(GATE_FIELD.match(k) or k in gate_cols for k in set(a) - set(b)), \
         sorted(set(a) - set(b) - gate_cols)
-    keys = [k for k in b if k != 'e_bao_max']
+    keys = [k for k in b if k not in added]
     assert s3.row_text({k: a[k] for k in keys}) == s3.row_text({k: b[k] for k in keys})
     if 'e_bao_max' in a:
         assert s3._bits(a['e_bao_max']) == s3._bits(b['e_bao_max'])
@@ -1311,9 +1443,9 @@ def _fake_classify(ctrl, gains):
 
 
 def test_gain_check_uses_classify_when_the_table_has_it(monkeypatch):
-    """C3-11: when tools/gain_table.py has classify(), its Verdict fields decide what a table or a
-    triangle violation is, never the wording of a message; the code still runs without it (the table
-    of this worktree has none)."""
+    """C3-11: with classify(), its Verdict fields decide what a table or a triangle violation is,
+    never the wording of a message; a table without it is a tool error (C3-25, next tests — the
+    real table of this worktree has it, the fake here only changes the wording)."""
     monkeypatch.setattr(s4.gain_table, 'classify', _fake_classify, raising=False)
     assert s4.gain_check('PID', G_PID) == ([], [])
     assert s4.gain_check('ADRC', G_ADRC) == ([], [])
@@ -1349,18 +1481,69 @@ def test_gain_check_uses_classify_when_the_table_has_it(monkeypatch):
         s4.Evaluator(None, 'x.dll', 'PID', [0.2, 0.5], [0.5], 'w').candidate(dict(G_PID, kp_wz=5.0), 1, 1, 0)
 
 
-def test_gain_check_without_classify_keeps_the_text_classification(monkeypatch):
-    """C3-11: a tools/gain_table without classify() (stand-in exposing only check and NAMES; the module
-    of this worktree has none either) keeps the text classification of check(), as before this change."""
+def test_gain_check_without_classify_is_a_tool_error(monkeypatch):
+    """C3-25: a tools/gain_table without callable classify() (stand-in exposing only check and NAMES) is a
+    tool error (S03Stop) in gain_check, Evaluator.candidate and pre_hil_check — never a text fallback, and
+    no simulation is called."""
     real = s4.gain_table
     monkeypatch.setattr(s4, 'gain_table', types.SimpleNamespace(check=real.check, NAMES=real.NAMES))
     assert not hasattr(s4.gain_table, 'classify')
-    t, tri = s4.gain_check('PID', dict(G_PID, kp_xy=41.00001))
-    assert t[0].startswith('kp_xy=') and tri == []
-    t, tri = s4.gain_check('ADRC', dict(G_ADRC, omega_c_xy=150.0, omega_o_xy=48.0))
-    assert t == [] and len(tri) == 1
-    with pytest.raises(s3.S03Stop):
-        s4.gain_check('PID', {})
+    for f in (lambda: s4.gain_check('PID', dict(G_PID, kp_xy=41.00001)),
+              lambda: s4.gain_check('ADRC', dict(G_ADRC, omega_c_xy=150.0, omega_o_xy=48.0)),
+              lambda: s4.gain_check('PID', {})):
+        with pytest.raises(s3.S03Stop, match='classify'):
+            f()
+    calls = []
+    monkeypatch.setattr(s4, 'safe_run_gate', lambda *a, **k: calls.append(a))
+    with pytest.raises(s3.S03Stop, match='classify'):
+        s4.Evaluator(None, 'x.dll', 'ADRC', [0.2], [0.5], 'w').candidate(G_ADRC, 1, 1, 0)
+    with pytest.raises(s3.S03Stop, match='classify'):            # not swallowed into a table violation
+        s4.pre_hil_check('PID', G_PID)
+    assert calls == []
+
+
+def test_triangle_cases_through_the_real_classify(monkeypatch):
+    """C3-25 through the REAL tools/gain_table.classify (no stand-in): ADRC omega_c_wz 150 + 2 x 25
+    = 200 is a triangle violation in gain_check, a ngoai_bang candidate with no run in
+    Evaluator.candidate and in_triangle False in pre_hil_check; omega_c_xy = float32
+    103.99999237060547 with omega_o_xy 48 (binary64 sum 199.99999237060547 < 200) passes all three."""
+    calls = []
+    monkeypatch.setattr(s4, 'safe_run_gate', lambda *a, **k: calls.append(a))
+    g = dict(G_ADRC, omega_c_wz=150.0, omega_o_wz=25.0)
+    t, tri = s4.gain_check('ADRC', g)
+    assert t == [] and len(tri) == 1 and 'omega_c_wz' in tri[0]
+    ev = s4.Evaluator(None, 'x.dll', 'ADRC', [0.2, 0.5], [0.5], 'w')
+    s = ev.candidate(g, 1, 1, 0)
+    assert s['status'] == 'ngoai_bang' and calls == [] and ev.evals == []
+    ph = s4.pre_hil_check('ADRC', g)
+    assert (ph['ok'], ph['in_table'], ph['in_triangle']) == (False, True, False)
+    g2 = dict(G_ADRC, omega_c_xy=float(np.float32(103.99999237060547)), omega_o_xy=48.0)
+    assert s4.gain_check('ADRC', g2) == ([], [])
+    monkeypatch.setattr(s4, 'safe_run_gate', lambda *a, **k: (calls.append(a), (R(), None))[1])
+    s = ev.candidate(g2, 1, 1, 0)
+    assert s['status'] == 'ok' and len(calls) == 2               # 1 eval mu x 2 gate speeds
+    ph = s4.pre_hil_check('ADRC', g2)
+    assert (ph['ok'], ph['in_table'], ph['in_triangle']) == (True, True, True)
+
+
+def test_main_post_sens_after_stop_without_classify(tmp_path, monkeypatch):
+    """C3-25: with a gain_table stand-in without classify, main() (trial, --tool-check), post() and
+    sens_after() raise SystemExit matching 'classify' and FirmwareSim is never created."""
+    real = s4.gain_table
+    monkeypatch.setattr(s4, 'gain_table', types.SimpleNamespace(check=real.check, NAMES=real.NAMES))
+    calls = []
+    monkeypatch.setattr(fwsim, 'FirmwareSim', lambda *a, **k: calls.append(a))
+    d = _s03_dir(tmp_path, trial=True)
+    monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'trial', '--tool-check', '--controller',
+                                    'PID', '--s03', str(d), '--out', str(tmp_path / 'o')])
+    with pytest.raises(SystemExit, match='classify'):
+        s4.main()
+    out = _lock_dir(tmp_path / 'r', tool_check=True, s03=d, unsealed=False)
+    for f in (lambda: s4.post(argparse.Namespace(out=str(out), dll='x.dll')),
+              lambda: s4.sens_after(argparse.Namespace(out=str(out), dll='x.dll', io_delay_ms=None))):
+        with pytest.raises(SystemExit, match='classify'):
+            f()
+    assert calls == []
 
 
 def test_candidate_outside_the_table_stops_before_any_run(monkeypatch):
@@ -1623,26 +1806,31 @@ def test_three_mu_findings_read_states_not_maxima():
     assert s4.three_mu_findings([dict(T(), controller='ADRC')], 'PID') == []
 
 
-def _fake_post(tmp_path, monkeypatch, gains=G_PID, eval_mu=(0.5,), levels=(0.4, 0.5, 0.6), tool_check=False,
-               mu3_mod=None):
-    """The real s4.post without a DLL: GA outputs (lock.yaml, selected.csv with one PID send_to_HIL row,
-    evals.csv attempt-1 rows) are written; every sim call is stubbed; write_root_meta and log_phase run
-    for real. mu3_mod(row, v, mu) modifies a three-mu run row. Returns (return code, notes.json, out,
+def _fake_post(tmp_path, monkeypatch, gains=G_PID, ctrl='PID', eval_mu=(0.5,), levels=(0.4, 0.5, 0.6),
+               tool_check=False, mu3_mod=None, sens_mod=None):
+    """The real s4.post without a DLL: GA outputs (lock.yaml, selected.csv with one send_to_HIL row,
+    evals.csv attempt-1 rows) and the S03 meta.yaml check_s03_trial reads are written; every sim call is
+    stubbed; write_root_meta and log_phase run for real. mu3_mod(row, v, mu) modifies a three-mu run row;
+    sens_mod(row, kind, factor, v, mu) modifies a b0/R run row. Returns (return code, notes.json, out,
     selected.csv bytes before post)."""
     out = tmp_path / 'run'
     out.mkdir(parents=True)
     dll = tmp_path / 'fake.dll'
     dll.write_bytes(b'fake dll')
+    s03 = tmp_path / 's03'
+    s03.mkdir(exist_ok=True)
+    (s03 / 'meta.yaml').write_text(f'trial: {str(tool_check).lower()}\n', encoding='utf-8')
     speeds = [0.2, 0.5]
-    lock = dict(common=dict(tool_check=tool_check, s03_run=str(tmp_path), fingerprint={}, unsealed=False),
+    lock = dict(common=dict(tool_check=tool_check, s03_run=str(s03), fingerprint={},
+                            unsealed=not tool_check),
                 s03_mu_levels=list(levels),
-                controllers=dict(PID=dict(eval_mu=list(eval_mu), speeds=speeds)))
+                controllers={ctrl: dict(eval_mu=list(eval_mu), speeds=speeds)})
     (out / 'lock.yaml').write_text(json.dumps(lock), encoding='utf-8')
     s3.write_csv(str(out / 'selected.csv'),
-                 [dict(kind='send_to_HIL', controller='PID', ga_seed=1, feasible='true', gen=1, cand_id=0,
+                 [dict(kind='send_to_HIL', controller=ctrl, ga_seed=1, feasible='true', gen=1, cand_id=0,
                        f1=0.03, f2=5.0, **{n: repr(float(v)) for n, v in gains.items()})])
     s3.write_csv(str(out / 'evals.csv'),
-                 [dict(controller='PID', ga_seed=1, gen=1, cand_id=0, v=v, mu=mu, attempt=1, log_sha256='')
+                 [dict(controller=ctrl, ga_seed=1, gen=1, cand_id=0, v=v, mu=mu, attempt=1, log_sha256='')
                   for mu in eval_mu for v in speeds])
 
     def row(**kw):
@@ -1650,18 +1838,25 @@ def _fake_post(tmp_path, monkeypatch, gains=G_PID, eval_mu=(0.5,), levels=(0.4, 
                          e_bao_max=0.03, e_theta_cmd_max_deg=2.0,
                          **{f'{c}_state': 'dat' for c in s4.og.CONDS}), **kw)
 
-    def fake_safe(fw, path, ctrl, g, v, mu):
+    def fake_safe(fw, path, c, g, v, mu):
         r = row()
         if mu3_mod:
             mu3_mod(r, v, mu)
         return r, None
 
+    def fake_custom(fw, path, c, g, v, mu, **kw):
+        r = row()
+        if sens_mod:
+            for kind in ('b0_factor', 'r_factor'):
+                if kind in kw:
+                    sens_mod(r, kind, kw[kind], v, mu)
+        return r, None, {}, dict(motor_R=1.0), dict(motor_R=1.0)
+
     monkeypatch.setattr(s4, 'fingerprint', lambda *a, **k: {})
     monkeypatch.setattr(fwsim, 'FirmwareSim', lambda dll_: None)
     monkeypatch.setattr(s3, 'run_in_new_process',
                         lambda dll_, jobs, work: [dict(row=row(), digest=None) for _ in jobs])
-    monkeypatch.setattr(s4, 'run_custom', lambda fw, path, ctrl, g, v, mu, **kw: (
-        row(), None, {}, dict(motor_R=1.0), dict(motor_R=1.0)))
+    monkeypatch.setattr(s4, 'run_custom', fake_custom)
     monkeypatch.setattr(s3, 'safe_run', fake_safe)
     sel = (out / 'selected.csv').read_bytes()
     rc = s4.post(argparse.Namespace(out=str(out), dll=str(dll)))
@@ -1726,18 +1921,30 @@ def test_post_three_mu_findings_wait_for_liam(tmp_path, monkeypatch, case):
 
 
 def test_pre_hil_check():
-    """S04 v6.8 section 6: range table and (LADRC) triangle on the float32 values before HIL; the
-    spectral radius is TODO (None)."""
+    """S04 v6.8 section 6: range table and (LADRC) triangle on the float32 values before HIL, plus the
+    spectral radius of the linear sub-model (tools/mo_hinh_con.py, report only) with the kept states."""
+    mh = s4.mo_hinh_con
     ph = s4.pre_hil_check('PID', G_PID)
     assert ph['ok'] is True and ph['in_table'] is True and ph['in_triangle'] is None
-    assert ph['spectral_radius'] is None and 'TODO' in ph['spectral_radius_note']
+    assert ph['spectral_radius'] == mh.ban_kinh_pho('PID', G_PID) and ph['spectral_radius_state'] == 'on_dinh'
+    assert ph['spectral_radius_states'] == list(mh.TEN['PID']) and ph['spectral_radius_dropped'] == []
+    m = ph['spectral_radius_model']
+    assert (m['G'], m['tau'], m['T'], m['b0'], m['module']) == (mh.G_MAC_DINH, mh.TAU, mh.T_TICK, None,
+                                                              'tools/mo_hinh_con.py')
+    assert m['sha256'] == s4.s3.sha256_file(os.path.join(s4._TOOLS, 'mo_hinh_con.py'))
+    assert 'report only' in ph['spectral_radius_note']
+    ph = s4.pre_hil_check('PID', dict(G_PID, pos_kp=0.0, pos_ki=3.0))
+    assert ph['ok'] is True and ph['spectral_radius_state'] == 'khong_on_dinh'  # report only: ok unchanged
     ph = s4.pre_hil_check('PID', dict(G_PID, kp_wz=5.0))
     assert ph['ok'] is False and ph['in_table'] is False and ph['table_violations']
     ph = s4.pre_hil_check('ADRC', dict(G_ADRC, omega_c_xy=150.0, omega_o_xy=48.0))
     assert ph['ok'] is False and ph['in_table'] is True and ph['in_triangle'] is False
     ph = s4.pre_hil_check('ADRC', G_ADRC)
     assert ph['ok'] is True and ph['in_triangle'] is True
-    assert s4.submodel_spectral_radius('PID', G_PID) is None
+    assert ph['spectral_radius'] == mh.ban_kinh_pho('ADRC', G_ADRC)
+    assert ph['spectral_radius_model']['b0'] == mh.B0_XY
+    assert s4.submodel_spectral_radius('PID', G_PID) == mh.ban_kinh_pho('PID', G_PID)
+    assert s4.submodel_spectral_radius('PID', {k: v for k, v in G_PID.items() if k != 'k_psi'}) is None
 
 
 def test_delay_steps():
@@ -1817,3 +2024,468 @@ def test_run_custom_gate_states_and_io_delay():
     res2, log2, *_ = s4.run_custom(fw, path, 'PID', g, 0.2, 0.436, io_delay_ms=2)
     assert s3.log_digest(log2) != s3.log_digest(log)
     assert all(res2[f'{c}_state'] in s4.og.STATES for c in s4.og.CONDS)
+
+
+# ── S04 v6.7 section 8 / 9.6, v6.8 (sealed inputs, classify, kep, spectral radius, plant) ──
+
+def test_v67_read_domain_reads_the_sealed_levels_only(tmp_path):
+    """S04 v6.7 9.6: the domain comes from sealed/levels_sangloc.csv only; the public levels.csv is
+    ignored (other numbers) and may be absent; no sealed file -> sys.exit (an S03 run before v8.5)."""
+    d = _s03_dir(tmp_path)
+    dom = s4.read_domain(str(d), 'PID')
+    with open(d / 'levels.csv', 'w', newline='') as f:                 # a public file with other numbers
+        w = csv.writer(f)
+        w.writerow(['controller', 'factor', 'L', 'H', 'centre', 'scale', 'default', 'rule_note'])
+        for c in s3.CONTROLLERS:
+            for n in s3.FACTORS[c]:
+                w.writerow([c, n, 9.0, 99.0, '', 'lin', '', ''])
+    assert s4.read_domain(str(d), 'PID') == dom                        # the sealed values, not 9..99
+    os.remove(str(d / 'levels.csv'))
+    assert s4.read_domain(str(d), 'PID') == dom                        # no public file at all
+    d2 = _s03_dir(tmp_path / 'm', sealed_levels=False)
+    with pytest.raises(SystemExit, match='sealed/levels_sangloc.csv'):
+        s4.read_domain(str(d2), 'PID')
+    with pytest.raises(SystemExit, match='sealed/levels_sangloc.csv'):
+        s4.domain_source(str(d2), 'PID')
+
+
+@pytest.mark.parametrize('upd', [dict(nguon_mien=''), dict(nguon_mien='khac')])
+def test_v67_nguon_mien_must_be_one_known_value(tmp_path, upd):
+    """S04 v6.7 9.6: nguon_mien empty or unknown stops; a mixed domain stops too."""
+    d = _s03_dir(tmp_path)
+    _edit_levels(d, **upd)
+    for f in (s4.read_domain, s4.domain_source):
+        with pytest.raises(SystemExit, match='nguon_mien'):
+            f(str(d), 'PID')
+    d2 = _s03_dir(tmp_path / 'x')
+    _edit_levels(d2, mod=lambda r: r.update(nguon_mien='du_phong')
+                 if (r['controller'], r['factor']) == ('PID', 'kp_xy') else None)
+    with pytest.raises(SystemExit, match='nguon_mien'):
+        s4.read_domain(str(d2), 'PID')
+
+
+def test_v67_domain_source(tmp_path):
+    """domain_source: the identical nguon_mien and the unique non-empty ly_do joined by ' | '."""
+    d = _s03_dir(tmp_path)
+    assert s4.domain_source(str(d), 'PID') == dict(nguon_mien='sang_loc', ly_do='')
+    d = _s03_dir(tmp_path / 'a', ly_do='sang loc 1')
+    assert s4.domain_source(str(d), 'ADRC') == dict(nguon_mien='sang_loc', ly_do='sang loc 1')
+    _edit_levels(d, mod=lambda r: r.update(ly_do='a' if r['factor'] == 'kp_xy' else
+                                           ('b' if r['factor'] == 'ki_xy' else '')))
+    assert s4.domain_source(str(d), 'PID') == dict(nguon_mien='sang_loc', ly_do='a | b')
+
+
+def _tran_levels(tmp_path, ctrl='PID', name='pos_kp', b=None, bn=None, h=None,
+                 h_nguon='trần bảng chặn'):
+    """du_phong levels with <name> at H = T (the table ceiling), b_n = H, b within TRAN_RTOL of T."""
+    T = s3.ceiling(ctrl, name)
+    if b is None:
+        b = repr(math.nextafter(T, 0.0))
+    d = _s03_dir(tmp_path, nguon_mien='du_phong')
+    _edit_levels(d, mod=lambda r: r.update(H=repr(h if h is not None else T), b=b,
+                                           b_n=repr(bn if bn is not None else T),
+                                           H_nguon=h_nguon)
+                 if (r['controller'], r['factor']) == (ctrl, name) else None)
+    return d, T
+
+
+def _sweep(d, ctrl, name, rows):
+    """A public sweep.csv: rows = (value, v, tran)."""
+    with open(d / 'sweep.csv', 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['controller', 'factor', 'value', 'v', 'tran'])
+        for val, v, tr in rows:
+            w.writerow([ctrl, name, val, v, tr])
+
+
+@pytest.mark.parametrize('ctrl, name', [('PID', 'pos_kp'), ('ADRC', 'omega_c_xy')])
+@pytest.mark.parametrize('b', ['199.9999999', None])
+def test_v67_du_phong_table_ceiling_extension_accepted(tmp_path, ctrl, name, b):
+    """C3-7 / C3-26 (S03 v8.6 3.1 rule (2)): du_phong with H = b_n = T, b within TRAN_RTOL of T
+    (the exact S03 output b = 199.9999999, b_n = H = T = 200.0, and the nextafter boundary),
+    H_nguon 'trần bảng chặn' and every sweep row at H 'tran' is accepted; a feasible point at
+    the H edge makes the send_to_HIL row of summarise() carry EDGE_LIMIT_TABLE as '<name>:H'."""
+    d, T = _tran_levels(tmp_path, ctrl=ctrl, name=name, b=b)
+    assert T == 200.0                                            # b is the exact S03 number
+    _sweep(d, ctrl, name, [(repr(T), v, 'true') for v in s3.SPEEDS] + [('', 0.2, 'false')])
+    dom = s4.read_domain(str(d), ctrl)
+    assert {x['name']: x for x in dom}[name]['H'] == T
+    lo, hi = s4.ga_bounds(dom)
+    rep = s4.edge_report(dom, hi)
+    assert f'{name}:H' in rep['edge_limit'] and s4.EDGE_LIMIT_TABLE in rep['edge_limit']
+    assert f'{name}:H:{s4.TABLE_CEILING_SOURCE}' in rep['edge_src']
+    rows, _ = s4.summarise(ctrl, dom, {1: [P(0.02, 5.0, x=list(hi))]})
+    send = [r for r in rows if r['kind'] == 'send_to_HIL'][0]
+    assert send['feasible'] and f'{name}:H' in send['edge_limit']
+    assert s4.EDGE_LIMIT_TABLE in send['edge_limit']
+
+
+def test_v67_du_phong_table_ceiling_extension_refused(tmp_path):
+    """C3-7 / C3-26: every failing condition of the exception falls back to the v6.6 refusal."""
+    d, T = _tran_levels(tmp_path)
+    with pytest.raises(SystemExit, match='extension'):                        # no sweep.csv
+        s4.read_domain(str(d), 'PID')
+    _sweep(d, 'PID', 'pos_kp', [(repr(T), v, 'true') for v in s3.SPEEDS[:1]] +
+           [(repr(T), s3.SPEEDS[1], 'false')])
+    with pytest.raises(SystemExit, match='extension'):                        # one tran false row
+        s4.read_domain(str(d), 'PID')
+    _sweep(d, 'PID', 'pos_kp', [(repr(T / 2), v, 'true') for v in s3.SPEEDS])
+    with pytest.raises(SystemExit, match='extension'):                        # no sweep row at H
+        s4.read_domain(str(d), 'PID')
+    for i, kw in enumerate((dict(b='199.999999'), dict(bn='250.0'),
+                            dict(h=math.nextafter(200.0, math.inf)), dict(h_nguon='hết lưới'))):
+        d2, T2 = _tran_levels(tmp_path / f'r{i}', **kw)
+        _sweep(d2, 'PID', 'pos_kp', [(repr(T2), v, 'true') for v in s3.SPEEDS])
+        with pytest.raises(SystemExit, match='extension'):
+            s4.read_domain(str(d2), 'PID')
+    # kp_wz at H written through float32, not the binary64 4.6 of the ceiling: H != T -> refused (b
+    # within TRAN_RTOL of 4.6, so only the H != T condition fails). The lower float32 neighbour of
+    # 4.6 (4.599999904632568) lies below every b within TRAN_RTOL of T (b >= 4.6 - 4.6e-9), so the
+    # float32 neighbour ABOVE 4.6 is the one that is on the extension (H > b) and != T.
+    h = float(np.nextafter(np.float32(4.6), np.float32(np.inf)))
+    assert h > 4.6 * (1 - 5e-10) and h != 4.6
+    d3, _ = _tran_levels(tmp_path / 'w', name='kp_wz', b=repr(4.6 * (1 - 5e-10)), bn=h, h=h)
+    _sweep(d3, 'PID', 'kp_wz', [(repr(h), v, 'true') for v in s3.SPEEDS])
+    with pytest.raises(SystemExit, match='extension'):
+        s4.read_domain(str(d3), 'PID')
+
+
+def test_v67_fingerprint_locks_the_sealed_files_and_the_root_number(tmp_path):
+    """S04 v6.7 8: fingerprint hashes meta.yaml, levels.csv, sweep.csv, the four S03_SEALED_LOCK
+    files (the root design.csv is NOT hashed), sealed/runs.csv when unsealed, kiem_ngoai_mien.csv,
+    plus so_goc; one changed byte in each sealed file and in the number file is caught."""
+    d = _s03_dir(tmp_path)
+    dll = str(d / 'levels.csv')
+    fp = s4.fingerprint(dll, str(d))
+    assert set(fp['s03_files']) == {'meta.yaml', 'levels.csv', 'sweep.csv', 'kiem_ngoai_mien.csv'} \
+        | set(s4.S03_SEALED_LOCK)
+    assert 'design.csv' not in fp['s03_files'] and fp['s03_files']['sweep.csv'] is None
+    assert all(fp['s03_files'][n] for n in s4.S03_SEALED_LOCK)
+    sg = fp['so_goc']
+    assert sg['file'] == str(tmp_path / 'so_goc.txt') \
+        and sg['s03_sha256'] == hashlib.sha256(b'so goc\n').hexdigest()
+    for n in s4.S03_SEALED_LOCK:
+        p = d / n
+        orig = p.read_bytes()
+        p.write_bytes(orig + b'\n')
+        assert s4.fingerprint(dll, str(d))['s03_files'][n] != fp['s03_files'][n]
+        p.write_bytes(orig)
+    fpu = s4.fingerprint(dll, str(d), unsealed=True)
+    assert 'sealed/runs.csv' in fpu['s03_files'] and 'sealed/runs.csv' not in fp['s03_files']
+    num = tmp_path / 'so_goc.txt'
+    num.write_bytes(b'so goc\r\n')                                    # CRLF form of the recorded bytes
+    assert s4.so_goc(str(d))['file'] == sg['file']
+    num.write_bytes(b'other number\n')
+    with pytest.raises(SystemExit, match='not the number file'):
+        s4.so_goc(str(d))
+    num.write_bytes(b'so goc\n')
+    d2 = _s03_dir(tmp_path / 'n', screen_u=False)
+    assert s4.so_goc(str(d2)) is None
+    fp2 = s4.fingerprint(dll, str(d2))
+    s4.check_s03_sealed(fp2, tool_check=True)                          # tool-check: two sealed files only
+    with pytest.raises(SystemExit, match='sealed'):
+        s4.check_s03_sealed(fp2, tool_check=False)                     # a main run needs so_goc too
+    d3 = _s03_dir(tmp_path / 'd', sealed_design=False)
+    with pytest.raises(SystemExit, match='sealed'):
+        s4.check_s03_sealed(s4.fingerprint(dll, str(d3)), tool_check=True)
+
+
+def test_v67_mu_rule_needs_the_sealed_design(tmp_path):
+    """S04 v6.7 9.6: a public design.csv alone cannot stand in for sealed/design.csv."""
+    d = _s03_dir(tmp_path, _runs(), sealed_design=False)
+    with open(d / 'design.csv', 'w', newline='') as f:
+        csv.writer(f).writerow(['controller', 'point_id', 'box'])
+    fp = s4.fingerprint(str(d / 'levels.csv'), str(d))
+    with pytest.raises(SystemExit, match='sealed'):
+        s4.check_s03_sealed(fp, tool_check=False)
+
+
+def _lock_dir(tmp_path, tool_check, s03, unsealed):
+    """A run folder with the files post() / sens_after() read before the S03 gate: lock.yaml,
+    selected.csv, evals.csv."""
+    out = tmp_path
+    out.mkdir(parents=True)
+    lock = dict(common=dict(tool_check=tool_check, s03_run=str(s03), fingerprint={}, unsealed=unsealed),
+                s03_mu_levels=[0.5], controllers=dict(PID=dict(eval_mu=[0.5], speeds=[0.2])))
+    (out / 'lock.yaml').write_text(json.dumps(lock), encoding='utf-8')
+    s3.write_csv(str(out / 'selected.csv'),
+                 [dict(kind='send_to_HIL', controller='PID', feasible='true',
+                       **{n: '1.0' for n in s3.FACTORS['PID']})])
+    s3.write_csv(str(out / 'evals.csv'), [dict(controller='PID', log_sha256='')])
+    return out
+
+
+def test_v67_gates_open_nothing_under_sealed(tmp_path, monkeypatch):
+    """S04 v6.7 8: --tool-check on an S03 run that is not --trial exits before read_domain /
+    fingerprint (nothing under sealed/ is opened); post() and sens_after() do the same through the
+    lock, and a main lock needs an unsealed S03 run."""
+    import builtins
+    d = _s03_dir(tmp_path, trial=False)                                # an S03 main run
+    opened = []
+    real = builtins.open
+
+    def spy(f, *a, **kw):
+        opened.append(str(f))
+        return real(f, *a, **kw)
+    monkeypatch.setattr(builtins, 'open', spy)
+    monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'trial', '--tool-check', '--controller',
+                                      'PID', '--s03', str(d), '--out', str(tmp_path / 'o')])
+    with pytest.raises(SystemExit, match='tool-check'):
+        s4.main()
+    assert not any('/sealed/' in p.replace('\\', '/') for p in opened)
+    out = _lock_dir(tmp_path / 'r1', tool_check=True, s03=d, unsealed=False)
+    for f in (lambda: s4.post(argparse.Namespace(out=str(out), dll='x.dll')),
+              lambda: s4.sens_after(argparse.Namespace(out=str(out), dll='x.dll', io_delay_ms=None))):
+        with pytest.raises(SystemExit, match='not an S03 --trial'):
+            f()
+    assert not any('/sealed/' in p.replace('\\', '/') for p in opened)
+    out2 = _lock_dir(tmp_path / 'r2', tool_check=False, s03=d, unsealed=False)
+    with pytest.raises(SystemExit, match='unsealed'):
+        s4.post(argparse.Namespace(out=str(out2), dll='x.dll'))
+    assert not any('/sealed/' in p.replace('\\', '/') for p in opened)
+
+
+def test_v67_source_diff_covers_this_script_and_the_screening_script(monkeypatch):
+    """S04 v6.7 9.6: source_diff compares the working-tree blob of fwsim/s04_ga.py and of
+    fwsim/s03_sangloc.py against the S03 commit; a script missing at the commit (blob_at None) is
+    reported."""
+    real_w, real_b = s4.work_blob, s4.blob_at
+    for path in ('fwsim/s04_ga.py', s4.S03_SCREEN_SCRIPT):
+        monkeypatch.setattr(s4, 'work_blob',
+                            lambda p, path=path: _other_blob(real_w(p) or 'a') if p == path else real_w(p))
+        assert [n for n, _, _ in s4.source_diff(_head())] == [path]
+        monkeypatch.setattr(s4, 'work_blob', real_w)
+        monkeypatch.setattr(s4, 'blob_at', lambda c, p, path=path: None if p == path else real_b(c, p))
+        assert [n for n, _, _ in s4.source_diff(_head())] == [path]     # missing at the S03 commit
+        monkeypatch.setattr(s4, 'blob_at', real_b)
+
+
+def test_kep_log_hash_uses_only_the_bit_exact_keys(monkeypatch):
+    """S03 v8.6 11.6: digest_sha hashes fwsim.BIT_EXACT_KEYS only (adding/removing 'kep' changes
+    nothing; the old formula for a digest without it); an unknown key is a ValueError."""
+    dig = {k: [0.0, 1.0] for k in fwsim.BIT_EXACT_KEYS}
+    old = hashlib.sha256(json.dumps(dig, sort_keys=True).encode()).hexdigest()
+    assert s4.digest_sha(dig) == old
+    assert s4.digest_sha(dict(dig, kep=[1, 2, 3])) == old            # the channel is not compared
+    assert s4.digest_sha(dict(dig, kep=[])) == old
+    with pytest.raises(ValueError, match='BIT_EXACT_KEYS'):
+        s4.digest_sha(dict(dig, other=[0.0]))
+    assert s4.log_sha(None) == ''
+    monkeypatch.setattr(s3, 'log_digest', lambda log: dict(dig, **({'kep': [1]} if log == 'with' else {})))
+    assert s4.log_sha('with') == s4.log_sha('plain') == old
+
+
+def test_kep_fields_report_only(monkeypatch):
+    """kep_fields: ADRC all ''; PID the fwsim.kep_indicator values; a ValueError gives '' fractions
+    and the message, never a change of status or score."""
+    assert s4.kep_fields('ADRC', 'log', 1.0) == dict(kep_frac_vx='', kep_frac_vy='', kep_frac_wz='',
+                                                    kep_note='')
+    monkeypatch.setattr(fwsim, 'kep_indicator',
+                        lambda log, t: dict(kep_frac_vx=0.1, kep_frac_vy=0.2, kep_frac_wz=0.3))
+    assert s4.kep_fields('PID', 'log', 1.0) == dict(kep_frac_vx=0.1, kep_frac_vy=0.2, kep_frac_wz=0.3,
+                                                   kep_note='')
+    monkeypatch.setattr(fwsim, 'kep_indicator',
+                        lambda log, t: (_ for _ in ()).throw(ValueError('no kep channel in log')))
+    k = s4.kep_fields('PID', 'log', 1.0)
+    assert k['kep_frac_vx'] == '' and 'no kep channel' in k['kep_note']
+
+
+def test_plant_variants_change_exactly_the_declared_keys(monkeypatch):
+    """S04 v6.1 6 (RB-1): apply_plant_variant of each variant changes exactly the declared keys
+    (motor_K and motor_u0 never); an unexpected change is an S03Stop."""
+    assert s4.PLANT_VARIANTS == ('R0.8_JbTcTs', 'R1.25_JbTcTs', 'R0.82_only', 'Vbatt11.1')
+
+    def plant():
+        return fwsim.plant_params(argparse.Namespace(ground='traction', mu=0.5))
+
+    for name, k in (('R0.8_JbTcTs', 0.8), ('R1.25_JbTcTs', 1.25)):
+        p = plant()
+        b = s4.plant_dump(p)
+        rep = s4.apply_plant_variant(p, name)
+        a = s4.plant_dump(p)
+        assert set(rep['expected']) == {'motor_R'} | set(s4.PLANT_COUPLED)
+        assert set(rep['changed']) == set(rep['expected']) | set(rep['derived'])
+        assert rep['derived'] and set(rep['derived']) <= set(s4.PLANT_DERIVED)
+        assert np.allclose(np.asarray(a['motor_R']), np.asarray(b['motor_R']) * k)
+        for n in s4.PLANT_COUPLED:
+            assert np.allclose(np.asarray(a[n]), np.asarray(b[n]) / k)
+        assert np.array_equal(np.asarray(a['motor_K']), np.asarray(b['motor_K']))
+        assert np.array_equal(np.asarray(a['motor_u0']), np.asarray(b['motor_u0']))
+    p = plant()
+    b = s4.plant_dump(p)
+    rep = s4.apply_plant_variant(p, 'R0.82_only')
+    assert rep['changed'] == ['motor_R'] and rep['derived'] == []
+    assert np.allclose(np.asarray(s4.plant_dump(p)['motor_R']), np.asarray(b['motor_R']) * 0.82)
+    p = plant()
+    rep = s4.apply_plant_variant(p, 'Vbatt11.1')
+    assert rep['changed'] == ['V_batt'] and s4.plant_dump(p)['V_batt'] == 11.1
+    with pytest.raises(s3.S03Stop, match='unknown plant variant'):
+        s4.apply_plant_variant(plant(), 'R2')
+    p = plant()                                                     # an unexpected key changes
+    monkeypatch.setattr(p, 'update_physical',
+                        lambda **kw: setattr(p, 'motor_K', np.asarray(p.motor_K) * 2.0))
+    with pytest.raises(s3.S03Stop, match='not the expected'):
+        s4.apply_plant_variant(p, 'R0.8_JbTcTs')
+
+
+def test_sens_after_pre_checks_every_variant_before_any_simulation(tmp_path, monkeypatch):
+    """S04 v6.8 6: sens_after runs the plant-variant pre-check of EVERY controller's eval mu and
+    EVERY variant before the first simulation of any controller (the pre-check is its own loop over
+    all send_to_HIL rows, not one per controller inside the run loop)."""
+    d = _s03_dir(tmp_path, trial=True)
+    out, dll = tmp_path / 'r', tmp_path / 'x.dll'
+    out.mkdir()
+    dll.write_bytes(b'x')
+    lock = dict(common=dict(tool_check=True, s03_run=str(d), fingerprint={}, unsealed=False),
+                s03_mu_levels=[0.5],
+                controllers={c: dict(eval_mu=[0.5], speeds=[0.2]) for c in s3.CONTROLLERS})
+    (out / 'lock.yaml').write_text(json.dumps(lock), encoding='utf-8')
+    s3.write_csv(str(out / 'selected.csv'),
+                 [dict(kind='send_to_HIL', controller=c, feasible='true',
+                       **{n: '1.0' for n in s3.FACTORS[c]}) for c in s3.CONTROLLERS])
+    calls, real_variant = [], s4.apply_plant_variant
+    monkeypatch.setattr(s4, 'fingerprint', lambda *a, **k: {})
+    monkeypatch.setattr(s4.fwsim, 'FirmwareSim', lambda *a, **k: object())
+    monkeypatch.setattr(s4, 'apply_plant_variant',
+                        lambda p, name: (calls.append(('pre', name)), real_variant(p, name))[1])
+    res = {c: '0' for c in s4.SENS_AFTER_COLS[7:]}
+    res.update(status='ok', completed='true')
+    monkeypatch.setattr(s4, 'run_custom',
+                        lambda *a, **k: (calls.append(('run', k.get('plant_variant'))),
+                                         (res, None, None, {}, {}))[1])
+    assert s4.sens_after(argparse.Namespace(out=str(out), dll=str(dll), io_delay_ms=None)) == 0
+    n_pre = len(s3.CONTROLLERS) * len(s4.PLANT_VARIANTS)               # one eval mu, all variants
+    pre = [i for i, c in enumerate(calls) if c[0] == 'pre']
+    run = [i for i, c in enumerate(calls) if c[0] == 'run']
+    assert len(pre) == n_pre and run and max(pre) < min(run)
+
+
+def test_post_spectral_radius_waits_for_liam(tmp_path, monkeypatch):
+    """S04 v6.8 6: rho >= 1 (or not computable although inside the table) is a cho_liam item —
+    post returns 2, selected.csv unchanged, meta.yaml pre_hil holds the radius and the states;
+    rho == 1.0 is the unstable boundary."""
+    g = dict(G_PID, pos_kp=0.0, pos_ki=3.0)                          # inside the table, rho >= 1
+    rc, notes, out, sel = _fake_post(tmp_path, monkeypatch, gains=g)
+    assert rc == 2 and len(notes['cho_liam']) == 1
+    assert notes['cho_liam'][0]['check'] == 'spectral_radius' and notes['cho_liam'][0]['reasons']
+    assert (out / 'selected.csv').read_bytes() == sel                # the selected gains are kept
+    yaml = pytest.importorskip('yaml')
+    ph = yaml.safe_load(open(out / 'meta.yaml', encoding='utf-8'))['pre_hil']['PID pre_hil']
+    assert ph['spectral_radius'] >= 1 and ph['spectral_radius_state'] == 'khong_on_dinh'
+    assert ph['spectral_radius_states'] or ph['spectral_radius_dropped']
+    mh = s4.mo_hinh_con
+    real = mh.ban_kinh_pho_va_trang_thai
+
+    def fake_rho(rho):
+        def f(ctrl, g_):
+            m = dict(real(ctrl, g_))
+            m['ban_kinh_pho'], m['trang_thai'] = rho, mh.trang_thai(rho)
+            return m
+        return f
+    monkeypatch.setattr(mh, 'ban_kinh_pho_va_trang_thai', fake_rho(1.0))
+    rc, notes, *_ = _fake_post(tmp_path / 'b', monkeypatch)
+    assert rc == 2 and notes['cho_liam'][0]['check'] == 'spectral_radius'   # rho == 1 is not stable
+    monkeypatch.setattr(mh, 'ban_kinh_pho_va_trang_thai', fake_rho(math.nextafter(1.0, 0.0)))
+    rc, notes, *_ = _fake_post(tmp_path / 'c', monkeypatch)
+    assert rc == 0 and notes['cho_liam'] == []
+    monkeypatch.setattr(mh, 'ban_kinh_pho_va_trang_thai',             # inside the table, not computable
+                        lambda c, g_: (_ for _ in ()).throw(ValueError('bad gains')))
+    rc, notes, *_ = _fake_post(tmp_path / 'd', monkeypatch)
+    assert rc == 2 and notes['cho_liam'][0]['check'] == 'spectral_radius'
+
+
+def test_post_sensitivity_waits_for_liam(tmp_path, monkeypatch):
+    """S04 v6.8 6: judge() 'sensitive' for b0 (LADRC) or motor R appends a cho_liam item and post
+    returns 2; unchanged runs give rc 0."""
+    def mod(r, kind, f, v, mu):
+        if f != 1.0:
+            r.update(completed='false')
+    rc, notes, *_ = _fake_post(tmp_path / 'a', monkeypatch, sens_mod=mod)
+    assert rc == 2 and [c['check'] for c in notes['cho_liam']] == ['r_factor']
+    assert notes['cho_liam'][0]['reasons']
+    rc, notes, *_ = _fake_post(tmp_path / 'b', monkeypatch, ctrl='ADRC', gains=G_ADRC, sens_mod=mod)
+    assert rc == 2 and {c['check'] for c in notes['cho_liam']} == {'b0_factor', 'r_factor'}
+    rc, notes, *_ = _fake_post(tmp_path / 'c', monkeypatch)
+    assert rc == 0 and notes['cho_liam'] == []
+
+
+def test_post_findings_gate_the_gain_send(tmp_path, monkeypatch, capsys):
+    """S04 6 hand-over: a post with a cho_liam finding makes gain_send --s04-run refuse (5, nothing
+    sent); --liam-da-quyet '<reason>' sends once and logs the reason; a clean post sends."""
+    import gain_send as gs
+    rc, notes, out, _ = _fake_post(
+        tmp_path / 'a', monkeypatch,
+        mu3_mod=lambda r, v, mu: r.update(g3_state='khong_dat') if mu == 0.4 else None)
+    assert rc == 2 and notes['cho_liam']
+    calls = []
+
+    def exch(ip, port, make_packet, timeout, tries, log=print):
+        calls.append(make_packet(7))
+        return dict(ok='1', req_id='1', id='1', ctrl='PID', mac='aa', boot='1', sha='s', env='e',
+                    applied_n='0', **{n: repr(float(np.float32(v))) for n, v in G_PID.items()}), 1
+    monkeypatch.setattr(gs, 'exchange', exch)
+    gains = ','.join(f'{n}={v}' for n, v in G_PID.items())
+    base = ['--ip', '127.0.0.1', '--port', '9', '--ctrl', 'PID', '--id', '1', '--gains', gains]
+    assert gs.main(base + ['--s04-run', str(out)]) == 5 and calls == []
+    txt = capsys.readouterr()
+    assert '# cho_liam:' in txt.err and txt.out.rstrip().endswith('#ket_qua,ma=5')
+    assert gs.main(base + ['--s04-run', str(out), '--liam-da-quyet', 'Liam checked']) == 0
+    assert len(calls) == 1
+    txt = capsys.readouterr().out
+    assert '#ban_giao_s04,' in txt and 'Liam checked' in txt and '# ban_kinh_pho=' in txt
+    assert txt.count('# ack ') == 1 and txt.rstrip().endswith('#ket_qua,ma=0')
+    rc, notes, out2, _ = _fake_post(tmp_path / 'b', monkeypatch)
+    assert rc == 0 and notes['cho_liam'] == []
+    assert gs.main(base + ['--s04-run', str(out2)]) == 0
+    txt = capsys.readouterr().out
+    assert 'liam_da_quyet=""' in txt and txt.rstrip().endswith('#ket_qua,ma=0')
+    assert gs.main(base + ['--liam-da-quyet', 'x']) == 1               # reason without --s04-run
+
+
+@needs_dll
+def test_run_gate_records_the_kep_columns(monkeypatch):
+    """S03 v8.6 11.6: the PID evals row holds the three kep fractions of fwsim.kep_indicator (report
+    only); the ADRC row has '' everywhere; a ValueError gives '' + kep_note, status/score unchanged."""
+    fw = fwsim.FirmwareSim(_DLL)
+    if not fw.pos_cols:
+        pytest.skip('DLL without pos_ctrl.c')
+    import o1_feasibility as o1
+    path, g = o1.Path8(), s3.defaults(fw, 'PID')
+    res, log = s4.run_gate(fw, path, 'PID', g, 0.2, 0.436)
+    if getattr(fw, 'kep_cols', 0):
+        k = fwsim.kep_indicator(log, res['t_end'])
+        assert (res['kep_frac_vx'], res['kep_frac_vy'], res['kep_frac_wz']) == \
+            (k['kep_frac_vx'], k['kep_frac_vy'], k['kep_frac_wz']) and res['kep_note'] == ''
+    else:                                       # an old DLL without the export: note, report only
+        assert res['kep_frac_vx'] == '' and res['status'] != 'run_error'
+    res2, _ = s4.run_gate(fw, path, 'ADRC', s3.defaults(fw, 'ADRC'), 0.2, 0.436)
+    assert res2['kep_frac_vx'] == res2['kep_frac_vy'] == res2['kep_frac_wz'] == res2['kep_note'] == ''
+    if getattr(fw, 'kep_cols', 0):
+        monkeypatch.setattr(fwsim, 'kep_indicator',
+                            lambda *a: (_ for _ in ()).throw(ValueError('no kep channel in log')))
+        res3, _ = s4.run_gate(fw, path, 'PID', g, 0.2, 0.436)
+        assert res3['kep_frac_vx'] == '' and 'no kep channel' in res3['kep_note']
+        assert res3['status'] != 'run_error' and math.isfinite(float(res3['e_perp_max']))
+
+
+def test_main_refuses_a_dll_without_the_kep_channel(tmp_path, monkeypatch):
+    """S03 v8.6 section 11 item 6 (c): a PID trial stops when the DLL has no clamp export
+    (kep_cols 0); an ADRC trial is not stopped by that check."""
+    d = _s03_dir(tmp_path, trial=True)
+    calls = []
+
+    class _NoKep:
+        kep_cols = 0
+        build_info = {}
+
+    monkeypatch.setattr(fwsim, 'FirmwareSim', lambda dll: (calls.append(dll), _NoKep())[1])
+    monkeypatch.setattr(s4, 'fingerprint', lambda *a, **k: sys.exit('past the kep check'))
+    monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'trial', '--tool-check', '--controller',
+                                    'PID', '--s03', str(d), '--out', str(tmp_path / 'o'), '--dll', 'x.dll'])
+    with pytest.raises(SystemExit, match='no kep channel'):
+        s4.main()
+    monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'trial', '--tool-check', '--controller',
+                                    'ADRC', '--s03', str(d), '--out', str(tmp_path / 'o2'), '--dll', 'x.dll'])
+    with pytest.raises(SystemExit, match='past the kep check'):       # stopped later, not by kep_cols
+        s4.main()
+    assert len(calls) == 2
