@@ -408,6 +408,17 @@ def test_gop_consistency_per_place_and_new_plate(places):
     assert not any('g_cal' in w for w in o['ly_do'])
     assert o['nhat_quan_cho']['goc']['dat'] is False and o['nhat_quan_cho']['K1']['dat'] is False
     assert o['eps_g'] == pytest.approx(o['s_E'] + sum(o['U_chuyen'].values()))
+    # 22/11 (Liam "Mien theo du lieu"): a tilt above the old 1.5 deg proposal is in the domain when e_bc converged
+    c, d = dict(pg), dict(pk)
+    c['g_E'], d['g_E'] = list(GC + [0.012, 0.0]), list(GC - [0.012, 0.0])
+    o3 = _gop((c, d))
+    m = o3['mien']
+    assert m['nghieng_max_rad'] == pytest.approx(math.atan(np.linalg.norm(o3['g_b']) + o3['eps_g']))
+    assert m['nghieng_max_rad'] > A.NGHIENG_MAX_RAD == m['nghieng_de_xuat_cu_rad'] and m['dat'] is True
+    assert o3['trang_thai']['a6'] == 'dat' and o3['e_bc_rad'] is not None, o3['ly_do']
+    far = dict(pg, rho_max_goc_m=1.7)                                  # a corner outside rho_max is still refused
+    o4 = _gop((far, pk))
+    assert o4['trang_thai']['a6'] == 'thieu' and o4['mien']['dat'] is False and any('rho' in w for w in o4['ly_do'])
     # A6C1-7: another plate than the caliper plate is a new plate; a place of another plate is refused
     o2 = _gop(places, tam_cal_id='T0')
     assert o2['trang_thai']['a6'] == 'thieu' and o2['g_cal'] is None and any('tam_moi' in w for w in o2['ly_do'])

@@ -132,7 +132,10 @@ SO_TAY = '05_DATA/results/C8/2026-11-18_run01/nhat_ky_buoi_CAM.md:27'
 S_CAL_M = 0.1445
 E_CAL_M = 0.0001                                           # caliper error per corner (design 2c)
 RHO_MAX_M = 1.6                                            # [DE XUAT] design 2a: every corner within it
-NGHIENG_MAX_RAD = math.radians(1.5)                        # [DE XUAT]
+NGHIENG_MAX_RAD = math.radians(1.5)                        # [DE XUAT] of design 2a; since 22/11 NOT a limit of gop
+                                                           # (Liam at CODE_C8B 22/11, box: "Mien theo du lieu
+                                                           # (Recommended)"): the tilt domain is the region of
+                                                           # the converged e_bc grid; kept as a reported number
 V_MAX_M = 0.001                                            # [DE XUAT] design 3 (twice the first plate's 0.475 mm)
 OMEGA_MAX_RAD_S = 1.0                                      # [DE XUAT] L133 (1): frames used for the fit with alpha
 SG_HALF = 5                                                # [DE XUAT] omega: quadratic fit over +-5 frames (A6C1-12)
@@ -1440,10 +1443,12 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
     if g_hat is not None:
         tilt = math.atan(float(np.linalg.norm(g_hat)) + (eps or 0.0))
         rho = max(p.get('rho_max_goc_m') or 0.0 for p in ok)
-        mien_ok = bool(tilt <= NGHIENG_MAX_RAD and rho <= RHO_MAX_M)
-        if not mien_ok:
-            why.append(f'outside the A6 domain: tilt {math.degrees(tilt):.2f} deg (<= 1.5) or a corner at rho '
-                       f'{rho:.3f} m (<= {RHO_MAX_M})')
+        # 22/11 (Liam at CODE_C8B, box, after the first official gop gave 2.46 deg: "Mien theo du lieu (Recommended)"):
+        # no fixed tilt cap. The tilt domain is the set the e_bc grid covers (g_b + eps_g in every direction, v within
+        # v_max), usable when that grid converged; a grid that did not converge already has its own reason above.
+        mien_ok = bool(rho <= RHO_MAX_M and (ebc is not None or not with_ebc))
+        if not rho <= RHO_MAX_M:
+            why.append(f'outside the A6 domain: a corner at rho {rho:.3f} m (<= {RHO_MAX_M})')
     imu_ok, w_imu, imu_b = kiem_imu_gop(kiem_imu, places, g_hat, eps, ebc, H, hb, tam_id, khoa_truoc_sha256, khoa)
     why += w_imu
     st_a6 = 'dat' if (not why and eps is not None and ebc is not None and imu_ok and o_ok is not False) else 'thieu'
@@ -1483,7 +1488,13 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
                 session=[dict(session_sha256=c['session_sha256'], cam_tam_m=c['cam_tam_m'], vai=c['vai']) for c in cams],
                 a6du_rad_per_m=None if eps is None else float(eps / (2.0 * (H - hb))),
                 H_m=float(H), h_m=float(hb), plumb_xy_m=[float(x) for x in C], side_m=float(side), cam_tam_m=cam_c,
-                mien=dict(rho_max_m=RHO_MAX_M, nghieng_max_rad=NGHIENG_MAX_RAD, v_max_m=V_MAX_M, dat=mien_ok,
+                mien=dict(rho_max_m=RHO_MAX_M,
+                          nghieng_max_rad=None if g_hat is None else float(math.atan(float(np.linalg.norm(g_hat))
+                                                                                     + (eps or 0.0))),
+                          nghieng_quy_tac='mien nghieng = vung luoi e_bc da hoi tu: atan(|g_b| + eps_g); khong tran co '
+                                          'dinh (Liam 22/11 o CODE_C8B: "Mien theo du lieu (Recommended)"); 1.5 do cua '
+                                          'thiet ke 2a chi con la so tham khao',
+                          nghieng_de_xuat_cu_rad=NGHIENG_MAX_RAD, v_max_m=V_MAX_M, dat=mien_ok,
                           quy_tac='moi goc trong rho_max; doc chi co tam: tam + canh/sqrt2 <= rho_max'),
                 h_goc_m=h_goc, u_h_goc_m=u_h_goc, u_h_chung_m=u_hc,
                 u_h_rieng_m=None, u_h_rieng_nguon='theo luot: lan_lap_v1 delta_h (NHACTAM F8), khong o file tam',
