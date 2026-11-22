@@ -8,6 +8,15 @@ phien phu theo cach nhanh"; Liam at CODE_C8B 19/11: "Lam M4 o day"). Round 1/2 o
 round 2/2 (A6C2-2..10, rest of A6C1-1, A6C1-2) fixed 20/11 (CODE_C8B local_d24e5a74; Liam at CODE_C8B: "Sua ngay, Codex
 sau (Recommended)": no round 3 now, one Codex pass after the data of session 2, L138).
 
+22/11/2026 (CODE_C8B local_bc420001, Fable 5.2; Liam at CODE_C8B, box, verbatim: "Sua mo hinh (Recommended)"; analysis
+05_DATA/results/C8/2026-11-20_run02/c8b/T7_a6_ra_mau_thuan/, note 03_CODE/docs/2026-11-22_Ra_mau_thuan_A6_T7_v1.md;
+not through Codex yet, L138): on the E clips of session 2 the plane model below does not hold: in the tag frame the
+corner deformation is u (x) slopes with FOUR slopes, the stretch slopes gm (-0.005, 0.005) and the slopes along the
+edges gk (-0.018, 0.004) at K1, and the camera-IMU heading follows gk. So: do fits fit_gk (MO_HINH) and writes
+g_E = gk (c8b_a6_cho_v3; g_gian, g_phang kept as information); gop takes the caliper g_cal as a reference only (not in
+eps_g, not in the status), needs the held-out camera-IMU check of E clips (kiem_imu), accepts ONE mounting in the lap
+file (mot_lan_lap, lap = 0) and the cell file c8b_a6_o as optional; new subcommands kiem_imu, goc, dong.
+
 Model (exact for the lifted points of car_pose): a corner at height h_i = hbar + g.r_i + v s_i (r_i the corner in the
 tag frame, car_corners_body order ArUco 0..3, s = (+1, -1, +1, -1)) lifted with ONE height hbar lands at
     P_i = X_i + (g.r_i + v s_i) d_i,   d_i = (P_i - C) / (H - hbar),   X_i = T + R(psi) (1 + sigma) r_i
@@ -73,7 +82,12 @@ Every number before the margin 1.25 (C8B applies it once, in c8b_khoa_v5). Const
       --tam-id T --lan-lap-id L --luot-id-E E_RUN --out a6_goc.json
   python tools/c8b_a6.py gop --cho-file a6_goc.json --cho-file a6_K1.json --tam-id T --tam-cal-id T \
       [--lan-lap-cal-id L] [--lap lap.json] [--dong dong.json] [--giu-ngoai o.json] [--u-h-chung uh.json] \
-      [--khoa-truoc khoa.json] --out c8b_a6_v2.json
+      [--khoa-truoc khoa.json] [--kiem-imu kiem_imu_goc.json --kiem-imu kiem_imu_K1.json] --out c8b_a6_v2.json
+  python tools/c8b_a6.py kiem_imu --frames E2/frames.csv --session session.json --f15 meo_E_2.json --cho goc \
+      --log pi/E2/log.csv --tam-id T --luot-id-E E_RUN_2 --khoa-truoc khoa.json --out kiem_imu_goc.json
+  python tools/c8b_a6.py goc --track track/RUN --session session.json --cua-so F2/cua_so_v1.jsonl --luot-id RUN \
+      --out goc_RUN.json
+  python tools/c8b_a6.py dong --goc goc_RUN1.json --goc goc_RUN2.json --tam-id T --out dong.json
 Last line: #ket_qua,ma=0 written / 2 refused or error.
 """
 from __future__ import annotations
@@ -98,11 +112,14 @@ if HERE not in sys.path:
 import c8_u_imu as cu                                                    # noqa: E402
 
 SCHEMA = 'c8b_a6_v2'
-SCHEMA_CHO = 'c8b_a6_cho_v2'                               # v2 20/11: tam_id, lan_lap_id, chan_doan, per-case changes
+SCHEMA_CHO = 'c8b_a6_cho_v3'                               # v3 22/11: g_E = the edge slope gk of fit_gk (MO_HINH)
+MO_HINH = 'c8b_a6_canh_v1'                                 # four slopes: gk (edges, heading) and gm (stretch)
 SCHEMA_O = 'c8b_a6_o_v1'                                   # cells of the camera-IMU check (design 2b, 7c)
 SCHEMA_LAP = 'c8b_a6_lap_v1'                               # U_chuyen.lap source (design 2c)
 SCHEMA_DONG = 'c8b_a6_dong_v1'                             # U_chuyen.dong source (design 2c, V5-02)
 SCHEMA_UH = 'c8b_u_h_chung_v1'                             # u_h_chung source (design 3, video multi-height)
+SCHEMA_IMU = 'c8b_a6_kiem_imu_v1'                          # held-out camera-IMU check of gk on an E clip (22/11)
+SCHEMA_GOC = 'c8b_a6_goc_v1'                               # lifted corners of the frames of a run (for dong)
 F15_FULL = 'c7_meo_ma_ao_E_v1'
 F15_DIAG = 'c7_meo_ma_ao_E_v1_chan_doan'                   # KIEMCHEO 02dea17 (KCF1-1): never a usable bound
 KC_VERSION = 'c7_kiem_cheo_v7'                             # kiem_cheo.json with S7 (A3 by position)
@@ -146,6 +163,11 @@ SU_THEO_SESSION = ('session_sha256', 'cam_tam_m')                # da session (A
 U_H_HANG_M = 0.0001                                        # design 3: the 0.1 mm term of u_h_chung
 HEX64 = re.compile(r'^[0-9a-f]{64}$')
 GIOI_HAN = [
+    '22/11: g_b la do doc doc theo canh ma gk (mo hinh c8b_a6_canh_v1); mat ma khong phang (gk khac do doc gian gm), co '
+    'che vat ly chua xac dinh (mat cong hay bo noi cua tam); e_bc, mien nghieng, h_goc van tinh theo mat phang do doc gk',
+    '22/11: g_cal (thuoc kep, lan dat dau buoi 1) chi tham khao; kiem cheo la kiem_imu (camera - IMU) tren clip E giu '
+    'ngoai theo clip; cac clip kiem da duoc xem luc ra nguyen nhan (22/11) truoc khi khoa: khong con sach cho viec '
+    'chon mo hinh, luot dich thi chua xem',
     'A6C1-14: sai che do chung cua ban do (F15) va do nghieng lan nhau hoan toan; SE_E, U_meo_E khong bat duoc phan '
     'do; vi the moi co kiem cheo g_cal (so tay) va giu ngoai camera-IMU',
     'v khop phu khong xac nhan venh vat ly; |v| <= v_max la gia dinh mien (thiet ke 3)',
@@ -343,6 +365,120 @@ def fit_g(P, C, H, hbar, side, iters=FIT_ITERS, fields=()):
                 se_alpha=se_al, sigma_toa_do_m=s_xy, bac_tu_do=dof)
 
 
+def fit_gk(P, C, H, hbar, side, iters=FIT_ITERS, fields=(), bien_dang=('ma', 'san')):
+    """The edge-slope model MO_HINH (CODE_C8B 22/11; Liam at CODE_C8B 22/11: "Sua mo hinh (Recommended)"; analysis
+    05_DATA/results/C8/2026-11-20_run02/c8b/T7_a6_ra_mau_thuan/). The corners of car_pose are the intersections of the
+    four fitted edge lines, and a line only feels the displacement normal to itself, so the parallax of a tag surface
+    that is not a plane moves the corners, in the TAG frame (u = R(psi)^T d, d = (P - C) / (H - hbar)), by
+        dx = u_x (gxm x + gyk y),   dy = u_y (gxk x + gym y)     (+ v s_i u, the warp nuisance of fit_g)
+    with FOUR slopes: gxm, gym from the mean heights of the two opposite edges (stretch) and gxk, gyk from the slope
+    ALONG the edges (shear). A plane has gk = gm = g (the model of fit_g). The Kabsch heading of the four corners moves
+    by (gxk u_y - gyk u_x) / 2 = [R(psi) gk] x d / 2: the heading error of design 2a with g = gk, so gk is the slope
+    A6 needs and gm is a nuisance. On the E clips of session 2 the two differ (K1: gk (-0.018, 0.004), gm (-0.005,
+    0.005)) and the camera-IMU heading follows gk. Same Gauss-Newton as fit_g with the per-frame pose eliminated;
+    the columns of the slopes are rebuilt from the current heading at every step (their change with the heading is
+    left out of the pose Jacobian: second order, the step still converges to the exact residual).
+    bien_dang: constant traceless symmetric strains fitted as nuisance (2 numbers each): 'ma' fixed in the TAG frame
+    (the print of the tag is not a square, the edge detector's bias by edge direction) and 'san' fixed in the FLOOR
+    frame (the map residual at the place of an E clip: only for frames at one place). Both are orthogonal to the
+    slopes only when the headings cover whole turns evenly; an E clip does not (at goc of session 2 leaving them out
+    moves gk by 0.0025), so they are fitted. A clip without rotation cannot tell them apart: the fit is then ill
+    conditioned and refused (fit_ok).
+    Returns g = gk, g_gian = gm, v_phu, sigma, bien_dang {ma, san}, alpha, the normal matrix M of (gxk, gyk, gxm, gym,
+    v, sigma, strains, alpha) with i_alpha = 6 + number of strain parameters, and the keys of fit_g."""
+    bd = tuple(bien_dang or ())
+    if any(b not in ('ma', 'san') for b in bd) or len(set(bd)) != len(bd):
+        raise A6Error(f'bien_dang {bien_dang!r}: ma | san')
+    NS = 2 * len(bd)
+    P = np.asarray(P, float)
+    n = len(P)
+    if n < 3:
+        raise A6Error('fewer than 3 frames')
+    r = body(side)
+    C = np.asarray(C, float)
+    d = (P - C) / (H - hbar)                                          # (n, 4, 2), fixed: built from the measured P
+    F = [np.asarray(f, float) for f in fields]
+    K = len(F)
+    IA = 6 + NS                                                       # first alpha index
+    NP = IA + K
+    gam = np.zeros(NP)
+    psi = np.array([kabsch_psi(P[f], side) for f in range(n)])
+    T = P.mean(1)
+    J = np.array([[0.0, 1.0], [-1.0, 0.0]])
+    x, y = r[:, 0][None, :], r[:, 1][None, :]
+    xb, yb = np.broadcast_to(x, (n, 4)), np.broadcast_to(y, (n, 4))
+    Bv = S_PATTERN[None, :, None] * d
+    M, ok, it = None, False, 0
+
+    def cols_of(psi_):
+        c, s = np.cos(psi_)[:, None], np.sin(psi_)[:, None]
+        Rr_ = np.stack([c * x - s * y, s * x + c * y], axis=2)                       # (n, 4, 2): R(psi) r_i
+        ux, uy = c * d[:, :, 0] + s * d[:, :, 1], -s * d[:, :, 0] + c * d[:, :, 1]   # u = R^T d per corner
+
+        def rot(a, b):                                                # tag-frame vector (a, b) -> floor
+            return np.stack([c * a - s * b, s * a + c * b], axis=2)
+        z = np.zeros_like(ux)
+        st = []
+        for b_ in bd:
+            if b_ == 'ma':                                            # tag frame: [[e1, e2], [e2, -e1]] r
+                st += [rot(xb, -yb), rot(yb, xb)]
+            else:                                                     # floor frame: [[f1, f2], [f2, -f1]] (R r)
+                st += [np.stack([Rr_[:, :, 0], -Rr_[:, :, 1]], axis=2), np.stack([Rr_[:, :, 1], Rr_[:, :, 0]], axis=2)]
+        return Rr_, [rot(z, uy * x), rot(ux * y, z), rot(ux * x, z), rot(z, uy * y), Bv, Rr_] + st + F
+
+    def nopose(Rr_, cs):
+        mod = T[:, None, :] + Rr_
+        for j in range(NP):
+            mod = mod + gam[j] * cs[j]
+        return mod
+
+    for it in range(1, iters + 1):
+        Rr, cs = cols_of(psi)
+        e = (P - nopose(Rr, cs)).reshape(n, 8)
+        A = np.zeros((n, 8, 3))
+        A[:, 0::2, 0], A[:, 1::2, 1] = 1.0, 1.0
+        A[:, :, 2] = ((1.0 + gam[5]) * Rr @ J).reshape(n, 8)
+        B = np.stack([q.reshape(n, 8) for q in cs], axis=2)             # (n, 8, NP)
+        try:
+            Ai = np.linalg.inv(np.einsum('fij,fik->fjk', A, A))
+            Q = np.eye(8)[None] - np.einsum('fij,fjk,flk->fil', A, Ai, A)
+            M = np.einsum('fij,fik,fkl->jl', B, Q, B)
+            b = np.einsum('fij,fik,fk->j', B, Q, e)
+            dgam = np.linalg.solve(M, b)
+        except np.linalg.LinAlgError:
+            return dict(g=gam[:2].copy(), g_gian=gam[2:4].copy(), sigma=float(gam[5]), v_phu=float(gam[4]),
+                        alpha=[float(v_) for v_ in gam[IA:]], T=T, psi=psi, M=None, i_alpha=IA, res_rms_m=math.nan,
+                        bien_dang={b_: [float(v_) for v_ in gam[6 + 2 * j:8 + 2 * j]] for j, b_ in enumerate(bd)},
+                        hoi_tu=False, so_vong=it, cond=math.inf, se_alpha=[math.inf] * K, sigma_toa_do_m=math.nan,
+                        bac_tu_do=None)
+        dn = np.einsum('fij,fkj,fk->fi', Ai, A, e - np.einsum('fij,j->fi', B, dgam))
+        T = T + dn[:, :2]
+        psi = psi + dn[:, 2]
+        gam = gam + dgam
+        mv = (np.einsum('fij,fj->fi', A, dn) + np.einsum('fij,j->fi', B, dgam)).reshape(n, 4, 2)
+        if float(np.max(np.linalg.norm(mv, axis=2))) < CONV_M:
+            ok = True
+            break
+    Rr, cs = cols_of(psi)
+    res = P - nopose(Rr, cs)
+    rms = float(np.sqrt(np.mean(np.sum(res ** 2, axis=2))))
+    dof = 8 * n - 3 * n - NP
+    s_xy = float(math.sqrt(np.sum(res ** 2) / dof)) if dof > 0 else math.inf
+    se_al = [math.inf] * K
+    if M is not None and K:
+        try:
+            dg = np.diag(np.linalg.inv(M))
+            se_al = [float(math.sqrt(v_) * max(s_xy, RES_FLOOR_M)) if v_ > 0 and math.isfinite(v_) else math.inf
+                     for v_ in dg[IA:]]
+        except np.linalg.LinAlgError:
+            pass
+    return dict(g=gam[:2].copy(), g_gian=gam[2:4].copy(), sigma=float(gam[5]), v_phu=float(gam[4]),
+                alpha=[float(v_) for v_ in gam[IA:]], T=T, psi=psi, M=M, i_alpha=IA, res_rms_m=rms, hoi_tu=ok,
+                bien_dang={b_: [float(v_) for v_ in gam[6 + 2 * j:8 + 2 * j]] for j, b_ in enumerate(bd)},
+                so_vong=it, cond=_cond_scaled(M) if M is not None else math.inf, se_alpha=se_al, sigma_toa_do_m=s_xy,
+                bac_tu_do=dof)
+
+
 def fit_ok(f):
     """A usable fit: converged, the column-scaled normal matrix well conditioned and every alpha identified (SE <=
     ALPHA_SE_MAX with the residual floored at RES_FLOOR_M: column scaling alone hides an empty shutter column, e.g.
@@ -350,10 +486,10 @@ def fit_ok(f):
     return bool(f['hoi_tu']) and math.isfinite(f['cond']) and f['cond'] <= COND_MAX         and all(x <= ALPHA_SE_MAX for x in f.get('se_alpha') or [])
 
 
-def corr_alpha_g(M):
+def corr_alpha_g(M, i_alpha=4):
     """Largest |correlation| between a component of g and an alpha in the least-squares covariance (M^-1): the price
-    of fitting alpha with g (L133 (2))."""
-    if M is None or M.shape[0] <= 4:
+    of fitting alpha with g (L133 (2)). i_alpha: the first alpha index of M (4 for fit_g, 6 for fit_gk)."""
+    if M is None or M.shape[0] <= i_alpha:
         return None
     try:
         cov = np.linalg.inv(M)
@@ -363,11 +499,13 @@ def corr_alpha_g(M):
     if not np.all(np.isfinite(cov)) or np.any(dg <= 0):
         return None
     sd = np.sqrt(dg)
-    return float(max(abs(cov[i, j] / (sd[i] * sd[j])) for i in (0, 1) for j in range(4, M.shape[0])))
+    return float(max(abs(cov[i, j] / (sd[i] * sd[j])) for i in (0, 1) for j in range(i_alpha, M.shape[0])))
 
 
-def se_jackknife(P, C, H, hbar, side, nb=N_BLOCK, fields=()):
-    """Block jackknife SE of g over nb blocks of consecutive frames; (SE, every leave-one-block fit usable)."""
+def se_jackknife(P, C, H, hbar, side, nb=N_BLOCK, fields=(), fit=None):
+    """Block jackknife SE of g over nb blocks of consecutive frames; (SE, every leave-one-block fit usable). fit: the
+    fit function (fit_g by default); with fit_gk the SE has four numbers: g (gk) then g_gian (gm)."""
+    fit = fit or fit_g
     n = len(P)
     nb = min(nb, n // 3)
     if nb < 3:
@@ -376,9 +514,9 @@ def se_jackknife(P, C, H, hbar, side, nb=N_BLOCK, fields=()):
     gs, good = [], True
     for k in range(nb):
         keep = np.r_[0:edges[k], edges[k + 1]:n]
-        f = fit_g(P[keep], C, H, hbar, side, fields=[x[keep] for x in fields])
+        f = fit(P[keep], C, H, hbar, side, fields=[x[keep] for x in fields])
         good = good and fit_ok(f)
-        gs.append(f['g'])
+        gs.append(np.concatenate([f['g'], f['g_gian']]) if 'g_gian' in f else f['g'])
     gs = np.array(gs)
     return np.sqrt((nb - 1) / nb * np.sum((gs - gs.mean(0)) ** 2, axis=0)), good
 
@@ -642,7 +780,7 @@ def do_place(cho, idx, t, P, ses, f15, cam, tam_id, lan_lap_id, luot_id_E=None):
     i1 = np.flatnonzero(sel)
     setup = dict(C=list(map(float, C)), H_m=H, h_m=hb, side_m=side, kappa=ses['kappa'], session_sha256=ses['sha256'],
                  cam_tam_m=[float(x) for x in np.asarray(getattr(cam, 'centre', (math.nan,) * 3), float)])
-    base = dict(schema=SCHEMA_CHO, cho=cho, tam_id=tam_id, lan_lap_id=lan_lap_id, luot_id_E=luot_id_E, n_khung_E=n_e,
+    base = dict(schema=SCHEMA_CHO, mo_hinh=MO_HINH, cho=cho, tam_id=tam_id, lan_lap_id=lan_lap_id, luot_id_E=luot_id_E, n_khung_E=n_e,
                 set_up=setup,
                 f15=dict(schema=f15['schema'], trang_thai=f15['trang_thai'], file=f15['file'], sha256=f15['sha256'],
                          sha256_file=f15.get('sha256_file'), clip_sha256=f15['clip_sha256'], ca=f15['ca']),
@@ -661,10 +799,14 @@ def do_place(cho, idx, t, P, ses, f15, cam, tam_id, lan_lap_id, luot_id_E=None):
     Pu = P[i1]
     uv = uv_of(Pu, cam, C, ses['kappa'])
     fl = list(shutter_fields(Pu, t[i1], uv))
-    fit = fit_g(Pu, C, H, hb, side, fields=fl)
-    se, jk_ok = se_jackknife(Pu, C, H, hb, side, fields=fl)
-    fit0 = fit_g(Pu, C, H, hb, side)                                    # L133 (2): the same frames without alpha
-    se0, _ = se_jackknife(Pu, C, H, hb, side)
+    fit = fit_gk(Pu, C, H, hb, side, fields=fl)                         # MO_HINH: g_E = gk (22/11)
+    se4, jk_ok = se_jackknife(Pu, C, H, hb, side, fields=fl, fit=fit_gk)
+    se, se_gian = se4[:2], se4[2:]
+    fit0 = fit_gk(Pu, C, H, hb, side)                                   # L133 (2): the same frames without alpha
+    se0, _ = se_jackknife(Pu, C, H, hb, side, fit=fit_gk)
+    se0 = se0[:2]
+    fit_p = fit_g(Pu, C, H, hb, side, fields=fl)                        # the plane model (one g), information only
+    fit_n = fit_gk(Pu, C, H, hb, side, fields=fl, bien_dang=())         # without the strain nuisances, information
     if not fit_ok(fit):
         why.append(f'fit of g not usable: converged {fit["hoi_tu"]}, scaled condition {fit["cond"]:.3g} '
                    f'(<= {COND_MAX:g}), SE alpha {[f"{x:.3g}" for x in fit["se_alpha"]]} s/px (<= {ALPHA_SE_MAX:g}) '
@@ -678,7 +820,7 @@ def do_place(cho, idx, t, P, ses, f15, cam, tam_id, lan_lap_id, luot_id_E=None):
     for nm in f15['ca']:
         D = np.array([f15['du'][int(k)][nm] for k in idx[i1]])
         P2 = Pu + D
-        fk = fit_g(P2, C, H, hb, side, fields=list(shutter_fields(P2, t[i1], uv)))
+        fk = fit_gk(P2, C, H, hb, side, fields=list(shutter_fields(P2, t[i1], uv)))
         rep_ok = rep_ok and fit_ok(fk)
         dg = fk['g'] - g
         theo_ca[nm] = [float(x) for x in dg]
@@ -699,7 +841,12 @@ def do_place(cho, idx, t, P, ses, f15, cam, tam_id, lan_lap_id, luot_id_E=None):
         chan_doan = dict(U_meo_E=[float(x) for x in dmax], s_E=[float(x) for x in sE_raw],
                          ghi_chu='so chan doan, khong vao eps_g, u_h')
     rho = float(np.max(np.linalg.norm(Pu - C, axis=2)))                # every corner (A6C1-8)
+    gm = fit['g_gian']
     return dict(base, g_E=[float(x) for x in g], sigma=fit['sigma'], SE_E=[float(x) for x in se],
+                g_gian=[float(x) for x in gm], SE_gian=[float(x) for x in se_gian],
+                lech_canh_gian=float(np.linalg.norm(g - gm)),
+                g_phang=[float(x) for x in fit_p['g']], g_phang_dat=bool(fit_ok(fit_p)),
+                bien_dang=fit['bien_dang'], g_khong_bien_dang=[float(x) for x in fit_n['g']],
                 U_meo_E=[float(x) for x in dmax] if usable else None,
                 s_E=[float(x) for x in sE_raw] if usable else None,
                 s_E_norm=float(np.linalg.norm(sE_raw)) if usable else None,
@@ -710,7 +857,8 @@ def do_place(cho, idx, t, P, ses, f15, cam, tam_id, lan_lap_id, luot_id_E=None):
                 res_rms_m=fit['res_rms_m'], n_khung=int(len(i1)),
                 man_trap=dict(cach='khop alpha_r, alpha_c lam tham so phu cung g (L133)',
                               alpha_r_s_px=fit['alpha'][0], alpha_c_s_px=fit['alpha'][1],
-                              omega_max_rad_s=OMEGA_MAX_RAD_S, tuong_quan_alpha_g_max=corr_alpha_g(fit['M']),
+                              omega_max_rad_s=OMEGA_MAX_RAD_S,
+                              tuong_quan_alpha_g_max=corr_alpha_g(fit['M'], fit['i_alpha']),
                               g_khong_alpha=[float(x) for x in fit0['g']], SE_E_khong_alpha=[float(x) for x in se0]),
                 rho_max_goc_m=rho, trang_thai='dat' if not why else 'thieu', ly_do=why)
 
@@ -819,8 +967,39 @@ def kiem_lap(d, tam_id):
     if d.get('trang_thai') != 'dat':
         why.append(f'lap: trang_thai {d.get("trang_thai")!r}')
     cap = d.get('cap')
+    mot = d.get('mot_lan_lap')
+    if isinstance(mot, dict) and not cap:
+        # One mounting for the E clips and every scored run (CODE_C8B 22/11): the transfer between mountings is 0 by
+        # its definition (design 2c: lap is the change of g between DIFFERENT mountings). Needs the mounting id, the
+        # basis (who said so, where) and the repeat pairs of E clips of that mounting on the same footprint, kept as
+        # evidence (not added: their noise is already in s_E). c8b_khoa_v5 checks every run against F8 lan_lap_v1.
+        if not (isinstance(mot.get('lan_lap_id'), str) and mot['lan_lap_id']
+                and isinstance(mot.get('can_cu'), list) and mot['can_cu']
+                and all(isinstance(x, str) and x for x in mot['can_cu'])):
+            why.append('lap: mot_lan_lap needs lan_lap_id and can_cu (the basis, a list of strings)')
+        ll = d.get('lap_lai')
+        if not isinstance(ll, list) or not ll:
+            why.append('lap: mot_lan_lap needs lap_lai (repeat pairs of E clips of the mounting, evidence)')
+        else:
+            for i, c in enumerate(ll):
+                try:
+                    if not isinstance(c, dict) or not (isinstance(c.get('luot_a'), str)
+                                                       and isinstance(c.get('luot_b'), str) and c['luot_a']
+                                                       and c['luot_b'] and c['luot_a'] != c['luot_b']):
+                        raise A6Error('luot_a, luot_b not two different run ids')
+                    if abs(_num(c.get('huong_lech_deg'), 'huong_lech_deg')) > LAP_HUONG_MAX_DEG:
+                        raise A6Error(f'heading apart {c["huong_lech_deg"]} deg > {LAP_HUONG_MAX_DEG}')
+                    if _num(c.get('khoang_m'), 'khoang_m', 0.0) > LAP_VUNG_M:
+                        raise A6Error(f'centres {c["khoang_m"]} m apart > {LAP_VUNG_M}')
+                    _vec(c.get('g_a'), 2, 'g_a'), _vec(c.get('g_b'), 2, 'g_b')
+                    _vec(c.get('SE_a'), 2, 'SE_a', 0.0), _vec(c.get('SE_b'), 2, 'SE_b', 0.0)
+                except A6Error as e:
+                    why.append(f'lap lap_lai {i}: {e}')
+        if why:
+            return None, why, {}
+        return 0.0, [], {}
     if not isinstance(cap, list) or not cap:
-        why.append('lap: no pair')
+        why.append('lap: no pair (and no mot_lan_lap block)')
         return None, why, {}
     us, per = [], {}
     for i, c in enumerate(cap):
@@ -1047,6 +1226,65 @@ def kiem_u_h(d, tam_id, h_m=None):
     return (None, why) if why else (v, [])
 
 
+def kiem_imu_gop(files, places, g_hat, eps, ebc, H, hb, tam_id, khoa_sha, khoa):
+    """The held-out camera-IMU check of the edge slope (22/11; design 2b "giu ngoai tuyet doi" on the E clips, in the
+    heading channel): every c8b_a6_kiem_imu_v1 file is of an E clip that NO place fit used (clip sha), of this plate,
+    written after the lock (khoa_truoc_sha256), its run in the test set of the lock and the runs of the place fits in
+    the fit set; every place of the A6 file has at least one. Pass per file: the slope seen by the heading channel
+    g_yaw agrees with g_b:  |g_yaw - g_b| rho / (2 (H - h)) <= eps_g rho / (2 (H - h)) + e_bc + 2 |SE_yaw| rho /
+    (2 (H - h))  (the left side is the first-harmonic heading residual after the correction; the last term the noise
+    of the IMU channel, added). Returns (dat, reasons, blocks)."""
+    if not files:
+        return False, ['no held-out camera-IMU check on an E clip (c8b_a6_kiem_imu_v1): A6 not checked (22/11)'], []
+    why, out = [], []
+    used = {(p.get('f15') or {}).get('clip_sha256') for p in places}
+    kt = (khoa or {}).get('tap') if isinstance(khoa, dict) else None
+    if not isinstance(kt, dict) or not all(isinstance(kt.get(k), list) for k in ('khop', 'kiem', 'dich')) \
+            or any(set(kt[a]) & set(kt[b]) for a, b in (('khop', 'kiem'), ('khop', 'dich'), ('kiem', 'dich'))):
+        why.append('kiem_imu: the lock has no three disjoint sets tap {khop, kiem, dich}')
+        kt = None
+    elif any(p.get('luot_id_E') not in kt['khop'] for p in places):
+        why.append('kiem_imu: the E run of a place fit is not in the fit set of the lock (tap.khop)')
+    seen = set()
+    for i, d in enumerate(files):
+        w = f'kiem_imu {i}'
+        try:
+            if not isinstance(d, dict) or d.get('schema') != SCHEMA_IMU:
+                raise A6Error(f'not a {SCHEMA_IMU} file')
+            _check_sha(d, w)
+            w = f'kiem_imu {d.get("luot_id_E")!r}'
+            if d.get('tam_id') != tam_id:
+                raise A6Error(f'plate {d.get("tam_id")!r}, not {tam_id!r}')
+            if d.get('cho') not in CHO or d.get('trang_thai') != 'dat':
+                raise A6Error(f'cho {d.get("cho")!r} / trang_thai {d.get("trang_thai")!r}')
+            if not isinstance(d.get('clip_sha256'), str) or not HEX64.match(d['clip_sha256']) \
+                    or d['clip_sha256'] in used:
+                raise A6Error('its clip is a clip of a place fit (not held out) or clip_sha256 missing')
+            if khoa_sha is None or d.get('khoa_truoc_sha256') != khoa_sha:
+                raise A6Error('khoa_truoc_sha256 is not the lock of this A6 file')
+            if kt is not None and d.get('luot_id_E') not in kt['kiem']:
+                raise A6Error('its run is not in the test set of the lock (tap.kiem)')
+            gy, se = _vec(d.get('g_yaw'), 2, 'g_yaw'), _vec(d.get('SE_yaw'), 2, 'SE_yaw', 0.0)
+            rho = _num(d.get('rho_m'), 'rho_m', 0.0)
+            if g_hat is None or eps is None or ebc is None:
+                raise A6Error('g_b, eps_g or e_bc missing: the check cannot be evaluated')
+            k2 = 2.0 * (H - hb)
+            du = float(np.linalg.norm(gy - np.asarray(g_hat, float)) * rho / k2)
+            lim = float(eps * rho / k2 + ebc + 2.0 * np.linalg.norm(se) * rho / k2)
+            out.append(dict(luot_id_E=d.get('luot_id_E'), cho=d['cho'], clip_sha256=d['clip_sha256'],
+                            sha256=d['sha256'], g_yaw=[float(v) for v in gy], SE_yaw=[float(v) for v in se],
+                            rho_m=rho, du_rad=du, nguong_rad=lim, dat=bool(du <= lim)))
+            seen.add(d['cho'])
+            if du > lim:
+                raise A6Error(f'heading residual {du:.6f} rad > A6du + IMU noise {lim:.6f} rad (kiem_imu_truot)')
+        except A6Error as e:
+            why.append(f'{w}: {e}')
+    miss = sorted({p['cho'] for p in places} - seen)
+    if miss:
+        why.append(f'kiem_imu: no held-out check at {miss}')
+    return not why, why, out
+
+
 # ── gop: the A6 file ─────────────────────────────────────────────────────────────────────────────
 
 def _deg_rad(v):
@@ -1089,11 +1327,18 @@ def set_up_of_session(ses):
 
 def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=None, khoa_truoc_sha256=None,
         script=None, cho_sha=(), nguon=(), with_ebc=True, lan_lap_cal_id=None, giu_ngoai_rows=None, khoa=None,
-        cam_cham=()):
+        cam_cham=(), kiem_imu=None):
     """c8b_a6_v2 of one plate from the place results (design 2c, 3, 10); the sources are parsed dicts (CLI: files);
     giu_ngoai_rows the rows of the held-out cells (c8b_a6_o.read_rows), khoa the parsed lock JSON (A6C2-2).
     cam_cham: set-ups (set_up_of_session) of the sessions where the file is used for scoring; e_bc is the largest
-    over the cameras of the places and of these (da session (A)); the places may come from different sessions."""
+    over the cameras of the places and of these (da session (A)); the places may come from different sessions.
+    22/11 (Liam at CODE_C8B: "Sua mo hinh (Recommended)"): g_b is the edge slope gk of the places (MO_HINH); the
+    caliper numbers g_cal are kept as a REFERENCE only (they are 4 corner heights of the plate at the first placement
+    of session 1, not the slope along the tag edges of the mounting scored): they no longer enter eps_g or the status;
+    the cross-check is the held-out camera-IMU check on E clips (kiem_imu: c8b_a6_kiem_imu_v1 files of clips that no
+    place fit used; every place needs one; the heading-channel slope must agree with g_b within eps_g, e_bc and the
+    noise of the IMU channel). The cell file giu_ngoai (c8b_a6_o_v1) stays checked when given; without it the cells
+    are the D2 check of the scored runs (c8b_a6_o d2, chain step T14)."""
     why = []
     if not places:
         raise A6Error('no place')
@@ -1148,25 +1393,26 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
             lim = p['s_E_norm'] + uc_norm + (u_pair or 0.0)
             nq[p['cho']] = dict(khoang=dist_p, nguong=lim, dat=bool(dist_p <= lim), u_lap_cap=u_pair,
                                 lan_lap_id=lp, lan_lap_cal_id=lan_lap_cal_id)
-            if dist_p > lim:
-                why.append(f'g_cal_bat_nhat at {p["cho"]}: |g_E - g_cal| {dist_p:.5f} > s_E + U_cal + dg_lap {lim:.5f}'
-                           f' (design 2c)')
+            # 22/11: reference only (no reason added): the caliper is not the slope along the tag edges of this mounting
     nhat_quan = None if (tam_moi or not nq) else all(v['dat'] for v in nq.values())
     dist = max(v['khoang'] for v in nq.values()) if nq else None
     uch = None if None in (u_lap, u_cho, u_dong) else float(u_lap + u_cho + u_dong)
-    eps0 = None if (dist is None or uch is None) else float(max(s_norm, dist + uc_norm) + u_lap + u_cho)
+    eps0 = None if (s_norm is None or uch is None) else float(s_norm + u_lap + u_cho)      # 22/11: no g_cal term
     eps = None if eps0 is None else eps0 + u_dong
     # design 2b joint replay (CODE 20/11, changed decision: A3 per H32 case of KIEMCHEO 692462f): the same eps without
     # the U_meo_E part (max(a + b, c) <= max(a, c) + b), and per case the signed change of g and A3 of that case
     s2 = max((2.0 * float(np.linalg.norm(p['SE_E'])) for p in ok), default=None)
-    eps0_km = None if (eps0 is None or s2 is None) else float(max(s2, dist + uc_norm) + u_lap + u_cho)
+    eps0_km = None if (eps0 is None or s2 is None) else float(s2 + u_lap + u_cho)
     ca_cho = {}
     for p in ok:
         a3c = p.get('A3_theo_ca_deg') or {}
         ca_cho[p['cho']] = {nm: dict(dg=dg, dg_norm=float(np.linalg.norm(dg)), A3_rad=_deg_rad(a3c.get(nm)))
                             for nm, dg in (p.get('U_meo_E_theo_ca') or {}).items()}
-    o_ok, w_o = kiem_o(giu_ngoai, cho_sha, khoa_truoc_sha256, giu_ngoai_rows, khoa)
-    why += w_o
+    if giu_ngoai is None:                        # 22/11: the cells are optional here (D2 of the runs at T14)
+        o_ok = None
+    else:
+        o_ok, w_o = kiem_o(giu_ngoai, cho_sha, khoa_truoc_sha256, giu_ngoai_rows, khoa)
+        why += w_o
     if khoa_truoc_sha256 is None:
         why.append('khoa_truoc_sha256 missing (the lock before the checks, design 0.3, A6C1-4)')
     if not isinstance(script, dict) or not script.get('commit') or script.get('dirty') is not False:
@@ -1198,13 +1444,18 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
         if not mien_ok:
             why.append(f'outside the A6 domain: tilt {math.degrees(tilt):.2f} deg (<= 1.5) or a corner at rho '
                        f'{rho:.3f} m (<= {RHO_MAX_M})')
-    st_a6 = 'dat' if (not why and eps is not None and ebc is not None and o_ok) else 'thieu'
+    imu_ok, w_imu, imu_b = kiem_imu_gop(kiem_imu, places, g_hat, eps, ebc, H, hb, tam_id, khoa_truoc_sha256, khoa)
+    why += w_imu
+    st_a6 = 'dat' if (not why and eps is not None and ebc is not None and imu_ok and o_ok is not False) else 'thieu'
     u_hc, w_h = kiem_u_h(u_h, tam_id, hb)
     r = body(side)
     why_h = list(w_h) + ([] if st_a6 == 'dat' else ['A6 not dat: h_goc_m from g_b not usable (A6C1-7)'])
     st_h = 'dat' if not why_h else 'thieu'
     h_goc = [float(hb + ri @ g_hat) for ri in r] if st_h == 'dat' else None
-    u_h_goc = [float(u_hc + np.linalg.norm(ri) * eps + V_MAX_M) for ri in r] if st_h == 'dat' else None
+    # 22/11: the corner heights of T16.8 from gk; the stretch slope gm is the other candidate, so their largest
+    # difference over the places is added per corner
+    dkm = max((float(p.get('lech_canh_gian') or 0.0) for p in ok), default=0.0)
+    u_h_goc = [float(u_hc + np.linalg.norm(ri) * (eps + dkm) + V_MAX_M) for ri in r] if st_h == 'dat' else None
     lans = sorted({p.get('lan_lap_id') for p in places})
     # A6C1-7 (CODE 20/11, hop dong ~05:00): the declared mounting and the E run of every place; c8b_khoa_v5 checks them
     # against F8 lan_lap_v1 (F8 is computed from this file's g_b, so it cannot be read here)
@@ -1212,8 +1463,12 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
     return dict(schema=SCHEMA, tam_id=tam_id, tam_cal_id=tam_cal_id, lan_lap_goc_id=lans[0] if len(lans) == 1 else lans,
                 lan_lap_cho=lan_cho,
                 g_b=None if g_hat is None else [float(x) for x in g_hat],
-                quy_tac_g_b='trung binh trong so 1/|s_E|^2 cac cho dat (khoa truoc)',
-                g_E_cho={p['cho']: p['g_E'] for p in places}, eps_g=eps, eps_g_khong_dong=eps0, s_E=s_norm,
+                quy_tac_g_b='trung binh trong so 1/|s_E|^2 cac cho dat (khoa truoc)', mo_hinh=MO_HINH,
+                g_b_y_nghia='do doc doc theo canh ma gk (quyet dinh sai huong); do doc gian gm o g_gian_cho',
+                g_E_cho={p['cho']: p['g_E'] for p in places}, g_gian_cho={p['cho']: p.get('g_gian') for p in places},
+                g_phang_cho={p['cho']: p.get('g_phang') for p in places},
+                eps_g=eps, eps_g_khong_dong=eps0, s_E=s_norm,
+                quy_tac_eps_g='s_E + U_chuyen (lap + cho + dong); g_cal khong vao (22/11)',
                 SE_E={p['cho']: p['SE_E'] for p in places}, U_meo_E={p['cho']: p['U_meo_E'] for p in places},
                 U_meo_E_theo_ca={p['cho']: p.get('U_meo_E_theo_ca') for p in places},
                 U_chuyen=dict(lap=u_lap, cho=u_cho, dong=u_dong), dong=dong_b,
@@ -1221,6 +1476,9 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
                 h_cal_m=None if tam_moi else h_cal, U_cal=uc_norm, U_cal_thanh_phan=uc,
                 U_cal_venh='0: venh tach bang tham so v trong phep giai 4 goc (s_i truc giao do doc)',
                 khoang_g_cal=dist, nhat_quan=nhat_quan, nhat_quan_cho=nq,
+                g_cal_vai_tro='tham khao: 4 do cao goc tam o lan dat dau buoi 1, khong phai do doc doc canh ma cua lan '
+                              'lap duoc cham; khong vao eps_g, khong vao trang_thai (Liam 22/11 o CODE_C8B)',
+                kiem_imu=imu_b, kiem_imu_dat=imu_ok,
                 e_bc_rad=ebc, e_bc_lan_chia=ebc_lv, e_bc_theo_session=ebc_ses,
                 session=[dict(session_sha256=c['session_sha256'], cam_tam_m=c['cam_tam_m'], vai=c['vai']) for c in cams],
                 a6du_rad_per_m=None if eps is None else float(eps / (2.0 * (H - hb))),
@@ -1229,7 +1487,10 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
                           quy_tac='moi goc trong rho_max; doc chi co tam: tam + canh/sqrt2 <= rho_max'),
                 h_goc_m=h_goc, u_h_goc_m=u_h_goc, u_h_chung_m=u_hc,
                 u_h_rieng_m=None, u_h_rieng_nguon='theo luot: lan_lap_v1 delta_h (NHACTAM F8), khong o file tam',
-                giu_ngoai_dat=o_ok, eps_g_khong_meo=None if eps0_km is None else eps0_km + u_dong,
+                giu_ngoai_dat=o_ok,
+                giu_ngoai_ghi_chu=None if giu_ngoai is not None else 'khong co file o (c8b_a6_o_v1) o buoc nay: o D2 '
+                                  'kiem tren luot dich o T14 (c8b_a6_o d2)',
+                eps_g_khong_meo=None if eps0_km is None else eps0_km + u_dong,
                 eps_g_khong_meo_khong_dong=eps0_km,
                 ghep_A3_A6=dict(cach='replay chung theo ca H32 (2b) khi hai dau cung mot cho co A3 tung ca; '
                                      'khong thi cong rieng (du phong)', theo_cho=ca_cho),
@@ -1237,6 +1498,273 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
                 khoa_truoc_sha256=khoa_truoc_sha256, khoa_truoc_sha=khoa_truoc_sha256,      # F3 2.C name (alias)
                 commit=(script or {}).get('commit'),
                 commit_dirty=(script or {}).get('dirty'), nguon=list(nguon), so_tay=SO_TAY, truoc_le=True)
+
+
+# ── kiem_imu: the heading channel of an E clip (22/11) ───────────────────────────────────────────
+
+IMU_GRID_S = 0.05                                          # as c8b_xoay.imu_check: grid of the turn-rate correlation
+IMU_SCAN_S = 0.1                                           # as c8b_xoay.imu_check: +-2 grid steps, in 1 ms steps
+
+
+def read_psi_series(path):
+    """(t, unwrapped car_pose heading psi) of the valid frames of a frames.csv: the whole clip, for the clock offset."""
+    cu.check_path(path)
+    with open(path, newline='', encoding='utf-8') as f:
+        rows = [r for r in csv.DictReader(f) if r.get('valid') in ('1', 'True', 'true') and r.get('psi') not in ('', None)]
+    if len(rows) < 20:
+        raise A6Error(f'{path}: fewer than 20 valid frames with a heading')
+    t = np.array([float(r['t_s']) for r in rows])
+    return t, np.unwrap(np.array([float(r['psi']) for r in rows]))
+
+
+def _imu_offset(tc, pc, S):
+    """Clock offset log - camera from the cross-correlation of the turn rates (c8b_xoay.imu_check)."""
+    g_c = np.arange(tc[0], tc[-1], IMU_GRID_S)
+    g_i = np.arange(S['t'][0], S['t'][-1], IMU_GRID_S)
+    if g_c.size < 20 or g_i.size < 20:
+        raise A6Error('kiem_imu: clip or log shorter than 1 s')
+    wc = np.gradient(np.interp(g_c, tc, pc), IMU_GRID_S)
+    wi = np.gradient(np.interp(g_i, S['t'], S['psi']), IMU_GRID_S)
+    nfft = 1 << int(math.ceil(math.log2(len(wc) + len(wi))))
+    xc = np.fft.irfft(np.fft.rfft(wi - wi.mean(), nfft) * np.conj(np.fft.rfft(wc - wc.mean(), nfft)), nfft)
+    k = int(np.argmax(xc))
+    lag = k if k < nfft // 2 else k - nfft
+    return float(g_i[0] - g_c[0] + lag * IMU_GRID_S)
+
+
+def _yaw_design(psi, pim, w, t, u):
+    """Columns of psi_cam - psi_imu: constant, IMU scale, turn rate (the rest of the clock offset and the shutter
+    skew are proportional to it), drift in time, the two slopes of design 2a (delta psi = (gx u_y - gy u_x) / 2) and
+    the second harmonic of the heading (the map residual at the place)."""
+    return np.column_stack([np.ones_like(psi), pim - pim.mean(), w, t - t.mean(), 0.5 * u[:, 1], -0.5 * u[:, 0],
+                            np.cos(2.0 * psi), np.sin(2.0 * psi)])
+
+
+def kiem_imu_do(cho, idx, t, P, ses, f15, tc, pc, L, tam_id, luot_id_E, khoa_sha):
+    """The slope g_yaw seen by the HEADING channel of one E clip (22/11): the Kabsch heading of the lifted corners
+    minus the IMU yaw (c8_u_imu.rv_samples: the game rotation vector of the log, no magnetometer), regressed on the
+    columns of _yaw_design over the E frames of F15 with |omega| <= OMEGA_MAX_RAD_S (the frames of do) that have an
+    IMU yaw; the clock offset from the turn rates of the whole clip (tc, pc), refined to the smallest residual; SE by
+    the block jackknife. Independent of the corner deformation that do fits (it uses the antisymmetric part only)."""
+    if cho not in CHO or f15.get('cho') != cho:
+        raise A6Error(f'cho {cho!r}: goc | K1, and the F15 of that place')
+    if not khoa_sha:
+        raise A6Error('kiem_imu: the lock (--khoa-truoc) is needed: the check is written after it')
+    C, H, hb, side = ses['C'], ses['H'], ses['hbar'], ses['side']
+    lo, hi = f15['mien_E']['sau_E_dau'], f15['mien_E']['truoc_E_cuoi']
+    w = omega_of(t, P, side)
+    psi_all = np.unwrap(np.array([kabsch_psi(q, side) for q in P]))
+    sel = (idx > lo) & (idx < hi) & np.isfinite(w) & (np.abs(np.nan_to_num(w, nan=np.inf)) <= OMEGA_MAX_RAD_S)
+    S = cu.rv_samples(L)
+    off0 = _imu_offset(tc, pc, S)
+    Tc = P.mean(1)
+    best = None
+    for off in np.arange(off0 - IMU_SCAN_S, off0 + IMU_SCAN_S + 5e-4, 1e-3):
+        pim = cu.interp_yaw(S, t + off)
+        m = sel & np.isfinite(pim)
+        if m.sum() < N_MIN:
+            continue
+        c_, s_ = np.cos(psi_all[m]), np.sin(psi_all[m])
+        dfl = (Tc[m] - C) / (H - hb)
+        u = np.column_stack([c_ * dfl[:, 0] + s_ * dfl[:, 1], -s_ * dfl[:, 0] + c_ * dfl[:, 1]])
+        X = _yaw_design(psi_all[m], pim[m], w[m], t[m], u)
+        e = psi_all[m] - pim[m]
+        co = np.linalg.lstsq(X, e, rcond=None)[0]
+        rms = float(np.sqrt(np.mean((e - X @ co) ** 2)))
+        if best is None or rms < best[0]:
+            best = (rms, float(off), co, m, X, e)
+    base = dict(schema=SCHEMA_IMU, tam_id=tam_id, cho=cho, luot_id_E=luot_id_E, clip_sha256=f15['clip_sha256'],
+                khoa_truoc_sha256=khoa_sha, truoc_le=True,
+                set_up=dict(C=list(map(float, C)), H_m=H, h_m=hb, side_m=side, session_sha256=ses['sha256']),
+                cach='psi Kabsch 4 goc da nang - yaw IMU (game RV) hoi quy tren [1, ty le IMU, omega, troi, u_y/2, '
+                     '-u_x/2, cos 2psi, sin 2psi]; lech gio tu tuong quan toc do quay, tinh chinh 1 ms',
+                omega_max_rad_s=OMEGA_MAX_RAD_S)
+    if best is None:
+        return dict(base, g_yaw=None, SE_yaw=None, rho_m=None, n_khung=0, trang_thai='thieu',
+                    ly_do=[f'fewer than {N_MIN} E frames with an IMU yaw at any clock offset'])
+    rms, off, co, m, X, e = best
+    ii = np.flatnonzero(m)
+    est = []
+    for b in np.array_split(np.arange(len(ii)), N_BLOCK):
+        keep = np.setdiff1d(np.arange(len(ii)), b)
+        est.append(np.linalg.lstsq(X[keep], e[keep], rcond=None)[0][4:6])
+    est = np.array(est)
+    se = np.sqrt((N_BLOCK - 1) / N_BLOCK * np.sum((est - est.mean(0)) ** 2, axis=0))
+    cond = float(np.linalg.cond(X / np.linalg.norm(X, axis=0)))
+    why = [] if cond <= math.sqrt(COND_MAX) else [f'design ill conditioned ({cond:.3g})']
+    rho = float(np.mean(np.linalg.norm(Tc[m] - C, axis=1)))
+    return dict(base, g_yaw=[float(v) for v in co[4:6]], SE_yaw=[float(v) for v in se], rho_m=rho,
+                n_khung=int(m.sum()), offset_s=off, rms_rad=rms, he_so=[float(v) for v in co], cond=cond,
+                bien_do_bac1_rad=float(np.linalg.norm(co[4:6]) * rho / (2.0 * (H - hb))),
+                imu=dict(log=os.path.basename(L['path']), log_sha256=cu.sha256(L['path']), n_late=S.get('n_late')),
+                trang_thai='dat' if not why else 'thieu', ly_do=why)
+
+
+# ── goc, dong: the lifted corners of the runs and U_chuyen.dong (22/11) ──────────────────────────
+
+DONG_BD = ('ma',)                                          # the runs move over the floor: no floor-fixed strain
+
+
+def read_cua_so(path):
+    cu.check_path(path)
+    with open(path, 'rb') as f:
+        b = f.read()
+    try:
+        rows = [json.loads(x) for x in b.decode('utf-8').splitlines() if x.strip()]
+    except ValueError as e:
+        raise A6Error(f'{path}: {e}')
+    return [r for r in rows if isinstance(r, dict)], hashlib.sha256(b).hexdigest()
+
+
+def goc_run(track, session, luot_id, cua_so_rows, model=None):
+    """Lifted corners (car_pose: per-frame scoring camera of the 33-mark chain, KIEMCHEO FramePoses on the dets.npz of
+    the track, as meo_E builds goc_m) of the valid frames of one run strictly between its pre and post windows of F2
+    (the moving part of the run, as E_doan between E_dau and E_cuoi). The replayed tag centre must be the one of
+    frames.csv (KIEMCHEO TOL_REPLAY_M); a frame whose pose refit is not trusted is left out and counted."""
+    import c7_kiem_cheo as kc
+    import c7_measure as cm
+    tp, fp = os.path.join(track, 'track.json'), os.path.join(track, 'frames.csv')
+    try:
+        tr, _ = kc.load_json_sha(tp)
+        with open(fp, 'rb') as f:
+            fb = f.read()
+        fr_sha = hashlib.sha256(fb).hexdigest()
+        if tr.get('frames_sha256') != fr_sha:
+            raise A6Error(f'{fp}: not the frames.csv of track.json')
+        clip = tr.get('video_sha256')
+        with open(session, encoding='utf-8') as f:
+            s0 = json.load(f)
+        s, ses_sha, mk, pc, full, kappa, C = kc._session_ctx(session, tr.get('session_sha256'), model or s0.get('chosen'))
+        win = {}
+        for r in cua_so_rows:
+            if r.get('luot_id') == luot_id and r.get('loai') in ('pre', 'post'):
+                if r.get('frames_sha256') != fr_sha or r.get('session_sha256') != ses_sha or r['loai'] in win:
+                    raise A6Error(f'cua_so_v1 {luot_id} {r["loai"]}: another frames / session, or twice')
+                win[r['loai']] = [int(x['id']) for x in r['khung']]
+        if set(win) != {'pre', 'post'}:
+            raise A6Error(f'cua_so_v1: run {luot_id!r} needs one pre and one post window')
+        lo, hi = max(win['pre']), min(win['post'])
+        if not lo < hi:
+            raise A6Error(f'cua_so_v1 {luot_id}: pre does not end before post')
+        import io as _io
+        rows = [r for r in csv.DictReader(_io.StringIO(fb.decode('utf-8')))
+                if kc._true(r.get('valid')) and lo < int(r['idx']) < hi and r.get('tag_x') not in ('', None)]
+        to = tr.get('tag_offset') or [0.0, 0.0, 0.0]
+        side = float(s['car_side_m'])
+        dets, dets_sha, _ = kc.load_dets_checked(tr.get('dets_file'), tr.get('dets_sha256'), None, clip, 'dets.npz')
+        fp_ = kc.FramePoses(s, pc)
+        khung, bo, dev = [], [], 0.0
+        for r in rows:
+            fid = int(r['idx'])
+            if fid not in dets or cm.CAR_ID not in dets[fid][1]:
+                raise A6Error(f'frame {fid}: valid in frames.csv but no car tag in dets.npz')
+            d = dets[fid][1]
+            try:
+                cam = fp_.full(kc._ids_of(r['moc_dung']), d, f'frame {fid}')
+            except kc.KCError as e:
+                bo.append([fid, str(e)])
+                continue
+            q = cm.car_pose(cam, d[cm.CAR_ID], side, kappa, C, to)
+            dev = max(dev, abs(q['tag_x'] - float(r['tag_x'])), abs(q['tag_y'] - float(r['tag_y'])))
+            if not dev <= kc.TOL_REPLAY_M:
+                raise A6Error(f'frame {fid}: replayed pose differs from frames.csv by {dev:.3g} m (> {kc.TOL_REPLAY_M})')
+            Pl = kc.lift(cam.pix2floor(np.asarray(d[cm.CAR_ID], float), 0.0), kappa, C)
+            khung.append([fid, float(r['t_s']), [float(v) for v in np.asarray(Pl, float).ravel()]])
+    except (kc.KCError, OSError, KeyError, TypeError) as e:
+        raise A6Error(f'goc {luot_id}: {e}')
+    if len(khung) < 3:
+        raise A6Error(f'goc {luot_id}: fewer than 3 frames')
+    return dict(schema=SCHEMA_GOC, luot_id=luot_id, clip_sha256=clip, frames_sha256=fr_sha, session_sha256=ses_sha,
+                session_file=os.path.abspath(session), dets_sha256=dets_sha, mien=dict(sau_pre=lo, truoc_post=hi),
+                thu_tu_goc='ArUco 0..3 (c7_measure.car_corners_body); x0 y0 .. x3 y3 [m], da nang (car_pose)',
+                n_khung=len(khung), n_bo=len(bo), bo=bo[:20], replay_max_m=dev, khung=khung)
+
+
+def acc_of(t, T, half=SG_HALF):
+    """Body acceleration magnitude [m/s^2] per frame from the tag centres T (n, 2): twice the quadratic coefficient of
+    a fit over +-half frames on the real times; NaN where the window is not full or crosses a gap (as omega_of)."""
+    t = np.asarray(t, float)
+    n = len(t)
+    a = np.full(n, np.nan)
+    if n < 2 * half + 1:
+        return a
+    dt = np.diff(t)
+    gap = dt > GAP_FACTOR * np.median(dt)
+    for k in range(half, n - half):
+        if gap[k - half:k + half].any():
+            continue
+        tt = t[k - half:k + half + 1] - t[k]
+        cx = np.polyfit(tt, T[k - half:k + half + 1, 0], 2)
+        cy = np.polyfit(tt, T[k - half:k + half + 1, 1], 2)
+        a[k] = 2.0 * math.hypot(cx[0], cy[0])
+    return a
+
+
+def dong_build(runs, tam_id, log=None):
+    """c8b_a6_dong_v1 from the corner files of the scored runs (design 2c, V5-02; 22/11 with the model MO_HINH): the
+    acceleration bands are ONE full band [0, a_max] and its two halves, a_max the largest body acceleration seen on
+    the frames given (no number chosen); per target run and band, gk fitted (fit_gk with the shutter fields of each
+    run and the tag-fixed strain; no floor-fixed strain, the runs move) on the frames of EVERY OTHER run in the band,
+    SE by the block jackknife. runs: {luot_id: (goc dict, session dict of read_session, camera)}."""
+    if len(runs) < 2:
+        raise A6Error('dong: at least two runs')
+    dat = {}
+    for lid, (g, ses, cam) in runs.items():
+        if g.get('schema') != SCHEMA_GOC or g.get('luot_id') != lid or g.get('session_sha256') != ses['sha256']:
+            raise A6Error(f'dong {lid}: not its {SCHEMA_GOC} file or another session')
+        idx = np.array([k[0] for k in g['khung']])
+        t = np.array([k[1] for k in g['khung']])
+        P = np.array([k[2] for k in g['khung']]).reshape(-1, 4, 2)
+        if np.any(np.diff(t) <= 0) or not np.all(np.isfinite(P)):
+            raise A6Error(f'dong {lid}: times not increasing or corners not finite')
+        uv = uv_of(P, cam, ses['C'], ses['kappa'])
+        fr, fc = shutter_fields(P, t, uv)
+        dat[lid] = dict(P=P, fr=fr, fc=fc, a=acc_of(t, P.mean(1)), n=len(idx))
+    s0 = next(iter(runs.values()))[1]
+    C, H, hb, side = s0['C'], s0['H'], s0['hbar'], s0['side']
+    for lid, (_, ses, _) in runs.items():
+        if abs(ses['H'] - H) > TOL_SETUP or abs(ses['hbar'] - hb) > TOL_SETUP or abs(ses['side'] - side) > TOL_SETUP \
+                or np.max(np.abs(ses['C'] - C)) > TOL_SETUP:
+            raise A6Error(f'dong {lid}: another car_pose set-up (L125)')
+    a_max = float(max(np.nanmax(d['a']) for d in dat.values()))
+    mid = 0.5 * a_max
+    dn = [dict(ten='a', a_lo=0.0, a_hi=a_max, nua=False), dict(ten='a_thap', a_lo=0.0, a_hi=mid, nua=True),
+          dict(ten='a_cao', a_lo=mid, a_hi=a_max, nua=True)]
+
+    def fit(P_, C_, H_, hb_, side_, fields=()):
+        return fit_gk(P_, C_, H_, hb_, side_, fields=fields, bien_dang=DONG_BD)
+
+    luot = {}
+    for lid in dat:
+        others = [x for x in dat if x != lid]
+        luot[lid] = dict(bo_luot=others, dai={})
+        for b in dn:
+            Ps, frs, fcs = [], [], []
+            for x in others:
+                m = np.isfinite(dat[x]['a']) & (dat[x]['a'] >= b['a_lo']) & (dat[x]['a'] <= b['a_hi'])
+                Ps.append(dat[x]['P'][m])
+                frs.append(dat[x]['fr'][m])
+                fcs.append(dat[x]['fc'][m])
+            Pb, fl = np.concatenate(Ps), [np.concatenate(frs), np.concatenate(fcs)]
+            ent = dict(n_khung=int(len(Pb)), g_bar=None, SE=None, trang_thai='thieu')
+            if len(Pb) < N_MIN:
+                ent['ly_do'] = f'{len(Pb)} frames < {N_MIN}'
+            else:
+                f = fit(Pb, C, H, hb, side, fl)
+                se, jk_ok = se_jackknife(Pb, C, H, hb, side, fields=fl, fit=fit)
+                ent.update(g_bar=[float(v) for v in f['g']], SE=[float(v) for v in se[:2]],
+                           g_gian=[float(v) for v in f['g_gian']], cond=f['cond'], hoi_tu=f['hoi_tu'],
+                           se_alpha_s_px=f['se_alpha'], jackknife_dat=bool(jk_ok))
+                if fit_ok(f) and jk_ok:
+                    ent['trang_thai'] = 'dat'
+                else:
+                    ent['ly_do'] = 'fit or a jackknife fit not usable (A6C1-11)'
+            luot[lid]['dai'][b['ten']] = ent
+            if log:
+                log(f'dong {lid} {b["ten"]}: n {ent["n_khung"]} g_bar {ent["g_bar"]} SE {ent["SE"]} {ent["trang_thai"]}')
+    return dict(schema=SCHEMA_DONG, tam_id=tam_id, trang_thai='dat', mo_hinh=MO_HINH, dai_dinh_nghia=dn, luot=luot,
+                a_max_nguon='gia toc than lon nhat tren moi khung dua vao (acc_of: khop bac hai +-%d khung)' % SG_HALF,
+                bien_dang=list(DONG_BD), n_khung_luot={k: v['n'] for k, v in dat.items()}, truoc_le=True)
 
 
 # ── readers ──────────────────────────────────────────────────────────────────────────────────────
@@ -1632,10 +2160,32 @@ def main(argv=None):
     a2.add_argument('--giu-ngoai', default=None, help=f'{SCHEMA_O} file (camera-IMU held-out check)')
     a2.add_argument('--u-h-chung', default=None, help=f'{SCHEMA_UH} file')
     a2.add_argument('--khoa-truoc', default=None, help='the lock manifest written before the checks (its sha256)')
+    a2.add_argument('--kiem-imu', action='append', default=[],
+                    help=f'{SCHEMA_IMU} file of a held-out E clip (repeat; every place needs one)')
     a2.add_argument('--session-cham', action='append', default=[],
                     help='session.json of a camera session where the file is used for scoring (repeat; e_bc is the '
                          'largest over the E places and these, da session (A))')
     a2.add_argument('--out', required=True)
+    a3 = sub.add_parser('kiem_imu', help='heading channel (camera - IMU) of a held-out E clip')
+    a3.add_argument('--frames', required=True)
+    a3.add_argument('--session', required=True)
+    a3.add_argument('--cho', required=True, choices=CHO)
+    a3.add_argument('--f15', required=True)
+    a3.add_argument('--log', required=True, help='agv_logger csv of the E clip (IMU yaw)')
+    a3.add_argument('--tam-id', required=True)
+    a3.add_argument('--luot-id-E', required=True)
+    a3.add_argument('--khoa-truoc', required=True)
+    a3.add_argument('--out', required=True)
+    a4 = sub.add_parser('goc', help='lifted corners of the frames of a scored run (for dong)')
+    a4.add_argument('--track', required=True, help='track directory (track.json, frames.csv; dets.npz named there)')
+    a4.add_argument('--session', required=True)
+    a4.add_argument('--cua-so', required=True, help='F2 cua_so_v1.jsonl (pre / post windows of the run)')
+    a4.add_argument('--luot-id', required=True)
+    a4.add_argument('--out', required=True)
+    a5 = sub.add_parser('dong', help=f'{SCHEMA_DONG} from the corner files of the scored runs')
+    a5.add_argument('--goc', action='append', required=True, help=f'{SCHEMA_GOC} file of a run (repeat)')
+    a5.add_argument('--tam-id', required=True)
+    a5.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
         if a.cmd == 'do':
@@ -1661,14 +2211,58 @@ def main(argv=None):
             _write(a.out, out)
             print(f'{a.cho}: g_E {out["g_E"]} SE {out["SE_E"]} U_meo {out["U_meo_E"]} n {out["n_khung"]}; '
                   f'{out["trang_thai"]} {"; ".join(out["ly_do"])}')
+        elif a.cmd == 'kiem_imu':
+            ses = read_session(a.session)
+            fsha = cu.sha256(a.frames)
+            t_all = read_frame_times(a.frames)
+            f15 = read_f15(a.f15, ses, fsha, t_all)
+            idx, t, P = e_frames_from_f15(f15)
+            tc, pc = read_psi_series(a.frames)
+            cu.check_path(a.khoa_truoc)
+            out = kiem_imu_do(a.cho, idx, t, P, ses, f15, tc, pc, cu.load_log(a.log), a.tam_id, a.luot_id_E,
+                              cu.sha256(a.khoa_truoc))
+            out.update(nguon=[dict(vai='frames', file=os.path.abspath(a.frames), sha256=fsha),
+                              dict(vai='session', file=ses['file'], sha256=ses['sha256']),
+                              dict(vai='f15', file=f15['file'], sha256=f15['sha256_file']),
+                              dict(vai='log', file=os.path.abspath(a.log), sha256=cu.sha256(a.log)),
+                              dict(vai='khoa_truoc', file=os.path.abspath(a.khoa_truoc),
+                                   sha256=cu.sha256(a.khoa_truoc))],
+                       script=script_state(), luc=datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
+            _write(a.out, with_sha(_clean(out)))
+            print(f'{a.cho} {a.luot_id_E}: g_yaw {out["g_yaw"]} SE {out["SE_yaw"]} rho {out["rho_m"]} n '
+                  f'{out["n_khung"]}; {out["trang_thai"]} {"; ".join(out["ly_do"])}')
+        elif a.cmd == 'goc':
+            rows, cs_sha = read_cua_so(a.cua_so)
+            out = goc_run(a.track, a.session, a.luot_id, rows)
+            out.update(nguon=[dict(vai='track', file=os.path.abspath(a.track)),
+                              dict(vai='cua_so_v1', file=os.path.abspath(a.cua_so), sha256=cs_sha)],
+                       script=script_state(), luc=datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
+            cu.check_path(a.out)
+            with open(a.out, 'x', encoding='utf-8') as f:
+                f.write(json.dumps(with_sha(_clean(out)), ensure_ascii=False, allow_nan=False))
+            print(f'{a.luot_id}: {out["n_khung"]} frames, {out["n_bo"]} left out, replay {out["replay_max_m"]:.3g} m')
+        elif a.cmd == 'dong':
+            runs, nguon = {}, []
+            for gp in a.goc:
+                g = _load(gp, SCHEMA_GOC)
+                ses = read_session(g['session_file'])
+                if g['luot_id'] in runs:
+                    raise A6Error(f'run {g["luot_id"]} given twice')
+                runs[g['luot_id']] = (g, ses, camera_of(ses))
+                nguon.append(dict(vai=f'goc {g["luot_id"]}', file=os.path.abspath(gp), sha256=cu.sha256(gp)))
+            out = dong_build(runs, a.tam_id, log=lambda m: print(m, flush=True))
+            out.update(nguon=nguon, script=script_state(),
+                       luc=datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
+            _write(a.out, with_sha(_clean(out)))
+            print(f'dong: a_max {out["dai_dinh_nghia"][0]["a_hi"]:.4f} m/s^2, {len(out["luot"])} runs')
         else:
             places, nguon, shas = [], [], []
             for p in a.cho_file:
                 cu.check_path(p)
                 with open(p, encoding='utf-8') as f:
                     d = json.load(f)
-                if d.get('schema') != SCHEMA_CHO:
-                    raise A6Error(f'{p}: not a {SCHEMA_CHO} file')
+                if d.get('schema') != SCHEMA_CHO or d.get('mo_hinh') != MO_HINH:
+                    raise A6Error(f'{p}: not a {SCHEMA_CHO} file of the model {MO_HINH}')
                 places.append(d)
                 shas.append(cu.sha256(p))
                 nguon.append(dict(vai=f'cho {d["cho"]}', file=os.path.abspath(p), sha256=shas[-1]))
@@ -1707,9 +2301,13 @@ def main(argv=None):
                 import c8b_a6_o as om
                 rows = om.read_rows(rn[0]['file'])
                 nguon.append(dict(vai='giu_ngoai rows', file=os.path.abspath(rn[0]['file']), sha256=rn[0]['sha256']))
+            imu = []
+            for ip in a.kiem_imu:
+                imu.append(_load(ip, SCHEMA_IMU))
+                nguon.append(dict(vai='kiem_imu', file=os.path.abspath(ip), sha256=cu.sha256(ip)))
             out = gop(places, a.tam_id, a.tam_cal_id, src['lap'], src['dong'], src['giu_ngoai'], src['u_h'], khoa,
                       script_state(), shas, nguon, lan_lap_cal_id=a.lan_lap_cal_id, giu_ngoai_rows=rows,
-                      khoa=khoa_d, cam_cham=cam_cham)
+                      khoa=khoa_d, cam_cham=cam_cham, kiem_imu=imu)
             out.update(script=script_state(), luc=datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
             _write(a.out, out)
             print(f'A6 {out["trang_thai"]}; g_b {out["g_b"]} eps_g {out["eps_g"]} e_bc {out["e_bc_rad"]}; '
