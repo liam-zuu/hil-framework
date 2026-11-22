@@ -94,6 +94,11 @@ def run_validity(log):
                                         pos[:, POS_COLS.index('pos_reset_n')]))
 # Wheel-consistency slip flag (wheel_slip.c, AGV feat/wheel-slip): only with a DLL that has it
 WS_COLS = ['ws_res', 'ws_th', 'ws_eval', 'ws_flag', 'ws_on_count']
+# PID integral clamp indicator "tick cham kep" (spec S03 v8.6 section 2.1; fw_sim.c fwsim_kep_last): only with
+# a DLL that has it. kep_<axis>: 1 when, right after the clamp of pid.c, |integral| equals integral_limit (also
+# when the sum lands on the limit without being cut); kep_I_<axis>: that integral; kep_lech: self-check of the
+# DLL, must be 0. All 0 on a tick where the PID did not run (motor off, ADRC).
+KEP_COLS = ['kep_vx', 'kep_vy', 'kep_wz', 'kep_I_vx', 'kep_I_vy', 'kep_I_wz', 'kep_lech']
 
 
 class FirmwareSim:
@@ -145,6 +150,14 @@ class FirmwareSim:
             self.ws_cols = 0
         if self.ws_cols not in (0, len(WS_COLS)):
             sys.exit('fwsim.dll wheel-slip columns mismatch: rebuild with build_fwsim.py')
+        try:                                   # older DLLs have no integral-clamp entry points
+            L.fwsim_kep_cols.restype = ctypes.c_int
+            L.fwsim_kep_last.argtypes = [ctypes.POINTER(ctypes.c_double)]
+            self.kep_cols = L.fwsim_kep_cols()
+        except AttributeError:
+            self.kep_cols = 0
+        if self.kep_cols not in (0, len(KEP_COLS)):
+            sys.exit('fwsim.dll integral-clamp columns mismatch: rebuild with build_fwsim.py')
         self._counts = (ctypes.c_int32 * 4)()
         self._sp = (ctypes.c_float * 3)()
         self._duty = (ctypes.c_double * 4)()
@@ -212,6 +225,12 @@ class FirmwareSim:
         self.lib.fwsim_ws_last(out)
         return list(out)
 
+    def kep_last(self):
+        """PID integral clamp columns of the last tick (KEP_COLS); only when kep_cols > 0."""
+        out = (ctypes.c_double * len(KEP_COLS))()
+        self.lib.fwsim_kep_last(out)
+        return list(out)
+
     def pos_params(self, raw=False):
         """Position-loop parameters held by the firmware: on, kp, ki, v_corr_max, e_win, e_exit,
         still_on, v_still, t_still_us. Rounded to 6 decimals for meta.yaml; raw=True: the exact
@@ -271,7 +290,8 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
              io_delay_ms=0, pid=None, mode=None, adrc=None, imu=None, run_active=True,
              fw_params=None, motor_on=True):
     """Run one closed-loop simulation. Returns a dict of arrays sampled at the
-    firmware tick (100 Hz). mode: 'PID' / 'ADRC' (None = firmware CTRL_MODE).
+    firmware tick (100 Hz). With a DLL that has it, log['kep'] (KEP_COLS) is the PID integral clamp
+    indicator of every tick. mode: 'PID' / 'ADRC' (None = firmware CTRL_MODE).
     pid: {axis: (kp, ki, kd, int_limit, out_limit)};
     adrc: {axis: (omega_c, omega_o, b0, out_limit)}; axis 0 vx, 1 vy, 2 wz.
     imu: None = no IMU reports (imu_get() never succeeds: wz from the encoders,
@@ -343,6 +363,8 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
         log['pos'] = []
     if fw.ws_cols:
         log['ws'] = []
+    if fw.kep_cols:
+        log['kep'] = []
 
     for k in range(n_plant + 1):
         t_us = k * 1000
@@ -382,6 +404,8 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
                 log['pos'].append(fw.pos_last())
             if fw.ws_cols:
                 log['ws'].append(fw.ws_last())
+            if fw.kep_cols:
+                log['kep'].append(fw.kep_last())
             log['r_true'].append((p.H_fwd @ x[6:10])[2] - x[5])     # wz from wheels - body wz
             log['inj'].append(bool(inj is not None and inj.active(t_us * 1e-6)))
         if k == n_plant:
@@ -411,6 +435,37 @@ def metrics(log, t_from=0.0):
         out[f'rms_{ax}_encoder'] = float(np.sqrt(np.mean(e_fw[:, i] ** 2)))
     out['sat_frac'] = float(np.mean(np.abs(log['pwm'][m]) >= 1000))
     out['tv_duty'] = float(np.sum(np.abs(np.diff(d, axis=0))) / max(log['t'][m][-1] - log['t'][m][0], 1e-9))
+    return out
+
+
+def kep_indicator(log, t_end):
+    """PID integral clamp indicator "tick cham kep" of one simulate() log (spec S03 v8.6 section 2.1):
+      kep_n_vx, kep_n_vy, kep_n_wz            ticks of the window with the DLL flag of the axis set
+      kep_mau                                 ticks of the window with the motor on (log['en'] = 1): the denominator
+      kep_frac_vx, kep_frac_vy, kep_frac_wz   kep_n / kep_mau (NaN when kep_mau = 0)
+    Window: the O1 window [0, t_end] of the evaluator (o1_feasibility.evaluate_v7, o1_gate_eval.evaluate_fig8:
+    the ticks with t <= t_end + 1e-9); the log does not hold it, so the caller passes the evaluator's t_end.
+    ADRC: the DLL reports 0 on every tick, so every kep_n and kep_frac is 0 (kep_mau still counts the ticks).
+    ValueError: no kep channel (DLL without fwsim_kep_last), t_end not a finite number >= 0, a flag that is
+    not 0 / 1 or is set on a tick with the motor off, kep_lech set (the self-check of the DLL failed)."""
+    t, en = np.asarray(log['t'], dtype=float), np.asarray(log['en'], dtype=float)
+    kep = np.asarray(log.get('kep', []), dtype=float)
+    if kep.shape != (len(t), len(KEP_COLS)):
+        raise ValueError('log without the kep channel (KEP_COLS): fwsim.dll has no fwsim_kep_last, rebuild it')
+    if isinstance(t_end, bool) or not isinstance(t_end, (int, float, np.integer, np.floating)) \
+            or not math.isfinite(t_end) or t_end < 0:
+        raise ValueError(f't_end = {t_end!r}: the evaluator t_end, a finite number >= 0')
+    flag, on = kep[:, :3], en == 1
+    if not np.all((flag == 0) | (flag == 1)) or np.any(flag[~on] != 0):
+        raise ValueError('kep flag not 0 / 1, or set on a tick with the motor off')
+    if np.any(kep[:, KEP_COLS.index('kep_lech')] != 0):
+        raise ValueError('kep_lech set: the replay of fw_sim.c kep_step differs from the firmware PID state')
+    m = on & (t <= t_end + 1e-9)
+    mau = int(np.count_nonzero(m))
+    n = [int(np.count_nonzero(flag[m, i])) for i in range(3)]
+    out = {f'kep_n_{a}': n[i] for i, a in enumerate(('vx', 'vy', 'wz'))}
+    out['kep_mau'] = mau
+    out.update({f'kep_frac_{a}': n[i] / mau if mau else float('nan') for i, a in enumerate(('vx', 'vy', 'wz'))})
     return out
 
 
