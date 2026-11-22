@@ -1330,6 +1330,29 @@ def build_lich(session, session_sha, runs, u_so=None, u_so_sha=None, prev=None, 
                           version=md.SCHEDULE_VERSION))
 
 
+LICH_SCRIPT_FILES = ('tools/c7_measure.py', 'tools/c7_moc_dich.py', 'tools/c7_clip_probe.py')
+
+
+def script_state(files=LICH_SCRIPT_FILES):
+    """{file, commit, dirty} of the hil repo this file runs from (GATE v6_C8 section 23 limit, CODE 22/11: the gate
+    can then compare the commit of every lich.json): commit = HEAD; dirty = a change not committed in any file that
+    builds the schedule (files), or git not answering (dirty None, commit ''). Written OUTSIDE the hashed body, so
+    lich_sha256 and the fixed point do not depend on the checkout."""
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        top = subprocess.run(['git', '-C', here, 'rev-parse', '--show-toplevel'], capture_output=True, text=True,
+                             timeout=10)
+        c = subprocess.run(['git', '-C', here, 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=10)
+        if top.returncode != 0 or c.returncode != 0:
+            return dict(file=files[0], commit='', dirty=None)
+        st = subprocess.run(['git', '-C', top.stdout.strip(), 'status', '--porcelain', '--', *files],
+                            capture_output=True, text=True, timeout=10)
+        return dict(file=files[0], commit=c.stdout.strip(), dirty=bool(st.stdout.strip()) or st.returncode != 0)
+    except (OSError, subprocess.SubprocessError):
+        return dict(file=files[0], commit='', dirty=None)
+
+
 LICH_VERSION = 'c7_lich_v3'                  # v2 (Codex C33-5b): converged = repeated AND every comparator set computed;
                                              # v3 (Codex C8BU4-R3-1 of C8B): lich_sha256 hashes the clips (names, kinds,
                                              # dets sha, order), the final pass checks its run and detections
@@ -1837,6 +1860,7 @@ def main(argv=None):
             with open(os.path.join(a.out, 'tap_moc.json'), 'w', encoding='utf-8') as f:
                 json.dump(lich['tap_moc'], f, ensure_ascii=False)
             lich['tap_moc_file_sha256'] = sha256(os.path.join(a.out, 'tap_moc.json'))
+            lich['script'] = script_state()          # not hashed (lich_sha256 above), for the gate (v6_C8 section 23)
             with open(os.path.join(a.out, 'lich.json'), 'w', encoding='utf-8') as f:
                 json.dump(_json(lich), f, ensure_ascii=False, indent=1)
             print(f"lich buoc {len(lich['lap'])}: {lich['ket_luan']}; loai " +

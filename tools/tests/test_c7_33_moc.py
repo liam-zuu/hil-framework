@@ -466,6 +466,9 @@ def test_cli_track_lich_track(tmp_path, sess, spike_run, monkeypatch):
                         '--truoc', str(tmp_path / a / 'lich.json'), '--out', str(tmp_path / b)]) == 0
     L2 = json.loads((tmp_path / 'L2' / 'lich.json').read_text(encoding='utf-8'))
     assert L2['hoi_tu']
+    # GATE v6_C8 section 23 (CODE 22/11): the hil commit of lich, outside the hashed body
+    assert L2['script'] == cm.script_state() and set(L2['script']) == {'file', 'commit', 'dirty'}
+    assert L2['script']['file'] == 'tools/c7_measure.py' and len(L2['script']['commit']) == 40
     tap = json.loads((tmp_path / 'L2' / 'tap_moc.json').read_text(encoding='utf-8'))
     assert set(tap) == {'xe', '0', '1', '2', '3'} and all(isinstance(S, list) for v in tap.values() for S in v)
     # the final pass refuses a schedule not converged, another u_so, or other detections
