@@ -2148,6 +2148,45 @@ DK_KHOA = ('khoa_kiem_truoc_giu_ngoai', 'luat_giu_mask_theo_phan_do')   # D1, D4
 DK_FILE = {'kiem_yaw_theo_hieu_mien_quyet': 'c8b_a6_o_v1', 'kiem_vi_tri_rieng': 'c8b_kiem_vi_tri_v1'}   # D2, D3
 
 
+def _check_a6(d: dict, goc: str, khoa: dict) -> str:
+    """CODE 23/11 (A6 changed sha 2aa8c970 -> d6bef847 with the same numbers; nothing tied the A6 of F4, F8 and the
+    C8b lock together, only c7_chuoi_khung.q_luot per run): the C8b lock names one A6 (khoa_truoc.nguon, vai a6) and
+    every JSON file of a C8 session folder that states an A6 (a6_sha256, as F4 xoay_v1, F5, the scorings; a6.sha256,
+    as F8 lan_lap_v1) states that one. A superseded file is kept in a folder whose name starts with '_' (_archive:
+    the folder rule of the project), skipped here. Returns the A6 sha256."""
+    kt = khoa.get('khoa_truoc') if isinstance(khoa.get('khoa_truoc'), dict) else {}
+    a6s = [n.get('sha256') for n in kt.get('nguon') or [] if isinstance(n, dict) and n.get('vai') == 'a6']
+    if len(a6s) != 1 or not _hex64(a6s[0]):
+        raise GateFileError(f'khoa_c8b: khoa_truoc.nguon names {len(a6s)} A6 file(s) (vai a6); one needed, the A6 every '
+                            'F file of C8 must have used (CODE 23/11)')
+    want, bad = a6s[0], []
+    base = os.path.realpath(goc)
+    for f in sorted({_folder_of(t) for t in d['thu_tu_clip']}):
+        for root, dirs, names in os.walk(os.path.join(base, f)):
+            dirs[:] = sorted(x for x in dirs if not x.startswith('_'))
+            for n in sorted(names):
+                q = os.path.join(root, n)
+                if not n.lower().endswith('.json') or os.path.getsize(q) > INDEX_MAX_BYTES:
+                    continue
+                try:
+                    with open(q, 'rb') as fh:
+                        x = json.loads(fh.read().decode('utf-8'))
+                except (OSError, UnicodeDecodeError, ValueError):
+                    continue
+                if not isinstance(x, dict):
+                    continue
+                a6 = x.get('a6')
+                for field, v in (('a6_sha256', x.get('a6_sha256')),
+                                 ('a6.sha256', a6.get('sha256') if isinstance(a6, dict) else None)):
+                    if v is not None and v != want:
+                        bad.append(f'{os.path.relpath(q, base).replace(os.sep, "/")} {field} {str(v)[:12]}...')
+    if bad:
+        raise GateFileError(f'the C8b lock used the A6 {want[:12]}...; {len(bad)} file(s) of the C8 sessions name another '
+                            f'(a step made with another A6; CODE 23/11): {"; ".join(bad[:8])}'
+                            + (' ...' if len(bad) > 8 else '') + ' (a superseded file goes to an _archive folder)')
+    return want
+
+
 def _check_bang_chung(d: dict, goc: str, scorers: set) -> None:
     """The four evidence files of the U standard (CODE_C8B design v7 section 0, D1-D4; signature agreed with C8B
     19/11): D1 (locked before the held-out part) and D4 (rule 2b masks only G2, G3, G5 at 8) are the C8b lock itself
@@ -2248,7 +2287,8 @@ def check_nguon(d: dict, goc: str) -> dict:
     have = [(c['o'], c['muc'], c['controller']) for c in d['o_c8']]
     if sorted(plan) != sorted(have) or len(set(plan)) != len(plan):
         raise GateFileError(f'o_c8 cells {sorted(have)}: the plan locked before C8 has {sorted(plan)} (each once)')
-    _, t_c8b = _check_khoa_c8b(d, goc)
+    khoa, t_c8b = _check_khoa_c8b(d, goc)
+    _check_a6(d, goc, khoa)
     eligible, cham_luc, scorers, elig_seg = _check_runs_nguon(d, goc)
     # GC6-1 (round 3): the C8b lock (its khoa_truoc) before the first scoring of any C8 run
     if cham_luc and not t_c8b < min(cham_luc.values()):
