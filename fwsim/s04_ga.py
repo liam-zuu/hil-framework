@@ -6,8 +6,9 @@ O1 v7 (o1_feasibility.evaluate_v7 on the true plant pose, the same runs as S03: 
 Section numbers below are those of S04 v5.
   2   variables: the 7 S03 factors of the controller (s03_doe.FACTORS); fixed parameters as
       S03 2.1 (s03_doe.sim_kwargs: kd = 0, limits, b0, out_limit from the firmware). Domain =
-      the S03 levels [L, H] (levels.csv), not widened; a factor coded log in S03 is searched on
-      log(gain). A chosen gain within 5 % of the coded width from a bound is flagged.
+      the S03 levels [L, H] (S04 v6.7 section 9 item 6: sealed/levels_sangloc.csv of the S03
+      v8.5 screening, never the public levels.csv), not widened; a factor coded log in S03 is
+      searched on log(gain). A chosen gain within 5 % of the coded width from a bound is flagged.
       S04 v6.8: every candidate is checked against the range table of the campaign binary
       (tools/gain_table.py, float32) before it runs; an ADRC candidate outside the triangle
       omega_c + 2 omega_o < 200 is not run (penalty, status ngoai_bang).
@@ -46,8 +47,10 @@ Section numbers below are those of S04 v5.
       the 7 chosen gains, same speeds and mu as the GA, criterion of B0_SENS/2026-11-05_run01
       plus the tv_duty change in %; the three mu levels when the GA used the middle one only;
       the report-only measures. S04 v6.8: the selected gains against the range table /
-      triangle before HIL; G1-G5 read from the gate state columns; --phase sens_after:
-      loop-delay variant (io_delay_ms), report only.
+      triangle before HIL, plus the spectral radius of the linear sub-model of one
+      translation axis (tools/mo_hinh_con.py; report only, not a GA constraint); G1-G5 read
+      from the gate state columns; --phase sens_after: loop-delay variant (io_delay_ms) and
+      the four plant variants of S04 v6.1 section 6, report only.
   7   K1, K2 are never run; nothing here runs on the car.
   8   outputs in --out (columns controller, ga_seed): history.csv, evals.csv (key controller,
       ga_seed, gen, cand_id, v, mu, attempt), hv.csv, pareto.csv (the non-dominated points of
@@ -56,9 +59,11 @@ Section numbers below are those of S04 v5.
       fingerprint for the folder), trial/ (the trial phase), post_checks/.
 
 L56: the mu rule reads sealed/runs.csv of the S03 run, so --phase trial / main need
---s03-unsealed (campaign A finished, the S03 results may be looked at). --tool-check (tool test,
-never main numbers): takes an S03 --trial run (one mu, the mu rule is not applied, sealed/ is
-never read), any budget and seeds, no preconditions.
+--s03-unsealed (campaign A finished, the S03 results may be looked at). S04 v6.7 section 9
+item 6: the domain and the S03 design come from the sealed files of the S03 v8.5 screening
+(sealed/levels_sangloc.csv, sealed/design.csv); they are read in every mode, so --tool-check
+(tool test, never main numbers) takes an S03 --trial run (one mu, the mu rule is not applied),
+any budget and seeds, no preconditions.
 
   python fwsim/s04_ga.py --phase trial --controller PID --s03 <S03 run> --s03-unsealed \\
       --preconditions <json> --out 05_DATA/results/S04/<date>_runNN
@@ -96,6 +101,7 @@ _TOOLS = os.path.join(HERE, '..', 'tools')
 if _TOOLS not in sys.path:
     sys.path.insert(0, _TOOLS)
 import gain_table            # noqa: E402  (tools/: range table of the campaign binary, LADRC triangle)
+import mo_hinh_con           # noqa: E402  (tools/: S04 v6.8 section 6 sub-model spectral radius, report only)
 
 D = o1.D                      # m, O1 v7 (temporary)
 F1_TOL = 0.01                 # m, section 3 / 5 (convention, same as S03 5.2)
@@ -108,7 +114,7 @@ SEEDS = (1, 2, 3, 4, 5)
 PENALTY = 1e6                 # section 3: f1 = f2 = 1e6 for a run_error candidate
 SEED_ERR_LIMIT = 0.10         # section 3
 EDGE_FRAC = 0.05              # section 2
-SPEC = 'S04 v6.6 with v6.7 section 9 item 7 and v6.8 section 9 item 9 (06_SPECS/2026-11-05_Spec_S04_GA_chon_gain.md)'   # S83-2: one version line for every meta.yaml
+SPEC = 'S04 v6.6 with v6.7 section 9 items 6, 7 and v6.8 section 9 item 9 (06_SPECS/2026-11-05_Spec_S04_GA_chon_gain.md)'   # S83-2: one version line for every meta.yaml
 B0_FACTORS = (0.7, 0.85, 1.0, 1.15, 1.3)
 R_FACTORS = (0.8, 0.9, 1.0, 1.1, 1.2)
 REL_LIMIT = 0.5               # B0_SENS criterion: e_perp_max change > 50 %
@@ -131,9 +137,10 @@ THETA_MAX_DEG = og.THETA_MAX_DEG    # deg, G5 (O1 v11.8 3.5; S04 v6.2 g5)
 PEN_KEYS = ('e_perp_max', 'e_trk_max', 'e_bao_max', 'e_theta_cmd_max_deg')
 PEN_COLS = ['pen_' + k for k in PEN_KEYS]
 N_CONSTR = 5                  # g1 .. g5 (S04 v6.2)
+KEP_FRAC_COLS = ['kep_frac_vx', 'kep_frac_vy', 'kep_frac_wz']   # S03 v8.6 section 11 item 6: PID clamp, report only
 EVAL_COLS = ['controller', 'ga_seed', 'gen', 'cand_id', 'v', 'mu', 'attempt', 'status', 'completed', 'e_perp_max',
              'tv_duty', 'sat_frac', 't_end', 'e_theta_lane_max_deg', 'e_theta_cmd_max_deg', 'ds_absmax', 'e_trk_max',
-             'e_bao_max'] + PEN_COLS + ['log_sha256', 'cause', 'error']
+             'e_bao_max'] + PEN_COLS + KEP_FRAC_COLS + ['kep_note'] + ['log_sha256', 'cause', 'error']
 GATE_STATE_COLS = [f'{c}_state' for c in og.CONDS]   # g1_state .. g5_state of the gate scorer (o1_gate.gate)
 MU_RULE_GATE = ('g3', 'g4', 'g5')                    # S04 v6.2 section 3: states that must not change with mu
 GA_IO_DELAY_MS = 0            # S04 v6.8 section 6 / S03 v8.6 section 8 condition 12: the GA condition
@@ -144,6 +151,30 @@ DELAY_INT_TOL = 1e-9          # ms: a measured delay this close to a whole numbe
 SENS_AFTER_COLS = ['tool_check', 'controller', 'variant', 'io_delay_ms', 'baseline', 'v', 'mu', 'status',
                    'completed', 'e_perp_max', 'e_trk_max', 'e_bao_max', 'e_theta_cmd_max_deg'] + GATE_STATE_COLS + \
     ['tv_duty']
+# S04 v6.1 section 6 (RB-1): the plant variants of --phase sens_after (report only; K = motor_K and
+# motor_u0 are never changed). S01 basis: matlab/identification/s01_identify.m lines 23-24, 97
+# (J = K tau V / (R s), b = J / tau_coast), s01_derive_plant_params.py lines 13-16, 28
+# (Tc = (Tc/J) J; u0 = u_int - Tc R / (K V) so u0 does not change; Ts = K/R V (u_start - u0)),
+# rpi5/params.py lines 94-95.
+PLANT_COUPLED = ('J_wheels', 'motor_b', 'motor_Tc', 'motor_Ts')   # arrays scaled 1/k with motor_R x k
+PLANT_DERIVED = ('M_eff', 'M_eff_inv', 'traction_lam_max', 'adrc')   # recomputed by update_physical
+PLANT_VARIANTS = ('R0.8_JbTcTs', 'R1.25_JbTcTs', 'R0.82_only', 'Vbatt11.1')
+PLANT_VARIANTS_DEFS = {'R0.8_JbTcTs': 'motor_R x 0.8 and J_wheels, motor_b, motor_Tc, motor_Ts / 0.8',
+                       'R1.25_JbTcTs': 'motor_R x 1.25 and J_wheels, motor_b, motor_Tc, motor_Ts / 1.25',
+                       'R0.82_only': 'motor_R x 0.82, nothing else',
+                       'Vbatt11.1': 'V_batt = 11.1 V, nothing else'}
+PLANT_BASIS = ('S01 basis: matlab/identification/s01_identify.m lines 23-24, 97 (J = K tau V / (R s), '
+               'b = J / tau_coast); s01_derive_plant_params.py lines 13-16, 28 (Tc = (Tc/J) J; '
+               'u0 = u_int - Tc R / (K V) so u0 does not change; Ts = K/R V (u_start - u0)); '
+               'rpi5/params.py lines 94-95')
+PLANT_SENS_COLS = ['tool_check', 'controller', 'variant', 'baseline', 'v', 'mu', 'status', 'completed',
+                   'e_perp_max', 'e_trk_max', 'e_bao_max', 'e_theta_cmd_max_deg'] + GATE_STATE_COLS + \
+    ['tv_duty', 'plant_changed']
+# S04 v6.7 section 9 item 6 / section 8: the sealed files of the S03 v8.5 screening the fingerprint locks
+S03_SEALED_LOCK = ('sealed/levels_sangloc.csv', 'sealed/design.csv', 'sealed/sangloc/ket_qua.json',
+                   'sealed/sangloc_thu/so_dem.json')
+SO_GOC_META_KEY = 'screen_u'   # S03 v8.5 section 8 condition 9: meta.yaml key of the root number file record
+S03_SCREEN_SCRIPT = 'fwsim/s03_sangloc.py'   # the S03 screening script (written in parallel), compared too
 
 
 # ── small helpers ────────────────────────────────────────────────────────────────────
@@ -160,11 +191,24 @@ def meta_value(text, key):
     raise KeyError(key)
 
 
+def digest_sha(digest):
+    """SHA-256 of json.dumps({k: digest[k] for k in digest if k in fwsim.BIT_EXACT_KEYS}, sort_keys=True)
+    (S03 v8.6 section 11 item 6: the kep channel is not in the compared bits); a key that is neither in
+    BIT_EXACT_KEYS nor 'kep' -> ValueError."""
+    bad = [k for k in digest if k not in fwsim.BIT_EXACT_KEYS and k != 'kep']
+    if bad:
+        raise ValueError(f'log digest keys {bad} are not fwsim.BIT_EXACT_KEYS (or kep)')
+    return hashlib.sha256(json.dumps({k: digest[k] for k in digest if k in fwsim.BIT_EXACT_KEYS},
+                                     sort_keys=True).encode()).hexdigest()
+
+
 def log_sha(log):
-    """One SHA-256 of a log: of the s03_doe.log_digest of every array (bit for bit)."""
+    """'' for None else digest_sha(s3.log_digest(log)): hashed on fwsim.BIT_EXACT_KEYS only, so a log of a DLL
+    with the kep channel and of an older DLL without it give the same value (for a log without 'kep' it is
+    the value the old code gave); comparisons with runs of the old DLL are on those keys."""
     if log is None:
         return ''
-    return hashlib.sha256(json.dumps(s3.log_digest(log), sort_keys=True).encode()).hexdigest()
+    return digest_sha(s3.log_digest(log))
 
 
 def write_rows(path, rows, cols=None):
@@ -213,24 +257,84 @@ def hypervolume(points, ref):
 
 # ── domain and mu rule ───────────────────────────────────────────────────────────────
 
+def _domain_rows(s03_dir, ctrl):
+    """Levels rows of one controller from <s03>/sealed/levels_sangloc.csv (S04 v6.7 section 9 item 6: the
+    sealed levels file of the S03 v8.5 screening, the columns of levels.csv plus nguon_mien and ly_do; the
+    public levels.csv is never read). sys.exit when the file is missing (an S03 run before v8.5 cannot be
+    used) or when nguon_mien of the controller's rows is not one identical value in ('sang_loc', 'du_phong')."""
+    p = os.path.join(s03_dir, 'sealed', 'levels_sangloc.csv')
+    if not os.path.isfile(p):
+        sys.exit(f'{p} missing: no sealed/levels_sangloc.csv (the S03 v8.5 screening levels): an S03 run '
+                 f'before v8.5 cannot be used (S04 v6.7 section 9 item 6)')
+    rows = [r for r in read_csv(p) if r['controller'] == ctrl]
+    nguon = {(r.get('nguon_mien') or '') for r in rows}
+    if len(nguon) != 1 or next(iter(nguon)) not in ('sang_loc', 'du_phong'):
+        sys.exit(f'{p}: nguon_mien of every {ctrl} row must be the same value, one of (sang_loc, du_phong); '
+                 f'got {sorted(nguon)} (S04 v6.7 section 9 item 6)')
+    return rows
+
+
+def domain_source(s03_dir, ctrl):
+    """dict(nguon_mien=..., ly_do=...) of the controller domain (S04 v6.7 section 9 item 6): the identical
+    nguon_mien of its sealed levels rows, and the unique non-empty ly_do values joined by ' | ' ('' when
+    none). Same rows and refusals as read_domain (one shared helper)."""
+    rows = _domain_rows(s03_dir, ctrl)
+    ly = sorted({(r.get('ly_do') or '') for r in rows} - {''})
+    return dict(nguon_mien=rows[0]['nguon_mien'], ly_do=' | '.join(ly))
+
+
+def _du_phong_tran_exception(s03_dir, ctrl, name, row, H):
+    """S03 v8.6 section 3.1 rule (2), Codex C3-7 / C3-26: inside the du_phong refusal of read_domain, H above
+    the original grid end b is accepted exactly when ALL hold: H == b_n == T as binary64 (T = s3.ceiling; a
+    factor without a ceiling is not accepted), the H level source is TABLE_CEILING_SOURCE, b <= T and
+    b within s3.TRAN_RTOL of T, and the PUBLIC <s03>/sweep.csv holds at least one row of this controller and
+    factor with float(value) == H and every such row has tran == 'true' (rows with an empty value are
+    skipped; no sweep.csv = not accepted)."""
+    if (row.get('H_nguon') or '') != TABLE_CEILING_SOURCE:
+        return False
+    try:
+        T = s3.ceiling(ctrl, name)
+    except s3.S03Stop:
+        return False
+    try:
+        b, b_n = float(row.get('b')), float(row.get('b_n'))
+    except (TypeError, ValueError):
+        return False
+    if not (H == b_n == T and b <= T and math.isclose(b, T, rel_tol=s3.TRAN_RTOL)):
+        return False
+    p = os.path.join(s03_dir, 'sweep.csv')
+    if not os.path.isfile(p):
+        return False
+    hit = [r for r in read_csv(p)
+           if r['controller'] == ctrl and r['factor'] == name and (r.get('value') or '') != ''
+           and float(r['value']) == H]
+    return bool(hit) and all((r.get('tran') or '') == 'true' for r in hit)
+
+
 def read_domain(s03_dir, ctrl):
-    """[(name, L, H, scale)] of the controller from the S03 levels.csv (S03 order of FACTORS)."""
-    rows = [r for r in read_csv(os.path.join(s03_dir, 'levels.csv')) if r['controller'] == ctrl]
+    """[(name, L, H, scale, L_src, H_src, L_kiem, H_kiem)] of the controller from the S03
+    sealed/levels_sangloc.csv (S04 v6.7 section 9 item 6; S03 order of FACTORS)."""
+    rows = _domain_rows(s03_dir, ctrl)
     by = {r['factor']: r for r in rows}
+    nguon = rows[0]['nguon_mien']
     kiem = read_out_of_range(s03_dir, ctrl)
     out = []
     for n in s3.FACTORS[ctrl]:
         if n not in by:
-            sys.exit(f'{s03_dir}/levels.csv has no level for {ctrl} {n}')
+            sys.exit(f'{s03_dir}/sealed/levels_sangloc.csv has no level for {ctrl} {n}')
         L, H = float(by[n]['L']), float(by[n]['H'])
         if not L < H:
             sys.exit(f'{ctrl} {n}: L = {L} is not below H = {H} (S03 3.1 (ii))')
-        # S04 v6.6: the GA domain is [L, H] of the ORIGINAL grid (S03 v8.4 3.1); levels of S03 v8.3 (set on the
-        # extension) are refused
-        if (by[n].get('H_nguon') or '') == 'hết lưới nối' or ((by[n].get('b') or '') != '' and H > float(by[n]['b'])):
+        # S04 v6.6: the GA domain is [L, H] of the ORIGINAL grid (S03 v8.4 3.1); levels of S03 v8.3 (set on
+        # the extension) are refused. S04 v6.7 section 9 item 6: the refusal applies only to the 'du_phong'
+        # source (for 'sang_loc' H may exceed b, up to b_n); the C3-7 / C3-26 exception accepts H = T.
+        if nguon == 'du_phong' and (
+                (by[n].get('H_nguon') or '') == 'hết lưới nối'
+                or ((by[n].get('b') or '') != '' and H > float(by[n]['b'])
+                    and not _du_phong_tran_exception(s03_dir, ctrl, n, by[n], H))):
             sys.exit(f'{ctrl} {n}: H = {H} is set on the extension of the S03 grid (S03 v8.3 levels): S04 v6.6 needs '
                      f'the levels of S03 v8.4 (original grid only)')
-        # S04 v6.4 (C14-2): the source of each level, from the S03 levels.csv ('' for an S03 run before v8.3);
+        # S04 v6.4 (C14-2): the source of each level, from the S03 levels file ('' for an S03 run before v8.3);
         # v6.6: with the result of the out-of-range check on each side (S03 v8.4 kiem_ngoai_mien.csv, '' without it)
         out.append(dict(name=n, L=L, H=H, scale=by[n]['scale'], L_src=by[n].get('L_nguon') or '',
                         H_src=by[n].get('H_nguon') or '', L_kiem=kiem.get((n, 'L'), ''), H_kiem=kiem.get((n, 'H'), '')))
@@ -381,12 +485,13 @@ def mu_rule(s03_dir, ctrl, gate, mu_levels):
     # completeness and membership checks; the point_id list used is locked to 0..256
     runs = [r for r in read_csv(os.path.join(s03_dir, 'sealed', 'runs.csv'))
             if r['controller'] == ctrl and r['box'] in MU_RULE_BOXES]
-    design = [(r['point_id'], r['box']) for r in read_csv(os.path.join(s03_dir, 'design.csv'))
+    # S04 v6.7 section 9 item 6: the design of the screening, sealed/design.csv (never the public one)
+    design = [(r['point_id'], r['box']) for r in read_csv(os.path.join(s03_dir, 'sealed', 'design.csv'))
               if r['controller'] == ctrl and r['box'] in MU_RULE_BOXES]
     if not design or len(set(design)) != len(design):
-        sys.exit(f'{s03_dir}/design.csv: no or duplicate design points for {ctrl} (S04 3, S4C-5)')
+        sys.exit(f'{s03_dir}/sealed/design.csv: no or duplicate design points for {ctrl} (S04 3, S4C-5)')
     if set(design) != MU_RULE_POINTS:
-        sys.exit(f'{s03_dir}/design.csv: the {len(design)} centre / outer / inner points of {ctrl} are not '
+        sys.exit(f'{s03_dir}/sealed/design.csv: the {len(design)} centre / outer / inner points of {ctrl} are not '
                  f'point_id 0..256 with their boxes (S04 v6 section 9 item 4)')
     lo, mid, hi = mu_levels
     by, dup = {}, []
@@ -408,7 +513,7 @@ def mu_rule(s03_dir, ctrl, gate, mu_levels):
         if not any(math.isclose(v, g) for g in gate):
             continue
         if (pid, box) not in design:
-            sys.exit(f'{s03_dir}/sealed/runs.csv: {ctrl} point {pid} ({box}) not in design.csv (S4C-5)')
+            sys.exit(f'{s03_dir}/sealed/runs.csv: {ctrl} point {pid} ({box}) not in sealed/design.csv (S4C-5)')
         n += 1
         why = []
         if set(rs) != {lo, mid, hi}:
@@ -442,25 +547,29 @@ def mu_rule(s03_dir, ctrl, gate, mu_levels):
 
 # ── one candidate ────────────────────────────────────────────────────────────────────
 
+def require_classify():
+    """C3-25: the candidate check needs the classify() Verdict of tools/gain_table.py (the check() text
+    fallback is removed: the wording of a message is never a violation class). S03Stop when the module has
+    no callable classify; the callers that simulate turn it into sys.exit: nothing is simulated without
+    classify()."""
+    if not callable(getattr(gain_table, 'classify', None)):
+        raise s3.S03Stop('tools/gain_table.py has no callable classify(): the range-table / triangle check '
+                         'needs its Verdict (C3-25); nothing may be simulated without it')
+
+
 def gain_check(ctrl, g):
     """S04 v6.8 section 2 (S03 v8.6 2.1, 3.1b item 4): one gain set against the range table of the campaign
     binary and the LADRC triangle, on the float32 values the firmware gets. The check itself is in
-    tools/gain_table.py (never recomputed here; its warnings are not violations): the classify() Verdict
-    when the module has it (C3-11), else the texts of check(). Returns (table, triangle): the violations
-    of one gain against its own bounds and the other violations (ADRC: omega_c + 2 omega_o of an axis not
-    below 200). S03Stop for a gain set the table cannot read and for a PID violation that is not a bound
-    (PID has no triangle)."""
-    classify = getattr(gain_table, 'classify', None)
+    tools/gain_table.py (never recomputed here; its warnings are not violations): the classify() Verdict,
+    required (C3-25, no text fallback). Returns (table, triangle): the violations of one gain against its
+    own bounds and the other violations (ADRC: omega_c + 2 omega_o of an axis not below 200). S03Stop for a
+    gain set the table cannot read and for a PID violation that is not a bound (PID has no triangle)."""
+    require_classify()
     try:
-        if classify is not None:               # C3-11: the Verdict decides, never the wording of a message
-            v = classify(ctrl, dict(g))
-            table = list(v.vi_pham_bang) or ([] if v.trong_bang else ['outside the range table'])
-            other = list(v.vi_pham_tam_giac) or ([] if v.trong_tam_giac or not v.trong_bang
-                                                 else ['outside the LADRC triangle'])
-        else:                                  # a gain_table without classify(): the texts of check()
-            violations, _ = gain_table.check(ctrl, dict(g))
-            table = [v for v in violations if any(v.startswith(n + '=') for n in gain_table.NAMES[ctrl])]
-            other = [v for v in violations if v not in table]
+        v = gain_table.classify(ctrl, dict(g))
+        table = list(v.vi_pham_bang) or ([] if v.trong_bang else ['outside the range table'])
+        other = list(v.vi_pham_tam_giac) or ([] if v.trong_tam_giac or not v.trong_bang
+                                             else ['outside the LADRC triangle'])
     except ValueError as e:
         raise s3.S03Stop(f'{ctrl}: gain set {g!r} refused by tools/gain_table ({e})') from None
     if other and ctrl != 'ADRC':
@@ -505,13 +614,26 @@ class Evaluator:
                         # diagnosis only: s03_doe's evaluator; an s03_doe without e_bao_max gives pen_e_bao_max = 1
                         # here (an s03_doe that writes G1-G5, hil feat/s03-gate, has it; S3G-6)
                         self._rec(ga_seed, gen, cand, v, mu, 2, again['row'], None,
-                                  log_sha256=(hashlib.sha256(json.dumps(again['digest'], sort_keys=True).encode())
-                                              .hexdigest() if again.get('digest') else ''),
+                                  log_sha256=digest_sha(again['digest']) if again.get('digest') else '',
                                   **run_values(again['row'])[1])
                     except Exception as exc:  # noqa: BLE001
                         self._rec(ga_seed, gen, cand, v, mu, 2, dict(status='diagnosis_failed'), None,
                                   error=f'{type(exc).__name__}: {exc}', **run_values(dict(status='run_error'))[1])
         return score(rows, error)
+
+
+def kep_fields(ctrl, log, t_end):
+    """S03 v8.6 section 11 item 6: the PID integral clamp indicator ("tick cham kep") of one run log, the
+    three kep_frac_* of fwsim.kep_indicator and kep_note ''. Report only: it never changes status or score.
+    ADRC: three '' and kep_note ''. On a ValueError of kep_indicator: three '' and kep_note = the message."""
+    if ctrl == 'ADRC':
+        return dict(kep_frac_vx='', kep_frac_vy='', kep_frac_wz='', kep_note='')
+    try:
+        k = fwsim.kep_indicator(log, t_end)
+        return dict(kep_frac_vx=k['kep_frac_vx'], kep_frac_vy=k['kep_frac_vy'], kep_frac_wz=k['kep_frac_wz'],
+                    kep_note='')
+    except ValueError as e:
+        return dict(kep_frac_vx='', kep_frac_vy='', kep_frac_wz='', kep_note=str(e))
 
 
 def run_gate(fw, path, ctrl, g, v, mu):
@@ -533,7 +655,8 @@ def run_gate(fw, path, ctrl, g, v, mu):
     if val['run_bad'] == 1:
         raise RuntimeError(f"pose reset mid-run in fwsim ({val['run_bad_reason']})")
     row = {k: res[k] for k in s3.RUN_COLS[5:] if k in res}
-    row.update(pos_reset_mid=val['pos_reset_mid'], e_bao_max=res['e_bao_max'])
+    row.update(pos_reset_mid=val['pos_reset_mid'], e_bao_max=res['e_bao_max'],
+               **kep_fields(ctrl, log, res['t_end']))
     return row, log
 
 
@@ -834,16 +957,57 @@ def gate_states(res, frames, sch):
     return {f'{c}_state': gt[c]['state'] for c in og.CONDS}
 
 
-def run_custom(fw, path, ctrl, g, v, mu, b0_factor=1.0, r_factor=1.0, io_delay_ms=0):
+def apply_plant_variant(p, name):
+    """S04 v6.1 section 6 (RB-1): one plant variant applied to the plant parameter object, ONE
+    p.update_physical(...) call so the derived matrices are recomputed. motor_K and motor_u0 are never
+    changed. S01 basis: matlab/identification/s01_identify.m lines 23-24, 97 (J = K tau V / (R s),
+    b = J / tau_coast), s01_derive_plant_params.py lines 13-16, 28 (Tc = (Tc/J) J; u0 = u_int - Tc R / (K V)
+    so u0 does not change; Ts = K/R V (u_start - u0)), rpi5/params.py lines 94-95. Returns
+    dict(changed=[sorted keys of plant_dump that differ], expected=[primary keys], derived=[changed keys in
+    PLANT_DERIVED]); raises s3.S03Stop unless the changed keys are exactly the expected primary keys plus a
+    subset of PLANT_DERIVED (coupled: all of {motor_R} + PLANT_COUPLED; 'R0.82_only': only motor_R;
+    'Vbatt11.1': only V_batt)."""
+    if name not in PLANT_VARIANTS:
+        raise s3.S03Stop(f'unknown plant variant {name!r} (S04 v6.1 section 6: {PLANT_VARIANTS})')
+    before = plant_dump(p)
+    if name == 'R0.8_JbTcTs':
+        k = 0.8
+        p.update_physical(motor_R=p.motor_R * k, **{n: getattr(p, n) / k for n in PLANT_COUPLED})
+    elif name == 'R1.25_JbTcTs':
+        k = 1.25
+        p.update_physical(motor_R=p.motor_R * k, **{n: getattr(p, n) / k for n in PLANT_COUPLED})
+    elif name == 'R0.82_only':
+        p.update_physical(motor_R=p.motor_R * 0.82)
+    else:                                        # Vbatt11.1
+        p.update_physical(V_batt=11.1)
+    after = plant_dump(p)
+    changed = sorted(n for n in before if before[n] != after[n])
+    if name in ('R0.8_JbTcTs', 'R1.25_JbTcTs'):
+        expected = ['motor_R'] + list(PLANT_COUPLED)
+        ok = all(n in changed for n in expected) and set(changed) - set(expected) <= set(PLANT_DERIVED)
+    elif name == 'R0.82_only':
+        expected, ok = ['motor_R'], changed == ['motor_R']
+    else:
+        expected, ok = ['V_batt'], changed == ['V_batt']
+    if not ok:
+        raise s3.S03Stop(f'plant variant {name}: the changed plant parameters {changed} are not the expected '
+                         f'{expected} plus a subset of PLANT_DERIVED {PLANT_DERIVED} (S04 v6.1 section 6, RB-1)')
+    return dict(changed=changed, expected=expected, derived=[n for n in changed if n in PLANT_DERIVED])
+
+
+def run_custom(fw, path, ctrl, g, v, mu, b0_factor=1.0, r_factor=1.0, io_delay_ms=0, plant_variant=None):
     """s03_doe.run_one with b0 (LADRC) and / or motor R scaled; io_delay_ms = pure delay on the duty in 1 ms
-    steps (fwsim.simulate). The row is the gate evaluator summary (o1_gate_eval.evaluate_fig8, evaluate_v7
-    unchanged inside) plus the g1_state .. g5_state of the gate scorer (gate_states, S04 v6.7 9.7). Returns
-    (row, log, read-back, plant before/after)."""
+    steps (fwsim.simulate); plant_variant = one of PLANT_VARIANTS (apply_plant_variant, applied after
+    r_factor, before the `after` dump). The row is the gate evaluator summary (o1_gate_eval.evaluate_fig8,
+    evaluate_v7 unchanged inside) plus the g1_state .. g5_state of the gate scorer (gate_states, S04 v6.7
+    9.7). Returns (row, log, read-back, plant before/after)."""
     sch = o1.Schedule(v)
     p = fwsim.plant_params(argparse.Namespace(ground='traction', mu=mu))
     before = plant_dump(p)
     if r_factor != 1.0:
         p.update_physical(motor_R=p.motor_R * r_factor)
+    if plant_variant is not None:
+        apply_plant_variant(p, plant_variant)
     after = plant_dump(p)
     kw = s3.sim_kwargs(fw, ctrl, g)
     if ctrl == 'ADRC' and b0_factor != 1.0:
@@ -919,31 +1083,49 @@ def three_mu_findings(rows, ctrl):
 
 
 def submodel_spectral_radius(ctrl, g):
-    """S04 v6.8 section 6: spectral radius of the linear sub-model for the whole gain set (5 states for PID, 6 for
-    LADRC; one translation axis). TODO: not computed in this version (the sub-model module is written in another
-    task); returns None and the caller records that it was not computed."""
-    return None
+    """S04 v6.8 section 6: spectral radius of the linear sub-model for the whole gain set (tools/mo_hinh_con.py:
+    one translation axis without saturation and clamps; the retained states are those of ma_tran). The float,
+    or None when mo_hinh_con raises ValueError (a gain set it cannot read)."""
+    try:
+        return mo_hinh_con.ban_kinh_pho(ctrl, g)
+    except ValueError:
+        return None
 
 
 def pre_hil_check(ctrl, g):
     """S04 v6.8 section 6, before the selected gains go to HIL: inside the range table of the campaign binary
-    (float32) and, for LADRC, inside the triangle of each axis (gain_check, i.e. tools/gain_table.py). A
-    failure is reported (tell Liam); the gains are never chosen again here."""
+    (float32) and, for LADRC, inside the triangle of each axis (gain_check, i.e. tools/gain_table.py), plus the
+    spectral radius of the linear sub-model (mo_hinh_con.ban_kinh_pho_va_trang_thai; report only, NOT a GA
+    constraint). A failure is reported (tell Liam); the gains are never chosen again here. require_classify()
+    is called OUTSIDE the try: a missing classify() is a tool error, never a table violation."""
+    require_classify()                          # C3-25
     try:
         table, tri = gain_check(ctrl, g)
     except s3.S03Stop as e:
         table, tri = [str(e)], []
+    try:
+        m = mo_hinh_con.ban_kinh_pho_va_trang_thai(ctrl, g)
+        rho, state, kept, dropped = (m[k] for k in
+                                     ('ban_kinh_pho', 'trang_thai', 'bien_trang_thai', 'bien_bo'))
+        model = dict(G=m['G'], tau=m['tau'], T=m['T'], b0=m['b0'], module='tools/mo_hinh_con.py',
+                     sha256=s3.sha256_file(os.path.join(_TOOLS, 'mo_hinh_con.py')))
+        note = ('report only, not a GA constraint: linear sub-model of one translation axis without '
+                'saturation and clamps (tools/mo_hinh_con.py, Codex C3 round-1 note (a))')
+    except ValueError as e:
+        rho, state, kept, dropped, model = None, None, None, None, None
+        note = f'not computed: {e} (tools/mo_hinh_con.py; S04 v6.8 section 6)'
     return dict(ok=not table and not tri, in_table=not table, in_triangle=(not tri) if ctrl == 'ADRC' else None,
                 table_violations=table, triangle_violations=tri,
-                spectral_radius=submodel_spectral_radius(ctrl, g),
-                spectral_radius_note='TODO: not computed in this version (S04 v6.8 section 6)')
+                spectral_radius=rho, spectral_radius_state=state, spectral_radius_states=kept,
+                spectral_radius_dropped=dropped, spectral_radius_model=model, spectral_radius_note=note)
 
 
 CHO_LIAM_NOTE = ('S04 section 6: cho_liam not empty = tell Liam before HIL (post returns 2); the selected gains are '
-                 'kept, never chosen again here. It lists the pre-HIL check (range table, LADRC triangle) and the '
-                 'three-mu check (a run of the selected gains not passing G1-G5 at a mu level, gate state columns). '
-                 'Not in this list: the b0 / R sensitivity result '
-                 '(notes["<controller> b0_factor" / "<controller> r_factor"]["sensitive"])')
+                 'kept, never chosen again here. It lists the pre-HIL check (range table, LADRC triangle: check '
+                 'pre_hil), the spectral radius of the linear sub-model (check spectral_radius: rho >= 1, or rho '
+                 'not computable although the gains are inside the table), the three-mu check (a run of the '
+                 'selected gains not passing G1-G5 at a mu level, gate state columns: check three_mu) and the '
+                 'b0 / R sensitivity result (check b0_factor / r_factor: judge() says sensitive)')
 
 
 def post(a):
@@ -957,6 +1139,11 @@ def post(a):
     common = lock.get('common')
     if not common:
         sys.exit(f'{out}/lock.yaml has no common block (written by this script version): run a new folder')
+    check_s03_trial(common, 'post')             # S04 v6.7 9.6 (SL4-4): before anything under sealed/
+    try:
+        require_classify()                    # C3-25: nothing is simulated without classify()
+    except s3.S03Stop as e:
+        sys.exit(str(e))
     check_fingerprint(common, fingerprint(a.dll, common['s03_run'], unsealed=common.get('unsealed', False)),
                       'post')                                                         # S4C-2
     tc = common['tool_check']
@@ -976,6 +1163,16 @@ def post(a):
         if not ph['ok']:
             cho_liam.append(dict(controller=ctrl, check='pre_hil',
                                  reasons=ph['table_violations'] + ph['triangle_violations']))
+        # S04 v6.8 section 6 (report only, never a reselection): rho >= 1, or rho not computable although
+        # the set is inside the table, waits for Liam
+        if ph['spectral_radius_state'] == mo_hinh_con.KHONG_ON_DINH:
+            cho_liam.append(dict(controller=ctrl, check='spectral_radius',
+                                 reasons=[f'spectral radius {ph["spectral_radius"]!r} >= 1: the linear sub-model '
+                                          f'is not stable (tools/mo_hinh_con.py; S04 v6.8 section 6)']))
+        elif ph['spectral_radius'] is None and ph['in_table']:
+            cho_liam.append(dict(controller=ctrl, check='spectral_radius',
+                                 reasons=[f'spectral radius not computable although the gains are inside the '
+                                          f'range table: {ph["spectral_radius_note"]}']))
         mus, speeds = L['eval_mu'], L['speeds']
         key = (s['ga_seed'], s['gen'], s['cand_id'])
         ref = {(float(e['v']), float(e['mu'])): e['log_sha256'] for e in evals
@@ -983,7 +1180,7 @@ def post(a):
         jobs = [(ctrl, g, v, mu) for mu in mus for v in speeds]
         res = s3.run_in_new_process(a.dll, jobs, os.path.join(pc, '_work'))
         for (c, _, v, mu), r in zip(jobs, res):
-            got = hashlib.sha256(json.dumps(r['digest'], sort_keys=True).encode()).hexdigest() if r['digest'] else ''
+            got = digest_sha(r['digest']) if r['digest'] else ''
             det.append(dict(tool_check=tc, controller=ctrl, v=v, mu=mu, ga_log_sha256=ref.get((v, mu), ''),
                             new_process_log_sha256=got, equal=got != '' and got == ref.get((v, mu))))
         for kind, factors in (('b0_factor', B0_FACTORS if ctrl == 'ADRC' else ()), ('r_factor', R_FACTORS)):
@@ -1007,6 +1204,8 @@ def post(a):
             if rows:
                 sensitive, reasons = judge(rows, kind)
                 notes[f'{ctrl} {kind}'] = dict(sensitive=sensitive, reasons=reasons)
+                if sensitive:                 # S04 v6.8 section 6: a sensitive factor waits for Liam
+                    cho_liam.append(dict(controller=ctrl, check=kind, reasons=reasons))
                 sens += rows
         if len(mus) == 1:                       # section 6: the three mu when the GA used the middle one
             levels = lock['s03_mu_levels']
@@ -1053,9 +1252,15 @@ def post(a):
     if any(c['check'] == 'pre_hil' for c in cho_liam):
         print('TELL LIAM before HIL: selected gains outside the range table or the LADRC triangle (S04 v6.8 '
               'section 6); no reselection')
+    if any(c['check'] == 'spectral_radius' for c in cho_liam):
+        print('TELL LIAM before HIL: the spectral radius of the linear sub-model is >= 1 or not computable '
+              '(tools/mo_hinh_con.py; S04 v6.8 section 6; post_checks/notes.json cho_liam); no reselection')
     if any(c['check'] == 'three_mu' for c in cho_liam):
         print('TELL LIAM before HIL: the selected gains do not pass G1-G5 at a mu level of the three-mu check '
               '(S04 section 6; post_checks/notes.json cho_liam); no reselection')
+    if any(c['check'] in ('b0_factor', 'r_factor') for c in cho_liam):
+        print('TELL LIAM before HIL: the b0 / R sensitivity check reports a sensitive factor '
+              '(S04 v6.8 section 6; post_checks/notes.json cho_liam); no reselection')
     return 2 if cho_liam else 0
 
 
@@ -1078,13 +1283,14 @@ def delay_steps(measured_ms):
 
 def sens_after(a):
     """S04 v6.1 / v6.8 section 6, sensitivity check after selection, REPORT ONLY (never used to change or choose
-    gains): the loop-delay variant. The send_to_HIL gains read back from selected.csv run at the GA speeds and mu
-    with io_delay_ms = 0 (the GA condition, baseline rows) and the values of delay_steps(--io-delay-ms). Reported
-    per run: completed, e_perp_max, the G3-G5 values and the G1-G5 states of the gate (gate state columns),
-    tv_duty. Output only in <out>/sens_after/ (delay.csv, notes.json): phases.json, meta.yaml, lock.yaml and
-    post_checks/ are not written, so the inputs the RSM comparison hashes (section 12) do not change. The three
-    plant variants of S04 v6.1 section 6 (R with J, b, T_c, T_s; R alone x 0.82; battery 11.1 V) are not in this
-    script."""
+    gains): the loop-delay variant and the four plant variants of PLANT_VARIANTS (S04 v6.1 section 6, RB-1).
+    The send_to_HIL gains read back from selected.csv run at the GA speeds and mu with io_delay_ms = 0 and no
+    plant variant (the GA condition: one baseline run per (controller, mu, v), used for BOTH tables), the values
+    of delay_steps(--io-delay-ms) and each plant variant. Reported per run: completed, e_perp_max, the G3-G5
+    values and the G1-G5 states of the gate (gate state columns), tv_duty; plant.csv adds plant_changed (JSON
+    list of the changed plant keys). Output only in <out>/sens_after/ (delay.csv, plant.csv, plant_params.json,
+    notes.json): phases.json, meta.yaml, lock.yaml and post_checks/ are not written, so the inputs the RSM
+    comparison hashes (section 12) do not change."""
     out = a.out
     lock = json.load(open(os.path.join(out, 'lock.yaml'), encoding='utf-8'))
     sel = [r for r in read_csv(os.path.join(out, 'selected.csv')) if r['kind'] == 'send_to_HIL']
@@ -1094,6 +1300,11 @@ def sens_after(a):
     common = lock.get('common')
     if not common:
         sys.exit(f'{out}/lock.yaml has no common block (written by this script version): run a new folder')
+    check_s03_trial(common, 'sens_after')       # S04 v6.7 9.6 (SL4-4): before anything under sealed/
+    try:
+        require_classify()                    # C3-25: nothing is simulated without classify()
+    except s3.S03Stop as e:
+        sys.exit(str(e))
     check_fingerprint(common, fingerprint(a.dll, common['s03_run'], unsealed=common.get('unsealed', False)),
                       'sens_after')
     measured = getattr(a, 'io_delay_ms', None)
@@ -1102,7 +1313,19 @@ def sens_after(a):
     os.makedirs(d, exist_ok=True)
     t0 = time.time()
     fw, path = fwsim.FirmwareSim(a.dll), o1.Path8()
-    rows, notes = [], {}
+    rows, prows, notes, entries = [], [], {}, {}
+    for s in sel:                               # RB-1: every (eval mu, variant) of EVERY controller is
+        ctrl = s['controller']                  # declared valid BEFORE the first simulation of any of them
+        if s.get('feasible') != 'true':
+            continue
+        for mu in lock['controllers'][ctrl]['eval_mu']:
+            for name in PLANT_VARIANTS:
+                p = fwsim.plant_params(argparse.Namespace(ground='traction', mu=mu))
+                before = plant_dump(p)
+                nsub0 = fwsim.traction_nsub(p)
+                rep = apply_plant_variant(p, name)            # a changed-key mismatch stops (S03Stop)
+                entries[f'{ctrl} {name} mu={mu!r}'] = dict(before=before, after=plant_dump(p),
+                                                           slip_nsub=[nsub0, fwsim.traction_nsub(p)], **rep)
     for s in sel:
         ctrl = s['controller']
         if s.get('feasible') != 'true':
@@ -1112,20 +1335,41 @@ def sens_after(a):
         g = {n: float(s[n]) for n in s3.FACTORS[ctrl]}          # read back from the file (section 6)
         for mu in L['eval_mu']:
             for v in L['speeds']:
-                for k in [GA_IO_DELAY_MS] + [x for x in steps if x != GA_IO_DELAY_MS]:
+                base, _, _, _, _ = run_custom(fw, path, ctrl, g, v, mu, io_delay_ms=GA_IO_DELAY_MS)
+                rows.append(dict(tool_check=tc, controller=ctrl, variant='io_delay_ms',
+                                 io_delay_ms=GA_IO_DELAY_MS, baseline=True, v=v, mu=mu,
+                                 **{c: base[c] for c in SENS_AFTER_COLS[7:]}))
+                prows.append(dict(tool_check=tc, controller=ctrl, variant='baseline', baseline=True, v=v, mu=mu,
+                                  **{c: base[c] for c in PLANT_SENS_COLS[6:-1]}, plant_changed='[]'))
+                for k in [x for x in steps if x != GA_IO_DELAY_MS]:
                     res, _, _, _, _ = run_custom(fw, path, ctrl, g, v, mu, io_delay_ms=k)
                     rows.append(dict(tool_check=tc, controller=ctrl, variant='io_delay_ms', io_delay_ms=k,
-                                     baseline=k == GA_IO_DELAY_MS, v=v, mu=mu,
+                                     baseline=False, v=v, mu=mu,
                                      **{c: res[c] for c in SENS_AFTER_COLS[7:]}))
+                for name in PLANT_VARIANTS:
+                    res, _, _, before, after = run_custom(fw, path, ctrl, g, v, mu, plant_variant=name)
+                    prows.append(dict(tool_check=tc, controller=ctrl, variant=name, baseline=False, v=v, mu=mu,
+                                      **{c: res[c] for c in PLANT_SENS_COLS[6:-1]},
+                                      plant_changed=json.dumps(sorted(k for k in before
+                                                                      if before[k] != after[k]))))
     write_rows(os.path.join(d, 'delay.csv'), rows, SENS_AFTER_COLS)
+    write_rows(os.path.join(d, 'plant.csv'), prows, PLANT_SENS_COLS)
+    with open(os.path.join(d, 'plant_params.json'), 'w', encoding='utf-8') as f:
+        json.dump(dict(note='every attribute of the plant parameters used, before and after the variant '
+                            '(one entry per controller, variant and eval mu; the same for every speed); '
+                            'slip_nsub = [before, after] of fwsim.traction_nsub',
+                       definitions=PLANT_VARIANTS_DEFS, entries=entries), f, indent=1, default=str)
     with open(os.path.join(d, 'notes.json'), 'w', encoding='utf-8') as f:
         json.dump(dict(tool_check=tc, report_only=True, variant='io_delay_ms', measured_io_delay_ms=measured,
                        io_delay_ms_run=steps, rule=rule, baseline_io_delay_ms=GA_IO_DELAY_MS,
-                       not_in_this_script='the three plant variants of S04 v6.1 section 6 (R x 0.8 / x 1.25 with J, '
-                                          'b, T_c, T_s; R x 0.82 alone; battery 11.1 V)',
+                       variants=['io_delay_ms'] + list(PLANT_VARIANTS), plant_variants=PLANT_VARIANTS_DEFS,
+                       plant_basis=PLANT_BASIS,
+                       when='after the seal is opened (S04 section 6); report only; the script cannot check '
+                            'the seal',
                        notes=notes, elapsed_s=round(time.time() - t0), script=s3.git_state(os.path.join(HERE, '..')),
                        dll_sha256=s3.sha256_file(a.dll)), f, indent=1, default=str)
-    print(f'sensitivity after selection (report only) -> {d}; io_delay_ms {steps} ({rule}); tool_check {tc}')
+    print(f'sensitivity after selection (report only) -> {d}; io_delay_ms {steps} ({rule}), plant variants '
+          f'{PLANT_VARIANTS}; tool_check {tc}')
     return 0
 
 
@@ -1136,7 +1380,8 @@ def main():
     ap.add_argument('--phase', required=True, choices=('trial', 'main', 'post', 'sens_after'))
     ap.add_argument('--out', required=True)
     ap.add_argument('--controller', choices=s3.CONTROLLERS)
-    ap.add_argument('--s03', help='S03 run folder (levels.csv, meta.yaml, sealed/runs.csv)')
+    ap.add_argument('--s03', help='S03 run folder (meta.yaml, levels.csv, sealed/levels_sangloc.csv, '
+                                  'sealed/design.csv, sealed/runs.csv)')
     ap.add_argument('--s03-unsealed', action='store_true',
                     help='campaign A has ended (L56): the S03 results may be read for the mu rule')
     ap.add_argument('--preconditions', help='JSON {condition: where checked} for the trial (S04 4.3)')
@@ -1174,7 +1419,13 @@ def main():
         sys.exit('--gen-base must be in 1 .. --gen-max')
     ctrl = a.controller
     s03_meta = open(os.path.join(a.s03, 'meta.yaml'), encoding='utf-8').read()
-    s03_trial = meta_value(s03_meta, 'trial') in (True, 'true')
+    try:
+        s03_trial = meta_value(s03_meta, 'trial') in (True, 'true')
+    except KeyError:
+        s03_trial = False                            # a missing trial line counts as not trial
+    if a.tool_check and not s03_trial:               # S04 v6.7 9.6 (SL4-4): BEFORE anything under sealed/
+        sys.exit(f'--tool-check takes an S03 --trial run; {a.s03} is not one (trial: true): nothing under '
+                 f'sealed/ is read for a tool check')
     s03_mu = [float(m) for m in meta_value(s03_meta, 'mu_levels')]
     if meta_value(s03_meta, 'status') != 'ran to the end':
         sys.exit(f'S03 run {a.s03} did not run to the end')
@@ -1192,13 +1443,21 @@ def main():
     dom = read_domain(a.s03, ctrl)
     mu_mid = s03_mu[len(s03_mu) // 2]
     lock_path = os.path.join(a.out, 'lock.yaml')
+    try:
+        require_classify()                    # C3-25: nothing is simulated without classify()
+    except s3.S03Stop as e:
+        sys.exit(str(e))
     fw = fwsim.FirmwareSim(a.dll)
+    if ctrl == 'PID' and not getattr(fw, 'kep_cols', 0):
+        sys.exit('the DLL has no kep channel (fwsim_kep_cols = 0): a DLL without the clamp export of S03 v8.6 '
+                 'section 11 item 6 (c) cannot run S04; rebuild it')
     if fw.build_info.get('esp32', {}).get('dirty', True):
         print('WARNING: fwsim.dll was built from a dirty firmware tree; not usable as a main result')
     import pymoo
     t0 = time.time()
 
     fp = fingerprint(a.dll, a.s03, unsealed=a.s03_unsealed and not a.tool_check)
+    check_s03_sealed(fp, a.tool_check)            # S04 v6.7 section 8
     src_diff = check_s03_source(s03_meta, fp, a.dll, a.tool_check)   # S4C-2: the source the S03 run used
 
     if a.phase == 'trial':
@@ -1230,14 +1489,15 @@ def main():
                 sys.exit(f'S04 4.3: preconditions without "where checked" (a non-empty text): {miss}')
         if a.tool_check:
             decision, report = 'mid', dict(note='tool check: mu rule not applied, the S03 run has one mu level '
-                                                 'or sealed/ is not read (L56)')
+                                                 'or sealed/runs.csv is not read (L56)')
         else:
             decision, report = mu_rule(a.s03, ctrl, gate, s03_mu)
         eval_mu = [mu_mid] if decision == 'mid' else list(s03_mu)
         os.makedirs(tdir, exist_ok=True)
         L_new = dict(tool_check=a.tool_check, domain=dom, s03_run=os.path.abspath(a.s03), speeds=gate, eval_mu=eval_mu,
                      mu_decision=decision, mu_rule_report=report, pop=a.pop, gen_rule=dict(base=a.gen_base, max=a.gen_max),
-                     seeds=list(a.seeds or SEEDS), preconditions=pre, n_gen='set by this trial (S04 4.3)')
+                     seeds=list(a.seeds or SEEDS), preconditions=pre, n_gen='set by this trial (S04 4.3)',
+                     **domain_source(a.s03, ctrl))                # nguon_mien, ly_do (S04 v6.7 9.6)
         # S4C-12: the root meta.yaml holds the locked items and the pymoo reading before the GA runs
         write_root_meta(a.out, a.dll, dict(lock, controllers=dict(lock['controllers'], **{ctrl: L_new})),
                         running=f'trial {ctrl}')
@@ -1304,8 +1564,10 @@ def main():
                 or L['seeds'] != list(SEEDS):
             sys.exit(f'{ctrl}: lock.yaml does not hold the S04 4.2-4.3 budget, seeds and preconditions '
                      f'(missing {miss}): not a main-run lock')
-    if dom != L['domain'] or gate != L['speeds'] or os.path.abspath(a.s03) != L['s03_run']:
-        sys.exit('the domain, gate speeds or S03 run differ from lock.yaml (S04 7: locked before the main runs)')
+    if dom != L['domain'] or gate != L['speeds'] or os.path.abspath(a.s03) != L['s03_run'] \
+            or domain_source(a.s03, ctrl) != {k: L.get(k) for k in ('nguon_mien', 'ly_do')}:
+        sys.exit('the domain, its source, gate speeds or S03 run differ from lock.yaml (S04 7: locked before '
+                 'the main runs)')
     seeds = list(a.seeds or L['seeds'])
     if not a.tool_check and seeds != L['seeds']:
         sys.exit('seeds differ from lock.yaml')
@@ -1373,10 +1635,12 @@ def pymoo_file_hashes():
 
 def fingerprint(dll, s03_dir, unsealed=False):
     """S4C-2: what must not change between the trial, the main runs and the post checks of one folder
-    (S04 7): the DLL, the S03 files the domain and the mu rule come from (v6.6: kiem_ngoai_mien.csv too; sealed/runs.csv only with
-    --s03-unsealed, L56), the plant source blobs (L34), the Python sources the simulation and the
-    scoring import (SOURCES), D, the library versions and the pymoo files of PYMOO_CV."""
-    names = ('meta.yaml', 'levels.csv', 'design.csv') + (('sealed/runs.csv',) if unsealed else ())
+    (S04 7): the DLL, the S03 files the domain and the mu rule come from (v6.6: kiem_ngoai_mien.csv too;
+    v6.7 9.6: the four sealed files of S03_SEALED_LOCK and the root number file so_goc; sealed/runs.csv
+    only with --s03-unsealed, L56; the root design.csv is not hashed, the sealed one is), the plant source
+    blobs (L34), the Python sources the simulation and the scoring import (SOURCES), D, the library
+    versions and the pymoo files of PYMOO_CV."""
+    names = ('meta.yaml', 'levels.csv', 'sweep.csv') + S03_SEALED_LOCK + (('sealed/runs.csv',) if unsealed else ())
     s03_files = {}
     for n in names:
         p = os.path.join(s03_dir, n)
@@ -1386,7 +1650,71 @@ def fingerprint(dll, s03_dir, unsealed=False):
     root = os.path.join(HERE, '..')
     scripts = {n: s3.sha256_file(os.path.join(root, n)) for n in SOURCES}
     return dict(dll_sha256=s3.sha256_file(dll), s03_files=s03_files, plant_src=fwsim.PLANT_SRC, scripts=scripts, D=D,
-                libraries=fwsim.lib_versions(), pymoo_files=pymoo_file_hashes())
+                libraries=fwsim.lib_versions(), pymoo_files=pymoo_file_hashes(), so_goc=so_goc(s03_dir))
+
+
+def so_goc(s03_dir):
+    """S03 v8.5 section 8 condition 9: the root number file the S03 screening recorded in its public
+    meta.yaml under the SO_GOC_META_KEY line 'screen_u: {"file": "<path>", "sha256": "<hex>", ...}'.
+    The meta key name and the record shape are this script's choice (the spec does not fix them; the
+    screening script is written in parallel): one constant holds them. No such line -> None; a record
+    that is not a dict with str 'file' and 'sha256' -> sys.exit. A relative file is relative to the repo
+    root; a missing file -> sys.exit. The bytes and their CRLF->LF form are both hashed: accepted when
+    rec['sha256'] equals either, or rec.get('sha256_lf') equals the LF hash; else sys.exit ("not the
+    number file the S03 run recorded"). Returns dict(file=..., s03_sha256=..., sha256_lf=<LF hash>)."""
+    meta = open(os.path.join(s03_dir, 'meta.yaml'), encoding='utf-8').read()
+    try:
+        rec = meta_value(meta, SO_GOC_META_KEY)
+    except KeyError:
+        return None
+    if not isinstance(rec, dict) or not isinstance(rec.get('file'), str) \
+            or not isinstance(rec.get('sha256'), str):
+        sys.exit(f'{s03_dir}/meta.yaml: {SO_GOC_META_KEY} is {rec!r}, not a dict with str "file" and '
+                 f'"sha256" (S03 v8.5 section 8 condition 9)')
+    p = rec['file'] if os.path.isabs(rec['file']) else os.path.join(HERE, '..', rec['file'])
+    if not os.path.isfile(p):
+        sys.exit(f'{SO_GOC_META_KEY} file {p} (meta.yaml of {s03_dir}) does not exist: not the number file '
+                 f'the S03 run recorded (S03 v8.5 section 8 condition 9)')
+    raw = open(p, 'rb').read()
+    h = hashlib.sha256(raw).hexdigest()
+    h_lf = hashlib.sha256(raw.replace(b'\r\n', b'\n')).hexdigest()
+    if rec['sha256'] not in (h, h_lf) and rec.get('sha256_lf') != h_lf:
+        sys.exit(f'{p}: not the number file the S03 run recorded (meta.yaml {SO_GOC_META_KEY} sha256 '
+                 f'{rec["sha256"][:12]}…, file {h[:12]}…; S03 v8.5 section 8 condition 9)')
+    return dict(file=rec['file'], s03_sha256=rec['sha256'], sha256_lf=h_lf)
+
+
+def check_s03_sealed(fp, tool_check):
+    """S04 v6.7 section 8: the S03 files the sealed lock needs. tool_check: only sealed/levels_sangloc.csv
+    and sealed/design.csv (the domain and the design are read in every mode). Else: every entry of
+    S03_SEALED_LOCK and the root number file so_goc. sys.exit on a missing one (fingerprint holds None)."""
+    need = ('sealed/levels_sangloc.csv', 'sealed/design.csv') if tool_check else S03_SEALED_LOCK
+    miss = [n for n in need if fp['s03_files'].get(n) is None]
+    if not tool_check and fp.get('so_goc') is None:
+        miss.append(f'so_goc (meta.yaml {SO_GOC_META_KEY})')
+    if miss:
+        sys.exit(f'missing S03 sealed inputs {miss}: the S03 v8.5 screening files are needed '
+                 f'(S04 v6.7 section 8)')
+
+
+def check_s03_trial(common, phase):
+    """S04 v6.7 section 9 item 6 (SL4-4): post() and sens_after() check the S03 run of the lock before
+    fingerprint() opens anything under sealed/. Reads the PUBLIC <common.s03_run>/meta.yaml only. A tool_check
+    lock: the S03 run must be --trial (trial: true; a missing trial line counts as not trial). A main lock:
+    the S03 run must not be trial and common.unsealed must be true. sys.exit else."""
+    meta = open(os.path.join(common['s03_run'], 'meta.yaml'), encoding='utf-8').read()
+    try:
+        trial = meta_value(meta, 'trial') in (True, 'true')
+    except KeyError:
+        trial = False                            # a missing trial line counts as not trial
+    if common['tool_check']:
+        if not trial:
+            sys.exit(f'{phase}: the lock is a --tool-check run but {common["s03_run"]} is not an S03 --trial '
+                     f'run (trial: true): nothing under sealed/ may be read for a tool check '
+                     f'(S04 v6.7 section 9 item 6)')
+    elif trial or not common.get('unsealed'):
+        sys.exit(f'{phase}: the lock is a main run; it needs the main S03 run (not --trial) unsealed by '
+                 f'--s03-unsealed (L56; S04 v6.7 section 9 item 6)')
 
 
 def s03_dll_sha(s03_meta):
@@ -1418,14 +1746,24 @@ def blob_at(commit, path):
     return out if r.returncode == 0 and len(out) == 40 else None
 
 
-SIM_SOURCES = tuple(n for n in SOURCES if n != 'fwsim/s04_ga.py')   # what S03 also ran (S4C-2, round 4)
+SIM_SOURCES = SOURCES + (S03_SCREEN_SCRIPT,)   # S4C-2 round 4 + S04 v6.7 9.6: this script and the screening
+                                               # script are compared too; SOURCES itself stays unchanged
+                                               # (fingerprint 'scripts' is unchanged)
+
+
+def work_blob(rel):
+    """git_blob of the WORKING-TREE file <rel> (repo-root relative), None when the file does not exist
+    (fwsim/s03_sangloc.py is written in parallel)."""
+    p = os.path.join(HERE, '..', rel)
+    return git_blob(p) if os.path.isfile(p) else None
 
 
 def source_diff(commit):
-    """The SIM_SOURCES whose working-tree blob is not the blob at <commit>: [(path, now, then)]."""
+    """The SIM_SOURCES whose working-tree blob is not the blob at <commit>: [(path, now, then)]; a path is
+    reported when then is None or now != then (a script missing at the S03 commit is reported)."""
     out = []
     for n in SIM_SOURCES:
-        now, then = git_blob(os.path.join(HERE, '..', n)), blob_at(commit, n)
+        now, then = work_blob(n), blob_at(commit, n)
         if then is None or now != then:
             out.append((n, now, then))
     return out
@@ -1436,8 +1774,9 @@ def check_s03_source(s03_meta, fp, dll, tool_check=False):
     S03 meta.yaml at every trial and main start, so the first trial cannot lock a source S03 did not
     use (later phases compare with lock.yaml). By class, not file by file: the DLL
     (firmware.dll_sha256), the plant blobs (plant.src, L34), the run configuration S03 wrote (o1, imu)
-    and every module S04 imports for the simulation and the scoring except this script
-    (SIM_SOURCES: the blob in this checkout against the blob at the S03 script commit, which must be
+    and every module S04 imports for the simulation and the scoring, this script and the screening
+    script fwsim/s03_sangloc.py included (S04 v6.7 section 9 item 6;
+    SIM_SOURCES: the blob in this checkout against the blob at the S03 script commit, which must be
     clean). A main run stops on any difference, so the S03 main run is run from the commit S04 runs
     on (L34: one merged commit). --tool-check stops on the DLL, plant, configuration and commit, and
     only warns about SIM_SOURCES; the differences are returned and written to lock.yaml and meta.yaml
@@ -1514,9 +1853,9 @@ def write_root_meta(out, dll, lock, running=None):
     common = lock.get('common', {})
     ctrls = {}
     for c, L in lock.get('controllers', {}).items():
-        ctrls[c] = {k: L.get(k) for k in ('tool_check', 'domain', 'speeds', 'eval_mu', 'mu_decision', 'mu_rule_report',
-                                          'pop', 'n_gen', 'gen_rule', 'seeds', 'hv_ref', 'preconditions',
-                                          'stop')}
+        ctrls[c] = {k: L.get(k) for k in ('tool_check', 'domain', 'nguon_mien', 'ly_do', 'speeds', 'eval_mu',
+                                          'mu_decision', 'mu_rule_report', 'pop', 'n_gen', 'gen_rule', 'seeds',
+                                          'hv_ref', 'preconditions', 'stop')}
         ctrls[c]['plant_by_mu'] = {repr(m): json.loads(fwsim.plant_meta(fwsim.plant_params(
             argparse.Namespace(ground='traction', mu=m)))) for m in (L.get('eval_mu') or [])}
     lines = dict(spec=SPEC, date=time.strftime('%Y-%m-%d'),
@@ -1603,10 +1942,13 @@ interpretations:   # of this script, not written in S04 v5; Liam or THESIS corre
   - "gains stored as Python repr (17 significant digits) and as the float32 value the firmware receives (fwsim set_pid / set_adrc take c_float)"
   - "g3-g5 (S04 v6.2, R134 package): e_bao_max of o1_gate_eval.evaluate_fig8 (evaluate_v7 unchanged inside); the diagnosis attempt 2 of a run_error runs s03_doe's evaluator in a new process (diagnosis only; pen_e_bao_max = 1 when that s03_doe writes no e_bao_max); a candidate with a run_error takes 1e6 for every quantity as for f1"
   - "S04 v6.7 9.7: the post checks read G1-G5 from the gate state columns (o1_gate.gate called as s03_doe.run_one calls it: U = 0, every condition deciding): run_custom scores with o1_gate_eval.evaluate_fig8 and the gate; sensitive when a G3, G4 or G5 state changes; three_mu.csv and sensitivity.csv carry g1_state .. g5_state; a three-mu run passes only with status ok and the five states dat"
-  - "S04 v6.8 2: every candidate is checked by tools/gain_table.py (gain_check) before it runs (float32 values): a gain outside the range table stops the run (tool error); an ADRC candidate outside the triangle is not run: penalty of a run_error candidate, status ngoai_bang in history.csv, no evals.csv row (so in neither part of the seed error rate), n_runs 0, pen_f1 1; the number per seed is n_ngoai_bang_per_seed of meta_<controller>.yaml; what counts as a table or a triangle violation is decided by tools/gain_table.py alone: its classify() Verdict when the module has it (C3-11), else the texts of check() (its warnings are not violations); C3-10: a seed whose candidates were all ngoai_bang has no evals.csv row and is reported in seed_error_rates with n 0 and rate null"
+  - "S04 v6.8 2: every candidate is checked by tools/gain_table.py (gain_check) before it runs (float32 values): a gain outside the range table stops the run (tool error); an ADRC candidate outside the triangle is not run: penalty of a run_error candidate, status ngoai_bang in history.csv, no evals.csv row (so in neither part of the seed error rate), n_runs 0, pen_f1 1; the number per seed is n_ngoai_bang_per_seed of meta_<controller>.yaml; what counts as a table or a triangle violation is decided by tools/gain_table.py alone: its classify() Verdict (C3-11; C3-25: required, the check() text fallback is removed - a module without callable classify() is a tool error and nothing is simulated); C3-10: a seed whose candidates were all ngoai_bang has no evals.csv row and is reported in seed_error_rates with n 0 and rate null"
   - "S04 v6.7 3: a run that is not a run_error but has tv_duty missing or not finite is recorded with status run_error and the reason in error (its other fields kept), then treated as any run_error (diagnosis rerun, candidate penalty, seed error rate)"
-  - "S04 v6.8 6: before HIL (post) the selected gains are checked against the range table and the triangle (post_checks/notes.json '<controller> pre_hil', copied to meta.yaml pre_hil; a failure is reported with exit code 2, no reselection); the spectral radius of the sub-model is not computed in this version (TODO, null); C3-8: a run of the three-mu check that does not pass G1-G5 (three mu levels, check done) is listed with the pre-HIL failures in post_checks/notes.json cho_liam, and post then returns 2 as well (no reselection)"
-  - "S04 v6.8 6: --phase sens_after (sensitivity check after selection, report only) has only the loop-delay variant (io_delay_ms; --io-delay-ms is the measured bench delay: not whole -> rounding down and up, within 1e-9 ms of a whole number -> that number; not given -> 1 and 2 ms) plus io_delay_ms 0 as baseline rows; output in sens_after/ only (phases.json, meta.yaml, post_checks/ not written); the three plant variants of S04 v6.1 6 are not in this script; the GA, the trial and the post checks run with io_delay_ms = 0 and slip_omega_s = 0.1 (run_gate stops on another slip_omega_s)"
+  - "S04 v6.8 6: before HIL (post) the selected gains are checked against the range table and the triangle (post_checks/notes.json '<controller> pre_hil', copied to meta.yaml pre_hil; a failure is reported with exit code 2, no reselection); the same entry holds the spectral radius of the linear sub-model of one translation axis (tools/mo_hinh_con.ban_kinh_pho_va_trang_thai, with the kept and dropped states and the model parameters and file hash): report only, NOT a GA constraint, but rho >= 1 (or not computable although the set is inside the table) is a cho_liam item 'spectral_radius'; C3-8: a run of the three-mu check that does not pass G1-G5 (three mu levels, check done) is a cho_liam item 'three_mu'; a sensitive b0_factor / r_factor result of judge() is a cho_liam item under its own check name; cho_liam not empty -> post returns 2 (no reselection)"
+  - "S04 v6.8 6 / v6.1 6 (RB-1): --phase sens_after (sensitivity check after selection, report only) runs the loop-delay variant (io_delay_ms; --io-delay-ms is the measured bench delay: not whole -> rounding down and up, within 1e-9 ms of a whole number -> that number; not given -> 1 and 2 ms) and the four plant variants of PLANT_VARIANTS (apply_plant_variant, ONE update_physical call per variant, the changed keys checked against the declared ones); one baseline run (io_delay_ms 0, no variant) per (controller, mu, v) serves both delay.csv and plant.csv; plant_params.json holds the before/after dumps and slip_nsub; output in sens_after/ only (phases.json, meta.yaml, post_checks/ not written); the GA, the trial and the post checks run with io_delay_ms = 0 and slip_omega_s = 0.1 (run_gate stops on another slip_omega_s)"
+  - "S04 v6.7 9.6: the GA domain and the S03 design come from the SEALED files of the S03 v8.5 screening (sealed/levels_sangloc.csv with nguon_mien, ly_do; sealed/design.csv), never the public levels.csv / design.csv; the v6.6 original-grid refusal applies only to nguon_mien 'du_phong' ('sang_loc' may reach b_n); inside it, the C3-7 / C3-26 exception accepts H = T = b_n when the sweep.csv rows at H are all tran 'true' (S03 v8.6 3.1 rule (2)); lock.yaml holds nguon_mien / ly_do and the main phase stops when they differ; --tool-check still takes an S03 --trial run but now reads the two sealed files it needs (checked before anything under sealed/ is opened)"
+  - "S04 v6.7 8 / S03 v8.5 8 (9): the fingerprint locks meta.yaml, levels.csv, sweep.csv, the four files of S03_SEALED_LOCK (None when missing), sealed/runs.csv when unsealed and kiem_ngoai_mien.csv, plus so_goc: the root number file the S03 meta.yaml records under 'screen_u' (a dict file / sha256 / optional sha256_lf; key name and record shape are this script's choice, the screening script is written in parallel); its bytes or their CRLF->LF form must hash to the recorded sha256; check_s03_sealed needs all five sealed items for a main run, two for --tool-check; check_s03_source also compares the blobs of this script and of fwsim/s03_sangloc.py (a script missing at the S03 commit is reported)"
+  - "S03 v8.6 11.6: the PID integral clamp indicator (fwsim.kep_indicator) is report only: evals.csv adds kep_frac_vx, kep_frac_vy, kep_frac_wz, kep_note (ADRC rows '' / ''); a kep_indicator ValueError only fills kep_note (status and score unchanged); a PID run on a DLL without the kep channel (fwsim_kep_cols = 0) stops in main() before the GA; log_sha hashes only fwsim.BIT_EXACT_KEYS (digest_sha), so a log with and without the 'kep' array gives the same value"
 """)
 
 

@@ -850,13 +850,21 @@ def inside(g, L, H):
     return bool(math.isfinite(g) and L - tol <= g <= H + tol)
 
 
+S03_INBOX_LEVELS = os.path.join('sealed', 'levels_sangloc.csv')   # S04 v6.7 9.6: B's domain is the sealed file
+
+
 def cmd_inbox(a):
-    """After the S03 main run: is each witness inside the [L, H] of S03 levels.csv (B's domain)? sealed only."""
+    """After the S03 main run: is each witness inside the [L, H] of S03 sealed/levels_sangloc.csv (B's
+    domain; S04 v6.7 9.6: the sealed levels of the v8.5 screening, never the public levels.csv)?
+    sealed only; a missing sealed levels file stops (FeasStop)."""
     wit, _ = read_source(getattr(a, 'from'))
     new_out(a.out)
     say = Console(a.out)
     sealed = os.path.join(a.out, 'sealed')
-    with open(os.path.join(a.s03, 'levels.csv'), encoding='utf-8') as f:
+    lp = os.path.join(a.s03, S03_INBOX_LEVELS)
+    if not os.path.isfile(lp):
+        raise FeasStop(f'{lp} missing: the sealed levels of the S03 v8.5 screening (S04 v6.7 section 9 item 6)')
+    with open(lp, encoding='utf-8') as f:
         lv = {(r['controller'], r['factor']): (float(r['L']), float(r['H'])) for r in csv.DictReader(f)}
     rows = []
     for (c, sn), w in sorted(wit.items()):
@@ -869,7 +877,8 @@ def cmd_inbox(a):
     with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
         f.write(f'kind: inbox\nstatus: complete\nscript_version: {SCRIPT_VERSION}\ndate: {time.strftime("%Y-%m-%d")}\n'
                 f'source_run: {json.dumps(getattr(a, "from"))}\ns03_run: {json.dumps(a.s03)}\n'
-                f's03_levels_sha256: {s3.sha256_file(os.path.join(a.s03, "levels.csv"))}\n'
+                f's03_levels_file: "sealed/levels_sangloc.csv"\n'
+                f's03_levels_sha256: {s3.sha256_file(lp)}\n'
                 f'sealed_sha256: {json.dumps(pub, sort_keys=True)}\n')
     say('inbox written (sealed)')
 

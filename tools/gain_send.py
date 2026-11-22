@@ -25,6 +25,16 @@ Every value is rounded to float32 and sent as %.9g, so the ESP32 gets exactly th
 Before sending, the set is checked against the PC gain table tools/gain_table.py (range; ADRC
 omega_c + 2*omega_o < 200 on each axis, xy and wz); a violation sends nothing (exit 1, like bad
 arguments); warnings (the pos_kp / pos_ki wedge) are printed and the set is still sent.
+--s04-run <S04 run folder>: before the send, the S04 section 6 hand-over check runs
+(s04_hand_over): post_checks/notes.json cho_liam must be a list and selected.csv must hold exactly
+one send_to_HIL row of this controller with feasible 'true' whose 7 gains are the sent ones bit for
+bit as float32; a non-empty cho_liam refuses the send (exit 5) unless --liam-da-quyet "<reason>"
+overrides it (every item is listed, the reason is logged on the '#ban_giao_s04' line).
+--liam-da-quyet without --s04-run, a blank reason, or a reason while cho_liam is empty: usage error
+(exit 1). Right before the '# send' line the spectral radius of the one-axis sub-model
+(tools/mo_hinh_con.ban_kinh_pho_va_trang_thai) is printed as an indicator: report only, it NEVER
+blocks the send ('(chi bao, khong chan)'; a '# warning: ban_kinh_pho >= 1' line when unstable, a
+'not computed' line when it fails).
 
 Packets (protocol after Codex round 1, 12/11): '#gain_set,v=1,tx=<nonce>,id=..,ctrl=..,<7 gains>' and
 '#gain_get,v=1,tx=<nonce>'. tx is a new random number for every packet sent; only an answer from the
@@ -40,11 +50,14 @@ The running set is not kept over a reset: after a reboot the ESP32 runs the buil
 
 Exit code / last line '#ket_qua,ma=N': 0 applied and verified (or --query read a complete set);
 2 rejected by the ESP32 (err=..); 3 no answer; 4 answer does not match what was sent (or another
-board's MAC); 1 bad arguments or refused by the PC gain table.
+board's MAC); 5 refused by the S04 hand-over check (--s04-run, nothing sent); 1 bad arguments or
+refused by the PC gain table.
 """
 import argparse
+import csv
 import json
 import math
+import os
 import secrets
 import socket
 import struct
@@ -276,6 +289,97 @@ def board_mismatch(ack: dict, want_mac):
     return None
 
 
+def s04_hand_over(run_dir, ctrl, gains, reason):
+    """S04 section 6 hand-over check before one gain set goes to the board. Reads
+    <run_dir>/post_checks/notes.json and <run_dir>/selected.csv. Returns (code, out_lines, err_lines):
+      5  refused, nothing may be sent: notes.json missing / not JSON / not an object / 'cho_liam'
+         missing or not a list; selected.csv missing or without exactly one row kind=send_to_HIL of
+         controller ctrl with feasible 'true'; the 7 sent gains differ bit for bit as float32 from
+         that row; or cho_liam is non-empty and reason is None (ANY item blocks, whatever its
+         controller; each item is listed: controller, check, number of reasons)
+      1  usage error: a reason is given but cho_liam is empty (nothing to override)
+      0  send; out_lines: '#ban_giao_s04,run=<json abs path>,tool_check=<json>,cho_liam=<n>,
+         liam_da_quyet=<json reason or "">' plus one '# cho_liam: ...' line per item overridden.
+    All text is ASCII (free text through json.dumps ensure_ascii=True)."""
+    p = os.path.join(run_dir, 'post_checks', 'notes.json')
+    try:
+        with open(p, encoding='utf-8') as f:
+            notes = json.load(f)
+    except FileNotFoundError:
+        return 5, [], [f'# error: {p} missing: the S04 hand-over check needs post_checks/notes.json '
+                       f'(S04 section 6)']
+    except (OSError, ValueError) as e:
+        return 5, [], [f'# error: {p}: {e}']
+    if not isinstance(notes, dict) or not isinstance(notes.get('cho_liam'), list):
+        return 5, [], [f"# error: {p}: 'cho_liam' missing or not a list: not the notes.json of an S04 "
+                       f'post check (S04 section 6)']
+    cho = notes['cho_liam']
+    sp = os.path.join(run_dir, 'selected.csv')
+    try:
+        with open(sp, newline='', encoding='utf-8') as f:
+            rows = list(csv.DictReader(f))
+    except OSError as e:
+        return 5, [], [f'# error: {sp}: {e}']
+    sel = [r for r in rows if r.get('kind') == 'send_to_HIL' and r.get('controller') == ctrl
+           and r.get('feasible') == 'true']
+    if len(sel) != 1:
+        return 5, [], [f"# error: {sp}: {len(sel)} rows kind=send_to_HIL controller={ctrl} "
+                       f"feasible='true' (exactly one needed; S04 section 6)"]
+    diff = []
+    for n in NAMES.get(ctrl, ()):
+        try:
+            same = struct.pack('<f', float(sel[0][n])) == struct.pack('<f', f32(gains[n]))
+        except (KeyError, TypeError, ValueError, OverflowError, UsageError):
+            same = False
+        if not same:
+            diff.append(n)
+    if diff:
+        return 5, [], [f'# error: the gains sent differ bit for bit (float32) from the selected.csv '
+                       f'send_to_HIL row ({", ".join(diff)}): send what S04 selected, nothing else']
+    if cho and reason is None:
+        err = ['# error: the S04 post checks have cho_liam items: Liam must see them before HIL; '
+               'send only with --liam-da-quyet "<reason>" (S04 section 6)']
+        for it in cho:
+            err.append(f'# cho_liam: controller={it.get("controller")} check={it.get("check")} '
+                       f'reasons={len(it.get("reasons") or [])}')
+        return 5, [], err
+    if reason is not None and not cho:
+        return 1, [], ['# error: --liam-da-quyet given but cho_liam of ' + p + ' is empty: nothing to '
+                       'override (usage error)']
+    out = ['#ban_giao_s04,run=' + json.dumps(os.path.abspath(run_dir), ensure_ascii=True)
+           + ',tool_check=' + json.dumps(notes.get('tool_check'))
+           + f',cho_liam={len(cho)}'
+           + ',liam_da_quyet=' + json.dumps(reason or '', ensure_ascii=True)]
+    for it in cho:
+        out.append('# cho_liam: ' + json.dumps(it.get('controller'), ensure_ascii=True)
+                   + ' ' + json.dumps(it.get('check'), ensure_ascii=True)
+                   + f' ({len(it.get("reasons") or [])} reasons)')
+    return 0, out, []
+
+
+def spectral_lines(ctrl, gains):
+    """S04 v6.8 section 6: the spectral-radius indicator line(s) printed before '# send'. Report only,
+    NEVER blocks: mo_hinh_con is imported lazily inside the try (package form under tools/, plain import
+    beside it); any exception gives one '# ban_kinh_pho: not computed (<reason>)' line and the send goes
+    on. '# warning: ban_kinh_pho >= 1' when the sub-model is not stable."""
+    try:
+        if __package__:
+            from . import mo_hinh_con           # run as -m tools.gain_send
+        else:
+            import mo_hinh_con                  # run as tools/gain_send.py
+        m = mo_hinh_con.ban_kinh_pho_va_trang_thai(ctrl, gains)
+    except Exception as e:                      # noqa: BLE001  the indicator may never stop the send
+        return ['# ban_kinh_pho: not computed (' + json.dumps(f'{type(e).__name__}: {e}',
+                                                            ensure_ascii=True) + ')']
+    lines = [f"# ban_kinh_pho={m['ban_kinh_pho']!r} trang_thai={m['trang_thai']} "
+             f"bien_trang_thai={','.join(m['bien_trang_thai'])} G={m['G']!r} tau={m['tau']!r} "
+             f"(chi bao, khong chan)"]
+    if m['trang_thai'] == mo_hinh_con.KHONG_ON_DINH:
+        lines.append('# warning: ban_kinh_pho >= 1: the one-axis sub-model is not stable '
+                     '(tools/mo_hinh_con.py; report only, the send goes on)')
+    return lines
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--ip', required=True, help='ESP32 address (its UART prints it at boot; one board only)')
@@ -286,9 +390,21 @@ def main(argv=None):
     ap.add_argument('--gains', help='name=value,... (7 names of the controller)')
     ap.add_argument('--file', help='JSON gain file (frozen gain_*.json)')
     ap.add_argument('--query', action='store_true', help='only read the running set (#gain_get)')
+    ap.add_argument('--s04-run',
+                    help='S04 run folder: the section 6 hand-over check (post_checks/notes.json cho_liam, '
+                         'selected.csv send_to_HIL row) runs before the send; a non-empty cho_liam refuses '
+                         '(exit 5) unless --liam-da-quyet overrides it')
+    ap.add_argument('--liam-da-quyet', metavar='LY_DO',
+                    help='the reason Liam gave for sending although the S04 post checks list cho_liam items '
+                         '(logged on the #ban_giao_s04 line)')
     ap.add_argument('--timeout', type=float, default=1.0)
     ap.add_argument('--tries', type=int, default=3)
     a = ap.parse_args(argv)
+
+    if a.liam_da_quyet is not None and (a.s04_run is None or not a.liam_da_quyet.strip()):
+        print('error: --liam-da-quyet needs --s04-run and a non-empty reason', file=sys.stderr)
+        print('#ket_qua,ma=1')
+        return 1
 
     if a.query:
         ack, _ = exchange(a.ip, a.port, lambda tx: f'#gain_get,v=1,tx={tx}', a.timeout, a.tries)
@@ -344,6 +460,18 @@ def main(argv=None):
         return 1
     for w in warnings:
         print(f'# warning: {w}')
+
+    if a.s04_run is not None:                    # S04 section 6: the hand-over check before anything is sent
+        code, out_lines, err_lines = s04_hand_over(a.s04_run, ctrl, gains, a.liam_da_quyet)
+        for t in out_lines:
+            print(t)
+        for t in err_lines:
+            print(t, file=sys.stderr)
+        if code:
+            print(f'#ket_qua,ma={code}')
+            return code
+    for t in spectral_lines(ctrl, gains):        # S04 v6.8 section 6: report only, never blocks
+        print(t)
 
     print(f'# send {a.ip}:{a.port} ' + build_packet(set_id, ctrl, gains, 0).replace(',tx=0,', ',tx=<new each try>,'))
     ack, n = exchange(a.ip, a.port, lambda tx: build_packet(set_id, ctrl, gains, tx), a.timeout, a.tries)

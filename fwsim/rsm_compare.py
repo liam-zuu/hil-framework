@@ -12,7 +12,8 @@ runs and post checks) and the S03 run it used; writes <S04>/rsm/ (S04 section 8)
               drop_axial_<point_id>; rsm/fit/ and rsm/fit/lock.yaml.
   opt   12.3  two SLSQP steps on the model from the 143 CCD points (min f1_hat; min f2_hat with
               f1_hat <= f1_hat* + 0.01 m and f1_hat <= D, for ADRC both with omega_c + 2 omega_o
-              <= 199.99 per axis (v6.8); candidates outside the range table stop, outside the LADRC
+              <= 199.99 - 1e-6 for the solver, the exact check 199.99 kept, per axis (v6.8;
+              C3-11 / C3-32); candidates outside the range table stop, outside the LADRC
               triangle on float32 are dropped before M), candidate list (eps 1e-6, duplicates
               closer than 1e-4, order f2_hat, f1_hat, codes); 12.4 confirmation on fwsim of at most
               min(5, M) candidates with the GA evaluator (s04_ga.Evaluator: same runs, scoring,
@@ -63,16 +64,20 @@ import fwsim                 # noqa: E402
 import s03_doe as s3         # noqa: E402
 import s04_ga as s4          # noqa: E402
 
-SPEC = 'S04 v6.4 section 12 with the v6.8 triangle rule of 12.3 (06_SPECS/2026-11-05_Spec_S04_GA_chon_gain.md)'
+SPEC = ('S04 v6.4 section 12 with v6.7 section 9 item 6 and the v6.8 triangle rule of 12.3 '
+        '(06_SPECS/2026-11-05_Spec_S04_GA_chon_gain.md)')
 # settings of phases 1-2, constants of the script, locked by its commit before any data is read (12.7)
-SOLVER = dict(method='SLSQP', ftol=1e-9, maxiter=500)      # 12.3
+TRI_MAX = 199.99              # S04 v6.8 12.3 (G-Q4): omega_c + 2 omega_o <= 199.99 per axis, real values (margin 0.01)
+TRI_SOLVER_MARGIN = 1e-6      # C3-11 / C3-32 (Liam 23/11 "Dung le 1e-6"): the solver sees TRI_MAX - this;
+                              # the independent binary64 check keeps the exact TRI_MAX
+TRI_AXES = ('xy', 'wz')
+SOLVER = dict(method='SLSQP', ftol=1e-9, maxiter=500, tri_max=TRI_MAX, tri_margin=TRI_SOLVER_MARGIN,
+              tri_margin_basis='cùng bậc ε = 1e-6 của ràng buộc f1, S04 §12.3')   # 12.3 (optimise reads method/ftol/maxiter)
 EPS = 1e-6                    # m, one tolerance everywhere in 12.3-12.4
 DEDUP = 1e-4                  # Euclidean distance in code space: closer candidates are one (12.3)
 K = 5                         # at most min(K, M) candidates confirmed (12.4)
 CENS = 0.5                    # m, f1 cut of the cens05 sensitivity fit (12.2)
 F2_REL = 0.2                  # R2 tolerance on f2 (12.5)
-TRI_MAX = 199.99              # S04 v6.8 12.3 (G-Q4): omega_c + 2 omega_o <= 199.99 per axis, real values (margin 0.01)
-TRI_AXES = ('xy', 'wz')
 D = s4.D
 F1_TOL = s4.F1_TOL
 THETA_MAX_DEG = s4.THETA_MAX_DEG
@@ -85,8 +90,8 @@ FIT_BOXES = ('centre', 'outer', 'axial')
 TEST_IDS = tuple(range(s3.TEST_FIRST, s3.TEST_FIRST + s3.N_TEST))
 USABLE_STATUS = ('ok', 'track_err')
 USABLE_COMPLETED = ('true', 'false', 'inconclusive')
-S03_PUBLIC = ['meta.yaml', 'design.csv', 'levels.csv']
-S03_SEALED = ['sealed/runs.csv', 'sealed/notes.json']
+S03_PUBLIC = ['meta.yaml', 'levels.csv']   # S04 v6.7 9.6: design.csv is sealed now (never the public one)
+S03_SEALED = ['sealed/runs.csv', 'sealed/notes.json', 'sealed/design.csv', 'sealed/levels_sangloc.csv']
 S03_SEALED_TEST = ['sealed_test/runs_test.csv', 'sealed_test/notes.json']
 CLIP_TOL = 1e-9               # RSM-15: largest move of an SLSQP solution back into the box (rounding only)
 PHASES = ('fit', 'opt', 'test')
@@ -118,7 +123,13 @@ INTERPRETATIONS = [
     'f1_hat, f2_hat on the clipped point',
     'duplicates: greedy in the sorted order, a candidate within 1e-4 (Euclidean, codes) of a kept one is dropped '
     '(Codex RSM-15 on chains A-B-C: kept, deterministic)',
-    'code to gain: s03_doe.decode on levels.csv; bounds: s03_doe.check_bounds; edge flag and level source: '
+    'S04 v6.7 9.6: the S03 inputs of every phase are the sealed files of the v8.5 screening: the design comes '
+    'from sealed/design.csv (never the public one, S03_PUBLIC no longer holds it), the GA domain check uses '
+    's04_ga.read_domain on sealed/levels_sangloc.csv; both are hashed in S03_SEALED after the start commit '
+    '(RSM-1 unchanged: nothing under sealed/ is opened before it); the S04 fingerprint of check_inputs '
+    '(s04_ga.fingerprint) now locks the same sealed files and so_goc, the recheck keeps working unchanged',
+    'code to gain: s03_doe.decode on the locked domain (sealed/levels_sangloc.csv); bounds: '
+    's03_doe.check_bounds; edge flag and level source: '
     's04_ga.edge_report on the GA coordinate lo + (c + 1) / 2 (hi - lo)',
     'confirmation: s04_ga.Evaluator.candidate (run_gate, run_error once more in a new process, cause empty, '
     'score); a candidate is feasible when score gives status ok, g1 = 0 and g2..g5 <= 0',
@@ -161,14 +172,17 @@ INTERPRETATIONS = [
     'file SHA-256 in the locks and attempts.csv: of the bytes as written and of the bytes with CRLF -> LF '
     '(compared: the LF value, so a checkout with core.autocrlf keeps the lock valid)',
     'no x_GA (send_to_HIL infeasible in S04) stops the run: 12.5 does not define the classes without it',
-    'S04 v6.8 12.3 (G-Q4): for ADRC both SLSQP steps carry omega_c + 2 omega_o <= 199.99 per axis (xy, wz) on the '
-    'real values after s03_doe.decode, analytic Jacobian; C3-11: each solver result of both steps is checked again '
+    'S04 v6.8 12.3 (G-Q4): for ADRC both SLSQP steps carry omega_c + 2 omega_o <= 199.99 - 1e-6 per axis '
+    '(xy, wz) on the real values after s03_doe.decode, analytic Jacobian; C3-11 / C3-32 (Liam 23/11 '
+    '"Dung le 1e-6"): the solver sees the margin tri_margin = 1e-6, same order as the epsilon of the f1 '
+    'constraint (SOLVER tri_margin_basis, written to rsm/meta.yaml solver and fit/lock.yaml); C3-11: each '
+    'solver result of both steps is checked again '
     'on the binary64 gains decoded from its code (omega_c + 2 omega_o <= 199.99 on each axis, no tolerance, whatever '
     'SLSQP reports): a result above is not converged (starts.csv tri_sums, tri_ok), so it sets neither f1* nor a '
     'candidate; when no result of a step is left the state is (i); the float32 check of the next item is kept '
     'before M is counted',
     'code to gain (S04 v6.8 12.3 (ii)): after s03_doe.check_bounds the float32 gains go through s04_ga.gain_check '
-    '(tools/gain_table.py: its classify() Verdict when the module has it, else the texts of check()): a gain outside '
+    '(tools/gain_table.py: the classify() Verdict is required, C3-25; a table without it stops the run): a gain outside '
     'the range table stops the run; a candidate outside the LADRC triangle on float32 is dropped before M is '
     'counted (result.csv n_ngoai_tam_giac), the kept candidates are ranked 1..M, and M = 0 after the drop is state '
     '(ii); a GA candidate with status ngoai_bang (not run) is counted as unlabelled in ga_errors.csv',
@@ -606,7 +620,7 @@ def check_inputs(inp):
                 raise Stop(f'{inp.s04}/{n} missing')
         L = inp.ctrl_lock(c)
         if s4.read_domain(inp.s03, c) != L['domain']:
-            raise Stop(f'{c}: the S03 levels.csv domain is not the S04 lock.yaml domain')
+            raise Stop(f'{c}: the S03 sealed/levels_sangloc.csv domain is not the S04 lock.yaml domain')
     for n in ('determinism.csv', 'sensitivity.csv', 'three_mu.csv', 'notes.json'):
         if not os.path.isfile(os.path.join(inp.s04, 'post_checks', n)):
             raise Stop(f'{inp.s04}/post_checks/{n} missing')
@@ -620,18 +634,22 @@ def expected_codes():
 
 
 def read_design(s03_dir, ctrl):
-    """{point_id: (box, codes)} of design.csv for one controller (duplicates stop)."""
+    """{point_id: (box, codes)} of sealed/design.csv for one controller (duplicates stop). S04 v6.7 9.6:
+    the sealed design of the S03 v8.5 screening, never the public design.csv; a missing file stops."""
+    p = os.path.join(s03_dir, 'sealed', 'design.csv')
+    if not os.path.isfile(p):
+        raise Stop(f'{p} missing: the design of the S03 v8.5 screening (S04 v6.7 section 9 item 6)')
     out = {}
-    for r in read_csv(os.path.join(s03_dir, 'design.csv')):
+    for r in read_csv(p):
         if r['controller'] != ctrl:
             continue
         pid = int(r['point_id'])
         if pid in out:
-            raise Stop(f'design.csv: point {pid} of {ctrl} twice')
+            raise Stop(f'sealed/design.csv: point {pid} of {ctrl} twice')
         try:
             codes = tuple(float(r[f'X{k}']) for k in range(1, 8))
         except (KeyError, ValueError):
-            raise Stop(f'design.csv: point {pid} of {ctrl} has no X1..X7 codes') from None
+            raise Stop(f'sealed/design.csv: point {pid} of {ctrl} has no X1..X7 codes') from None
         out[pid] = (r['box'], codes)
     return out
 
@@ -640,7 +658,8 @@ def check_fit_design(design, ctrl):
     exp = expected_codes()
     fit = {p: v for p, v in design.items() if v[0] in FIT_BOXES}
     if set(fit) != set(FIT_IDS):
-        raise Stop(f'{ctrl}: the centre / outer / axial points of design.csv are not point_id 0, 1-128, 257-270 '
+        raise Stop(f'{ctrl}: the centre / outer / axial points of sealed/design.csv are not point_id 0, '
+                   f'1-128, 257-270 '
                    f'(12.2): extra {sorted(set(fit) - set(FIT_IDS))[:5]}, missing {sorted(set(FIT_IDS) - set(fit))[:5]}')
     for p in FIT_IDS:
         if fit[p] != exp[p]:
@@ -669,7 +688,7 @@ def need_run(by, pid, v, mu, ctrl, src, box):
         raise Stop(f'{src}: {len(rs)} runs of {ctrl} point {pid} at v = {v}, mu = {mu} (exactly one needed)')
     r = rs[0]
     if r['box'] != box:
-        raise Stop(f'{src}: {ctrl} point {pid} v = {v} mu = {mu} has box {r["box"]!r}, design.csv {box!r}')
+        raise Stop(f'{src}: {ctrl} point {pid} v = {v} mu = {mu} has box {r["box"]!r}, sealed/design.csv {box!r}')
     if r['status'] == 'run_error':
         raise Stop(f'{src}: run_error at {ctrl} point {pid} v = {v} mu = {mu} (S03 has no replacement row)')
     if r['status'] not in USABLE_STATUS or r['completed'] not in USABLE_COMPLETED:
@@ -979,9 +998,11 @@ def triangle_sums(ctrl, g):
 
 
 def triangle_constraints(ctrl, dom):
-    """S04 v6.8 12.3 (G-Q4): for LADRC the SLSQP constraints omega_c + 2 omega_o <= TRI_MAX of each axis, on the
-    real values after decoding (s03_doe.decode on the locked domain dom), with the analytic Jacobian; () for PID.
-    They go into BOTH steps of optimise."""
+    """S04 v6.8 12.3 (G-Q4): for LADRC the SLSQP constraints omega_c + 2 omega_o <= TRI_MAX - TRI_SOLVER_MARGIN
+    of each axis, on the real values after decoding (s03_doe.decode on the locked domain dom), with the analytic
+    Jacobian; () for PID. They go into BOTH steps of optimise. C3-11 / C3-32: the solver works against the
+    margin 1e-6 (same order as the f1 constraint epsilon); the independent exact check of triangle_check keeps
+    TRI_MAX."""
     if ctrl != 'ADRC':
         return ()
     at = {d['name']: (k, d['L'], d['H'], d['scale']) for k, d in enumerate(dom)}
@@ -990,7 +1011,7 @@ def triangle_constraints(ctrl, dom):
         (ic, *lc), (io, *lo) = at[f'omega_c_{ax}'], at[f'omega_o_{ax}']
 
         def fun(c, ic=ic, io=io, lc=lc, lo=lo):
-            return TRI_MAX - (s3.decode(c[ic], *lc) + 2.0 * s3.decode(c[io], *lo))
+            return TRI_MAX - TRI_SOLVER_MARGIN - (s3.decode(c[ic], *lc) + 2.0 * s3.decode(c[io], *lo))
 
         def jac(c, ic=ic, io=io, lc=lc, lo=lo):
             g = np.zeros(len(c))
@@ -1071,7 +1092,8 @@ def candidates(points, f1s):
 
 
 def to_gains(inp, ctrl, code):
-    """Code -> gains by s03_doe.decode on levels.csv, bounds by s03_doe.check_bounds (12.3 [v6]); S04 v6.8
+    """Code -> gains by s03_doe.decode on the locked domain (sealed/levels_sangloc.csv, S04 v6.7 9.6), bounds
+    by s03_doe.check_bounds (12.3 [v6]); S04 v6.8
     12.3 (ii): the float32 gains then go through s04_ga.gain_check (the range table of the campaign binary)."""
     dom = inp.ctrl_lock(ctrl)['domain']
     lv = {d['name']: (d['L'], d['H'], d['scale']) for d in dom}
@@ -1371,6 +1393,10 @@ def shared_cost_rows(inp):
 
 
 def run_opt(inp, ctx, log=print):
+    try:
+        s4.require_classify()                   # C3-25: nothing is simulated without classify()
+    except s3.S03Stop as e:
+        raise Stop(str(e)) from None
     coefs = load_coefs(inp)
     fitp = {}
     for r in read_csv(os.path.join(inp.out, 'fit', 'fit_points.csv')):
@@ -1532,7 +1558,8 @@ def run_test(inp, ctx):
         design = read_design(inp.s03, ctrl)
         tp = {p: c for p, (box, c) in design.items() if box == 'test'}
         if set(tp) != set(TEST_IDS):
-            raise Stop(f'design.csv: the test points of {ctrl} are not point_id {TEST_IDS[0]}..{TEST_IDS[-1]}')
+            raise Stop(f'sealed/design.csv: the test points of {ctrl} are not point_id '
+                       f'{TEST_IDS[0]}..{TEST_IDS[-1]}')
         by = index_runs(runs, ctrl, set(TEST_IDS), speeds, [inp.mu_mid])
         b1, b2 = coefs[(ctrl, 'mid', 'base', 'f1')], coefs[(ctrl, 'mid', 'base', 'f2')]
         e1, e2, mis, n_pen = [], [], 0, 0
