@@ -173,7 +173,8 @@ PLANT_SENS_COLS = ['tool_check', 'controller', 'variant', 'baseline', 'v', 'mu',
 # S04 v6.7 section 9 item 6 / section 8: the sealed files of the S03 v8.5 screening the fingerprint locks
 S03_SEALED_LOCK = ('sealed/levels_sangloc.csv', 'sealed/design.csv', 'sealed/sangloc/ket_qua.json',
                    'sealed/sangloc_thu/so_dem.json')
-SO_GOC_META_KEY = 'screen_u'   # S03 v8.5 section 8 condition 9: meta.yaml key of the root number file record
+SO_GOC_META_KEY = 'sang_loc'   # S03 v8.5 section 8 condition 9: meta.yaml line of the S03 screening plan
+SO_GOC_FIELD = 'file_so'       # its record of the root number file (fwsim/s03_doe.py meta.yaml, D2a 13d0a76)
 S03_SCREEN_SCRIPT = 'fwsim/s03_sangloc.py'   # the S03 screening script (written in parallel), compared too
 
 
@@ -1655,17 +1656,20 @@ def fingerprint(dll, s03_dir, unsealed=False):
 
 def so_goc(s03_dir):
     """S03 v8.5 section 8 condition 9: the root number file the S03 screening recorded in its public
-    meta.yaml under the SO_GOC_META_KEY line 'screen_u: {"file": "<path>", "sha256": "<hex>", ...}'.
-    The meta key name and the record shape are this script's choice (the spec does not fix them; the
-    screening script is written in parallel): one constant holds them. No such line -> None; a record
+    meta.yaml: field SO_GOC_FIELD of the SO_GOC_META_KEY line, as fwsim/s03_doe.py writes it
+    ('sang_loc: {..., "file_so": {"file": "<path>", "sha256": "<hex>", "sha256_lf": ...}}'; CODE 23/11,
+    gop thu dot 2: the reader follows the writer). No such line or no such field -> None; a record
     that is not a dict with str 'file' and 'sha256' -> sys.exit. A relative file is relative to the repo
     root; a missing file -> sys.exit. The bytes and their CRLF->LF form are both hashed: accepted when
     rec['sha256'] equals either, or rec.get('sha256_lf') equals the LF hash; else sys.exit ("not the
     number file the S03 run recorded"). Returns dict(file=..., s03_sha256=..., sha256_lf=<LF hash>)."""
     meta = open(os.path.join(s03_dir, 'meta.yaml'), encoding='utf-8').read()
     try:
-        rec = meta_value(meta, SO_GOC_META_KEY)
+        plan = meta_value(meta, SO_GOC_META_KEY)
     except KeyError:
+        return None
+    rec = plan.get(SO_GOC_FIELD) if isinstance(plan, dict) else None
+    if rec is None:
         return None
     if not isinstance(rec, dict) or not isinstance(rec.get('file'), str) \
             or not isinstance(rec.get('sha256'), str):

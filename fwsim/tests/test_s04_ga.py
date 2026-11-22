@@ -163,7 +163,8 @@ def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None, 
     num.write_bytes(number)
     y3 = {f'{c} v={v:g}': 5.0 for c in s3.CONTROLLERS for v in s3.SPEEDS}
     dll_sha = s3.sha256_file(_DLL) if os.path.isfile(_DLL) else 'no dll'
-    su = ('screen_u: ' + json.dumps(dict(file=str(num), sha256=hashlib.sha256(number).hexdigest())) + '\n'
+    su = ('sang_loc: ' + json.dumps(dict(file_so=dict(file=str(num), sha256=hashlib.sha256(number).hexdigest())))
+          + '\n'
           if screen_u else '')
     (d / 'meta.yaml').write_text(
         f'trial: {str(trial).lower()}     # x\nstatus: "ran to the end"\nmu_levels: {json.dumps(list(mu))}\n'
@@ -2489,3 +2490,24 @@ def test_main_refuses_a_dll_without_the_kep_channel(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match='past the kep check'):       # stopped later, not by kep_cols
         s4.main()
     assert len(calls) == 2
+
+
+# CODE 23/11 (gop thu dot 2): so_goc doc dung dong 'sang_loc:' ma fwsim/s03_doe.py ghi (D2a 13d0a76)
+def test_so_goc_doc_dong_sang_loc_cua_s03_doe(tmp_path):
+    num = tmp_path / 'so.csv'
+    num.write_bytes(b'set,row\r\nS0,1\r\n')
+    raw = num.read_bytes()
+    plan = dict(che_do='chinh', m_min=86, ghi_chu='kế hoạch, không có kết quả',
+                file_so=dict(file=str(num), sha256=hashlib.sha256(raw).hexdigest(),
+                             sha256_lf=hashlib.sha256(raw.replace(b'\r\n', b'\n')).hexdigest()))
+    (tmp_path / 'meta.yaml').write_text(
+        'spec: S03 v8.6\n'
+        f"sang_loc: {json.dumps(plan, ensure_ascii=False)}   # PLAN of S03 3.1b (item 10, 8.10)\n",
+        encoding='utf-8')
+    got = s4.so_goc(str(tmp_path))
+    assert got['file'] == str(num) and got['s03_sha256'] == plan['file_so']['sha256']
+    (tmp_path / 'meta.yaml').write_text(
+        'sang_loc: ' + json.dumps(dict(che_do='khong_chay: --trial mot muc mu')) + '\n', encoding='utf-8')
+    assert s4.so_goc(str(tmp_path)) is None
+    (tmp_path / 'meta.yaml').write_text('spec: S03 v8.6\n', encoding='utf-8')
+    assert s4.so_goc(str(tmp_path)) is None
