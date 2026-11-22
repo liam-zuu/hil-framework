@@ -2019,3 +2019,64 @@ def test_full_chain_unchanged_bit_for_bit(tmp_path):
     assert old['truot_cheo'] == new['truot_cheo'] and old['thang_hang_m'] == new['thang_hang_m']
 
 
+# ------------------------------------------------------------------ option A in the CAM chain (CAM 63dd13d)
+def _fake_ck_q(monkeypatch, seen):
+    import types
+    m = types.ModuleType('c7_chuoi_khung')
+
+    def chuoi_khung(frames_csv, a6_, xoay, lan_lap=None, track=None, cho=None, tam_id=None, cho_q=None, ll_id=None,
+                    ll_id_q=None):
+        seen.append(dict(cho=cho, cho_q=cho_q, ll_id=ll_id, ll_id_q=ll_id_q))
+        return [_row(0), _row(1), _row(2)]
+    m.doc_a6, m.chuoi_khung = (lambda p: dict(sha256='x')), chuoi_khung
+    monkeypatch.setitem(sys.modules, 'c7_chuoi_khung', m)
+
+
+def test_frames_chain_passes_option_a_to_cam(tmp_path, monkeypatch):
+    a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2', tam_id='T1'))
+    seen = []
+    _fake_ck_q(monkeypatch, seen)
+    ca.frames_chain('f.csv', a6, 'xoay.json', cho='K2', cho_q='K1', ll_id='L2', ll_id_q='L2')
+    ca.frames_chain('f.csv', a6, 'xoay.json', cho='K1')
+    assert seen == [dict(cho='K2', cho_q='K1', ll_id='L2', ll_id_q='L2'),
+                    dict(cho='K1', cho_q=None, ll_id=None, ll_id_q=None)]
+    old = _fake_ck(monkeypatch, rows=[_row(0), _row(1)])                  # a CAM without cho_q: not passed
+    assert ca.frames_chain('f.csv', a6, 'xoay.json', cho='K2', cho_q='K1', ll_id='L2', ll_id_q='L2') is not None
+    assert old['cho'] == 'K2'
+
+
+def test_q_cung_lan_lap_inputs(tmp_path):
+    a6, xv, x = _k2_setup(tmp_path)
+    k1 = _f5_file(tmp_path, 'f5_k1', 'K1', 'HC_K1_2', 'L2', xv, a6)
+    assert ca.q_cung_lan_lap(x, 'K2', k1, 'L2') == dict(cho_q='K1', ll_id='L2', ll_id_q='L2')
+    assert ca.q_cung_lan_lap(x, 'K2', k1, None) == dict(cho_q='K1', ll_id=None, ll_id_q='L2')   # CAM refuses
+    assert ca.q_cung_lan_lap(x, 'K1', k1, 'L2') is None                  # own block: CAM reads it, no option A
+    assert ca.q_cung_lan_lap(x, 'K2', None, 'L2') is None
+    with pytest.raises(ca.AError):
+        ca.q_cung_lan_lap(x, 'K2', _f5_file(tmp_path, 'f5_k2', 'K2', 'HC_K2_1', 'L2', xv, a6), 'L2')
+
+
+def test_cua_so_tinh_give_cam_the_mounting_ids(tmp_path, monkeypatch):
+    """cua_so (K2, --lan-lap absent: ll_id None) and tinh (ll_id from the F5 of the issued attempt) pass cho_q and the
+    two lan_lap_id to the CAM chain."""
+    a6, xv, x = _k2_setup(tmp_path)
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    k1 = _f5_file(tmp_path, 'f5_k1', 'K1', 'HC_K1_2', 'L2', xv, a6)
+    own = _f5_file(tmp_path, 'f5_k2_own', 'K2', 'HC_K2_1', 'L2', xv, a6)
+    seen = []
+
+    def fake(fr, a6_, xo, track=None, cho=None, **k):
+        seen.append(dict(cho=cho, **k))
+        return None                                                       # chain refused: basic frames
+    monkeypatch.setattr(ca, 'frames_chain', fake)
+    assert ca.main(['cua_so', d, '--frames', os.path.join(d, 'frames.csv'), '--track', os.path.join(d, 'track.json'),
+                    '--a6', a6, '--xoay', xv, '--q-tu', k1, '--ra', str(tmp_path / 'r')]) == 0
+    assert seen[-1] == dict(cho='K2', cho_q='K1', ll_id=None, ll_id_q='L2')
+    assert ca.main(tinh_args(d, 'K2', '--xoay', xv, '--a6', a6, '--q-tu', k1, '--doan', own,
+                             '--out', str(tmp_path / 'f7.json'))) in (0, 1)
+    assert seen[-1] == dict(cho='K2', cho_q='K1', ll_id='L2', ll_id_q='L2')
+    n = len(seen)
+    assert ca.main(tinh_args(d, 'K2', '--xoay', xv, '--a6', a6, '--out', str(tmp_path / 'f7b.json'))) in (0, 1)
+    assert seen[n] == dict(cho='K2')                                      # no --q-tu: nothing extra
+
+

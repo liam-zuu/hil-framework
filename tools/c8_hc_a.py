@@ -649,8 +649,11 @@ def _accepts(fn, name):
         return False
 
 
-def frames_chain(frames_csv, a6, xoay, lan_lap=None, track=None, cho=None):
+def frames_chain(frames_csv, a6, xoay, lan_lap=None, track=None, cho=None, cho_q=None, ll_id=None, ll_id_q=None):
     """F1 of CAM when importable: frame_id, t_cam, p_x, p_y, psi_ma_p, cong_ok, a6_ok, q_ok, trang_thai.
+    cho_q, ll_id, ll_id_q (CODE 22/11 option A; CAM hil fix/c7-chuoi-khung-q-k2 63dd13d): a place without its own F4
+    block (K2) takes q from the place cho_q with E when the lan_lap_id of the two F5 (ll_id here, ll_id_q there, F8
+    run 1) are equal non-empty strings; CAM checks them. Passed only when cho_q is given and CAM has the parameter.
     None (caller falls back to frames_basic, chain 'chan_doan') when CAM or C8B (c8b_a6) is not merged yet, when
     the chain refuses its inputs (ValueError: schema, track tag_offset), or when no frame has A6 AND q applied
     (e.g. xoay_v1 without a6_sha256 or of another A6: CAM gives q None, p NaN). A frame is used only when its gate,
@@ -663,6 +666,8 @@ def frames_chain(frames_csv, a6, xoay, lan_lap=None, track=None, cho=None):
         kw = dict(lan_lap=lan_lap, track=track, cho=cho)
         if lan_lap is None and _accepts(ck.chuoi_khung, 'tam_id'):
             kw['tam_id'] = a6_tam_id(a6)
+        if cho_q is not None and _accepts(ck.chuoi_khung, 'cho_q'):
+            kw.update(cho_q=cho_q, ll_id=ll_id, ll_id_q=ll_id_q)
         rows = ck.chuoi_khung(frames_csv, ck.doc_a6(a6), xoay, **kw)
     except (ImportError, ValueError):
         return None
@@ -1445,12 +1450,25 @@ def cmd_kiem(a):
     return 0 if all(ok for _, ok, _ in ck) else 1
 
 
-def frames_of(a, A):
+def frames_of(a, A, q_cung=None):
+    """q_cung (option A): dict(cho_q, ll_id, ll_id_q) for a place without its own F4 block, or None."""
     F = None
     if a.a6 and a.xoay:
         F = frames_chain(a.frames, a.a6, a.xoay, track=a.track,
-                         cho=A['cho'] if A else getattr(a, 'cho', None))     # HCC7-6, CT2-10
+                         cho=A['cho'] if A else getattr(a, 'cho', None), **(q_cung or {}))   # HCC7-6, CT2-10
     return F or frames_basic(a.frames, a.track)
+
+
+def q_cung_lan_lap(x, cho, q_tu, ll_id):
+    """dict(cho_q, ll_id, ll_id_q) for CAM chuoi_khung when this place has no F4 block of its own and --q-tu names the
+    F5 of a place with E (option A), else None. The F5 is read with its content check; CAM decides from the two ids."""
+    has_block = isinstance(x, dict) and isinstance(x.get('cho'), dict) and isinstance(x['cho'].get(cho), dict)
+    if has_block or not q_tu:
+        return None
+    o = _f5_checked(q_tu)
+    if o.get('cho') == cho:
+        raise AError(f'{q_tu}: --q-tu la F5 cua chinh cho {cho}')
+    return dict(cho_q=o.get('cho'), ll_id=ll_id, ll_id_q=o.get('lan_lap_id'))
 
 
 def window_roles(segs):
@@ -1474,8 +1492,6 @@ def cmd_cua_so(a):
     ck, info = kiem(A)
     if 'windows' not in info:
         raise AError('kiem: no windows (log checks failed before the windows)')
-    F = frames_of(a, A)
-    an = analyse(A, F, info, F_gio=frames_basic(a.frames, a.track))      # option B (CODE 22/11): align off-A6
     clip_sha = sha256(a.clip) if a.clip else None
     tj0 = json.load(open(a.track, encoding='utf-8'))
     ses_sha = sha256(a.session) if a.session else a.session_sha256
@@ -1494,8 +1510,12 @@ def cmd_cua_so(a):
                                              ses_sha=ses_sha)
     # F4 (CODE 22/11): q, u_q from the place block of a xoay_v1 file made on this A6, never the top level; a place
     # without E (K2) from a place with E on the same mounting (--q-tu, option A); read before any file is written
-    xq, xu, x_why, x_ng = (q_cua_cho(json.load(open(a.xoay, encoding='utf-8')), A['cho'], a.a6, a.xoay, ll_id,
-                                     getattr(a, 'q_tu', None)) if a.xoay else (None, None, 'chua co --xoay', None))
+    xo_j = json.load(open(a.xoay, encoding='utf-8')) if a.xoay else None
+    xq, xu, x_why, x_ng = (q_cua_cho(xo_j, A['cho'], a.a6, a.xoay, ll_id, getattr(a, 'q_tu', None)) if a.xoay
+                           else (None, None, 'chua co --xoay', None))
+    # the chain of CAM gets the same option-A inputs (K2: q of the place with E on the same mounting; CAM checks ids)
+    F = frames_of(a, A, q_cung=q_cung_lan_lap(xo_j, A['cho'], getattr(a, 'q_tu', None), ll_id) if a.xoay else None)
+    an = analyse(A, F, info, F_gio=frames_basic(a.frames, a.track))      # option B (CODE 22/11): align off-A6
     ra = ra_dir or a.dir                     # run 2 (with --a6 --xoay --lan-lap) writes to a new folder (mode x)
     if ra_dir:
         os.makedirs(ra, exist_ok=True)
@@ -2020,6 +2040,16 @@ def cmd_tinh(a):
     nguon += [dict(vai_tro='session', duong_dan=os.path.abspath(p), sha256=sha256(p)) for p in ses_files]
     khung_files = read_khung_giua_session(getattr(a, 'khung_giua_session', None))
     att_ses = {}
+    # option A (CODE 22/11): the mounting of the issued attempt from its F5 (run 2 of cua_so), read before the chain
+    q_tu, ll_cap_q, q_cung_cap = getattr(a, 'q_tu', None), None, None
+    if a.xoay and q_tu:
+        dp_q = a.doan or os.path.join(a.cap, 'doan_12b_v1.json')
+        if os.path.isfile(dp_q):
+            f5q = _f5_checked(dp_q)
+            if f5q.get('thu_id') != cap_id or f5q.get('cho') != a.cho:
+                raise AError(f'{dp_q}: F5 cua {f5q.get("thu_id")} ({f5q.get("cho")}), khong phai luot cap')
+            ll_cap_q = f5q.get('lan_lap_id')
+        q_cung_cap = q_cung_lan_lap(json.load(open(a.xoay, encoding='utf-8')), a.cho, q_tu, ll_cap_q)
     for d in [a.cap] + list(a.them or []):
         A = load_attempt(d)
         if A['cho'] != a.cho:
@@ -2044,7 +2074,8 @@ def cmd_tinh(a):
             continue
         F = None
         if a.a6 and a.xoay:
-            F = frames_chain(frames, a.a6, a.xoay, track=track, cho=A['cho'])          # HCC7-6, CT2-10
+            # HCC7-6, CT2-10; option A inputs only for the issued attempt (its F5 gives the mounting)
+            F = frames_chain(frames, a.a6, a.xoay, track=track, cho=A['cho'], **((q_cung_cap or {}) if is_cap else {}))
         F_gio = frames_basic(frames, track)
         F = F or F_gio
         try:
@@ -2079,14 +2110,7 @@ def cmd_tinh(a):
     q = du = None
     x_why = x_ng = None
     if a.xoay:                       # F4 (CODE 22/11): place block of xoay_v1 on this A6 only, never the top level
-        ll_q, q_tu = ll_f5, getattr(a, 'q_tu', None)
-        if q_tu and ll_q is None:    # option A: the mounting of the issued attempt from its F5 (run 2 of cua_so)
-            dp_q = a.doan or os.path.join(a.cap, 'doan_12b_v1.json')
-            if os.path.isfile(dp_q):
-                f5q = _f5_checked(dp_q)
-                if f5q.get('thu_id') != cap_id or f5q.get('cho') != a.cho:
-                    raise AError(f'{dp_q}: F5 cua {f5q.get("thu_id")} ({f5q.get("cho")}), khong phai luot cap')
-                ll_q = f5q.get('lan_lap_id')
+        ll_q = ll_f5 if ll_f5 is not None else ll_cap_q   # option A: mounting of the issued attempt (its F5)
         q, du, x_why, x_ng = q_cua_cho(json.load(open(a.xoay, encoding='utf-8')), a.cho, a.a6, a.xoay, ll_q, q_tu)
         nguon.append(dict(vai_tro='xoay_v1', duong_dan=os.path.abspath(a.xoay), sha256=sha256(a.xoay)))
         if q_tu:
