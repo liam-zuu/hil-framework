@@ -98,6 +98,41 @@ def test_old_17_visit_schedule_rejected(monkeypatch):
     assert sc.schedule_matches_locked(t5.make_schedule(1)) == []
 
 
+def test_c3_18_schedule_with_old_9995_not_locked(monkeypatch):
+    # C3-18: 9.995 (int16 8188) moved to 9.9942 (int16 8187); a schedule still carrying 9.995 is not locked
+    monkeypatch.setattr(t5, 'POINTS', tuple(9.995 if m == 9.9942 else m for m in t5.POINTS))
+    old = t5.make_schedule(1)
+    monkeypatch.undo()
+    assert sum(abs(v.w_fl) == 9.995 for v in old) == 2
+    assert sc.schedule_matches_locked(old) != []
+    new = t5.make_schedule(1)
+    for v in new:                                           # 1e-12 off in the CSV: still the locked one
+        v.w_fl, v.w_fr, v.w_rl, v.w_rr = (w + 1e-12 for w in v.omegas)
+    assert sc.schedule_matches_locked(new) == []
+
+
+def test_c3_18_point_9_9942_scored_indicator_not(sched1):
+    # C3-18: the moved point is scored in both directions with f_cmd from code 8187; the 0.29 indicator
+    # visits report their counts and never enter the H5 score
+    reads = synth(sched1, 5e6)
+    v0 = sched1[0]
+    assert v0.kind == 'indicator'
+    reads.c[reads.tb > 5e6 + v0.t_start_ms * 1000.0 + 3.5e7, 0] += 50     # stray counts in window 3 of visit 0
+    rows = sc.score_run(reads, sched1, 5e6)
+    wd = 8187 / 32767 * 40.0
+    for s in (1, -1):
+        rm = [r for r in rows if r['omega_cmd'] == s * 9.9942]
+        assert len(rm) == 5 * 4 and all(r['kind'] == 'point' and r['verdict'] == 'pass' for r in rm)
+        assert all(r['omega_d'] == pytest.approx(s * wd, rel=1e-15) for r in rm)
+        assert all(r['f_cmd_hz'] == pytest.approx(s * K * wd, rel=1e-12) for r in rm)
+    assert not any(abs(r['omega_cmd']) == 9.995 for r in rows)
+    ind = [r for r in rows if r['kind'] == 'indicator']
+    assert len(ind) == 2 * 5 * 4 and {r['verdict'] for r in ind} == {'indicator_ok', 'indicator_counts'}
+    assert all(p['kind'] != 'indicator' for p in sc.points(rows)) and len(sc.points(rows)) == 23 * 4
+    summ = sc.summarize(rows)
+    assert summ['pass'] == 23 * 5 * 4 and summ['indicator_counts_total'] == 50 and sc.exit_code(rows) == 0
+
+
 def test_small_error_passes_large_error_fails(sched1):
     # at 0.32 rad/s one count is 0.15 % of a window, so a sure pass needs |e| + u <= 0.6 %
     _, _, rows = run(synth(sched1, 5e6, gain=(1.0025, 1, 1, 1)), sched1)

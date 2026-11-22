@@ -24,3 +24,4 @@ Nguồn từng công thức của bang.csv (worktree D:/HIL_WT/devin_e3, nhánh 
 Hằng: 40.0f/32767.0f = 0.0012207403779029846; 1e6f*(float)M_PI = 3141592.75; 1e6*pi/330 = 9519.977738150888; K = 210.08452488130186
 Giả định: tick timer đúng 1 MHz danh định (ENC_CLOCK_CAL = 1.0); đồng hồ H7 thật không có trong bảng.
 Cột: frac_f32 = phần lẻ của hp float32 của H7 (trước làm tròn), từ ω_d H7; frac_exact_set = phần lẻ 9519.98/ω đặt (như spec); hp_timer = giá trị thật sau (uint32_t)(hp + 0.5f); err_vs_set = (2e6/hp_timer)/(K·|ω đặt|) − 1; err_vs_d = so f_lệnh của bộ chấm (K·ω_d); err_round = hp_f32/hp_timer − 1.
+C3-18: nhóm spec_goc = điểm 9,995 của spec (int16 8188, phần lẻ 0,434), thay bằng ω đặt 9,9942 (int16 8187, phần lẻ 0,550, gần 0,5 hơn; "chỉnh ω đặt nếu cần", CC1-10) ghi ở cột de_xuat_*; nhóm moi dùng điểm đã thay, khớp OFF_GRID_LOCK của rpi5/t5_schedule.py.

@@ -40,22 +40,31 @@ def test_frac_ok_closed_interval():
     assert not k.frac_ok(0.4 - 1e-9) and not k.frac_ok(0.6 + 1e-9)
 
 
-def test_table_24_rows_new_points_inside_frac_band():
+def test_table_26_rows_new_points_inside_frac_band():
     rows = k.table()
-    assert len(rows) == 24                       # (1 indicator + 7 old + 4 new) x 2 directions
+    assert len(rows) == 26                       # (1 indicator + 7 old + 4 new + 1 spec point replaced) x 2
     moi = [r for r in rows if r['nhom'] == 'moi']
     assert len(moi) == 8
     assert all(r['frac_trong_04_06'] == 1 for r in moi)
     assert all(r['de_xuat_omega_set'] == '' for r in moi)     # inside the band: no proposal needed
-    expected = {9.995: (8188, 952), 19.979: (16366, 477), 31.68: (25951, 301), 38.78: (31768, 245)}
+    # C3-18: 9.995 of the spec moved to 9.9942 (int16 8187, timer 953)
+    expected = {9.9942: (8187, 953), 19.979: (16366, 477), 31.68: (25951, 301), 38.78: (31768, 245)}
     for r in moi:
         raw, hp_t = expected[abs(r['omega_set'])]
         sign = 1 if r['omega_set'] > 0 else -1
         assert r['int16'] == sign * raw
         assert r['hp_timer'] == hp_t
     frac = {abs(r['omega_set']): r['frac_f32'] for r in moi}
-    assert frac[9.995] == pytest.approx(0.4338, abs=1e-4)
+    assert frac[9.9942] == pytest.approx(0.5502, abs=1e-4)
     assert frac[38.78] == pytest.approx(0.4837, abs=1e-4)
+    goc = [r for r in rows if r['nhom'] == 'spec_goc']
+    assert [r['omega_set'] for r in goc] == [9.995, -9.995]
+    for r in goc:
+        sign = 1 if r['omega_set'] > 0 else -1
+        assert r['int16'] == sign * 8188 and r['hp_timer'] == 952
+        assert r['frac_f32'] == pytest.approx(0.4338, abs=1e-4)
+        assert r['de_xuat_omega_set'] == sign * 9.9942 and r['de_xuat_int16'] == sign * 8187
+        assert abs(r['de_xuat_frac_f32'] - 0.5) < abs(r['frac_f32'] - 0.5)
     assert all(r['phat_xung'] == 0 for r in rows if r['nhom'] == 'chi_bao')
     for r in rows:
         if r['phat_xung']:
@@ -78,6 +87,16 @@ def test_point_outside_band_gets_proposal(monkeypatch):
         assert abs(r['de_xuat_frac_f32'] - 0.5) <= 0.05
 
 
-def test_frame_roundtrip_all_24_omega_set():
+def test_new_points_match_t5_schedule_lock():
+    import t5_schedule as t5
+    assert k.NEW_POINTS == t5.OFF_GRID_POINTS
+    for r in k.table():
+        if r['nhom'] == 'moi':
+            raw, wd, hp, timer = t5.OFF_GRID_LOCK[abs(r['omega_set'])]
+            sign = 1 if r['omega_set'] > 0 else -1
+            assert (r['int16'], r['omega_d_h7'], r['hp_f32'], r['hp_timer']) == (sign * raw, sign * wd, hp, timer)
+
+
+def test_frame_roundtrip_all_26_omega_set():
     for r in k.table():
         assert k.frame_roundtrip_ok(r['omega_set'])

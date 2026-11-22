@@ -34,7 +34,10 @@ F = np.float32
 # Điểm (spec S06 v3.5 dòng 119, cột Điểm thử): 0,29 chỉ báo; 7 điểm cũ; 4 điểm mới của câu 7
 INDICATOR = 0.29
 OLD_POINTS = (0.32, 0.5, 1.0, 2.0, 10.0, 20.0, 39.2)
-NEW_POINTS = (9.995, 19.979, 31.68, 38.78)
+NEW_POINTS = (9.9942, 19.979, 31.68, 38.78)
+# C3-18 (Codex vòng 1, Claude ACCEPTED): 9,995 của spec cho int16 8188, phần lẻ 0,434; mã 8187 (ω đặt 9,9942)
+# cho 0,550, gần 0,5 hơn ("chỉnh ω đặt nếu cần", CC1-10). Điểm gốc của spec ghi ở nhóm `spec_goc`, cột de_xuat_*.
+SPEC_REPLACED = {9.995: 9.9942}
 FRAC_LO, FRAC_HI = 0.4, 0.6            # đề E3 bước 2: ngoài [0,4; 0,6] thì đề xuất ω đặt mới
 PROPOSE_TOL = 0.05                     # mã int16 gần nhất có |phần lẻ − 0,5| ≤ 0,05 (khi cần đề xuất)
 PROPOSE_SPAN = 400                     # tìm trong ± 400 mã int16 quanh mã gốc
@@ -157,7 +160,8 @@ COLUMNS = ['nhom', 'omega_set', 'chieu', 'int16', 'omega_d_pi', 'omega_d_h7', 'p
 
 def table() -> list:
     rows = []
-    for grp, pts in (('chi_bao', (INDICATOR,)), ('cu', OLD_POINTS), ('moi', NEW_POINTS)):
+    for grp, pts in (('chi_bao', (INDICATOR,)), ('cu', OLD_POINTS), ('moi', NEW_POINTS),
+                     ('spec_goc', tuple(SPEC_REPLACED))):
         for m in pts:
             for w in (m, -m):
                 r = evaluate(w)
@@ -165,7 +169,11 @@ def table() -> list:
                 inside = r['frac_f32'] != '' and frac_ok(r['frac_f32'])
                 r['frac_trong_04_06'] = '' if r['frac_f32'] == '' else int(inside)
                 r.update(de_xuat_omega_set='', de_xuat_int16='', de_xuat_frac_f32='')
-                if grp == 'moi' and not inside:
+                if grp == 'spec_goc':
+                    n = evaluate(math.copysign(SPEC_REPLACED[m], w))
+                    r.update(de_xuat_omega_set=n['omega_set'], de_xuat_int16=n['int16'],
+                             de_xuat_frac_f32=n['frac_f32'])
+                elif grp == 'moi' and not inside:
                     p = propose(w)
                     if p is not None:
                         r.update(de_xuat_omega_set=p[0], de_xuat_int16=p[1], de_xuat_frac_f32=p[2])
@@ -202,6 +210,9 @@ def main() -> int:
                 'phần lẻ 9519.98/ω đặt (như spec); hp_timer = giá trị thật sau (uint32_t)(hp + 0.5f); '
                 'err_vs_set = (2e6/hp_timer)/(K·|ω đặt|) − 1; err_vs_d = so f_lệnh của bộ chấm (K·ω_d); '
                 'err_round = hp_f32/hp_timer − 1.\n')
+        f.write('C3-18: nhóm spec_goc = điểm 9,995 của spec (int16 8188, phần lẻ 0,434), thay bằng ω đặt 9,9942 '
+                '(int16 8187, phần lẻ 0,550, gần 0,5 hơn; "chỉnh ω đặt nếu cần", CC1-10) ghi ở cột de_xuat_*; '
+                'nhóm moi dùng điểm đã thay, khớp OFF_GRID_LOCK của rpi5/t5_schedule.py.\n')
     bad = [r for r in rows if r['nhom'] == 'moi' and r['frac_trong_04_06'] != 1]
     print(f'bang.csv: {len(rows)} rows; new points outside [0.4, 0.6]: {len(bad)}')
     for r in rows:
