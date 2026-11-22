@@ -399,6 +399,15 @@ def car_pose(cam, corners_px, side, kappa, plumb, tag_offset=(0.0, 0.0, 0.0)):
                 tag_psi=float(ang), res_m=res, res_sim_m=res_sim, scale=sc)
 
 
+def tag_corners_floor(cam, corners_px, kappa, plumb):
+    """{c0_x .. c3_y}: the 4 corners of the car tag on the floor AFTER the parallax, ArUco order 0..3 (CAM design v4
+    sec 2, for c8b_a6; C8Bv2 sec 9): the same P that car_pose fits (same two lines), kept out of car_pose so its pinned
+    source (CAR_POSE_VERSION) does not change."""
+    p_floor = cam.pix2floor(np.asarray(corners_px, float), 0.0)
+    P = p_floor + kappa * (np.asarray(plumb, float) - p_floor)
+    return {f'c{i}_{a}': float(P[i][j]) for i in range(4) for j, a in enumerate(('x', 'y'))}
+
+
 def res_sim_from(res_m, scale, side):
     """Residual of the fit WITH scale from the rigid residual and the scale of the same 4 corners: the
     rotation of the two Procrustes fits is the same and the scale is the least-squares one, so
@@ -922,6 +931,7 @@ def track(video, session, tag_offset=None, max_frames=None, progress=None, gates
             cam_prev = cam
         if cam is not None and CAR_ID in d:
             r.update(car_pose(cam, d[CAR_ID], side, kappa, plumb, off))
+            r.update(tag_corners_floor(cam, d[CAR_ID], kappa, plumb))
             r['car_seen'] = True
             r['row_px'] = float(d[CAR_ID][:, 1].mean())
             r['col_px'] = float(d[CAR_ID][:, 0].mean())      # C8b v4 3: rolling shutter by row and column
@@ -1136,6 +1146,7 @@ def track_chains(frames, video_name, video_sha, session, tag_offset=None, gates=
             r['cam_z'] = float(cam.centre[2])
         if cam is not None and CAR_ID in d:
             r.update(car_pose(cam, d[CAR_ID], side, kappa, plumb, off))
+            r.update(tag_corners_floor(cam, d[CAR_ID], kappa, plumb))
             r['car_seen'] = True
             r['row_px'] = float(d[CAR_ID][:, 1].mean())
             r['col_px'] = float(d[CAR_ID][:, 0].mean())
@@ -1484,6 +1495,10 @@ FINE_COLS = ('res_m', 'res_sim_m', 'scale', 'scale_ref')     # written with 10 d
 EXTRA_FIXED = ('khop_ok', 'khop_ly_do', 'cond', 'moc_thay', 'moc_dung', 'nen_doi', 'bat_dinh_moc', 'chua_ket_luan_xe',
                'U_moc_xy_m', 'U_moc_psi_rad', 'do_nhay_xy', 'do_nhay_psi')
 TEXT_COLS = ('khop_ly_do', 'moc_thay', 'moc_dung', 'nen_doi', 'bat_dinh_moc')
+# CAM design v4 sec 2 (19/11; written from 22/11, C8 session 2 A6 of C8B needed them): tag heading and the 4 tag corners
+# on the floor after the parallax, ArUco order. Appended AFTER every other column, so a file written before keeps the
+# same leading columns; a row without a car pose leaves them empty.
+GOC_COLS = ('tag_psi',) + tuple(f'c{i}_{a}' for i in range(4) for a in ('x', 'y'))
 
 
 def extra_cols(rows):
@@ -1501,6 +1516,8 @@ def write_frames(path, rows):
     """FINE_COLS with 10 decimals, or with the decimals the row was read with (read_frames '_dec'; CS2-7: a regate
     must not write a rounded value with more digits than it holds). The 33-mark columns (extra_cols) follow FRAME_COLS."""
     cols = FRAME_COLS + extra_cols(rows)
+    if rows and any('c0_x' in r for r in rows):
+        cols = cols + GOC_COLS
     with open(path, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
         w.writerow(cols)
