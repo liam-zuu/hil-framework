@@ -43,6 +43,19 @@ c8b_u.py takes q_tag_m and du_m: P2 = |(dx, dy)_scorer - R(dpsi_scorer) q_tag| +
 
   python tools/c8b_xoay.py --cho goc=frames_goc.csv --cho K1=frames_K1.csv [--log goc=log_goc.csv ...] --out xoay.json
   (PLACE names as CHO = goc, K1, K2; trinh tu chuoi C8 muc 2.6: the old 'O' of this line was a docstring slip)
+  The c8b_xoay_v1 file above is a DIAGNOSTIC before A6 (one q over all places), not the contract F4.
+
+F4 xoay_v1 per place (contract 03_CODE/docs/2026-11-19_Hop_dong_du_lieu_C8_tuong_doi_v1.md row F4, 2.B; CODE_C8B
+22/11, step T7b of the C8 chain: after c8b_a6 gop, before NHACTAM / HIEUCHUAN read --xoay): with --a6 the same model
+is fitted per E place (goc, K1) on the frames of E_doan only (ids strictly between the one E_dau and the one E_cuoi
+row of the F2 files for that frames file) with the heading psi' = psi - delta_psi_a6 (c8b_a6, F3). Per place:
+q_tag_m, u_q_m (= du_m of the place: spread + 3 SE + residual as above, + |q| a6du_rad), r_floor_m (turning centre on
+the floor) and u_r_m (an index), the two directions and their difference, cua_so_E, d_vet_m = |q| + u_q (check of the
+E trace only, <= 0.020 m [DE XUAT]), trang_thai dat | chua_ket_luan with ly_do (A6 not dat for the plate, the E
+window missing or twice, the session of the E clip not among the A6 sessions, frames without A6, a direction
+missing). File: version = schema = 'xoay_v1', a6_sha256, tam_id, cho {goc, K1}; numbers before the margin.
+  python tools/c8b_xoay.py --cho goc=frames_goc.csv --cho K1=frames_K1.csv --a6 c8b_a6_v2.json \
+      --cua-so cua_so_v1.jsonl [--cua-so ...] --tam-id T [--log goc=log.csv ...] --out xoay_v1.json
 Last line: #ket_qua,ma=0 written / 2 refused or error.
 """
 from __future__ import annotations
@@ -105,12 +118,14 @@ def read_frames(path):
     if info.get('frames_sha256') != cu.sha256(path):          # C8BU-R3-1: another tracking of the same clip
         raise XError(f'{tj}: frames_sha256 is not the SHA-256 of {path} (not its track.json; a regate output has no '
                      f'tag_offset: use the track output)')
-    keep = []
+    keep, ids = [], []
+    has_idx = 'idx' in rows[0]
     for r in rows:
         if r['valid'] != '1' or r['car_seen'] != '1':
             continue
         try:
             v = [float(r[c]) for c in ('t_s', 'tag_x', 'tag_y', 'psi', 'x', 'y')]
+            k = int(r['idx']) if has_idx else -1
         except ValueError:
             continue
         if all(math.isfinite(x) for x in v):
@@ -118,12 +133,15 @@ def read_frames(path):
                 raise XError(f'{path}: x, y differ from tag_x, tag_y at t_s {v[0]}: tracked with a tag_offset; '
                              f'track the clip with tag_offset 0')
             keep.append(v[:4])
+            ids.append(k)
     if len(keep) < 10:
         raise XError(f'{path}: fewer than 10 valid frames with the tag seen')
     a = np.array(keep)
     if np.any(np.diff(a[:, 0]) <= 0):
         raise XError(f'{path}: t_s not increasing')
-    return dict(t=a[:, 0], x=a[:, 1], y=a[:, 2], psi=np.unwrap(a[:, 3]), path=path)
+    return dict(t=a[:, 0], x=a[:, 1], y=a[:, 2], psi=np.unwrap(a[:, 3]), path=path,
+                idx=np.array(ids, int) if has_idx else None, sha256=cu.sha256(path),
+                video_sha256=info.get('video_sha256'), session_sha256=info.get('session_sha256'))
 
 
 def turn_rate(t, psi, smooth_s=SMOOTH_S):
@@ -257,6 +275,42 @@ def imu_check(F, L, segs):
                 log=os.path.basename(L['path']), log_sha256=cu.sha256(L['path']))
 
 
+def _fit_place(F):
+    """The turning intervals of one place and their fits (shared by analyse and theo_cho): doan (every interval),
+    used (signs of the usable ones), qs / c0s (q, centre of the usable linear fits), alts / c0_alts (quadratic drift
+    and per turn), ses, rms, troi (largest linear centre drift of a usable interval), short."""
+    segs, short = intervals(F)
+    out = dict(doan=[], used=[], qs=[], c0s=[], alts=[], c0_alts=[], ses=[], rms=[], troi=[], short=short, segs=segs)
+    for (i0, i1, sg) in segs:
+        d = dict(fit_interval(F, i0, i1), chieu=sg)
+        d2 = fit_interval(F, i0, i1, deg=2)                 # C8BU-R1-2: a curved drift is not linear
+        vong = [fit_interval(F, a, b) for (a, b) in revolutions(F, i0, i1)]   # drift ~linear within one turn
+        # C8BU-R2-2: a creep moving in step with the turn cannot be told from another q (page v10 P2 limit), so
+        # an interval whose centre path is visibly not linear, or whose residual is large, is not used
+        cong = float(np.max(np.hypot(*(d2.pop('_centre') - d.pop('_centre')).T)))
+        for v in vong:
+            v.pop('_centre')
+        d['bac2'] = dict(q_m=d2['q_m'], se_m=d2['se_m'], troi_m=d2['troi_m'], lech_tuyen_tinh_m=cong)
+        d['tung_vong'] = [dict(t0=v['t0'], t1=v['t1'], q_m=v['q_m'], se_m=v['se_m']) for v in vong]
+        d['troi_lon'] = max(d['troi_m'], d2['troi_m']) > DRIFT_WARN_M
+        why = ([f'centre path curved by {cong * 1e3:.2f} mm > {CURVE_MAX_M * 1e3:.1f}'] if cong > CURVE_MAX_M
+               else []) + ([f'residual RMS {d["res_rms_m"] * 1e3:.2f} mm > {RES_MAX_M * 1e3:.1f}']
+                           if d['res_rms_m'] > RES_MAX_M else [])
+        d['dung'], d['bo_vi'] = not why, why
+        out['doan'].append(d)
+        if why:
+            continue
+        out['used'].append(sg)
+        out['qs'].append(d['q_m'])
+        out['c0s'].append(d['c0_m'])
+        out['rms'].append(d['res_rms_m'])
+        out['troi'].append(d['troi_m'])
+        out['alts'].extend([d2['q_m']] + [v['q_m'] for v in vong])
+        out['c0_alts'].extend([d2['c0_m']] + [v['c0_m'] for v in vong])
+        out['ses'].extend([d['se_m'], d2['se_m']] + [v['se_m'] for v in vong])
+    return out
+
+
 def analyse(places, logs=None):
     """places: {name: frames path}; logs: {name: log path}. Returns the c8b_xoay_v1 dict."""
     if len(places) < 2:
@@ -264,39 +318,19 @@ def analyse(places, logs=None):
     res, qs, ses, alts, rms = {}, [], [], [], []
     for name, path in places.items():
         F = read_frames(path)
-        segs, short = intervals(F)
-        doan, used = [], []
-        for (i0, i1, sg) in segs:
-            d = dict(fit_interval(F, i0, i1), chieu=sg)
-            d2 = fit_interval(F, i0, i1, deg=2)                 # C8BU-R1-2: a curved drift is not linear
-            vong = [fit_interval(F, a, b) for (a, b) in revolutions(F, i0, i1)]   # drift ~linear within one turn
-            # C8BU-R2-2: a creep moving in step with the turn cannot be told from another q (page v10 P2 limit), so
-            # an interval whose centre path is visibly not linear, or whose residual is large, is not used
-            cong = float(np.max(np.hypot(*(d2.pop('_centre') - d.pop('_centre')).T)))
-            for v in vong:
-                v.pop('_centre')
-            d['bac2'] = dict(q_m=d2['q_m'], se_m=d2['se_m'], troi_m=d2['troi_m'], lech_tuyen_tinh_m=cong)
-            d['tung_vong'] = [dict(t0=v['t0'], t1=v['t1'], q_m=v['q_m'], se_m=v['se_m']) for v in vong]
-            d['troi_lon'] = max(d['troi_m'], d2['troi_m']) > DRIFT_WARN_M
-            why = ([f'centre path curved by {cong * 1e3:.2f} mm > {CURVE_MAX_M * 1e3:.1f}'] if cong > CURVE_MAX_M
-                   else []) + ([f'residual RMS {d["res_rms_m"] * 1e3:.2f} mm > {RES_MAX_M * 1e3:.1f}']
-                               if d['res_rms_m'] > RES_MAX_M else [])
-            d['dung'], d['bo_vi'] = not why, why
-            doan.append(d)
-            if why:
-                continue
-            used.append(sg)
-            qs.append(d['q_m'])
-            rms.append(d['res_rms_m'])
-            alts.extend([d2['q_m']] + [v['q_m'] for v in vong])
-            ses.extend([d['se_m'], d2['se_m']] + [v['se_m'] for v in vong])
+        P = _fit_place(F)
+        doan, used, short = P['doan'], P['used'], P['short']
+        qs += P['qs']
+        alts += P['alts']
+        ses += P['ses']
+        rms += P['rms']
         if set(used) != {1, -1}:
             raise XError(f'place {name}: needs a usable turning interval of at least one full turn in each direction '
                          f'(usable {sorted(set(used))}; left out: {[(x["chieu"], x["bo_vi"]) for x in doan if not x["dung"]]}'
                          f'; shorter intervals: {short}): turn again there, slowly and evenly')
         entry = dict(file=os.path.basename(path), sha256=cu.sha256(path), doan=doan, ngan=short)
         if logs and name in logs:
-            entry['imu'] = imu_check(F, cu.load_log(logs[name]), segs)
+            entry['imu'] = imu_check(F, cu.load_log(logs[name]), P['segs'])
         res[name] = entry
     Q = np.array(qs)
     qm = Q.mean(axis=0)
@@ -399,6 +433,181 @@ def ghep_q(lan_lap, cho, xoay, truc_xe=None, u_psi_w_rad=None):
                 gioi_han=['LL4-6: sai yaw ma chung ca clip khong co chi so rieng'])
 
 
+# ── F4 xoay_v1 per place (contract 03_CODE/docs/2026-11-19_Hop_dong_du_lieu_C8_tuong_doi_v1.md row F4, section 2.B;
+#    CODE_C8B 22/11: no tool wrote it at 6c14b4f, the readers CAM c7_chuoi_khung.doc_xoay, NHACTAM c7_nhac_tam,
+#    HIEUCHUAN c8_hc_a / c8_hc_vet and ghep_q above waited for it) ─────────────────────────────────────────────────
+
+VERSION_F4 = 'xoay_v1'
+CHO_E = ('goc', 'K1')          # the E clips (turning in place) are at goc and K1 only (C8 guide part E, design C8B v7 1)
+D_VET_MAX_M = 0.020            # contract F4: d for the E trace <= 20 mm [DE XUAT], a check of the trace only, not in U
+
+
+def read_cua_so(paths):
+    """cua_so_v1 rows (JSON lines; F2 of HIEUCHUAN c8_hc_a cua_so or the joined file of CAM) -> list of dicts."""
+    rows = []
+    for p in paths or []:
+        cu.check_path(p)
+        with open(p, encoding='utf-8') as f:
+            for k, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError as exc:
+                    raise XError(f'{p}:{k}: not JSON ({exc})')
+                if r.get('schema') != 'cua_so_v1':
+                    raise XError(f'{p}:{k}: schema {r.get("schema")!r} is not cua_so_v1')
+                rows.append(dict(r, _file=os.path.abspath(p), _sha256=cu.sha256(p)))
+    return rows
+
+
+def e_window(rows, cho, F):
+    """The E window of the clip of F at place cho from the F2 rows: the ONE E_dau and the ONE E_cuoi row of that place
+    whose frames_sha256 is the SHA-256 of the frames file (so the same tracking of the same clip); E_doan = the frame
+    ids strictly between the last E_dau frame and the first E_cuoi frame. Returns (dict or None, reasons)."""
+    why = []
+    mine = [r for r in rows if r.get('cho') == cho and r.get('loai') in ('E_dau', 'E_cuoi')
+            and r.get('frames_sha256') == F['sha256']]
+    by = {k: [r for r in mine if r['loai'] == k] for k in ('E_dau', 'E_cuoi')}
+    for k, v in by.items():
+        if len(v) != 1:
+            why.append(f'{len(v)} {k} rows of place {cho} for frames {F["sha256"][:12]} in the cua_so_v1 files (need 1)')
+    if why:
+        return None, why
+    ed, ec = by['E_dau'][0], by['E_cuoi'][0]
+    try:
+        a = max(int(k['id']) for k in ed['khung'])
+        b = min(int(k['id']) for k in ec['khung'])
+    except (KeyError, TypeError, ValueError):
+        return None, ['E_dau / E_cuoi khung without frame ids']
+    if not a < b:
+        return None, [f'E_dau ends at frame {a}, not before E_cuoi starts at {b}']
+    for r in (ed, ec):
+        if F.get('video_sha256') and r.get('clip_sha256') != F['video_sha256']:
+            why.append(f'{r["loai"]} clip_sha256 is not the video of track.json')
+        if F.get('session_sha256') and r.get('session_sha256') != F['session_sha256']:
+            why.append(f'{r["loai"]} session_sha256 is not the session of track.json')
+    if why:
+        return None, why
+    return dict(clip=ed.get('clip'), clip_sha256=ed.get('clip_sha256'), session_sha256=ed.get('session_sha256'),
+                luot_id_E=ed.get('luot_id'), E_dau=dict(id=[int(ed['khung'][0]['id']), a], chi_so=ed.get('chi_so')),
+                E_cuoi=dict(id=[b, int(ec['khung'][-1]['id'])], chi_so=ec.get('chi_so')), E_doan=[a + 1, b - 1],
+                cua_so_v1=[dict(file=r.get('_file'), sha256=r.get('_sha256'))
+                           for r in ((ed,) if ed.get('_file') == ec.get('_file') else (ed, ec))]), []
+
+
+def _sub(F, keep):
+    return dict(F, t=F['t'][keep], x=F['x'][keep], y=F['y'][keep], psi=F['psi'][keep],
+                idx=None if F.get('idx') is None else F['idx'][keep])
+
+
+def theo_cho_place(cho, F, rows, a6, tam_id):
+    """F4 block of one place: the E frames (E_doan), heading psi' = psi - delta_psi_a6 (c8b_a6 contract F3), the same
+    interval model and checks as analyse, per place. Never raises for the data: a place that cannot be concluded is
+    'chua_ket_luan' with its reasons (contract F4 trang_thai dat | chua_ket_luan + ly_do)."""
+    import c8b_a6 as A6
+    why = []
+    out = dict(trang_thai='chua_ket_luan', ly_do=why, q_tag_m=None, u_q_m=None, du_m=None, r_floor_m=None,
+               u_r_m=None, d_vet_m=None, frames=os.path.basename(F['path']), frames_sha256=F['sha256'])
+    st, lw = A6.ap_dung(a6, tam_id)
+    if st != 'dat':
+        why.append(f'A6: {lw}')
+    if F.get('idx') is None:
+        why.append('frames.csv without the idx column: the E window cannot be applied')
+        return out
+    win, ww = e_window(rows, cho, F)
+    why += ww
+    if win is None:
+        return out
+    out['cua_so_E'] = win
+    ses_a6 = [s.get('session_sha256') for s in (a6 or {}).get('session') or []]
+    if ses_a6 and win['session_sha256'] not in ses_a6:          # da session (A): e_bc of the A6 file covers it
+        why.append('session of the E clip is not among the sessions of the A6 file (e_bc not taken there)')
+    keep = (F['idx'] >= win['E_doan'][0]) & (F['idx'] <= win['E_doan'][1])
+    if keep.sum() < 10:
+        why.append(f'{int(keep.sum())} valid frames in E_doan')
+        return out
+    E = _sub(F, keep)
+    if st != 'dat':
+        return out
+    xy = np.column_stack([E['x'], E['y']])
+    dpsi, ok, wk = A6.delta_psi_a6(a6, xy, E['psi'], a6['plumb_xy_m'], a6['H_m'])
+    out['n_khung_E'], out['n_khung_a6_khong_dat'] = int(len(ok)), int((~ok).sum())
+    if (~ok).any():
+        why.append(f'{int((~ok).sum())} E frames without an A6 correction ({sorted(set(w for w in wk if w))})')
+        return out
+    Ep = dict(E, psi=E['psi'] - dpsi)                          # psi' (contract F3: SUBTRACT from the car_pose heading)
+    P = _fit_place(Ep)
+    out.update(doan=P['doan'], ngan=P['short'])
+    if set(P['used']) != {1, -1}:
+        why.append(f'needs a usable turning interval of at least one full turn in each direction in E_doan (usable '
+                   f'{sorted(set(P["used"]))}; left out {[(x["chieu"], x["bo_vi"]) for x in P["doan"] if not x["dung"]]})')
+        return out
+    Q, C0 = np.array(P['qs']), np.array(P['c0s'])
+    qm, cm = Q.mean(axis=0), C0.mean(axis=0)
+    Eq = np.array(P['qs'] + P['alts'])
+    spread = float(np.max(np.hypot(*(Eq - qm).T)))
+    se3 = 3.0 * float(max(P['ses']))
+    res_t = float(max(P['rms']))
+    rho = float(np.max(np.hypot(*(xy - np.asarray(a6['plumb_xy_m'], float)).T)))
+    a6du = A6.a6du_rad(a6, rho)
+    if a6du is None:
+        why.append(f'A6 residual bound a6du_rad not available at rho {rho:.3f} m')
+        return out
+    u_a6 = float(np.hypot(*qm)) * a6du                        # a heading error of psi' moves R(psi') q by |q| a6du
+    u_q = spread + se3 + res_t + u_a6
+    Ec = np.array(P['c0s'] + P['c0_alts'])
+    spread_r = float(np.max(np.hypot(*(Ec - cm).T)))
+    u_r = spread_r + float(max(P['troi'])) + res_t
+    sg = {s: np.array([q for q, x in zip(P['qs'], [d for d in P['doan'] if d['dung']]) if x['chieu'] == s]).mean(axis=0)
+          for s in (1, -1)}
+    d_vet = float(np.hypot(*qm)) + u_q
+    out.update(q_tag_m=[float(qm[0]), float(qm[1])], u_q_m=u_q, du_m=u_q, r_floor_m=[float(cm[0]), float(cm[1])],
+               u_r_m=u_r, d_vet_m=d_vet, d_vet_dat=bool(d_vet <= D_VET_MAX_M),
+               hai_chieu={'+': [float(v) for v in sg[1]], '-': [float(v) for v in sg[-1]],
+                          'lech_m': float(np.hypot(*(sg[1] - sg[-1])))},
+               u_q_phan=dict(spread_m=spread, se3_m=se3, res_m=res_t, a6_m=u_a6, a6du_rad=a6du, rho_max_m=rho),
+               u_r_phan=dict(spread_m=spread_r, troi_m=float(max(P['troi'])), res_m=res_t),
+               n_doan=len(P['qs']), n_uoc=len(Eq), a6_sha256=a6.get('_sha256'))
+    if not why:
+        out['trang_thai'] = 'dat'
+    return out
+
+
+def theo_cho(places, a6, rows, tam_id, logs=None):
+    """F4 xoay_v1: {version, schema, a6_sha256, tam_id, cho: {goc, K1: block}}; every number before the margin."""
+    bad = sorted(set(places) - set(CHO_E))
+    if bad:
+        raise XError(f'places {bad}: F4 xoay_v1 is per E place {CHO_E}')
+    if not isinstance(a6, dict) or not a6.get('_sha256'):
+        raise XError('the A6 file (c8b_a6.load_a6) is needed: q is fitted on psi\' after A6 (contract F4)')
+    cho = {}
+    for name, path in places.items():
+        F = read_frames(path)
+        b = theo_cho_place(name, F, rows, a6, tam_id)
+        if logs and name in logs and b.get('trang_thai') == 'dat':
+            keep = (F['idx'] >= b['cua_so_E']['E_doan'][0]) & (F['idx'] <= b['cua_so_E']['E_doan'][1])
+            E = _sub(F, keep)
+            b['imu'] = imu_check(E, cu.load_log(logs[name]), intervals(E)[0])   # heading before A6: a check only
+        cho[name] = b
+    return dict(version=VERSION_F4, schema=VERSION_F4, a6_sha256=a6['_sha256'], tam_id=tam_id, cho=cho,
+                truoc_le=True, d_vet_max_m=D_VET_MAX_M,
+                quy_uoc=dict(w_min=W_MIN, smooth_s=SMOOTH_S, gap_s=GAP_S, drift_warn_m=DRIFT_WARN_M,
+                             curve_max_m=CURVE_MAX_M, res_max_m=RES_MAX_M,
+                             u_q='spread (linear, quadratic drift, each turn) + 3 x largest SE + largest residual RMS '
+                                 '+ |q| x a6du_rad (page v10 P2 per place, plus the A6 residual)',
+                             u_r='spread of the centre estimates + largest linear centre drift + largest residual RMS '
+                                 '[DE XUAT], an index',
+                             d_vet='|q| + u_q (tag centre to turning centre; the turning centre is taken as the '
+                                   'nominal body centre, page v10 P2)'),
+                gioi_han=['turning centre = centre of the four wheels and of the IMU unless the wheels slip; a slip '
+                          'repeated about an off-centre point is not seen (page v10 P2)',
+                          'a creep of the centre moving in step with the turn cannot be told from another q (C8BU-R2-2)',
+                          'u_r_m is an index of the centre on the floor, not a bound',
+                          'imu: a check only, on the heading before A6, not in U'],
+                written_at=datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
+
+
 def script_state():
     """Commit of the repo and whether this script or c8_u_imu.py has local changes."""
     import subprocess
@@ -429,6 +638,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--cho', action='append', required=True, help='PLACE=frames.csv (tag_offset 0)')
     ap.add_argument('--log', action='append', help='PLACE=agv_logger csv (IMU check)')
+    ap.add_argument('--a6', default=None, help="c8b_a6_v2 file: write the F4 xoay_v1 per place (q on psi' after A6)")
+    ap.add_argument('--cua-so', action='append', default=[], help='cua_so_v1 (F2) with the E_dau / E_cuoi rows (F4)')
+    ap.add_argument('--tam-id', default=None, help='plate of the runs (F4: A6 must be dat for it)')
     ap.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
@@ -438,6 +650,29 @@ def main(argv=None):
         cu.check_path(a.out)
         if os.path.exists(a.out):
             raise XError(f'{a.out} exists')
+        if a.a6:
+            import c8b_a6 as A6
+            if not a.cua_so or not a.tam_id:
+                raise XError('F4 (--a6) needs --cua-so and --tam-id')
+            try:
+                a6 = A6.load_a6(a.a6)
+            except A6.A6Error as exc:
+                raise XError(f'--a6: {exc}')
+            d = theo_cho(places, a6, read_cua_so(a.cua_so), a.tam_id, logs)
+            d['nguon'] = ([dict(vai='a6', file=os.path.abspath(a.a6), sha256=a6['_sha256'])]
+                          + [dict(vai='cua_so_v1', file=os.path.abspath(p), sha256=cu.sha256(p)) for p in a.cua_so]
+                          + [dict(vai=f'frames {k}', file=os.path.abspath(v), sha256=cu.sha256(v))
+                             for k, v in places.items()])
+            d['script'] = script_state()
+            with open(a.out, 'x', encoding='utf-8') as f:
+                json.dump(d, f, indent=1, ensure_ascii=False, allow_nan=False)
+            for k, b_ in d['cho'].items():
+                q = b_['q_tag_m']
+                print(f'{k}: {b_["trang_thai"]}' + (f' q_tag ({q[0] * 1e3:.2f}, {q[1] * 1e3:.2f}) mm, u_q '
+                                                    f'{b_["u_q_m"] * 1e3:.2f} mm, d_vet {b_["d_vet_m"] * 1e3:.2f} mm'
+                                                    if q else '') + (f'; {"; ".join(b_["ly_do"])}' if b_['ly_do'] else ''))
+            print('#ket_qua,ma=0')
+            return 0
         d = analyse(places, logs)
         d['script'] = script_state()
         with open(a.out, 'x', encoding='utf-8') as f:
