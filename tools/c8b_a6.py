@@ -184,10 +184,11 @@ TOL_L125 = 1e-6                                            # the session numbers
 SU_THEO_SESSION = ('session_sha256', 'cam_tam_m')                # da session (A): set-up fields of the camera
 U_H_HANG_M = 0.0001                                        # design 3: the 0.1 mm term of u_h_chung
 HEX64 = re.compile(r'^[0-9a-f]{64}$')
-GIOI_HAN = [
+GIOI_HAN_DONG_H = (
     '22/11 dem: U_chuyen.dong tu file c8b_a6_dong_v2 la chi so cua kenh huong camera - IMU tren cac luot khac (bo luot '
     'dang cham): gom ca sai huong theo vi tri cua ban do (A3) va sai IMU ngoai mo hinh, khong tach; hai nua dai chia o '
-    'trung vi gia toc, nen hieu ung chi co o gia toc rat cao bi pha loang; phep kiem quyet cho yaw la o D2 (T14)',
+    'trung vi gia toc, nen hieu ung chi co o gia toc rat cao bi pha loang; phep kiem quyet cho yaw la o D2 (T14)')
+GIOI_HAN = [                                               # + GIOI_HAN_DONG_H only when dong is a c8b_a6_dong_v2 file
     '22/11: g_b la do doc doc theo canh ma gk (mo hinh c8b_a6_canh_v1); mat ma khong phang (gk khac do doc gian gm), co '
     'che vat ly chua xac dinh (mat cong hay bo noi cua tam); e_bc, mien nghieng, h_goc van tinh theo mat phang do doc gk',
     '22/11: g_cal (thuoc kep, lan dat dau buoi 1) chi tham khao; kiem cheo la kiem_imu (camera - IMU) tren clip E giu '
@@ -1550,7 +1551,8 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
                 eps_g_khong_meo_khong_dong=eps0_km,
                 ghep_A3_A6=dict(cach='replay chung theo ca H32 (2b) khi hai dau cung mot cho co A3 tung ca; '
                                      'khong thi cong rieng (du phong)', theo_cho=ca_cho),
-                trang_thai=dict(a6=st_a6, h=st_h), ly_do=why, ly_do_h=why_h, gioi_han=list(GIOI_HAN),
+                trang_thai=dict(a6=st_a6, h=st_h), ly_do=why, ly_do_h=why_h,
+                gioi_han=([GIOI_HAN_DONG_H] if (dong or {}).get('schema') == SCHEMA_DONG_H else []) + list(GIOI_HAN),
                 khoa_truoc_sha256=khoa_truoc_sha256, khoa_truoc_sha=khoa_truoc_sha256,      # F3 2.C name (alias)
                 commit=(script or {}).get('commit'),
                 commit_dirty=(script or {}).get('dirty'), nguon=list(nguon), so_tay=SO_TAY, truoc_le=True)

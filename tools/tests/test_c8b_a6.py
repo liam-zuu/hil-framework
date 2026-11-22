@@ -1132,6 +1132,8 @@ def test_dong_v2_through_gop_and_the_half_band_rule(places):
     o = _gop(places, dong=A.with_sha(dict(v2)))
     assert o['trang_thai']['a6'] == 'dat', o['ly_do']
     assert o['dong']['schema'] == A.SCHEMA_DONG_H and o['dong']['kenh'] == A.DONG_KENH_H
+    assert A.GIOI_HAN_DONG_H in o['gioi_han']                         # the v2 limit only with a v2 file (23/11)
+    assert A.GIOI_HAN_DONG_H not in _gop(places)['gioi_han']
     assert A.a6du_rad(o, 0.5, 'r1', ['a0', 'a0_hi']) is not None
     o = _gop(places, dong=A.with_sha(dict(v2, khoa_truoc_sha256='z' * 64)))
     assert o['trang_thai']['a6'] == 'thieu' and any('dong v2' in w and 'lock' in w for w in o['ly_do'])
