@@ -3,7 +3,8 @@ fw_sim.c fwsim_kep_last, fwsim.py KEP_COLS / log['kep'] / kep_indicator.
 Run: python -m pytest -q fwsim/tests/test_fwsim_kep.py   (needs fwsim/build/fwsim.dll)
      python fwsim/tests/test_fwsim_kep.py --digest       (old channels of the golden run, as recorded in GOLDEN)
      python fwsim/tests/test_fwsim_kep.py --scan         (cross-check against phan_tich_kep_pid, one JSON line per run)
-     python fwsim/tests/test_fwsim_kep.py --pair <dll>   (old / new DLL pair on the bit-exact channels, one JSON line per run)"""
+     python fwsim/tests/test_fwsim_kep.py --pair <dll>   (old / new DLL pair on the bit-exact channels, one JSON
+     line per run, with the SHA-256 of both DLLs)"""
 import argparse
 import csv
 import ctypes
@@ -681,8 +682,9 @@ def _trace_works(dll):
 def variants(tmp_path_factory):
     """Lazy build-and-cache of variant DLLs (trace, FWSIM_NO_KEP, vel_ctrl.c mutants), each get() one
     gcc run of build_variant into a private dir; every variant has a different base name (several are
-    loaded in one process). A trace DLL is probed once: when --wrap left no calls the same name is
-    rebuilt with the renamed-symbol fallback (_WRAP_OK = False)."""
+    loaded in one process). A trace DLL is probed once: when --wrap left no calls the fallback is
+    built under its own name <name>_du_phong.dll with the renamed symbols (_WRAP_OK = False):
+    the first DLL stays loaded and is not overwritten."""
     if shutil.which('gcc') is None:
         pytest.skip('gcc not on PATH')
     if _fw_tree() is None:
@@ -703,16 +705,18 @@ def variants(tmp_path_factory):
             if not kw.get('trace') or _WRAP_OK is False:
                 raise
             _WRAP_OK = False                         # this ld cannot --wrap into the DLL: fallback
+            dll = os.path.join(out_dir, name + '_du_phong.dll')   # own name: the loaded DLL is not overwritten
             build_variant(dll, **kw)
         if kw.get('trace'):
             if not _trace_works(dll):
                 if _WRAP_OK is False:
                     raise RuntimeError('the trace records no pid_update calls')
                 _WRAP_OK = False                     # --wrap linked but intercepts nothing: fallback
+                dll = os.path.join(out_dir, name + '_du_phong.dll')   # own name: the loaded DLL is not overwritten
                 build_variant(dll, **kw)
                 if not _trace_works(dll):
                     raise RuntimeError('the trace records no pid_update calls (renamed symbols too)')
-            else:
+            elif _WRAP_OK is None:
                 _WRAP_OK = True
         cache[name] = dll
         return dll
@@ -977,7 +981,8 @@ def test_bit_exact_keys_definition(glog):
 
 def _cap_runs(fw_cu, fw_moi):
     """The four run pairs of test_dll_pair_without_and_with_kep and of the --pair CLI:
-    (label, old log, new log); old = the DLL without the kep channel, new = the production one."""
+    (label, old log, new log); old = the DLL without the kep channel, new = the production one.
+    Both sides of every pair are simulated directly here (no _RUNS cache)."""
     sp = lambda t: (0.3, 0.0, 0.0)      # noqa: E731
     return [('golden', golden_run(fw_cu), golden_run(fw_moi)),
             ('adrc', fwsim.simulate(fw_cu, sp, 1.0, mode='ADRC'),
@@ -985,7 +990,12 @@ def _cap_runs(fw_cu, fw_moi):
             ('motor_tat', fwsim.simulate(fw_cu, sp, 0.5, mode='PID', motor_on=False),
                           fwsim.simulate(fw_moi, sp, 0.5, mode='PID', motor_on=False)),
             ('s03', s03_run(fw_cu, 0.8, s03_defaults(fw_cu))[0],
-                    kiem_cheo_run(fw_moi, 'v08_mac_dinh')[0])]
+                    s03_run(fw_moi, 0.8, s03_defaults(fw_moi))[0])]
+
+
+def _dll_tin(path):
+    """'<path> sha256=<hex>' of a DLL, for the messages of the pair tests."""
+    return f'{os.path.abspath(path)} sha256={build_fwsim.file_sha256(path)}'
 
 
 def so_cap(old_log, new_log):
@@ -1010,14 +1020,17 @@ def test_dll_pair_without_and_with_kep(fw, variants, tmp_path):
     """C3-13: a DLL built with -DFWSIM_NO_KEP is the DLL without the counter (no fwsim_kep_last):
     on the BIT_EXACT channels its logs equal the production DLL's bit for bit, and the whole-log
     outputs differ by the 'kep' entry only."""
-    ref = fwsim.FirmwareSim(variants('fwsim_nokep', defines=('FWSIM_NO_KEP',)))
+    ref_path = variants('fwsim_nokep', defines=('FWSIM_NO_KEP',))
+    ref = fwsim.FirmwareSim(ref_path)
     assert ref.kep_cols == 0 and not hasattr(ref.lib, 'fwsim_kep_last')
+    msg = f'old {_dll_tin(ref_path)}; new {_dll_tin(_DLL)}'
     runs = _cap_runs(ref, fw)
     for name, old_log, new_log in runs:
         r = so_cap(old_log, new_log)
-        assert r['old_keys'] == list(fwsim.BIT_EXACT_KEYS), name
-        assert r['new_keys'] == r['old_keys'] + ['kep'], name
-        assert r['n_lech'] == 0 and r['digest_win_bang'] and r['digest_khac_chi_kep'] and r['npz'], name
+        assert r['old_keys'] == list(fwsim.BIT_EXACT_KEYS), f'{name}: {msg}'
+        assert r['new_keys'] == r['old_keys'] + ['kep'], f'{name}: {msg}'
+        assert r['n_lech'] == 0 and r['digest_win_bang'] and r['digest_khac_chi_kep'] and r['npz'], \
+            f'{name}: {msg}'
     _, old_log, new_log = runs[0]          # the golden pair, written by save_log_csv and compared as text
     s3.save_log_csv(str(tmp_path), 'cap_cu', old_log)
     s3.save_log_csv(str(tmp_path), 'cap_moi', new_log)
@@ -1026,6 +1039,93 @@ def test_dll_pair_without_and_with_kep(fw, variants, tmp_path):
     ik = [i for i, c in enumerate(moi[0]) if c.startswith('kep_')]
     assert [c for i, c in enumerate(moi[0]) if i not in ik] == cu[0]
     assert [[x for i, x in enumerate(r) if i not in ik] for r in moi[1:]] == cu[1:]
+
+
+# fw_sim.c of commit 62e2fa5 (before the kep channel), placed by CODE: `git show 62e2fa5:fwsim/fw_sim.c` cannot run here
+NGUON_CU = os.path.join(fwsim.HERE, '..', '_nguon_cu', 'fw_sim_62e2fa5.c')
+NGUON_CU_SHA = 'a93b6d0928a83ea3c7301fd98a57ac9c67d2edfa88109f1deaa6310a9e3e4b4d'   # sha256, CR stripped
+
+
+def test_dll_pair_with_the_source_before_kep(fw, variants, tmp_path):
+    """The pair against the real pre-kep source: a DLL built of the fw_sim.c of 62e2fa5 has no kep
+    channel, and the real --pair CLI reports every run identical on the BIT_EXACT keys."""
+    if not os.path.isfile(NGUON_CU):
+        pytest.skip(f'{NGUON_CU} not present: the pair with the DLL of 62e2fa5 is not run')
+    with open(NGUON_CU, 'rb') as f:
+        assert hashlib.sha256(f.read().replace(b'\r\n', b'\n')).hexdigest() == NGUON_CU_SHA
+    shutil.copytree(os.path.join(fwsim.HERE, 'shim'), str(tmp_path / 'shim'))
+    src_cu = str(tmp_path / 'fw_sim_62e2fa5.c')
+    shutil.copyfile(os.path.abspath(NGUON_CU), src_cu)
+    old = variants('fwsim_62e2fa5', fw_sim_c=src_cu)
+    sim = fwsim.FirmwareSim(old)
+    assert sim.kep_cols == 0 and not hasattr(sim.lib, 'fwsim_kep_last')
+    del sim
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), '--pair', old],
+                       capture_output=True, text=True, cwd=os.path.dirname(fwsim.HERE), timeout=600)
+    assert r.returncode == 0, r.stderr[-2000:]
+    msg = (f'old {_dll_tin(old)}; new {_dll_tin(_DLL)}; build {fw.build_info.get("compiler")} '
+           f'esp32 {fw.build_info.get("esp32")} flags {fw.build_info.get("flags")}')
+    lines = [json.loads(x) for x in r.stdout.splitlines() if x.strip()]
+    assert [x['run'] for x in lines] == ['golden', 'adrc', 'motor_tat', 's03']
+    for line in lines:
+        m = f"{line['run']}: {msg}"
+        assert line['old_keys'] == list(fwsim.BIT_EXACT_KEYS), m
+        assert line['new_keys'] == line['old_keys'] + ['kep'], m
+        assert line['n_lech'] == 0, m
+        assert line['digest_win_bang'], m
+        assert line['digest_khac_chi_kep'], m
+        assert line['npz'], m
+        assert line['dll_cu_sha256'] == build_fwsim.file_sha256(old), m
+        assert line['dll_moi_sha256'] == build_fwsim.file_sha256(_DLL), m
+    print(msg)
+
+
+def test_cap_runs_simulates_both_sides(fw, variants, monkeypatch):
+    """Codex C3-33: the new side of a pair is simulated on fw_moi here, not taken from the _RUNS
+    cache (keyed by the case name only): a stale 'v08_mac_dinh' entry must not leak into 's03'."""
+    ref_path = variants('fwsim_nokep', defines=('FWSIM_NO_KEP',))
+    ref = fwsim.FirmwareSim(ref_path)
+    stale = kiem_cheo_run(fw, 'v08_ki_xy_1500')   # a run another firmware defaults cached under the name
+    monkeypatch.setitem(_RUNS, 'v08_mac_dinh', stale)
+    runs = dict((n, (o, nw)) for n, o, nw in _cap_runs(ref, fw))
+    o, nw = runs['s03']
+    assert nw is not stale[0]
+    r = so_cap(o, nw)
+    msg = f's03: {_dll_tin(ref_path)}; {_dll_tin(_DLL)}'
+    assert r['n_lech'] == 0 and r['digest_win_bang'] and r['npz'], msg
+    assert _RUNS['v08_mac_dinh'] is stale
+
+
+def test_trace_fallback_builds_a_separate_dll(variants, glog, monkeypatch):
+    """Codex C3-33: when a --wrap trace DLL records no calls, the renamed-symbol fallback is built
+    under its own name <name>_du_phong.dll: the first DLL stays loaded and is not overwritten."""
+    mod = sys.modules[__name__]
+    monkeypatch.setattr(mod, '_WRAP_OK', None)
+    built, probes = [], []
+    real_build, real_works = mod.build_variant, mod._trace_works
+
+    def spy_build(out_dll, **kw):
+        built.append((out_dll, mod._WRAP_OK))
+        return real_build(out_dll, **kw)
+
+    def fake_works(dll):   # loads the DLL (it stays loaded); the first probe: --wrap intercepts nothing
+        probes.append(dll)
+        return real_works(dll) and len(probes) > 1
+
+    monkeypatch.setattr(mod, 'build_variant', spy_build)
+    monkeypatch.setattr(mod, '_trace_works', fake_works)
+    dll = variants('fwsim_trace_thu_du_phong', trace=True)
+    assert len(built) == 2, built
+    msg = f'trace {_dll_tin(built[0][0])}; {_dll_tin(built[1][0])}'
+    assert built[0][1] is None and built[1][1] is False, msg
+    assert built[1][0] != built[0][0], msg
+    assert dll == built[1][0], msg
+    assert probes == [built[0][0], built[1][0]], msg
+    assert os.path.isfile(built[0][0]) and os.path.isfile(built[1][0]), msg
+    log = golden_run(TraceSim(dll))
+    assert list(log) == list(glog)
+    for k in glog:
+        assert _bits_eq(log[k], glog[k]), k
 
 
 def _eval_rows(log, v):
@@ -1110,7 +1210,11 @@ if __name__ == '__main__':
     if a.pair:
         ref_ = fwsim.FirmwareSim(a.pair)
         for name_, old_log_, new_log_ in _cap_runs(ref_, fw_):
-            print(json.dumps(dict(run=name_, **so_cap(old_log_, new_log_))))
+            print(json.dumps(dict(run=name_, **so_cap(old_log_, new_log_),
+                                  dll_cu=os.path.abspath(a.pair),
+                                  dll_cu_sha256=build_fwsim.file_sha256(a.pair),
+                                  dll_moi=os.path.abspath(_DLL),
+                                  dll_moi_sha256=build_fwsim.file_sha256(_DLL))))
         sys.exit(0)
     if a.digest:
         log_ = golden_run(fw_)
