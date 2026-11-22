@@ -419,6 +419,7 @@ def test_gop_consistency_per_place_and_new_plate(places):
     far = dict(pg, rho_max_goc_m=1.7)                                  # a corner outside rho_max is still refused
     o4 = _gop((far, pk))
     assert o4['trang_thai']['a6'] == 'thieu' and o4['mien']['dat'] is False and any('rho' in w for w in o4['ly_do'])
+    assert o4['mien']['rho_max_m'] == A.RHO_MAX_M and o4['mien']['rho_theo_khung'] is None
     # A6C1-7: another plate than the caliper plate is a new plate; a place of another plate is refused
     o2 = _gop(places, tam_cal_id='T0')
     assert o2['trang_thai']['a6'] == 'thieu' and o2['g_cal'] is None and any('tam_moi' in w for w in o2['ly_do'])
@@ -1178,3 +1179,33 @@ def test_dong_huong_clock_error_and_noise(imu_patch):
         gs = np.array(list(e['g_bo_tung_luot'].values()))
         assert se == pytest.approx(np.linalg.norm(np.sqrt(3 / 4 * np.sum((gs - gs.mean(0)) ** 2, axis=0)))) and se > 1e-6
         assert blk['theo_luot'][lid]['a'] == pytest.approx(np.linalg.norm(np.array(e['g_bar']) - gk) + 2 * se)
+
+
+def test_gop_rho_max_from_the_frames(places, tmp_path, monkeypatch):
+    """23/11 (Liam at CODE_C8B "Mo theo du lieu"): rho_max = largest centre rho over the given frames + side/sqrt2;
+    e_bc on that grid; every given frame inside (_rho_ok, same expression); a place beyond it still refused."""
+    pg, pk = places
+    o0 = _gop(places)
+    C, side = np.array(o0['plumb_xy_m']), o0['side_m']
+    fp = tmp_path / 'frames.csv'
+    far = C + np.array([1.65, 0.0])
+    fp.write_text('t_s,valid,tag_x,tag_y\n0,1,%r,%r\n1,0,9,9\n2,1,%r,%r\n3,1,nan,0\n'
+                  % (float(far[0]), float(far[1]), float(C[0] + 0.3), float(C[1] - 0.2)), encoding="utf-8")
+    rk = A.read_rho_khung([str(fp)])
+    assert len(rk[0]['xy']) == 2                                        # invalid and non-finite rows dropped
+    seen = []
+    real = A.e_bc
+    monkeypatch.setattr(A, 'e_bc', lambda *a, **k: (seen.append(k.get('rho_max')), real(*a, **k))[1])
+    o = _gop((dict(pg, rho_max_goc_m=1.7), pk), rho_khung=rk)
+    rm = 1.65 + side / math.sqrt(2.0)
+    assert o['mien']['rho_max_m'] == pytest.approx(rm, abs=1e-12) and o['mien']['rho_de_xuat_cu_m'] == A.RHO_MAX_M
+    assert seen and all(v == o['mien']['rho_max_m'] for v in seen)
+    assert o['trang_thai']['a6'] == 'dat', o['ly_do']                  # the 1.7 m corner is now inside
+    rt = o['mien']['rho_theo_khung']
+    assert rt['rho_tam_max_m'] == pytest.approx(1.65, abs=1e-12) and rt['file'][0]['n_khung'] == 2
+    r_far = float(np.linalg.norm(np.array(rk[0]['xy'][0]) - C))
+    assert A._rho_ok(o, r_far) and not A._rho_ok(o, r_far + 1e-6)
+    o5 = _gop((dict(pg, rho_max_goc_m=rm + 0.01), pk), rho_khung=rk)
+    assert o5['trang_thai']['a6'] == 'thieu' and any('rho' in w for w in o5['ly_do'])
+    with pytest.raises(A.A6Error):
+        A.rho_max_of([dict(file='x', sha256='0' * 64, xy=[])], C, side)
