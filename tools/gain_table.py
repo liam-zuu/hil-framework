@@ -6,13 +6,17 @@ old table (firmware chưa đổi bảng (L142)); diff_with_firmware lists the ce
 
 check() looks at one gain set and reports:
   * range violations: a gain not finite, below LO or above HI (the bounds themselves are allowed);
-  * the ADRC xy triangle, hard: omega_c_xy + 2*omega_o_xy must stay < 200;
-  * warnings only: omega_c_wz + 2*omega_o_wz >= 200, and the wedge pos_kp <= pos_ki / WEDGE_DIV.
-The sums and the quotient are computed in float32, the same arithmetic the ESP32 does.
+  * the ADRC triangle, hard on each axis: omega_c + 2*omega_o must stay < 200 (xy and wz);
+  * one warning only: the wedge pos_kp <= pos_ki / WEDGE_DIV.
+The triangle sum is computed in binary64 on the float32 values the firmware receives and passes
+only strictly below 200; the wedge quotient stays float32, the same arithmetic the ESP32 does.
+lower() / upper() give the bounds of one gain; classify() returns the Verdict (vi_pham_bang,
+vi_pham_tam_giac); check() is classify() plus the wedge warning.
 """
 import math
 import re
 import struct
+import typing
 from fractions import Fraction
 
 TABLE_VERSION = '2026-11-22 chot chung cau 1 + vong 6 a.7 (Liam 21/11)'
@@ -23,8 +27,10 @@ ALIASES = {'wc_xy': 'omega_c_xy', 'wo_xy': 'omega_o_xy', 'wc_wz': 'omega_c_wz', 
 LO = {'PID': (0.0,) * 7, 'ADRC': (0.5, 1.0, 0.5, 1.0, 0.0, 0.0, 0.0)}
 HI = {'PID': (41.0, 1500.0, 4.6, 230.0, 200.0, 5500.0, 50.0),
       'ADRC': (200.0, 100.0, 200.0, 100.0, 200.0, 40000.0, 50.0)}
-XY_SUM_MAX = 200.0                     # omega_c_xy + 2*omega_o_xy must stay below (hard)
-WZ_SUM_WARN = 200.0                    # omega_c_wz + 2*omega_o_wz at/above only warns
+SUM_MAX = 200.0                        # omega_c + 2*omega_o must stay below on each axis (hard, S03 v8.6 2.1)
+XY_SUM_MAX = SUM_MAX
+WZ_SUM_MAX = SUM_MAX
+AXES = ('xy', 'wz')
 WEDGE_DIV = {'PID': 16.0, 'ADRC': 5.5}
 FW_ARRAYS = ('LO_PID', 'HI_PID', 'LO_ADRC', 'HI_ADRC')
 _F32_MAX = 3.4028234663852886e+38      # FLT_MAX, bits 0x7f7fffff (exact in float64)
@@ -68,33 +74,88 @@ def _gains(ctrl, gains: dict) -> dict:
     return {n: g[n] for n in want}
 
 
-def check(ctrl, gains: dict):
-    """(violations, warnings) for one gain set; ValueError when the set itself is malformed."""
-    g = _gains(ctrl, gains)
-    violations, warnings = [], []
+def _index(ctrl, name) -> int:
+    """Position of a gain name (aliases allowed) in NAMES[ctrl]; ValueError when unknown."""
+    if not isinstance(ctrl, str) or ctrl not in NAMES:
+        raise ValueError(f'controller {ctrl!r}: PID or ADRC')
+    n = ALIASES.get(name, name)
+    if n not in NAMES[ctrl]:
+        raise ValueError(f'{ctrl} has no gain {name!r} (one of {", ".join(NAMES[ctrl])})')
+    return NAMES[ctrl].index(n)
+
+
+def lower(ctrl, name) -> float:
+    """The table's lower bound of one gain (LO[ctrl][name]); name may be an alias."""
+    i = _index(ctrl, name)
+    return LO[ctrl][i]
+
+
+def upper(ctrl, name) -> float:
+    """The table's upper bound of one gain as written (binary64, e.g. 4.6 for PID kp_wz); the
+    firmware compares float32 values with the float32 of this number, see pc_arrays."""
+    i = _index(ctrl, name)
+    return HI[ctrl][i]
+
+
+class Verdict(typing.NamedTuple):
+    """classify() of one gain set: trong_bang (every gain, as float32, finite and in [LO, HI]),
+    trong_tam_giac (ADRC: omega_c + 2*omega_o < 200 on each axis; PID: always True) and the
+    messages of each part."""
+    trong_bang: bool
+    trong_tam_giac: bool
+    vi_pham_bang: tuple
+    vi_pham_tam_giac: tuple
+
+
+def _range_messages(ctrl, g: dict) -> list:
+    """The per-gain table messages: the float32 value against the float32 bounds, bounds allowed."""
+    out = []
     for i, n in enumerate(NAMES[ctrl]):
         v, lo, hi = g[n], _f32(LO[ctrl][i]), _f32(HI[ctrl][i])
         if not math.isfinite(v):
-            violations.append(f'{n}={v!r} is not finite (allowed {lo:.9g}..{hi:.9g})')
+            out.append(f'{n}={v!r} is not finite (allowed {lo:.9g}..{hi:.9g})')
         elif v < lo:
-            violations.append(f'{n}={v:.9g} < lower bound {lo:.9g}')
+            out.append(f'{n}={v:.9g} < lower bound {lo:.9g}')
         elif v > hi:
-            violations.append(f'{n}={v:.9g} > upper bound {hi:.9g}')
-    # One +, * or / computed in float64 on float32 operands and then rounded gives the float32
-    # result exactly, so _f32(x + _f32(2*y)) is the same arithmetic the ESP32 does in float.
+            out.append(f'{n}={v:.9g} > upper bound {hi:.9g}')
+    return out
+
+
+def classify(ctrl, gains: dict) -> Verdict:
+    """The Verdict of one gain set; ValueError when the set itself is malformed (as check).
+
+    vi_pham_bang: the per-gain range messages (0 is in the table exactly where LO is 0).
+    vi_pham_tam_giac: ADRC only, axes xy then wz; the axis passes only when its omega_c, omega_o
+    are finite and the binary64 sum c + 2*o is strictly below 200; a non-finite axis fails with no
+    message (the range message covers it). PID always has trong_tam_giac True and no messages."""
+    g = _gains(ctrl, gains)
+    vi_pham_bang = _range_messages(ctrl, g)
+    vi_pham_tam_giac = []
+    trong_tam_giac = True
     if ctrl == 'ADRC':
-        c, o = g['omega_c_xy'], g['omega_o_xy']
-        if math.isfinite(c) and math.isfinite(o):
-            s = _f32(c + _f32(2 * o))
-            if not s < _f32(XY_SUM_MAX):
-                violations.append(f'omega_c_xy + 2*omega_o_xy = {c:.9g} + 2*{o:.9g} = {s:.9g}'
-                                  ' >= 200 (must be < 200)')
-        c, o = g['omega_c_wz'], g['omega_o_wz']
-        if math.isfinite(c) and math.isfinite(o):
-            s = _f32(c + _f32(2 * o))
-            if s >= _f32(WZ_SUM_WARN):
-                warnings.append(f'omega_c_wz + 2*omega_o_wz = {c:.9g} + 2*{o:.9g} = {s:.9g} >= 200')
+        for ax in AXES:
+            c, o = g[f'omega_c_{ax}'], g[f'omega_o_{ax}']
+            if math.isfinite(c) and math.isfinite(o):
+                s = c + 2.0 * o
+                if not s < SUM_MAX:
+                    vi_pham_tam_giac.append(
+                        f'omega_c_{ax} + 2*omega_o_{ax} = {c:.9g} + 2*{o:.9g} = {s:.9g}'
+                        ' >= 200 (must be < 200)')
+                    trong_tam_giac = False
+            else:
+                trong_tam_giac = False
+    return Verdict(not vi_pham_bang, trong_tam_giac, tuple(vi_pham_bang), tuple(vi_pham_tam_giac))
+
+
+def check(ctrl, gains: dict):
+    """(violations, warnings) for one gain set; ValueError when the set itself is malformed."""
+    g = _gains(ctrl, gains)
+    v = classify(ctrl, g)
+    violations = list(v.vi_pham_bang) + list(v.vi_pham_tam_giac)
+    warnings = []
     kp, ki, div = g['pos_kp'], g['pos_ki'], WEDGE_DIV[ctrl]
+    # One / computed in float64 on float32 operands and then rounded gives the float32 result
+    # exactly, so _f32(ki / _f32(div)) is the same arithmetic the ESP32 does in float.
     q = _f32(ki / _f32(div))
     if math.isfinite(kp) and math.isfinite(ki) and ki > 0 and kp <= q:
         warnings.append(f'pos_kp={kp:.9g} <= pos_ki/{div:g} = {q:.9g} (pos_ki={ki:.9g})')

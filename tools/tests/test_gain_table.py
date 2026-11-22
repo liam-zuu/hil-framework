@@ -84,18 +84,21 @@ def test_base_sets_are_clean():
 
 @pytest.mark.parametrize('ctrl,base', [('PID', PID), ('ADRC', ADRC)])
 def test_bounds_themselves_are_allowed(ctrl, base):
+    # S03 v8.6 2.1: the wz triangle is hard like xy, so the wz omega pair is treated like the xy pair
     for i, n in enumerate(gt.NAMES[ctrl]):
         for bound in (EXPECT_LO[ctrl][i], EXPECT_HI[ctrl][i]):
             gains = dict(base)
-            if ctrl == 'ADRC' and n == 'omega_c_xy':
-                gains['omega_o_xy'] = 1          # keep the xy triangle small
-            if ctrl == 'ADRC' and n == 'omega_o_xy':
-                gains['omega_c_xy'] = 0.5
+            for ax in ('xy', 'wz'):
+                if ctrl == 'ADRC' and n == f'omega_c_{ax}':
+                    gains[f'omega_o_{ax}'] = 1           # keep the {ax} triangle small
+                if ctrl == 'ADRC' and n == f'omega_o_{ax}':
+                    gains[f'omega_c_{ax}'] = 0.5
             gains[n] = bound
             v, w = gt.check(ctrl, gains)
-            if ctrl == 'ADRC' and n in ('omega_c_xy', 'omega_o_xy') and bound == EXPECT_HI[ctrl][i]:
-                # the ADRC xy upper bounds can never pass: the triangle fires first
-                assert len(v) == 1 and v[0].startswith('omega_c_xy + 2*omega_o_xy')
+            if ctrl == 'ADRC' and n.startswith('omega_') and bound == EXPECT_HI[ctrl][i]:
+                # the ADRC omega upper bounds can never pass: the axis triangle fires first
+                ax = n.rsplit('_', 1)[1]
+                assert len(v) == 1 and v[0].startswith(f'omega_c_{ax} + 2*omega_o_{ax}'), (ctrl, n, v)
             else:
                 assert v == [], (ctrl, n, bound, v)
 
@@ -106,12 +109,13 @@ def test_pid_kp_wz_bound_is_the_f32():
 
 @pytest.mark.parametrize('ctrl,base', [('PID', PID), ('ADRC', ADRC)])
 def test_one_ulp_above_upper_is_a_violation(ctrl, base):
-    xy = ('omega_c_xy', 'omega_o_xy')
+    # S03 v8.6 2.1: all four ADRC omega gains trip their axis triangle, not just the xy pair
+    omegas = ('omega_c_xy', 'omega_o_xy', 'omega_c_wz', 'omega_o_wz')
     for i, n in enumerate(gt.NAMES[ctrl]):
         v, w = gt.check(ctrl, dict(base, **{n: ulp_up(EXPECT_HI[ctrl][i])}))
         assert any(n in x and 'upper bound' in x for x in v), (ctrl, n, v)
-        if not (ctrl == 'ADRC' and n in xy):
-            assert len(v) == 1, (ctrl, n, v)     # the ADRC xy pair also trips the triangle
+        if not (ctrl == 'ADRC' and n in omegas):
+            assert len(v) == 1, (ctrl, n, v)     # the ADRC omega gains also trip the triangle
 
 
 def test_below_lower_is_a_violation():
@@ -133,17 +137,35 @@ def test_xy_triangle():
     assert len(v) == 1 and v[0].startswith('omega_c_xy + 2*omega_o_xy')
 
 
-def test_xy_sum_is_float32():
-    # 0x42c7ffff + 2*50 rounds to exactly 200.0 in float32 (tie to even), so it violates
+def test_xy_sum_is_binary64_on_float32_values():
+    # S03 v8.6 2.1: the sum is binary64 on the float32 values; float32 addition of
+    # 0x42c7ffff + 2*50 would round to exactly 200.0 (tie to even), binary64 gives
+    # 199.99999237060547 < 200, so the set passes
     assert f32_bits(99.99999237060547) == 0x42c7ffff
-    v, w = gt.check('ADRC', dict(ADRC, omega_c_xy=99.99999237060547, omega_o_xy=50))
-    assert len(v) == 1 and v[0].startswith('omega_c_xy + 2*omega_o_xy')
+    assert gt.check('ADRC', dict(ADRC, omega_c_xy=99.99999237060547, omega_o_xy=50)) == ([], [])
 
 
-def test_wz_sum_is_float32():
+def test_wz_sum_is_binary64_on_float32_values():
+    # S03 v8.6 2.1: same binary64 sum on the wz axis
     assert f32_bits(99.99999237060547) == 0x42c7ffff
-    v, w = gt.check('ADRC', dict(ADRC, omega_c_wz=99.99999237060547, omega_o_wz=50))
-    assert v == [] and any('omega_c_wz' in x for x in w)
+    assert gt.check('ADRC', dict(ADRC, omega_c_wz=99.99999237060547, omega_o_wz=50)) == ([], [])
+
+
+@pytest.mark.parametrize('ax', ['xy', 'wz'])
+def test_triangle_float32_rounding_crosses_the_threshold(ax):
+    def chk(c, o):
+        gains = dict(ADRC)
+        gains[f'omega_c_{ax}'], gains[f'omega_o_{ax}'] = c, o
+        return gt.check('ADRC', gains)
+
+    prefix = f'omega_c_{ax} + 2*omega_o_{ax}'
+    v, w = chk(99.999999, 50)                # float32 of 99.999999 is 100.0: sum exactly 200
+    assert len(v) == 1 and v[0].startswith(prefix)
+    v, w = chk(100, 49.9999999)              # float32 of 49.9999999 is 50.0: sum exactly 200
+    assert len(v) == 1 and v[0].startswith(prefix)
+    assert chk(103.99999, 48) == ([], [])    # float32 is 103.99999237060547: sum 199.99999... < 200
+    v, w = chk(104, 48)                      # the binary64 sum is exactly 200
+    assert len(v) == 1 and v[0].startswith(prefix)
 
 
 def test_wedge_quotient_is_float32():
@@ -153,9 +175,10 @@ def test_wedge_quotient_is_float32():
     assert v == [] and any('pos_kp' in x for x in w)
 
 
-def test_wz_sum_warns_only():
+def test_wz_sum_is_hard():
+    # S03 v8.6 2.1: the wz triangle violates, it does not warn
     v, w = gt.check('ADRC', dict(ADRC, omega_c_wz=100, omega_o_wz=50))
-    assert v == [] and any('omega_c_wz' in x for x in w)
+    assert len(v) == 1 and v[0].startswith('omega_c_wz + 2*omega_o_wz') and w == []
     assert gt.check('ADRC', dict(ADRC, omega_c_wz=99.9, omega_o_wz=50)) == ([], [])
 
 
@@ -193,6 +216,65 @@ def test_missing_and_extra_gains():
         gt.check('PID', [])
     with pytest.raises(ValueError, match='not a string'):
         gt.check('PID', {**PID, 1: 0})
+
+
+def test_upper_lower_by_name():
+    for c in gt.NAMES:
+        for i, n in enumerate(gt.NAMES[c]):
+            assert gt.upper(c, n) == EXPECT_HI[c][i]
+            assert gt.lower(c, n) == EXPECT_LO[c][i]
+            assert gt._f32(gt.upper(c, n)) == gt.pc_arrays()['HI_' + c][i]
+    assert gt.upper('PID', 'kp_wz') == 4.6          # the table number as written, binary64
+    assert gt.upper('ADRC', 'wc_xy') == 200.0       # aliases accepted
+    assert gt.lower('ADRC', 'wo_wz') == 1.0
+    with pytest.raises(ValueError, match='PID or ADRC'):
+        gt.upper('pid', 'kp_xy')
+    with pytest.raises(ValueError):
+        gt.upper('PID', 'omega_c_xy')
+
+
+def test_classify_parts():
+    assert gt.classify('PID', dict(PID)) == gt.Verdict(True, True, (), ())
+    assert gt.classify('ADRC', dict(ADRC)) == gt.Verdict(True, True, (), ())
+    v = gt.classify('PID', dict(PID, kp_xy=ulp_up(41.0)))
+    assert v.trong_bang is False and v.trong_tam_giac is True and v.vi_pham_tam_giac == ()
+    assert len(v.vi_pham_bang) == 1 and 'kp_xy' in v.vi_pham_bang[0] and 'upper bound' in v.vi_pham_bang[0]
+    assert gt.classify('PID', dict(PID, kp_xy=41.0000001)).trong_bang is True     # float32 is 41.0
+    assert gt.classify('PID', dict(PID, kp_wz=4.60000001)).trong_bang is True     # float32 is f32(4.6)
+    assert gt.classify('PID', dict(PID, kp_wz=4.6000002)).trong_bang is False     # float32 above f32(4.6)
+    # 0 is in the table exactly where LO is 0
+    assert gt.classify('PID', dict(PID, ki_xy=0)).trong_bang is True
+    assert gt.classify('ADRC', dict(ADRC, pos_kp=0, pos_ki=0, k_psi=0)).trong_bang is True
+    assert gt.classify('ADRC', dict(ADRC, omega_c_xy=0)).trong_bang is False      # LO is 0.5
+    assert gt.classify('ADRC', dict(ADRC, omega_o_wz=1.0)).trong_bang is True
+    assert gt.classify('ADRC', dict(ADRC, omega_o_wz=0.9999999403953552)).trong_bang is False
+    v = gt.classify('ADRC', dict(ADRC, omega_c_wz=150, omega_o_wz=48))
+    assert (v.trong_bang, v.trong_tam_giac) == (True, False) and v.vi_pham_bang == ()
+    assert len(v.vi_pham_tam_giac) == 1 and v.vi_pham_tam_giac[0].startswith('omega_c_wz + 2*omega_o_wz')
+    v = gt.classify('ADRC', dict(ADRC, omega_c_xy=ulp_up(200.0)))
+    assert (v.trong_bang, v.trong_tam_giac) == (False, False)
+    v = gt.classify('PID', dict(PID, kp_xy=float('nan')))
+    assert (v.trong_bang, v.trong_tam_giac) == (False, True)
+    v = gt.classify('ADRC', dict(ADRC, omega_c_xy=float('nan')))
+    assert (v.trong_bang, v.trong_tam_giac) == (False, False) and v.vi_pham_tam_giac == ()
+    with pytest.raises(ValueError):
+        gt.classify('PID', {k: x for k, x in PID.items() if k != 'k_psi'})
+
+
+def test_check_is_classify_plus_wedge():
+    sets = [('PID', dict(PID)),
+            ('ADRC', dict(ADRC)),
+            ('PID', dict(PID, kp_xy=41.01)),
+            ('ADRC', dict(ADRC, omega_c_xy=100, omega_o_xy=50)),
+            ('ADRC', dict(ADRC, omega_c_wz=100, omega_o_wz=50)),
+            ('ADRC', dict(ADRC, omega_c_xy=100, omega_o_xy=50, omega_c_wz=100, omega_o_wz=50)),
+            ('ADRC', dict(ADRC, pos_ki=55, pos_kp=10))]
+    for c, g in sets:
+        v = gt.classify(c, g)
+        assert gt.check(c, g)[0] == list(v.vi_pham_bang) + list(v.vi_pham_tam_giac)
+    wedge = sets[-1]
+    assert gt.check(*wedge)[1] != []                       # the wedge warning
+    assert gt.classify(*wedge) == gt.Verdict(True, True, (), ())
 
 
 @needs_fw

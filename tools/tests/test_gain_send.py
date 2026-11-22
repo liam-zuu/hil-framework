@@ -302,6 +302,14 @@ def test_gain_table_violation_sends_nothing(fake, tmp_path, capsys, monkeypatch)
         assert cap.out.rstrip().endswith('#ket_qua,ma=1')
         assert 'omega_c_xy + 2*omega_o_xy' in cap.err and 'nothing sent' in cap.err
         assert len(calls) == 0 and adrc.received == []
+        # S03 v8.6: the wz triangle is a hard violation like xy
+        a = dict(omega_c_xy='8', omega_o_xy='30', omega_c_wz='100', omega_o_wz='50',
+                 pos_kp='6', pos_ki='3', k_psi='1')
+        assert gs.main(args(adrc, '--ctrl', 'ADRC', '--id', '3', '--gains', gains_arg(a))) == 1
+        cap = capsys.readouterr()
+        assert cap.out.rstrip().endswith('#ket_qua,ma=1')
+        assert 'omega_c_wz + 2*omega_o_wz' in cap.err and 'nothing sent' in cap.err
+        assert len(calls) == 0 and adrc.received == []
     finally:
         adrc.close()
     f = tmp_path / 'gain_violating.json'
@@ -317,11 +325,12 @@ def test_gain_table_violation_sends_nothing(fake, tmp_path, capsys, monkeypatch)
 @pytest.mark.parametrize('fake', [dict(ctrl='ADRC')], indirect=True)
 def test_gain_table_warning_still_sends(fake, capsys, monkeypatch):
     calls = spy_exchange(monkeypatch)
-    a = dict(omega_c_xy='8', omega_o_xy='30', omega_c_wz='100', omega_o_wz='50',
-             pos_kp='6', pos_ki='3', k_psi='1')
+    # S03 v8.6: the wz triangle is a violation now; the only warning left is the pos_kp/pos_ki wedge
+    a = dict(omega_c_xy='8', omega_o_xy='30', omega_c_wz='8', omega_o_wz='30',
+             pos_kp='10', pos_ki='55', k_psi='1')
     assert gs.main(args(fake, '--ctrl', 'ADRC', '--id', '3', '--gains', gains_arg(a))) == 0
     out = capsys.readouterr().out
-    assert '# warning: omega_c_wz' in out and len(fake.received) == 1
+    assert '# warning: pos_kp' in out and len(fake.received) == 1
     assert len(calls) == 1                       # the spy sits on the real send path
 
 

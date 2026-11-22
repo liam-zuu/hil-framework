@@ -22,9 +22,9 @@ Gains: 7 per controller, the fwsim names (fwsim/tune_ga.py VARS_BY_MODE):
 --file: JSON {"ctrl": "PID", "id": 3, "gains": {name: value, ...}} or a flat {name: value} (then
 --ctrl is needed); --id / --ctrl on the command line must agree with the file when both are given.
 Every value is rounded to float32 and sent as %.9g, so the ESP32 gets exactly those bits.
-Before sending, the set is checked against the PC gain table tools/gain_table.py (range, ADRC xy
-omega_c_xy + 2*omega_o_xy < 200); a violation sends nothing (exit 1, like bad arguments); warnings
-are printed and the set is still sent.
+Before sending, the set is checked against the PC gain table tools/gain_table.py (range; ADRC
+omega_c + 2*omega_o < 200 on each axis, xy and wz); a violation sends nothing (exit 1, like bad
+arguments); warnings (the pos_kp / pos_ki wedge) are printed and the set is still sent.
 
 Packets (protocol after Codex round 1, 12/11): '#gain_set,v=1,tx=<nonce>,id=..,ctrl=..,<7 gains>' and
 '#gain_get,v=1,tx=<nonce>'. tx is a new random number for every packet sent; only an answer from the

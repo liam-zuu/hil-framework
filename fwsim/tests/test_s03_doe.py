@@ -515,7 +515,7 @@ def _row(e, tv=1.0, sat=0.0, completed='true', status='ok'):
 
 def test_analyse_worst_range_and_thresholds():
     """Y2 = 0.05 + 0.01 X1 + 0.02 mu X2: effect X1 0.02 (significant at 0.01), X2 2*0.02*mu;
-    worst over mu takes mu = 0.6; Y3 threshold 20 % of the reference."""
+    worst over mu takes mu = 0.6; Y3 threshold the absolute 0.4 s^-1 (S03 v8.6 section 5.2)."""
     def model(c, mu):
         return _row(0.05 + 0.01 * c[0] + 0.02 * mu * c[1], tv=1.0 + 0.1 * c[2],
                     completed='false' if c[3] > 0 and c[4] > 0 else 'true')
@@ -530,7 +530,8 @@ def test_analyse_worst_range_and_thresholds():
     assert get[('e_perp_max', 'range', 'X2')]['effect'] == pytest.approx(0.0, abs=1e-12)
     assert get[('e_perp_max', 'range', 'X3')]['effect'] == pytest.approx(0.0, abs=1e-12)
     r3 = get[('tv_duty', '0.5', 'X3')]
-    assert r3['threshold'] == pytest.approx(0.2) and r3['effect'] == pytest.approx(0.2) and not r3['significant']
+    # S03 v8.6: the Y3 threshold is the absolute 0.4 s^-1 (before: 20 % of the default-gain run)
+    assert r3['threshold'] == pytest.approx(0.4) and r3['effect'] == pytest.approx(0.2) and not r3['significant']
     assert all(v['main'] == 'as_measured' for v in ver)
     nc = {(f['factors'], f['levels'], f['mu']): f['count'] for f in fails if f['kind'] == 'not_completed'}
     assert nc[('X4:X5', '+,+', 0.5)] == 32 and nc[('X4:X5', '-,+', 0.5)] == 0 and nc[('X4', '+', 0.5)] == 32
@@ -1005,13 +1006,15 @@ def test_analyse_no_conclusion_speed_has_no_effects():
 
 
 def test_analyse_y3_zero_reference_and_worst_counts():
-    """S3C-13: Y3 reference 0 -> note; fail counts over mu ('worst': any mu not completed)."""
+    """S3C-13 / S03 v8.6: with the reference 0 the tv_duty threshold is still the absolute 0.4
+    (the X3 effect 0.2 is not significant, no 'reference run is 0' note); fail counts over mu."""
     def model(c, mu):
         return _row(0.05, tv=0.1 * c[2], completed='false' if (c[0] > 0 and mu == 0.6) else 'true')
     pts, runs = _runs(model)
     eff, _, _, fails = s3.analyse('PID', 'outer', pts, runs, [0.4, 0.5, 0.6], [0.5], {('PID', 0.5): 0.0})
     r = next(x for x in eff if x['response'] == 'tv_duty' and x['term'] == 'X3' and x['mu'] == '0.5')
-    assert r['significant'] and 'reference run is 0' in r['note']
+    # S03 v8.6: the Y3 threshold is the absolute 0.4 s^-1 whatever the reference holds
+    assert r['threshold'] == 0.4 and not r['significant'] and 'reference run is 0' not in r['note']
     w = {(f['factors'], f['levels']): f['count'] for f in fails if f['kind'] == 'not_completed' and f['mu'] == 'worst'}
     assert w[('X1', '+')] == 64 and w[('X1', '-')] == 0
 
@@ -1570,8 +1573,13 @@ def test_v82_main_writes_the_gate_columns_and_meta(tmp_path, monkeypatch, capsys
     code, out, _, _, _ = _run_main(tmp_path, monkeypatch, capsys)
     assert code == 0
     for f in ('sealed/runs.csv', 'sealed_test/runs_test.csv'):
-        assert next(_csv.reader(open(out / f))) == V8_COLS + V82_COLS + G1C_COLS, f
+        # S03 v8.6: ngoai_tam_giac is the last column of the two sealed run files only
+        assert next(_csv.reader(open(out / f))) == V8_COLS + V82_COLS + G1C_COLS + ['ngoai_tam_giac'], f
     assert next(_csv.reader(open(out / 'sweep.csv'))) == list(s3.SWEEP_ID_COLS) + s3.RUN_COLS[5:]   # S3G2-3
+    assert 'ngoai_tam_giac' not in next(_csv.reader(open(out / 'sweep.csv')))
+    for f in ('sealed/runs.csv', 'sealed_test/runs_test.csv'):
+        # S03 v8.6: the standard fake defaults never break the LADRC triangle
+        assert {r['ngoai_tam_giac'] for r in _csv.DictReader(open(out / f))} == {'false'}
     # S3G-3: the VALUES reach the three files (fake gate fields differ per gains and speed)
     gains = {(d['controller'], d['point_id']): {n: float(d[f'{n}_value']) for n in s3.FACTORS[d['controller']]}
              for d in _csv.DictReader(open(out / 'design.csv'))}
@@ -1967,19 +1975,25 @@ def test_v84_bound_helpers(fn, x, ref, thr, want):
     assert f(x, ref, thr) is want
 
 
-def test_v84_y3_threshold_exact():
-    """S84V3-1: the Y3 threshold is the exact 0.2 x tv_duty of the decimals (binary64 0.2 * 0.9 is
-    0.18000000000000002, 0.2 * 0.7 is 0.13999999999999999); non-finite stays non-finite."""
+def test_v86_y3_threshold_is_absolute():
+    """S03 v8.6 section 5.2: the Y3 threshold is the exact decimal 0.4 s^-1 at every speed, mu,
+    worst and range (before: the exact 0.2 x tv_duty of the default-gain run); Y3_REL is gone."""
     from fractions import Fraction
-    assert s3.y3_threshold(0.9) == Fraction('0.18') and s3.y3_threshold(0.7) == Fraction('0.14')
-    assert math.isnan(s3.y3_threshold(float('nan'))) and math.isinf(s3.y3_threshold(float('inf')))
-    t09 = {v: s3.y3_threshold(0.9) for v in GATE3}
-    t07 = {v: s3.y3_threshold(0.7) for v in GATE3}
-    # tv lower by exactly 0.2 x 0.9 = 0.18 at one speed: flag
-    assert s3.classify_point(_w(_all(tv=0.9), {0.8: _kr(tv=0.72)}), _all(tv=0.9), GATE3, t09) == ('cờ', 3, False)
-    # tv higher by exactly 0.2 x 0.7 = 0.14 at one speed is not worse: the e lower elsewhere flags
-    assert s3.classify_point(_w(_all(tv=0.7), {0.2: _kr(tv=0.84), 0.5: _kr(e=0.0, tv=0.7)}), _all(tv=0.7), GATE3,
-                             t07) == ('cờ', 3, False)
+    assert s3.Y3_ABS == 0.4 and s3.THRESH['tv_duty'] == 0.4 and not hasattr(s3, 'Y3_REL')
+    assert s3.y3_threshold() == Fraction(2, 5)
+    thr = {v: s3.y3_threshold() for v in GATE3}
+    # tv lower by exactly 0.4 at one speed: flag (binary64 0.7 - 0.3 is 0.39999999999999997; exact: 0.4)
+    assert s3.classify_point(_w(_all(tv=0.7), {0.8: _kr(tv=0.3)}), _all(tv=0.7), GATE3, thr) == ('cờ', 3, False)
+    # tv lower by 0.39: no flag
+    assert s3.classify_point(_w(_all(tv=0.7), {0.8: _kr(tv=0.31)}), _all(tv=0.7), GATE3,
+                             thr) == ('không cờ', 4, False)
+    # tv higher by exactly 0.4 at 0.2 is not worse (binary64 1.1 - 0.7 is 0.40000000000000013, exact 0.4):
+    # the e lower at 0.5 flags
+    assert s3.classify_point(_w(_all(tv=0.7), {0.2: _kr(tv=1.1), 0.5: _kr(e=0.0, tv=0.7)}), _all(tv=0.7), GATE3,
+                             thr) == ('cờ', 3, False)
+    # tv higher by 0.41 at 0.2 is worse: no flag; the e lower at 0.5 is bao_rieng
+    assert s3.classify_point(_w(_all(tv=0.7), {0.2: _kr(tv=1.11), 0.5: _kr(e=0.0, tv=0.7)}), _all(tv=0.7), GATE3,
+                             thr) == ('không cờ', 4, True)
 
 
 def _kiem_rows(ctrl, grids, fn, mu=0.5):
@@ -2035,7 +2049,7 @@ def test_v84_check_totals_and_rows():
     assert by[('ki_xy', ki_noi[0])]['ket_qua'] == 'cờ' and by[('ki_xy', ki_noi[0])]['buoc'] == 3
     assert by[('ki_xy', ki_noi[1])]['ket_qua'] == 'chưa kết luận'
     assert by[('ki_xy', ki_noi[0])]['e_diem_v0.5'] == 0.03 and by[('ki_xy', ki_noi[0])]['e_can_v0.5'] == 0.05
-    assert by[('ki_xy', ki_noi[0])]['nguong_tv_v0.5'] == pytest.approx(0.2)
+    assert by[('ki_xy', ki_noi[0])]['nguong_tv_v0.5'] == pytest.approx(0.4)  # S03 v8.6: absolute 0.4 s^-1
     t = tot[0]
     assert t['ket_qua'] == 'đã kiểm đủ' and t['n_diem_ngoai'] == t['n_da_kiem'] == n_noi + 2
     assert (t['n_co'], t['n_chua_ket_luan'], t['n_khong_co'], t['n_chua_kiem']) == (1, 1, n_noi, 0)
@@ -2043,23 +2057,26 @@ def test_v84_check_totals_and_rows():
     assert set(s3.KIEM_COLS) >= set(k for r in rows for k in r)
 
 
-def test_v84_check_y3_threshold_exact():
-    """S84V3-1: out_of_range_check takes the Y3 threshold as the exact 0.2 x tv_duty of the default run: with a
-    default tv_duty of 0.9 a point whose tv_duty is 0.18 lower at one speed is flagged (the binary64 product
-    0.18000000000000002 would miss it); the CSV column holds the float threshold."""
+def test_v86_check_y3_threshold_absolute():
+    """S03 v8.6 section 5.2: out_of_range_check takes the Y3 threshold as the exact decimal 0.4
+    s^-1 at every speed whatever y3_ref holds (binary64 0.7 - 0.3 is 0.39999999999999997, the
+    exact decimals give 0.4); the CSV column holds it as a float."""
     grids, levels, y3 = _kiem_setup()
-    y3 = {k: 0.9 for k in y3}
     ki_noi = grids[('PID', 'ki_xy')][1]['noi']
 
     def fn(name, x, v):
         if name == 'ki_xy' and x == ki_noi[0] and v == 0.8:
-            return _kr(tv=0.72)
-        return _kr(tv=0.9)
-    rows, _ = s3.out_of_range_check(_kiem_rows('PID', grids, fn), levels, grids, FAKE_DEFAULTS, ['PID'],
-                                    list(s3.SPEEDS), 0.5, y3, None)
+            return _kr(tv=0.3)                              # 0.4 below the level's 0.7: flag
+        return _kr(tv=0.7)
+    args = (_kiem_rows('PID', grids, fn), levels, grids, FAKE_DEFAULTS, ['PID'], list(s3.SPEEDS), 0.5)
+    rows, _ = s3.out_of_range_check(*args, {k: 0.9 for k in y3}, None)
+    rows2, _ = s3.out_of_range_check(*args, {k: 123.0 for k in y3}, None)
+    rows3, _ = s3.out_of_range_check(*args, {}, None)
+    assert rows == rows2 == rows3                           # S03 v8.6: the reference is not used any more
     by = {(r['factor'], r['value']): r for r in rows if r['dong'] == 'diem'}
     assert (by[('ki_xy', ki_noi[0])]['ket_qua'], by[('ki_xy', ki_noi[0])]['buoc']) == ('cờ', 3)
-    assert by[('ki_xy', ki_noi[0])]['nguong_tv_v0.8'] == 0.18 and type(by[('ki_xy', ki_noi[0])]['nguong_tv_v0.8']) is float
+    assert by[('ki_xy', ki_noi[0])]['nguong_tv_v0.8'] == 0.4
+    assert type(by[('ki_xy', ki_noi[0])]['nguong_tv_v0.8']) is float
     assert by[('ki_xy', ki_noi[1])]['ket_qua'] == 'không cờ'
 
 
@@ -2120,19 +2137,22 @@ def test_v83_main_writes_levels_sources_luoi_and_grid_meta(tmp_path, monkeypatch
         lo_b, hi_b = _tg.BOUNDS[ctrl]
         for name, lo, hi in zip(s3.FACTORS[ctrl], lo_b, hi_b):
             d = FAKE_DEFAULTS[ctrl][name]
-            grid, info = s3.sweep_grid_n(name, d, lo, hi)
+            grid, info = s3.sweep_grid_cut(ctrl, name, d, lo, hi)      # S03 v8.6: cut at the ceiling
             base = s3.base_grid(grid, info)
             r = lv[(ctrl, name)]
             assert float(r['a']) == info['a'] and float(r['b']) == info['b']
             assert r['b_n'] == ('' if info['b_n'] is None else repr(info['b_n']))
-            # the fake completes every sweep run: L, H are the ends of the ORIGINAL grid (v8.4)
-            assert float(r['L']) == base[0] and float(r['H']) == base[-1] == info['b']
+            # the fake completes every sweep run: L, H are the ends of the cut original grid
+            assert float(r['L']) == base[0] and float(r['H']) == base[-1] == min(info['b'], info['T'])
             assert (r['L_nguon'], r['H_nguon']) == s3.level_sources(base, base[0], base[-1], info, name)
             rows = [x for x in sweep if x['controller'] == ctrl and x['factor'] == name]
             assert len(rows) == len(grid) * len(s3.SPEEDS)
             for x in rows:
                 assert x['luoi'] == s3.grid_label(float(x['value']), d, info['noi'])
+                # S03 v8.6: tran is true at the point equal to the ceiling T
+                assert x['tran'] == ('true' if float(x['value']) == info['T'] else 'false')
     assert {x['luoi'] for x in sweep if x['factor'].startswith('(')} == {'mac_dinh'}
+    assert {x['tran'] for x in sweep if x['factor'].startswith('(')} == {'false'}
     # S83-5: every design value (centre, outer, inner, axial, test) is the decoding of its code with the levels
     # read back from levels.csv
     design = list(_csv.DictReader(open(out / 'design.csv', encoding='utf-8')))
@@ -2142,18 +2162,27 @@ def test_v83_main_writes_levels_sources_luoi_and_grid_meta(tmp_path, monkeypatch
         for k, n in enumerate(s3.FACTORS[c]):
             L_, H_, sc = float(lv[(c, n)]['L']), float(lv[(c, n)]['H']), lv[(c, n)]['scale']
             assert r[f'{n}_value'] == repr(s3.decode(float(r[f'X{k + 1}']), L_, H_, sc)), (c, r['point_id'], n)
-    assert {r['H_nguon'] for r in lv.values()} == {'hết lưới', 'trần ω_o'}
+    # S03 v8.6: the cut inside the original grid of PID kp_wz ends at the ceiling T = 4.6
+    assert (lv[('PID', 'kp_wz')]['H'], lv[('PID', 'kp_wz')]['H_nguon'], lv[('PID', 'kp_wz')]['b'],
+            lv[('PID', 'kp_wz')]['b_n']) == ('4.6', 'trần bảng chặn', '10.0', '4.6')
+    assert lv[('PID', 'kp_xy')]['b_n'] == '41.0'
+    assert {r['H_nguon'] for r in lv.values()} == {'hết lưới', 'trần ω_o', 'trần bảng chặn'}
     assert {r['L_nguon'] for r in lv.values()} == {'0', 'hết lưới dưới'}
     meta = (out / 'meta.yaml').read_text(encoding='utf-8')
     assert meta.startswith('spec: S03 v8.4 ')
+    assert 'reference only' not in meta                                     # S03 v8.6: b_n is used
     grid_meta = _json.loads(next(x for x in meta.splitlines() if x.startswith('grid: ')).split('   #')[0][6:])
     assert set(grid_meta) == {f'{c} {n}' for c in s3.CONTROLLERS for n in s3.FACTORS[c]}
-    assert grid_meta['PID ki_xy']['K'] == 4 and grid_meta['ADRC omega_o_xy']['b_n'] is None
-    # v8.4: the check file, fixed header; with the fake every extension point is 'không cờ'
+    assert grid_meta['PID kp_wz']['b_n'] == grid_meta['PID kp_wz']['T'] == 4.6
+    assert grid_meta['PID kp_wz']['n_noi'] == 0
+    assert grid_meta['PID ki_xy']['K'] == 4 and grid_meta['PID ki_xy']['n_bo'] == 0
+    assert grid_meta['ADRC omega_o_xy']['b_n'] is None
+    # v8.4: the check file, fixed header; with the fake every point outside [L, H] is 'không cờ'
     kiem = list(_csv.DictReader(open(out / 'kiem_ngoai_mien.csv', encoding='utf-8')))
     assert next(_csv.reader(open(out / 'kiem_ngoai_mien.csv', encoding='utf-8'))) == s3.KIEM_COLS
     pts = [r for r in kiem if r['dong'] == 'diem']
-    n_noi = sum(i['n_noi'] for i in (s3.sweep_grid_n(n, FAKE_DEFAULTS[c][n], lo, hi)[1] for c in s3.CONTROLLERS
+    n_noi = sum(i['n_noi'] for i in (s3.sweep_grid_cut(c, n, FAKE_DEFAULTS[c][n], lo, hi)[1]
+                                     for c in s3.CONTROLLERS
                                      for n, lo, hi in zip(s3.FACTORS[c], *_tg.BOUNDS[c])))
     assert len(pts) == n_noi and {r['luoi'] for r in pts} == {'noi'} and {r['ket_qua'] for r in pts} == {'không cờ'}
     assert [(r['controller'], r['ket_qua']) for r in kiem if r['dong'] == 'tong'] == \
@@ -2162,6 +2191,14 @@ def test_v83_main_writes_levels_sources_luoi_and_grid_meta(tmp_path, monkeypatch
                                                      if x.startswith('file_sha256: '))[13:])
     km = _json.loads(next(x for x in meta.splitlines() if x.startswith('kiem_ngoai_mien: ')).split('   #')[0][17:])
     assert km['PID']['ket_qua'] == 'đã kiểm đủ' and km['ADRC']['co'] == []
+    # S03 v8.6 section 5.2: the thresholds as a JSON dict, tv_duty the absolute 0.4 s^-1
+    th = _json.loads(next(x for x in meta.splitlines() if x.startswith('thresholds: ')).split('   #')[0][12:])
+    assert th['tv_duty'] == 0.4
+    y3 = _json.loads(next(x for x in meta.splitlines() if x.startswith('y3_reference: '))
+                     [len('y3_reference: '):])
+    assert set(y3) == {f'{c} v={v}' for c in s3.CONTROLLERS for v in s3.SPEEDS}
+    import yaml as _yaml
+    _yaml.safe_load(meta)                                   # the whole meta.yaml is valid YAML
 
 
 def _over_k_psi(ctrl_want, fields):
@@ -2176,23 +2213,32 @@ def _over_k_psi(ctrl_want, fields):
 
 
 @needs_dll
-def test_v84_main_flag_stops_before_the_main_design(tmp_path, monkeypatch, capsys):
-    """A flagged extension point (e_perp_max lower by 0.02 m, tv the same) stops S03 before design.csv: exit 2,
-    no main-design run, no sealed runs; the check file says 'cờ'; levels and sweep are written."""
+def test_v85_main_flag_is_reported_and_s03_goes_on(tmp_path, monkeypatch, capsys):
+    """S03 v8.5 K6: a flagged point (ADRC k_psi extension better on e) no longer stops S03; the PID
+    k_psi extension points stay inconclusive; exit 0, the main design ran, both are reported in
+    kiem_ngoai_mien.csv, on the console and in meta.yaml."""
     import csv as _csv
+    import json as _json
+    over_a = _over_k_psi('ADRC', dict(e_perp_max=0.0))
+    over_p = _over_k_psi('PID', dict(status='track_err'))
     code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys,
-                                             row_over=_over_k_psi('ADRC', dict(e_perp_max=0.0)))
-    assert code == 2
-    assert max(calls) <= 1                                        # no run with two factors off
-    runs = out / 'sealed' / 'runs.csv'
-    assert not runs.exists() or len(runs.read_text().strip().splitlines()) <= 1   # header only
-    assert (out / 'design.csv').read_text().strip() == ''
+                                             row_over=lambda c, g, v: over_a(c, g, v) or over_p(c, g, v))
+    assert code == 0
+    assert max(calls) == 7                                          # the main design ran
+    assert len(list(_csv.DictReader(open(out / 'sealed' / 'runs.csv')))) == 2 * 271 * 3
+    assert len(list(_csv.DictReader(open(out / 'design.csv')))) == 2 * 371
     kiem = list(_csv.DictReader(open(out / 'kiem_ngoai_mien.csv', encoding='utf-8')))
     co = [r for r in kiem if r['ket_qua'] == 'cờ']
     assert co and {(r['controller'], r['factor'], r['can']) for r in co} == {('ADRC', 'k_psi', 'H')}
-    assert '[STOP] out-of-range check' in console and 'Liam decides' in console
+    assert {r['ket_qua'] for r in kiem if r['dong'] == 'diem' and r['controller'] == 'PID'
+            and r['factor'] == 'k_psi'} == {'chưa kết luận'}
+    assert '[STOP]' not in console
+    assert '[out-of-range check] flagged points' in console
+    assert 'WARNING: out-of-range check has inconclusive points' in console
     meta = (out / 'meta.yaml').read_text(encoding='utf-8')
-    assert 'stopped in the sweep: out-of-range check' in meta
+    assert 'status: "ran to the end"' in meta
+    km = _json.loads(next(x for x in meta.splitlines() if x.startswith('kiem_ngoai_mien: ')).split('   #')[0][17:])
+    assert km['ADRC']['co']
 
 
 @needs_dll
@@ -2215,7 +2261,8 @@ def test_v84_main_check_totals_when_s03_stops_in_the_sweep(tmp_path, monkeypatch
     assert code == 2
     tot = {r['controller']: r for r in _csv.DictReader(open(out / 'kiem_ngoai_mien.csv', encoding='utf-8'))
            if r['dong'] == 'tong'}
-    n_all = {c: sum(len(s3.sweep_grid_n(n, FAKE_DEFAULTS[c][n], lo, hi)[0])
+    # S03 v8.6: the points not checked are those of the grid after the cut at the ceiling
+    n_all = {c: sum(len(s3.sweep_grid_cut(c, n, FAKE_DEFAULTS[c][n], lo, hi)[0])
                     for n, lo, hi in zip(s3.FACTORS[c], *_tg.BOUNDS[c])) for c in s3.CONTROLLERS}
     for c in s3.CONTROLLERS:
         assert tot[c]['ket_qua'] == 'kiểm dở' and tot[c]['n_gain_chua_kiem'] == '7'
@@ -2281,3 +2328,367 @@ def test_b813_g1_fields_on_real_runs(v82_runs):
         for c in Q_OF:
             for x in ('q', 'lo', 'hi', 'n_undef'):
                 assert s3._bits(row[f'{c}_{x}_chung']) == s3._bits(row[f'{c}_{x}'])
+
+
+# ── S03 v8.6: the sweep grid cut at the gain-table ceiling, W nodes, absolute Y3, triangle ──────
+
+HI_T = {'PID': dict(kp_xy=41.0, ki_xy=1500.0, kp_wz=4.6, ki_wz=230.0, pos_kp=200.0, pos_ki=5500.0,
+                    k_psi=50.0),
+        'ADRC': dict(omega_c_xy=200.0, omega_o_xy=100.0, omega_c_wz=200.0, omega_o_wz=100.0,
+                     pos_kp=200.0, pos_ki=40000.0, k_psi=50.0)}
+
+
+def _f32v(x):
+    return struct.unpack('<f', struct.pack('<f', x))[0]
+
+
+def test_v86_factor_names_are_the_gain_table_names():
+    """S03 v8.6 section 3.1: the factors are the names of tools/gain_table.py and ceiling() is its
+    upper bound; a name that is not a gain of the controller raises S03Stop."""
+    assert s3.FACTORS == {c: s3.gain_table.NAMES[c] for c in s3.CONTROLLERS}
+    for c in s3.CONTROLLERS:
+        for n in s3.FACTORS[c]:
+            assert s3.ceiling(c, n) == HI_T[c][n]
+    with pytest.raises(s3.S03Stop, match='ceiling'):
+        s3.ceiling('PID', 'omega_c_xy')
+
+
+def test_v86_cut_at_ceiling_rules():
+    """S03 v8.6 section 3.1 rules (1), (2): points above T dropped; a remaining point within 1e-9
+    becomes T, else T is appended."""
+    assert s3.cut_at_ceiling([1.0, 2.0, 4.0, 8.0], 5.0) == ([1.0, 2.0, 4.0, 5.0], 1, True)
+    assert s3.cut_at_ceiling([1.0, 2.0, 4.0], 5.0) == ([1.0, 2.0, 4.0], 0, False)
+    assert s3.cut_at_ceiling([1.0, 2.0, 4.0, 8.0], 4.0) == ([1.0, 2.0, 4.0], 1, False)
+    x = 4.0 * (1 - 5e-10)                             # within 1e-9: becomes T, same bits
+    pts, n_bo, them = s3.cut_at_ceiling([1.0, x, 8.0], 4.0)
+    assert pts == [1.0, 4.0] and s3._bits(pts[-1]) == s3._bits(4.0) and (n_bo, them) == (1, False)
+    x = 4.0 * (1 - 2e-9)                              # just outside: T appended
+    pts, n_bo, them = s3.cut_at_ceiling([1.0, x, 8.0], 4.0)
+    assert pts == [1.0, x, 4.0] and (n_bo, them) == (1, True)
+    # a point within 1e-9 ABOVE T is dropped like any point above
+    assert s3.cut_at_ceiling([1.0, 4.0 * (1 + 5e-10)], 4.0) == ([1.0, 4.0], 1, True)
+    # nothing dropped: the points stay as they are even within 1e-9 below T
+    pts, n_bo, them = s3.cut_at_ceiling([1.0, 4.0 * (1 - 5e-10)], 4.0)
+    assert pts == [1.0, 4.0 * (1 - 5e-10)] and (n_bo, them) == (0, False)
+    # two remaining points within 1e-9 with one dropped: error
+    with pytest.raises(s3.S03Stop, match='ceiling'):
+        s3.cut_at_ceiling([1.0, 4.0 * (1 - 7e-10), 4.0 * (1 - 5e-10), 8.0], 4.0)
+
+
+def test_v86_spec_example_pid_kp_wz_is_cut_in_the_original_grid():
+    """S03 v8.6 section 3.1 example: PID kp_wz (default 1.0, bounds 0..6, T = 4.6 < b = 10): the
+    cut is inside the original grid, T is appended and the extension is gone entirely."""
+    grid, info = s3.sweep_grid_cut('PID', 'kp_wz', 1.0, 0.0, 6.0)
+    old = s3.sweep_grid('kp_wz', 1.0, 0.0, 6.0)
+    kept = [x for x in old if x <= 4.6]
+    assert [s3._bits(x) for x in grid] == [s3._bits(x) for x in kept + [4.6]]
+    assert kept[-1] == pytest.approx(3.98, abs=0.01)
+    assert min(x for x in old if x > 4.6) == pytest.approx(6.31, abs=0.01)
+    assert s3.base_grid(grid, info) == grid
+    assert info['noi'] == [] and info['n_noi'] == 0
+    assert info['b'] == 10.0 and info['a'] == 0.1 and info['T'] == 4.6 and info['b_n'] == 4.6 == grid[-1]
+    i0 = s3.sweep_grid_n('kp_wz', 1.0, 0.0, 6.0)[1]
+    assert info['n_bo'] == len(s3.sweep_grid_n('kp_wz', 1.0, 0.0, 6.0)[0]) - len(kept)
+    assert info['n_points'] == len(grid)
+    assert info['K'] == i0['K'] and info['r'] == i0['r']
+    assert s3.grid_label(4.6, 1.0, info['noi']) == 'log'
+    assert s3.levels_from_sweep(grid, 1.0, [True] * len(grid)) == (0.0, 4.6)
+    assert s3.level_sources(grid, 0.0, 4.6, info, 'kp_wz') == ('0', 'trần bảng chặn')
+    ok = [True] * (len(grid) - 1) + [False]
+    L, H = s3.levels_from_sweep(grid, 1.0, ok)
+    assert H == kept[-1] and s3.level_sources(grid, L, H, info, 'kp_wz')[1] == \
+        'điểm kế tiếp không hoàn thành'
+
+
+@pytest.mark.parametrize('ctrl, name', [('PID', 'kp_xy'), ('PID', 'pos_kp'), ('PID', 'k_psi'),
+                                        ('ADRC', 'omega_c_xy'), ('ADRC', 'omega_c_wz'),
+                                        ('ADRC', 'pos_kp'), ('ADRC', 'k_psi')])
+def test_v86_cut_in_the_extension(ctrl, name):
+    """b < T < b_n: the original grid is kept bit for bit, the extension is cut at T."""
+    lo, hi = dict(zip(s3.FACTORS[ctrl], zip(*_tg.BOUNDS[ctrl])))[name]
+    d = FAKE_DEFAULTS[ctrl][name]
+    T = HI_T[ctrl][name]
+    g0, i0 = s3.sweep_grid_n(name, d, lo, hi)
+    g, i = s3.sweep_grid_cut(ctrl, name, d, lo, hi)
+    assert i0['b'] < T < i0['b_n']
+    assert [s3._bits(x) for x in s3.base_grid(g, i)] == [s3._bits(x) for x in s3.sweep_grid(name, d, lo, hi)]
+    assert i['noi'] == [x for x in i0['noi'] if x <= T] + [T]
+    assert g[-1] == T == i['b_n']
+    assert i['n_bo'] == len([x for x in i0['noi'] if x > T]) >= 1
+    for k in ('a', 'b', 'r', 'K', 'n_log'):
+        assert i[k] == i0[k]
+    assert s3.grid_label(T, d, i['noi']) == 'noi'
+    base = s3.base_grid(g, i)
+    assert s3.levels_from_sweep(base, d, [True] * len(base))[1] == i['b']
+    assert s3.level_sources(base, base[0], i['b'], i, name)[1] == 'hết lưới'
+
+
+@pytest.mark.parametrize('ctrl, name', [('PID', 'ki_xy'), ('PID', 'ki_wz'), ('PID', 'pos_ki'),
+                                        ('ADRC', 'omega_o_xy'), ('ADRC', 'omega_o_wz'),
+                                        ('ADRC', 'pos_ki')])
+def test_v86_uncut_gains_keep_the_old_grid_bit_for_bit(ctrl, name):
+    """T >= b_n: the grid and every old info key are exactly those of sweep_grid_n."""
+    lo, hi = dict(zip(s3.FACTORS[ctrl], zip(*_tg.BOUNDS[ctrl])))[name]
+    d = FAKE_DEFAULTS[ctrl][name]
+    g0, i0 = s3.sweep_grid_n(name, d, lo, hi)
+    g, i = s3.sweep_grid_cut(ctrl, name, d, lo, hi)
+    assert [s3._bits(x) for x in g] == [s3._bits(x) for x in g0]
+    assert {k: v for k, v in i.items() if k not in ('T', 'n_bo')} == i0
+    assert i['n_bo'] == 0 and i['T'] == HI_T[ctrl][name]
+    if name.startswith('omega_o'):
+        assert i['b_n'] is None
+    if (ctrl, name) == ('PID', 'ki_xy'):
+        want = V8_GRID_BITS[('ki_xy', 0.05, 0.0, 10.0)].split()
+        assert [struct.pack('<d', x).hex() for x in g[:len(want)]] == want
+    if (ctrl, name) == ('ADRC', 'omega_o_xy'):
+        want = V8_GRID_BITS[('omega_o_xy', 30.0, 5.0, 48.0)].split()
+        assert [struct.pack('<d', x).hex() for x in g[:len(want)]] == want
+
+
+def test_v86_point_within_1e9_of_the_ceiling_becomes_the_ceiling():
+    """(a) b itself within 1e-9 of T (here b == T == 50): the base end becomes T, no extension.
+    (b) cut_grid: T a hair above b keeps b and adds T to the extension; a hair below drops b and
+    appends T to the original grid."""
+    g, i = s3.sweep_grid_cut('PID', 'k_psi', 5.0, 0.0, 4.0)      # b = 50.0 = T
+    _, i_uncut = s3.sweep_grid_n('k_psi', 5.0, 0.0, 4.0)
+    assert g == s3.sweep_grid('k_psi', 5.0, 0.0, 4.0)
+    assert i['noi'] == [] and i['b_n'] == 50.0 == g[-1] and i['n_bo'] == i_uncut['K']
+    assert s3.level_sources(s3.base_grid(g, i), g[0], 50.0, i, 'k_psi')[1] == 'trần bảng chặn'
+
+    g0, i0 = s3.sweep_grid_n('ki_xy', 0.05, 0.0, 10.0)           # b = 10.0
+    base0 = s3.base_grid(g0, i0)
+    pts, info = s3.cut_grid(g0, i0, 10.0 * (1 + 5e-10))          # b within 1e-9 below T: becomes T
+    assert len(s3.base_grid(pts, info)) == len(base0)
+    assert s3.base_grid(pts, info)[-1] == 10.0 * (1 + 5e-10) and info['noi'] == []
+    pts, info = s3.cut_grid(g0, i0, 10.0 * (1 + 2e-9))           # just above: b kept, T in noi
+    assert s3.base_grid(pts, info)[-1] == 10.0 and info['noi'] == [10.0 * (1 + 2e-9)]
+    pts, info = s3.cut_grid(g0, i0, 10.0 * (1 - 5e-10))          # just below: b dropped, T appended
+    assert s3.base_grid(pts, info)[-1] == 10.0 * (1 - 5e-10) and info['noi'] == []
+    for T in (10.0 * (1 + 5e-10), 10.0 * (1 + 2e-9), 10.0 * (1 - 5e-10)):
+        _, info = s3.cut_grid(g0, i0, T)
+        assert info['b_n'] == T and info['b'] == 10.0
+
+
+def test_v86_default_above_the_ceiling_stops():
+    """S03 v8.6 section 3.1: a firmware default above its ceiling is not a grid point: S03 stops."""
+    with pytest.raises(s3.S03Stop, match='ceiling'):
+        s3.sweep_grid_cut('PID', 'kp_wz', 5.0, 0.0, 6.0)
+
+
+W_NODE_CASES = ([(c, n, FAKE_DEFAULTS[c][n], lo, hi)
+                 for c in s3.CONTROLLERS
+                 for n, lo, hi in zip(s3.FACTORS[c], *_tg.BOUNDS[c])]
+                + [('PID', 'kp_wz', 0.37, 0.0, 6.0), ('PID', 'kp_xy', 0.6, 0.0, 6.0),
+                   ('ADRC', 'omega_c_wz', 0.5, 1.0, 25.0)])
+
+
+def _w_nodes_want(name, d, lo, hi, T):
+    """The spec expectation of w_nodes (S03 v8.6 section 3.1b item 2), written here from the spec:
+    the 11 values of geomspace(a, b, 11) (the one within 1e-9 of the default is the default) plus
+    b r^k, then rules (1), (2): drop > T; if dropped, a point within 1e-9 becomes T else T appended."""
+    a = d / 10.0 if lo == 0.0 else min(d / 10.0, lo)
+    b = max(10.0 * d, hi)
+    if name.startswith('omega_o'):
+        b = min(b, 48.0)
+    logs = [d if math.isclose(x, d, rel_tol=1e-9) else float(x) for x in np.geomspace(a, b, 11)]
+    r = (b / a) ** 0.1
+    K = 0
+    if not name.startswith('omega_o'):
+        K = 1
+        while r ** K < 10 * (1 - 1e-9):
+            K += 1
+    ext = [float(b * r ** k) for k in range(1, K + 1)]
+    pts = [x for x in logs + ext if not x > T]
+    if len(pts) < len(logs) + len(ext):
+        near = [i for i, x in enumerate(pts) if math.isclose(x, T, rel_tol=1e-9)]
+        if near:
+            pts[near[0]] = T
+        else:
+            pts.append(T)
+    return pts, a, b
+
+
+@pytest.mark.parametrize('ctrl, name, d, lo, hi', W_NODE_CASES)
+def test_v86_w_nodes_definition(ctrl, name, d, lo, hi):
+    """The W nodes are the cut log-plus-extension lists of the grid, never the luoi labels."""
+    want, a, b = _w_nodes_want(name, d, lo, hi, HI_T[ctrl][name])
+    nodes = s3.w_nodes(ctrl, name, d, lo, hi)
+    assert [s3._bits(x) for x in nodes] == [s3._bits(x) for x in want]
+    grid, info = s3.sweep_grid_cut(ctrl, name, d, lo, hi)
+    gbits = [s3._bits(x) for x in grid]
+    nbits = [s3._bits(x) for x in nodes]
+    assert all(x in gbits for x in nbits)
+    assert 0.0 not in nodes and nodes[0] == a
+    assert nodes[-1] == (info['b_n'] if info['b_n'] is not None else info['b'])
+    assert set(x for x in grid if s3._bits(x) not in nbits) <= {0.0, d}
+    assert (d in nodes) == any(math.isclose(x, d, rel_tol=1e-9) for x in np.geomspace(a, b, 11))
+
+
+def test_v86_w_nodes_do_not_follow_the_luoi_label():
+    """PID kp_wz: 4.6 is a node although grid_label calls it 'log' and the default 1.0 is a node
+    although its label is 'mac_dinh'; with a default off the log points the default is no node."""
+    nodes = s3.w_nodes('PID', 'kp_wz', 1.0, 0.0, 6.0)
+    grid, info = s3.sweep_grid_cut('PID', 'kp_wz', 1.0, 0.0, 6.0)
+    assert 4.6 in nodes and s3.grid_label(4.6, 1.0, info['noi']) == 'log'
+    assert 1.0 in nodes and s3.grid_label(1.0, 1.0, info['noi']) == 'mac_dinh'
+    assert nodes != [x for x in grid if s3.grid_label(x, 1.0, info['noi']) in ('log', 'noi')]
+    old = s3.sweep_grid('kp_wz', 1.0, 0.0, 6.0)
+    assert len(nodes) == len([x for x in old if x != 0.0 and x <= 4.6]) + 1
+    nodes2 = s3.w_nodes('PID', 'kp_wz', 0.37, 0.0, 6.0)
+    assert 0.37 not in nodes2 and s3.grid_label(0.37, 0.37, []) == 'mac_dinh'
+
+
+def test_v86_analyse_threshold_does_not_depend_on_the_reference():
+    """S03 v8.6 section 5.2: the analysis threshold is the absolute 0.4 s^-1 at every speed, mu,
+    worst and range; tv = 0.2 X3 gives the effect exactly 0.4 -> NOT significant (strictly above)."""
+    all_eff = []
+    for ref in (0.0, 1.0, 100.0):
+        pts, runs = _runs(lambda c, mu: _row(0.05, tv=0.2 * c[2]))
+        eff, _, _, _ = s3.analyse('PID', 'outer', pts, runs, [0.4, 0.5, 0.6], [0.5], {('PID', 0.5): ref})
+        all_eff.append(eff)
+    assert all_eff[0] == all_eff[1] == all_eff[2]
+    eff = all_eff[0]
+    tv_rows = [r for r in eff if r['response'] == 'tv_duty']
+    assert {r['mu'] for r in tv_rows} == {'0.4', '0.5', '0.6', 'worst', 'range'}
+    assert all(r['threshold'] == 0.4 for r in tv_rows)
+    x3 = next(r for r in tv_rows if r['mu'] == '0.5' and r['term'] == 'X3')
+    assert x3['effect'] == pytest.approx(0.4) and not x3['significant']
+    assert not any('reference' in r['note'] for r in eff)
+    pts, runs = _runs(lambda c, mu: _row(0.05, tv=0.25 * c[2]))
+    eff, _, _, _ = s3.analyse('PID', 'outer', pts, runs, [0.4, 0.5, 0.6], [0.5], {('PID', 0.5): 1.0})
+    x3 = next(r for r in eff if r['response'] == 'tv_duty' and r['mu'] == '0.5' and r['term'] == 'X3')
+    assert x3['effect'] == pytest.approx(0.5) and x3['significant']
+
+
+def test_v86_bounds_check_gain_table():
+    """S03 v8.6 section 3.1b item 4: check_table compares the float32 of every gain with the
+    gain table (bounds themselves pass, 0 accepted where the lower bound is 0); the triangle is
+    NOT checked there. check_bounds keeps its v8 behaviour: a gain outside the table but inside
+    [L, H] does not raise."""
+    lv = {n: (0.0, 1.0, 'lin') for n in s3.FACTORS['PID']}
+    lv['kp_wz'] = (0.0, 4.6, 'lin')
+
+    def gains_at(codes):
+        return {n: s3.decode(c, *lv[n]) for n, c in zip(s3.FACTORS['PID'], codes)}
+    pts = [(1, 'outer', (1.0,) * 7), (2, 'outer', (-1.0,) * 7)]
+    s3.check_table('PID', pts, gains_at)                    # 4.6 and 0 are in the table
+    lv['kp_wz'] = (0.0, 4.60000001, 'lin')                  # float32 of the corner is f32(4.6): passes
+    s3.check_table('PID', pts, gains_at)
+    lv['kp_wz'] = (0.0, 4.6000002, 'lin')                   # float32 above the table bound
+    s3.check_bounds('PID', lv, pts, gains_at)               # inside [L, H]: the v8 check does not raise
+    with pytest.raises(s3.S03Stop, match='gain table'):
+        s3.check_table('PID', pts, gains_at)
+
+    lv = {n: (1.0, 8.0, 'log') for n in s3.FACTORS['ADRC']}
+    lv['omega_c_xy'] = (0.4, 8.0, 'log')
+
+    def gains_at_a(codes):
+        return {n: s3.decode(c, *lv[n]) for n, c in zip(s3.FACTORS['ADRC'], codes)}
+    s3.check_bounds('ADRC', lv, [(2, 'outer', (-1.0,) * 7)], gains_at_a)      # inside [L, H]: no raise
+    with pytest.raises(s3.S03Stop, match='gain table'):
+        s3.check_table('ADRC', [(2, 'outer', (-1.0,) * 7)], gains_at_a)       # 0.4 < lower bound 0.5
+    lv['omega_c_xy'] = (1.0, 8.0, 'log')
+    lv['pos_kp'] = (0.0, 6.0, 'lin')                        # 0 where the lower bound is 0: passes
+    s3.check_table('ADRC', [(2, 'outer', (-1.0,) * 7)], gains_at_a)
+    lv['omega_c_xy'] = (1.0, 150.0, 'log')
+    lv['omega_o_xy'] = (12.0, 48.0, 'log')
+    # (150, 48): outside the triangle but inside the table: no raise
+    s3.check_table('ADRC', [(1, 'outer', (1.0,) * 7)], gains_at_a)
+
+
+def test_v86_candidate_check_and_outside_triangle():
+    """check_candidate is gain_table.classify; outside_triangle is 'not trong_tam_giac' (PID always
+    False); the sum is binary64 on the float32 values, strictly below 200."""
+    base = dict(omega_c_xy=8.0, omega_o_xy=30.0, omega_c_wz=8.0, omega_o_wz=30.0, pos_kp=6.0,
+                pos_ki=3.0, k_psi=1.0)
+    v = s3.check_candidate('ADRC', base)
+    assert (v.trong_bang, v.trong_tam_giac) == (True, True) and s3.outside_triangle('ADRC', base) is False
+    v = s3.check_candidate('ADRC', dict(base, omega_c_xy=150.0, omega_o_xy=48.0))
+    assert (v.trong_bang, v.trong_tam_giac) == (True, False)
+    assert s3.outside_triangle('ADRC', dict(base, omega_c_xy=150.0, omega_o_xy=48.0)) is True
+    v = s3.check_candidate('ADRC', dict(base, omega_c_wz=104.0, omega_o_wz=48.0))   # sum exactly 200
+    assert (v.trong_bang, v.trong_tam_giac) == (True, False)
+    v = s3.check_candidate('ADRC', dict(base, omega_c_wz=103.99999, omega_o_wz=48.0))
+    assert (v.trong_bang, v.trong_tam_giac) == (True, True)
+    v = s3.check_candidate('ADRC', dict(base, omega_c_xy=103.9999999, omega_o_xy=48.0))  # f32 = 104.0
+    assert (v.trong_bang, v.trong_tam_giac) == (True, False)
+    g = dict(FAKE_DEFAULTS['PID'])
+    v = s3.check_candidate('PID', g)
+    assert (v.trong_bang, v.trong_tam_giac) == (True, True) and s3.outside_triangle('PID', g) is False
+    v = s3.check_candidate('PID', dict(g, kp_xy=41.1))
+    assert (v.trong_bang, v.trong_tam_giac) == (False, True)
+    with pytest.raises(ValueError):
+        s3.check_candidate('PID', {k: x for k, x in g.items() if k != 'k_psi'})
+
+
+@needs_dll
+def test_v86_main_ngoai_tam_giac_columns_and_count(tmp_path, monkeypatch, capsys):
+    """S03 v8.6 sections 3.1b/3.2: with the ADRC omega_c_xy default 12.0 the outer corners with
+    X1 = X2 = +1 break the triangle; they run like any point and carry ngoai_tam_giac in design.csv,
+    runs.csv, runs_test.csv; the per-controller counts are in the notes files."""
+    import csv as _csv
+    import json as _json
+    monkeypatch.setitem(FAKE_DEFAULTS['ADRC'], 'omega_c_xy', 12.0)
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys)
+    assert code == 0
+    header = next(_csv.reader(open(out / 'design.csv', encoding='utf-8')))
+    assert header[-1] == 'ngoai_tam_giac'
+    # S03 v8.6: the value columns are the factor names, shared names deduplicated (pos_*, k_psi)
+    assert header[:-1] == (['controller', 'point_id', 'box'] + [f'X{k}' for k in range(1, 8)]
+                           + [f'{n}_value' for n in s3.FACTORS['PID']]
+                           + [f'{n}_value' for n in s3.FACTORS['ADRC'] if n not in s3.FACTORS['PID']])
+    design = list(_csv.DictReader(open(out / 'design.csv', encoding='utf-8')))
+
+    def want_flag(r):
+        if r['controller'] == 'PID':
+            return 'false'
+        g = {n: float(r[f'{n}_value']) for n in s3.FACTORS['ADRC']}
+        bad = (_f32v(g['omega_c_xy']) + 2.0 * _f32v(g['omega_o_xy']) >= 200.0
+               or _f32v(g['omega_c_wz']) + 2.0 * _f32v(g['omega_o_wz']) >= 200.0)
+        return 'true' if bad else 'false'
+    for r in design:
+        assert r['ngoai_tam_giac'] == want_flag(r), (r['controller'], r['point_id'])
+    outer_flag = [r for r in design if r['controller'] == 'ADRC' and r['ngoai_tam_giac'] == 'true'
+                  and r['box'] == 'outer']
+    assert len(outer_flag) == 32
+    assert all(r['X1'] == '1.0' and r['X2'] == '1.0' for r in outer_flag)
+    assert not [r for r in design if r['ngoai_tam_giac'] == 'true' and r['box'] != 'test'
+                and not (r['box'] == 'outer' and r['X1'] == '1.0' and r['X2'] == '1.0')]
+    assert not any(r['ngoai_tam_giac'] == 'true' for r in design if r['controller'] == 'PID')
+    flags = {(r['controller'], r['point_id']): r['ngoai_tam_giac'] for r in design}
+    for f in ('sealed/runs.csv', 'sealed_test/runs_test.csv'):
+        with open(out / f, encoding='utf-8') as fh:
+            rd = list(_csv.DictReader(fh))
+        for r in rd:
+            assert r['ngoai_tam_giac'] == flags[(r['controller'], r['point_id'])], (f, r['point_id'])
+    runs = list(_csv.DictReader(open(out / 'sealed' / 'runs.csv', encoding='utf-8')))
+    assert len(runs) == 2 * 271 * 3 and {r['status'] for r in runs} == {'ok'}
+    notes = _json.load(open(out / 'sealed' / 'notes.json'))
+    assert notes['ngoai_tam_giac_points'] == {'PID': 0, 'ADRC': 32}
+    n_test = sum(1 for r in design if r['box'] == 'test' and r['ngoai_tam_giac'] == 'true')
+    notes_t = _json.load(open(out / 'sealed_test' / 'notes.json'))
+    assert notes_t['ngoai_tam_giac_points'] == {'PID': 0, 'ADRC': n_test}
+    meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    # S03 v8.6: the counts are in the notes files only, not a meta.yaml field (the files: block
+    # only documents the notes key)
+    assert 'ngoai_tam_giac_points:' not in meta
+    assert 'ngoai_tam_giac' not in console.replace(str(out), '')  # nothing of it on the console
+    # (the tmp path itself contains the test name)
+    assert 'ngoai_tam_giac' not in next(_csv.reader(open(out / 'sweep.csv', encoding='utf-8')))
+
+
+@needs_dll
+def test_v86_main_gain_table_failure_stops_before_the_main_design(tmp_path, monkeypatch, capsys):
+    """S03 v8.6 section 3.1b item 4: an ADRC omega_c_xy design corner below the (raised) table
+    lower bound stops S03 before the main design: no main-design run, no sealed run row."""
+    import csv as _csv
+    monkeypatch.setitem(s3.gain_table.LO, 'ADRC', (1.0, 1.0, 0.5, 1.0, 0.0, 0.0, 0.0))
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys)
+    assert code == 2
+    assert '[STOP] before the main design' in console and 'gain table' in console
+    assert max(calls) <= 1                                          # no run with two factors off
+    # as before v8.6: the public design.csv holds the rows made before the stop, here the PID rows
+    rows = list(_csv.DictReader(open(out / 'design.csv', encoding='utf-8')))
+    assert rows and {r['controller'] for r in rows} == {'PID'}
+    runs = out / 'sealed' / 'runs.csv'
+    assert not runs.exists() or len(list(_csv.DictReader(open(runs)))) == 0
