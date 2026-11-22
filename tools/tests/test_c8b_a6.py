@@ -55,10 +55,11 @@ def _f15(idx, t, scale=0.0001, seed=1, schema=A.F15_FULL, trang_thai='dat', cho=
                       list(fields), khung, 'c' * 64, '1' * 64, 'f15.json', '2' * 64, [])
 
 
-def _do(cho='goc', idx=None, t=None, P=None, f15=None, tam='T1', lan='L1', **kw):
+def _do(cho='goc', idx=None, t=None, P=None, f15=None, tam='T1', lan='L1', luot='c1', **kw):
     if idx is None:
         idx, t, P = _clip(**kw)
-    return A.do_place(cho, idx, t, P, _ses(), f15 if f15 is not None else _f15(idx, t, cho=cho), TopCam(), tam, lan)
+    return A.do_place(cho, idx, t, P, _ses(), f15 if f15 is not None else _f15(idx, t, cho=cho), TopCam(), tam, lan,
+                      luot)
 
 
 def test_g_cal_from_the_four_caliper_heights():
@@ -294,11 +295,19 @@ def places():
     return _do('goc'), _do('K1', seed=3, centre=(-0.5, 0.7))
 
 
+def _imu(cho='goc', g=GC, se=(0.0002, 0.0002), rho=0.7, luot='c2', clip='d' * 64, **kw):
+    d = dict(schema=A.SCHEMA_IMU, tam_id='T1', cho=cho, luot_id_E=luot, clip_sha256=clip, khoa_truoc_sha256=KHOA,
+             g_yaw=[float(x) for x in g], SE_yaw=list(se), rho_m=rho, n_khung=900, trang_thai='dat', ly_do=[])
+    d.update(kw)
+    return A.with_sha(d)
+
+
 def _gop(pl, **kw):
     sha = ['a' * 64, 'b' * 64]
     g_hat = np.mean([p['g_E'] for p in pl], axis=0)
     base = dict(lap=_lap(), dong=_dong(g_hat), giu_ngoai=_o(sha), u_h=_uh(), khoa_truoc_sha256=KHOA, script=SCRIPT,
-                cho_sha=sha, with_ebc=True, lan_lap_cal_id='L1', giu_ngoai_rows=_rows_o(), khoa=LOCK)
+                cho_sha=sha, with_ebc=True, lan_lap_cal_id='L1', giu_ngoai_rows=_rows_o(), khoa=LOCK,
+                kiem_imu=[_imu('goc', g_hat), _imu('K1', g_hat)])
     base.update(kw)
     return A.gop(list(pl), 'T1', base.pop('tam_cal_id', 'T1'), **base)
 
@@ -316,17 +325,20 @@ def test_gop_dat_and_eps_g(places):
                                       + 2 * math.sqrt(2e-8))
     dist = max(np.linalg.norm(np.array(p['g_E']) - GC) for p in places)
     assert out['khoang_g_cal'] == pytest.approx(dist)
-    assert out['eps_g'] == pytest.approx(max(s, dist + A.u_cal()[1]) + u['lap'] + u['cho'] + u['dong'])
+    assert out['eps_g'] == pytest.approx(s + u['lap'] + u['cho'] + u['dong'])       # 22/11: no g_cal term
+    assert 'tham khao' in out['g_cal_vai_tro'] and out['mo_hinh'] == A.MO_HINH and out['kiem_imu_dat'] is True
     assert out['U_cal'] == pytest.approx(A.u_cal()[1]) and out['U_cal_thanh_phan'] == pytest.approx(A.u_cal()[0])
     assert out['e_bc_rad'] is not None and out['e_bc_rad'] < 1e-3 and len(out['e_bc_lan_chia']) >= 2
     assert out['h_goc_m'] == pytest.approx([HB + ri @ g_hat for ri in A.body(SIDE)])
-    assert out['u_h_goc_m'][0] == pytest.approx(0.0003 + np.linalg.norm(A.body(SIDE)[0]) * out['eps_g'] + A.V_MAX_M)
+    dkm = max(p['lech_canh_gian'] for p in places)
+    assert out['u_h_goc_m'][0] == pytest.approx(0.0003 + np.linalg.norm(A.body(SIDE)[0]) * (out['eps_g'] + dkm)
+                                                + A.V_MAX_M)
     assert out['khoa_truoc_sha256'] == KHOA and out['commit'] == 'abc' and out['nhat_quan'] is True
     assert out['khoa_truoc_sha'] == KHOA                                  # F3 2.C name
 
 
 @pytest.mark.parametrize('kw,txt', [
-    (dict(lap=None), 'lap'), (dict(dong=None), 'dong'), (dict(giu_ngoai=None), 'held-out'),
+    (dict(lap=None), 'lap'), (dict(dong=None), 'dong'), (dict(kiem_imu=None), 'held-out'),
     (dict(khoa_truoc_sha256=None), 'khoa_truoc'), (dict(script=dict(commit='abc', dirty=True)), 'dirty'),
     (dict(script=None), 'commit'), (dict(u_h=None), None)])
 def test_gop_missing_part(places, kw, txt):
@@ -386,14 +398,27 @@ def test_gop_dong_band_thieu_reaches_the_reader(places):
 
 
 def test_gop_consistency_per_place_and_new_plate(places):
-    # A6C1-6: two places on either side of g_cal, their mean on it: each place checked
+    # A6C1-6: each place compared with g_cal (22/11: a reference only, see below)
     pg, pk = places
     a, b = dict(pg), dict(pk)
-    a['g_E'], b['g_E'] = list(GC + [0.008, 0.0]), list(GC - [0.008, 0.0])
+    a['g_E'], b['g_E'] = list(GC - [0.0, 0.009]), list(GC - [0.0, 0.009])     # both 0.009 off the caliper
     o = _gop((a, b))
-    assert o['nhat_quan'] is False and o['trang_thai']['a6'] == 'thieu'
-    assert any('g_cal_bat_nhat' in w for w in o['ly_do'])
+    # 22/11 (Liam "Sua mo hinh"): the caliper is a reference only: reported, not a reason, not in eps_g
+    assert o['nhat_quan'] is False and o['trang_thai']['a6'] == 'dat', o['ly_do']
+    assert not any('g_cal' in w for w in o['ly_do'])
     assert o['nhat_quan_cho']['goc']['dat'] is False and o['nhat_quan_cho']['K1']['dat'] is False
+    assert o['eps_g'] == pytest.approx(o['s_E'] + sum(o['U_chuyen'].values()))
+    # 22/11 (Liam "Mien theo du lieu"): a tilt above the old 1.5 deg proposal is in the domain when e_bc converged
+    c, d = dict(pg), dict(pk)
+    c['g_E'], d['g_E'] = list(GC + [0.012, 0.0]), list(GC - [0.012, 0.0])
+    o3 = _gop((c, d))
+    m = o3['mien']
+    assert m['nghieng_max_rad'] == pytest.approx(math.atan(np.linalg.norm(o3['g_b']) + o3['eps_g']))
+    assert m['nghieng_max_rad'] > A.NGHIENG_MAX_RAD == m['nghieng_de_xuat_cu_rad'] and m['dat'] is True
+    assert o3['trang_thai']['a6'] == 'dat' and o3['e_bc_rad'] is not None, o3['ly_do']
+    far = dict(pg, rho_max_goc_m=1.7)                                  # a corner outside rho_max is still refused
+    o4 = _gop((far, pk))
+    assert o4['trang_thai']['a6'] == 'thieu' and o4['mien']['dat'] is False and any('rho' in w for w in o4['ly_do'])
     # A6C1-7: another plate than the caliper plate is a new plate; a place of another plate is refused
     o2 = _gop(places, tam_cal_id='T0')
     assert o2['trang_thai']['a6'] == 'thieu' and o2['g_cal'] is None and any('tam_moi' in w for w in o2['ly_do'])
@@ -544,8 +569,7 @@ def test_u_psi_joint_replay_per_case(places):
     assert a6['trang_thai']['a6'] == 'dat' and a6['eps_g_khong_meo'] < a6['eps_g']
     s2 = max(2 * np.linalg.norm(p['SE_E']) for p in places)
     u = a6['U_chuyen']
-    assert a6['eps_g_khong_meo'] == pytest.approx(max(s2, a6['khoang_g_cal'] + A.u_cal()[1]) + u['lap'] + u['cho']
-                                                  + u['dong'])
+    assert a6['eps_g_khong_meo'] == pytest.approx(s2 + u['lap'] + u['cho'] + u['dong'])      # 22/11: no g_cal term
     p1, p2 = C + np.array([1.03, 0.02]), C + np.array([0.97, -0.03])         # both in the goc disc
     r = A.u_psi_hai_dau_rad(a6, _kc(), p1, p2, 'T1')
     r1, r2 = np.linalg.norm(p1 - C), np.linalg.norm(p2 - C)
@@ -768,3 +792,219 @@ def test_da_session_cli_session_cham(places, tmp_path):
     ses.write_text(json.dumps(dict(kappa=HB / H, tag_h_m=HB, car_side_m=SIDE, plumb_xy_m=list(C))), encoding='utf-8')
     with pytest.raises(A.A6Error, match='camera'):                      # a session without camera: refused, not NaN
         A.set_up_of_session(A.read_session(str(ses)))
+
+
+def test_cli_do_corners_from_f15_when_frames_has_none(tmp_path, monkeypatch):
+    # CODE_C8B 22/11: the frames.csv of session 2 has no corner columns; the corners come from F15 khung.goc_m
+    # (KIEMCHEO, per-frame scoring camera). Same corners either way -> the same place result.
+    import c8_u_imu as cu
+    idx, t, P = _clip()
+    t = np.round(t, 6)
+    full, bare = tmp_path / 'full', tmp_path / 'bare'
+    full.mkdir()
+    bare.mkdir()
+    _write_frames(full / 'frames.csv', idx, t, P)
+    with open(bare / 'frames.csv', 'w', newline='', encoding='utf-8') as fh:
+        w = csv.writer(fh)
+        w.writerow(['idx', 't_s', 'valid'])
+        for k, tt in zip(idx, t):
+            w.writerow([int(k), f'{tt:.6f}', 1])
+    sp = tmp_path / 'session.json'
+    sp.write_text(json.dumps(dict(kappa=HB / H, tag_h_m=HB, car_side_m=SIDE, plumb_xy_m=list(C),
+                                  camera=dict(model='x', f=1, cx=0, cy=0, k=[], rvec=[0, 0, 0], tvec=[0, 0, 0]))),
+                  encoding='utf-8')
+    f = _f15(idx, t)
+    monkeypatch.setattr(A, 'camera_of', lambda ses: TopCam())
+    res = {}
+    for name, d in (('full', full), ('bare', bare)):
+        f15 = A.with_sha(dict(
+            schema=A.F15_FULL, trang_thai='dat', cho='goc', chieu='held_minus_full', bo_H32=True, truoc_le=True,
+            thu_tu_goc='ArUco 0..3 (c7_measure.car_corners_body)', clip_sha256='c' * 64,
+            nguon=[dict(vai_tro='frames', sha256=cu.sha256(d / 'frames.csv')), dict(vai_tro='session', sha256=cu.sha256(sp)),
+                   dict(vai_tro='track', sha256='d' * 64), dict(vai_tro='cua_so_v1', sha256='e' * 64)],
+            kappa=HB / H, Zc_m=H, h_m=HB, plumb_xy_m=list(C), mien_E=f['mien_E'],
+            ban_do=dict(H32_ids=[18, 19, 30], ca=[dict(ten=c, bo_ids=[int(x) for x in c[3:].split('-')],
+                                                     A3=dict(quy_max_deg=0.1)) for c in CASES]),
+            khung=[dict(frame_id=int(k), t_s=float(tt), goc_m=P[i].tolist(),
+                        du_m={c: v.tolist() for c, v in f['du'][int(k)].items()}) for i, (k, tt) in enumerate(zip(idx, t))]))
+        fp15 = d / 'f15.json'
+        fp15.write_text(json.dumps(f15), encoding='utf-8')
+        out = d / 'goc.json'
+        assert A.main(['do', '--frames', str(d / 'frames.csv'), '--session', str(sp), '--cho', 'goc', '--tam-id', 'T1',
+                       '--lan-lap-id', 'L1', '--luot-id-E', 'E_goc_1', '--f15', str(fp15), '--out', str(out)]) == 0
+        res[name] = json.loads(out.read_text(encoding='utf-8'))
+    assert res['bare']['goc_nguon'].startswith('f15') and res['full']['goc_nguon'] == 'frames.csv c0..c3'
+    assert res['bare']['trang_thai'] == res['full']['trang_thai'] == 'dat'
+    assert res['bare']['g_E'] == pytest.approx(res['full']['g_E'], abs=1e-9)
+    assert res['bare']['n_khung'] == res['full']['n_khung']
+
+
+# ── 22/11: the edge-slope model, the held-out IMU check, one mounting, dong ──────────────────────
+
+def _clip4(gk, gm, n=900, centre=(0.9, 0.3), noise=0.0, seed=0, fps=30.0, rate=0.3, turn_back=True):
+    """E clip of a tag whose surface is not a plane: flat lifted corners plus the tag-frame parallax of fit_gk
+    (dx = u_x (gxm x + gyk y), dy = u_y (gxk x + gym y)); the car turns one way then back."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(n) / fps
+    psi = rate * t if not turn_back else rate * np.where(t < t[-1] / 2, t, t[-1] - t)
+    cen = C + np.asarray(centre, float)
+    r = A.body(SIDE)
+    P = []
+    for p_ in psi:
+        P0 = A.lifted_corners(cen, p_, (0.0, 0.0), 0.0, C, H, HB, SIDE)
+        R = A._rot(p_)
+        u = ((P0 - C) / (H - HB)) @ R                                  # rows R^T d
+        dl = np.column_stack([u[:, 0] * (gm[0] * r[:, 0] + gk[1] * r[:, 1]),
+                              u[:, 1] * (gk[0] * r[:, 0] + gm[1] * r[:, 1])])
+        P.append(P0 + dl @ R.T)
+    P = np.array(P)
+    return np.arange(n) + 100, t, P + rng.normal(0, noise, P.shape), psi
+
+
+def test_fit_gk_equals_the_plane_model_on_a_plane():
+    _, _, P = _clip(noise=0.0, v=-0.000475, n=1300)                   # more than one turn: strains identified
+    f = A.fit_gk(P, C, H, HB, SIDE)
+    assert A.fit_ok(f) and f['g'] == pytest.approx(GC, abs=2e-6) and f['g_gian'] == pytest.approx(GC, abs=2e-6)
+    assert f['v_phu'] == pytest.approx(-0.000475, abs=1e-6) and f['i_alpha'] == 10
+    assert set(f['bien_dang']) == {'ma', 'san'} and np.abs(sum(f['bien_dang'].values(), [])).max() < 1e-6
+
+
+def test_fit_gk_separates_the_edge_and_the_stretch_slopes():
+    gk, gm = np.array([-0.0185, 0.0037]), np.array([-0.0050, 0.0052])     # K1 of session 2
+    _, _, P, _ = _clip4(gk, gm)
+    f = A.fit_gk(P, C, H, HB, SIDE)
+    assert A.fit_ok(f) and f['g'] == pytest.approx(gk, abs=2e-5) and f['g_gian'] == pytest.approx(gm, abs=2e-5)
+    one = A.fit_g(P, C, H, HB, SIDE)['g']                              # the plane model mixes the two
+    assert np.linalg.norm(one - gk) > 0.003 and np.linalg.norm(one - gm) > 0.003
+    # the Kabsch heading of these corners follows gk (design 2a with g = gk), not gm
+    cen = C + np.array([0.9, 0.3])
+    for k in (50, 300, 700):
+        psi_k = A.kabsch_psi(P[k], SIDE)
+        tk = P[k].mean(0)
+        f_true = _clip4(gk, gm)[3][k]
+        assert math.remainder(psi_k - f_true, 2 * math.pi) == pytest.approx(
+            A.dpsi_model(gk, tk, psi_k, C, H, HB), abs=3e-5)
+    assert np.linalg.norm(cen - P[:, :, :].mean((0, 1))) < 0.01
+    with pytest.raises(A.A6Error):
+        A.fit_gk(P, C, H, HB, SIDE, bien_dang=('x',))
+    still = np.repeat(P[:1], 300, axis=0)                              # no rotation: tag and floor strains the same
+    assert not A.fit_ok(A.fit_gk(still, C, H, HB, SIDE))
+
+
+def test_do_place_gives_the_edge_slope():
+    gk, gm = np.array([-0.0185, 0.0037]), np.array([-0.0050, 0.0052])
+    idx, t, P, _ = _clip4(gk, gm, noise=0.00005)
+    r = _do(idx=idx, t=t, P=P, f15=_f15(idx, t, scale=0.00002))
+    assert r['trang_thai'] == 'dat', r['ly_do']
+    assert r['schema'] == A.SCHEMA_CHO == 'c8b_a6_cho_v3' and r['mo_hinh'] == A.MO_HINH and r['luot_id_E'] == 'c1'
+    assert r['g_E'] == pytest.approx(gk, abs=4 * np.linalg.norm(r['SE_E']) + 2e-5)
+    assert r['g_gian'] == pytest.approx(gm, abs=4 * np.linalg.norm(r['SE_gian']) + 2e-5)
+    assert r['lech_canh_gian'] == pytest.approx(np.linalg.norm(gk - gm), abs=1e-3)
+    assert np.linalg.norm(np.array(r['g_phang']) - gk) > 0.003 and len(r['g_khong_bien_dang']) == 2
+
+
+def test_kiem_lap_one_mounting():
+    cap = dict(luot_a='E1', luot_b='E2', huong_lech_deg=0.0, khoang_m=0.01, g_a=[0.01, 0.0], g_b=[0.011, 0.0],
+               SE_a=[0.001, 0.001], SE_b=[0.001, 0.001])
+    ok = A.with_sha(dict(schema=A.SCHEMA_LAP, tam_id='T1', trang_thai='dat', cap=[],
+                         mot_lan_lap=dict(lan_lap_id='L0', can_cu=['Liam 22/11']), lap_lai=[cap]))
+    assert A.kiem_lap(ok, 'T1') == (0.0, [], {})
+    for bad, txt in ((dict(ok, mot_lan_lap=dict(lan_lap_id='L0', can_cu=[])), 'can_cu'),
+                     (dict(ok, lap_lai=[]), 'lap_lai'),
+                     (dict(ok, lap_lai=[dict(cap, luot_b='E1')]), 'different run'),
+                     (dict(ok, lap_lai=[dict(cap, khoang_m=0.5)]), 'centres'),
+                     (dict(ok, mot_lan_lap=None), 'no pair'), (dict(ok, tam_id='T2'), 'plate')):
+        u, why, _ = A.kiem_lap(bad, 'T1')
+        assert u is None and any(txt in w for w in why), (txt, why)
+
+
+def test_gop_held_out_imu_check(places):
+    g_hat = np.mean([p['g_E'] for p in places], axis=0)
+    o = _gop(places, giu_ngoai=None, giu_ngoai_rows=None)             # the cell file is optional now
+    assert o['trang_thai']['a6'] == 'dat' and o['giu_ngoai_dat'] is None and o['giu_ngoai_ghi_chu']
+    assert [b['dat'] for b in o['kiem_imu']] == [True, True] and o['kiem_imu'][0]['du_rad'] <= o['kiem_imu'][0]['nguong_rad']
+    lim = o['kiem_imu'][0]['nguong_rad']
+    assert lim == pytest.approx((o['eps_g'] + 2 * math.hypot(0.0002, 0.0002)) * 0.7 / (2 * (H - HB)) + o['e_bc_rad'])
+    far = g_hat + [o['eps_g'] + 0.01, 0.0]
+    for imu, txt in (([_imu('goc', far), _imu('K1', g_hat)], 'kiem_imu_truot'),
+                     ([_imu('goc', g_hat)], "no held-out check at ['K1']"),
+                     ([_imu('goc', g_hat, clip='c' * 64), _imu('K1', g_hat)], 'not held out'),
+                     ([_imu('goc', g_hat, luot='c1'), _imu('K1', g_hat)], 'test set'),
+                     ([_imu('goc', g_hat, khoa_truoc_sha256='z' * 64), _imu('K1', g_hat)], 'lock'),
+                     ([_imu('goc', g_hat, tam_id='T2'), _imu('K1', g_hat)], 'plate'),
+                     ([_imu('goc', g_hat, trang_thai='thieu'), _imu('K1', g_hat)], 'trang_thai'),
+                     ([dict(_imu('goc', g_hat), rho_m=0.9), _imu('K1', g_hat)], 'sha256'),
+                     ([], 'held-out')):
+        o2 = _gop(places, kiem_imu=imu)
+        assert o2['trang_thai']['a6'] == 'thieu' and any(txt in w for w in o2['ly_do']), (txt, o2['ly_do'])
+    # the E run of a place fit must be in the fit set of the lock
+    o3 = _gop([dict(places[0], luot_id_E='zz'), places[1]])
+    assert o3['trang_thai']['a6'] == 'thieu' and any('tap.khop' in w for w in o3['ly_do'])
+    # a place file of the plane model (schema v2) is not accepted by the CLI check
+    assert A.SCHEMA_CHO != 'c8b_a6_cho_v2'
+
+
+def test_kiem_imu_do_recovers_the_slope_of_the_heading_channel(tmp_path, monkeypatch):
+    gk, gm = np.array([-0.0185, 0.0037]), np.array([-0.0050, 0.0052])
+    idx, t, P, psi = _clip4(gk, gm, n=1800, centre=(1.4, 0.1))
+    f15 = _f15(idx, t)
+    log = tmp_path / 'log.csv'
+    log.write_text('x', encoding='utf-8')
+    S = dict(t=t + 3.21, psi=psi + 0.5 + 0.0004 * t, n_late=0)       # IMU: clock offset, constant, slow drift
+    monkeypatch.setattr(A.cu, 'rv_samples', lambda L: S)
+    monkeypatch.setattr(A.cu, 'interp_yaw', lambda S_, tq, h_lim=None: np.interp(tq, S_['t'], S_['psi'],
+                                                                                 left=np.nan, right=np.nan))
+    pc = np.unwrap(np.array([A.kabsch_psi(q, SIDE) for q in P]))
+    r = A.kiem_imu_do('goc', idx, t, P, _ses(), f15, t, pc, dict(path=str(log)), 'T1', 'c2', KHOA)
+    assert r['trang_thai'] == 'dat', r['ly_do']
+    assert r['schema'] == A.SCHEMA_IMU and r['clip_sha256'] == 'c' * 64 and r['khoa_truoc_sha256'] == KHOA
+    assert r['offset_s'] == pytest.approx(3.21, abs=0.002)
+    assert r['g_yaw'] == pytest.approx(gk, abs=3e-4)                  # the heading follows gk, not gm
+    assert np.linalg.norm(np.array(r['g_yaw']) - gm) > 0.01
+    assert r['rho_m'] == pytest.approx(np.linalg.norm([1.4, 0.1]), abs=0.01) and r['n_khung'] >= A.N_MIN
+    with pytest.raises(A.A6Error):
+        A.kiem_imu_do('goc', idx, t, P, _ses(), f15, t, pc, dict(path=str(log)), 'T1', 'c2', None)
+
+
+def test_acc_of_and_dong_build():
+    t = np.arange(600) / 60.0
+    T = np.column_stack([0.5 * 0.8 * t ** 2, np.zeros_like(t)])       # 0.8 m/s^2 along x
+    a = A.acc_of(t, T)
+    assert np.isnan(a[:A.SG_HALF]).all() and a[A.SG_HALF:-A.SG_HALF] == pytest.approx(0.8, abs=1e-6)
+    t2 = np.r_[t[:300], t[300:] + 1.0]                                # a gap: no window across it
+    assert np.isnan(A.acc_of(t2, T)[296:304]).all()
+    gk, gm = np.array([-0.0185, 0.0037]), np.array([-0.0050, 0.0052])
+    r = A.body(SIDE)
+    ses = dict(_ses(), sha256='5' * 64)
+    runs = {}
+    for j, lid in enumerate(('r1', 'r2', 'r3')):
+        tt = np.arange(700) / 60.0
+        ph = 0.9 * tt + j
+        cen = C + np.column_stack([0.9 * np.cos(0.7 * tt + j) + 0.3 * np.sin(2.3 * tt), 0.6 * np.sin(1.1 * tt + j)])
+        psi = 1.3 * np.sin(0.8 * tt + j) + ph
+        Ps = []
+        for c_, p_ in zip(cen, psi):
+            P0 = A.lifted_corners(c_, p_, (0.0, 0.0), 0.0, C, H, HB, SIDE)
+            R = A._rot(p_)
+            u = ((P0 - C) / (H - HB)) @ R
+            dl = np.column_stack([u[:, 0] * (gm[0] * r[:, 0] + gk[1] * r[:, 1]),
+                                  u[:, 1] * (gk[0] * r[:, 0] + gm[1] * r[:, 1])])
+            Ps.append(P0 + dl @ R.T)
+        khung = [[int(k), float(a_), [float(v) for v in q.ravel()]] for k, a_, q in zip(range(700), tt, Ps)]
+        runs[lid] = (dict(schema=A.SCHEMA_GOC, luot_id=lid, session_sha256='5' * 64, khung=khung), ses, TopCam())
+    d = A.dong_build(runs, 'T1')
+    assert d['schema'] == A.SCHEMA_DONG and [b['ten'] for b in d['dai_dinh_nghia']] == ['a', 'a_thap', 'a_cao']
+    full, lo_, hi_ = d['dai_dinh_nghia']
+    assert full['a_lo'] == 0.0 and lo_['a_hi'] == hi_['a_lo'] == pytest.approx(full['a_hi'] / 2) and full['a_hi'] > 0
+    assert set(d['luot']) == {'r1', 'r2', 'r3'} and d['luot']['r1']['bo_luot'] == ['r2', 'r3']
+    for lid in runs:
+        e = d['luot'][lid]['dai']['a']
+        assert e['trang_thai'] == 'dat' and e['g_bar'] == pytest.approx(gk, abs=1e-4) and e['n_khung'] > 1000
+    blk, why = A.kiem_dong(A.with_sha(d), 'T1', gk)                   # the file is one gop accepts
+    assert why == [] and blk['max'] is not None
+    with pytest.raises(A.A6Error):
+        A.dong_build({'r1': runs['r1']}, 'T1')
+    bad = dict(runs)
+    bad['r2'] = (dict(runs['r2'][0], session_sha256='6' * 64), ses, TopCam())
+    with pytest.raises(A.A6Error):
+        A.dong_build(bad, 'T1')
