@@ -98,7 +98,9 @@ HO_SO_FORMAT = 'ho_so_c8_v1'                             # F17: the U-standard d
 KIEM_CHEO_VERSION = 'c7_kiem_cheo_v7'                    # KIEMCHEO 19/11: kiem_cheo.json with its khoa_s7 block
 LUOI_STATES = ('cham', 'chua_ket_luan_khong_nut', 'hong_he_do')     # c8b_luoi trang_thai_luot (F11, CODE_C8B)
 MOC_KEYS = ('U_moc_dong_xy_m', 'U_moc_tham_xy_m', 'U_moc_dong_psi_rad', 'U_moc_tham_psi_rad')
-MOC_NGUON = ('bo_lay_mau', 'car_pose', 'tap_moc')         # the source block each U manifest carries (CAM, ghep)
+MOC_NGUON = ('bo_lay_mau', 'car_pose')         # the part of the U manifest source the same for every scoring (CAM, ghep)
+MANIFEST_NGUON = MOC_NGUON + ('tap_moc', 'lich')   # CODE 22/11: tap_moc is the result of lich per camera segment
+LICH_VERSION = 'c7_lich_v3'                        # the schedule file of c7_measure lich (CAM v3)
 
 TOP_KEYS = ('format', 'levels', 'muc_kha_thi', 'muc_bo_theo_liam', 'quyet_liam', 'u_t_branch', 'lich_doi_chieu',
             'bo_cham', 'ke_hoach_c8', 'thu_tu_clip', 'khoa_c8b', 'o_c8', 'chuan_u', 'tien_de_c8', 'runs_c8',
@@ -1041,10 +1043,12 @@ def _check_camera(d: dict) -> dict:
     md = _obj(c8b['moc_dich'], MOC_KEYS + ('nguon',), f'{w}.moc_dich', extra_ok=True)
     for k in MOC_KEYS:
         _num(md[k], f'{w}.moc_dich.{k}')
-    ng = _obj(md['nguon'], ('bo_lay_mau', 'car_pose', 'tap_moc', 'manifests'), f'{w}.moc_dich.nguon')
+    ng = _obj(md['nguon'], ('bo_lay_mau', 'car_pose', 'luat_lich', 'manifests'), f'{w}.moc_dich.nguon')
     _text(ng['bo_lay_mau'], f'{w}.moc_dich.nguon.bo_lay_mau')
-    if not _hex64(ng['tap_moc']):
-        raise GateFileError(f'{w}.moc_dich.nguon.tap_moc: sha256 of tap_moc.json (64 hex)')
+    ll = _obj(ng['luat_lich'], ('version', 'luat'), f'{w}.moc_dich.nguon.luat_lich')    # CODE 22/11: the rule, not a sha
+    _text(ll['version'], f'{w}.moc_dich.nguon.luat_lich.version')
+    if not isinstance(ll['luat'], dict) or not ll['luat']:
+        raise GateFileError(f'{w}.moc_dich.nguon.luat_lich.luat: the rule constants of lich (an object)')
     if not isinstance(ng['manifests'], list) or not ng['manifests']:
         raise GateFileError(f'{w}.moc_dich.nguon.manifests: the U manifests of the C8 scorings used for the lock')
     for i, x in enumerate(ng['manifests']):
@@ -1699,7 +1703,7 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
         if r['clip'] in by_clip:
             raise GateFileError(f'thu_tu_clip: clip {r["clip"]!r} twice ({by_clip[r["clip"]]["_vt"]}, {r["_vt"]})')
         by_clip[r['clip']] = r
-    eligible, cham_luc, logs_seen, clip_shas, scorers = {}, {}, {}, {}, set()
+    eligible, cham_luc, logs_seen, clip_shas, scorers, elig_seg = {}, {}, {}, {}, set(), {}
     spans = _doan_spans(goc, segs, rows, slices)
     part_drift = {}                                      # GC6-3 (round 3): one comparison per camera segment
     for c in d['o_c8']:
@@ -1902,8 +1906,10 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
                         raise GateFileError(f'{w}: no node relies on any frame (every node lost): not a scoring of an '
                                             'eligible run')
                 eligible[x['file_cham']['sha256']] = mpp0
+                elig_seg[x['file_cham']['sha256']] = segs[part]
                 if fc1 is not None:
                     eligible[x['file_cham_h1']['sha256']] = scorings[1][2]
+                    elig_seg[x['file_cham_h1']['sha256']] = segs[part]
     # CODE 20/11 (the luot_c8 check of c8b_u cong, C8BU4-R1-3, now here): each run of the plan is scored once; its
     # scoring is the one first scoring of its clip under the C8 folder, and the clip H comparison, second scoring and
     # second time file of the chain are those that scoring names (so its time files are those of its gio_sha256)
@@ -1956,7 +1962,7 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
                 scorers.add(sc.get('commit'))
         cham_luc[x['run_id']] = min(t for fk in fks for t in _scoring_times(fk, f'{w}: scoring'))
         _one_first_scoring(first, x, w)
-    return eligible, cham_luc, scorers
+    return eligible, cham_luc, scorers, elig_seg
 
 
 def _first_scorings(goc: str) -> Dict[str, set]:
@@ -2117,6 +2123,27 @@ def _check_session(s: dict, w: str) -> None:
                             'four corners in ref_corners_px; GC6-4)')
 
 
+def _manifest_lich(goc: str, mf: dict, w: str) -> Tuple[dict, dict]:
+    """CODE 22/11 (C8 contract section 3, after CAM): the mark set tap_moc is the result of lich for one camera segment
+    (session 2 has three), so a U manifest names its tap_moc (sha256 of tap_moc.json) and the lich it came from (lich
+    {duong_dan, sha256}): a converged c7_lich_v3 file whose tap_moc_file_sha256 is that tap_moc. Returns (the lich, its
+    rule {version, luat}); the rule is what is the same for every segment and session."""
+    ng = mf.get('nguon')
+    if not isinstance(ng, dict) or set(ng) != set(MANIFEST_NGUON) or not _hex64(ng.get('tap_moc')) \
+            or not isinstance(ng.get('lich'), dict):
+        raise GateFileError(f'{w}: nguon {{{", ".join(MANIFEST_NGUON)}}}: tap_moc the sha256 of tap_moc.json, lich '
+                            '{duong_dan, sha256} of the lich it came from (CODE 22/11)')
+    lref = _ref(dict(duong_dan=_rel_in(goc, ng['lich'].get('duong_dan')), sha256=ng['lich'].get('sha256')),
+                f'{w}.nguon.lich')
+    li = _open_ref(goc, lref, f'{w}.nguon.lich')
+    if li.get('version') != LICH_VERSION or li.get('hoi_tu') is not True \
+            or li.get('tap_moc_file_sha256') != ng['tap_moc'] or not isinstance(li.get('luat'), dict) \
+            or not li['luat'] or not _hex64(li.get('session_sha256')):
+        raise GateFileError(f'{w}.nguon.lich: a converged {LICH_VERSION} file (hoi_tu true) whose tap_moc_file_sha256 '
+                            'is nguon.tap_moc, with its rule luat and session_sha256 (CODE 22/11)')
+    return li, dict(version=li['version'], luat=li['luat'])
+
+
 DK_KHOA = ('khoa_kiem_truoc_giu_ngoai', 'luat_giu_mask_theo_phan_do')   # D1, D4: the C8b lock itself (C8B 19/11)
 DK_FILE = {'kiem_yaw_theo_hieu_mien_quyet': 'c8b_a6_o_v1', 'kiem_vi_tri_rieng': 'c8b_kiem_vi_tri_v1'}   # D2, D3
 
@@ -2222,7 +2249,7 @@ def check_nguon(d: dict, goc: str) -> dict:
     if sorted(plan) != sorted(have) or len(set(plan)) != len(plan):
         raise GateFileError(f'o_c8 cells {sorted(have)}: the plan locked before C8 has {sorted(plan)} (each once)')
     _, t_c8b = _check_khoa_c8b(d, goc)
-    eligible, cham_luc, scorers = _check_runs_nguon(d, goc)
+    eligible, cham_luc, scorers, elig_seg = _check_runs_nguon(d, goc)
     # GC6-1 (round 3): the C8b lock (its khoa_truoc) before the first scoring of any C8 run
     if cham_luc and not t_c8b < min(cham_luc.values()):
         raise GateFileError(f'khoa_c8b: khoa_truoc.luc {t_c8b.isoformat()} is not before the first scoring of a C8 run '
@@ -2275,7 +2302,7 @@ def check_nguon(d: dict, goc: str) -> dict:
     # covered = the frames that scoring relies on, before the maximum is taken)
     md = d['camera']['c8b']['moc_dich']
     tops = {k: 0.0 for k in MOC_KEYS}
-    seen = {}
+    seen, tap_of = {}, {}
     for i, ref in enumerate(md['nguon']['manifests']):
         w = f'camera.c8b.moc_dich.nguon.manifests[{i}]'
         mf = _open_ref(goc, ref, w)
@@ -2293,9 +2320,24 @@ def check_nguon(d: dict, goc: str) -> dict:
                                 'scored node: node, D_s, frame ids incl. the reference window W and the t_done frames)')
         for k in MOC_KEYS:
             tops[k] = max(tops[k], _num(mf.get(k), f'{w}.{k}'))
-        # round 3 (ghep): the sampler, car_pose and mark set the gate copies are those of every manifest (CAM)
-        if mf.get('nguon') != {k: md['nguon'][k] for k in MOC_NGUON}:
-            raise GateFileError(f'{w}: nguon {{bo_lay_mau, car_pose, tap_moc}} is not that of the gate')
+        # round 3 (ghep): the sampler and car_pose the gate copies are those of every manifest (CAM); CODE 22/11: the
+        # mark set is the result of lich per camera segment: its rule is that of the gate, its sha one per segment and
+        # made with a session of the run's segment
+        li, rule = _manifest_lich(goc, mf, w)
+        if {k: mf['nguon'][k] for k in MOC_NGUON} != {k: md['nguon'][k] for k in MOC_NGUON}:
+            raise GateFileError(f'{w}: nguon bo_lay_mau, car_pose are not those of the gate (the same for every scoring '
+                                'of every session; CODE 22/11)')
+        if rule != md['nguon']['luat_lich']:
+            raise GateFileError(f'{w}: its lich has the rule {rule!r}, the gate {md["nguon"]["luat_lich"]!r} (one rule '
+                                'for every camera segment and session; CODE 22/11)')
+        seg = elig_seg[fs]
+        if li['session_sha256'] not in [x['sha256'] for x in seg['clips'][:2]]:
+            raise GateFileError(f'{w}: its lich was made with session {li["session_sha256"][:12]}..., no clip H at the '
+                                f'start of the camera segment {seg["ten"]!r} of its run (tap_moc per segment; CODE 22/11)')
+        key = (seg['k'], seg['ten'])
+        if tap_of.setdefault(key, mf['nguon']['tap_moc']) != mf['nguon']['tap_moc']:
+            raise GateFileError(f'{w}: another tap_moc than the other scorings of the camera segment {seg["ten"]!r} '
+                                '(one lich result per segment; CODE 22/11)')
     miss = sorted(set(eligible) - set(seen))
     if miss:
         raise GateFileError(f'camera.c8b.moc_dich.nguon.manifests: no U manifest for {len(miss)} scoring(s) of eligible '
@@ -2379,12 +2421,13 @@ def car_pose_of(cp, what: str) -> dict:
 
 def moc_dich_of(gate: 'GateC8') -> dict:
     """The C8 lock of the shifted-anchor bound (design section 10): the four locked numbers (before the margin),
-    the source {bo_lay_mau, car_pose (5 keys), tap_moc, manifests} and khoa_sha256."""
+    the source {bo_lay_mau, car_pose (5 keys), luat_lich, manifests} and khoa_sha256 (CODE 22/11: the lich rule, the
+    mark set being per camera segment)."""
     c8b = gate.data['camera']['c8b']
     md = c8b['moc_dich']
     out = {k: float(md[k]) for k in MOC_KEYS}
     out.update(bo_lay_mau=md['nguon']['bo_lay_mau'], car_pose=car_pose_v2_of(md['nguon']['car_pose'], 'moc_dich'),
-               tap_moc=md['nguon']['tap_moc'], khoa_sha256=c8b['khoa_sha256'])
+               luat_lich=md['nguon']['luat_lich'], khoa_sha256=c8b['khoa_sha256'])
     return out
 
 
@@ -2516,7 +2559,8 @@ def fake_gate(levels=('O1-F05',), u_p_m=0.002, u_psi_deg=2.0, u_t_s=0.010) -> di
     clip = lambda i: dict(duong_dan=f'FAKE/clip_H{i}.json', sha256=format(i, 'x') * 64)  # noqa: E731
     md = {k: 0.0 for k in MOC_KEYS}
     md.update(U_moc_dong_xy_m=0.005, U_moc_tham_xy_m=0.005, U_moc_dong_psi_rad=0.004, U_moc_tham_psi_rad=0.004,
-              nguon=dict(bo_lay_mau='FAKE_blm_v1', tap_moc=FAKE_SHA, manifests=[ref('u_moc_manifest.json')],
+              nguon=dict(bo_lay_mau='FAKE_blm_v1', luat_lich=dict(version='FAKE', luat=dict(FAKE=0)),
+                         manifests=[ref('u_moc_manifest.json')],
                          car_pose=dict(tag_offset=None, side_m=0.1445, h_m=0.20, kappa=0.0, phien_ban='FAKE')))
     cam = {'c8b': dict(moc_dich=md, khoa_sha256='f' * 64, eps_H=dict(mm=1.0, huong_deg=0.2),
                        mien_car_pose=dict(side_m=0.1445, phien_ban='FAKE', h_m=[0.19, 0.21], kappa=[0.0, 0.0]))}
@@ -2904,11 +2948,15 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
                         and m.get('file_cham_sha256') in eligible)
     if not mans:
         raise GateFileError('ghep: no U manifest (u_moc_manifest_v1) of an eligible scoring')
-    ngs = [m.get('nguon') for _, m in mans]
-    if any(n != ngs[0] for n in ngs) or not isinstance(ngs[0], dict) or set(ngs[0]) != set(MOC_NGUON):
-        raise GateFileError(f'ghep: the U manifests do not share one nguon {{{", ".join(MOC_NGUON)}}} (CAM)')
+    ngs = [m.get('nguon') if isinstance(m.get('nguon'), dict) else {} for _, m in mans]
+    if any({k: n.get(k) for k in MOC_NGUON} != {k: ngs[0].get(k) for k in MOC_NGUON} for n in ngs):
+        raise GateFileError(f'ghep: the U manifests do not share one {", ".join(MOC_NGUON)} (CAM; CODE 22/11)')
+    rules = [_manifest_lich(kho.goc, m, f'ghep: U manifest {ref["duong_dan"]}')[1] for ref, m in mans]
+    if any(r != rules[0] for r in rules):
+        raise GateFileError(f'ghep: the U manifests name lich files of {len({json.dumps(r, sort_keys=True) for r in rules})}'
+                            ' rules; one rule for every camera segment and session (CODE 22/11)')
     md = {k: max(_num(m.get(k), f'manifest {k}') for _, m in mans) for k in MOC_KEYS}
-    md['nguon'] = dict(ngs[0], manifests=[ref for ref, _ in mans])
+    md['nguon'] = dict({k: ngs[0][k] for k in MOC_NGUON}, luat_lich=rules[0], manifests=[ref for ref, _ in mans])
     if 'mien_car_pose' not in khoa or 'eps_H' not in khoa:
         raise GateFileError('ghep: the C8b lock has no mien_car_pose / eps_H (GATE to C8B 19/11)')
     cam = {'c8b': dict(moc_dich=md, khoa_sha256=kc8_ref['sha256'], mien_car_pose=khoa['mien_car_pose'],

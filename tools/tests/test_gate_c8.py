@@ -640,6 +640,27 @@ def _drift(two, levels, clips, **kw):
     return x
 
 
+LUAT_LICH = dict(win_s=0.5, win_min_n=10, version='c7_moc_dich_v1')
+
+
+def _lich(goc, ten, s0, sets, **kw):
+    """CODE 22/11: the tap_moc.json and lich.json of a camera segment (lich made with its first clip H session s0);
+    returns the manifest source {tap_moc, lich} naming them."""
+    tm = _jw(goc, f'lich/{ten}/tap_moc.json', dict(xe=sets))
+    li = dict(version=GC.LICH_VERSION, session_sha256=s0['sha256'], hoi_tu=True, tap_moc_file_sha256=tm['sha256'],
+              luat=dict(LUAT_LICH))
+    li.update(kw)
+    return dict(tap_moc=tm['sha256'], lich=_jw(goc, f'lich/{ten}/lich.json', li))
+
+
+def _man_nguon(goc, d, x, ng):
+    """The U manifest of the scoring of run x takes the manifest source ng (its segment's tap_moc and lich)."""
+    for m in d['camera']['c8b']['moc_dich']['nguon']['manifests']:
+        if json.load(open(os.path.join(goc, m['duong_dan']), encoding='utf-8'))['file_cham_sha256'] == \
+                x['file_cham']['sha256']:
+            _rewrite(goc, m, lambda y: y['nguon'].update(ng))
+
+
 def build_c8(tmp_path, levels=LEVELS, u_t=0.014, two=False, sub=''):
     """A C8 folder (FAKE numbers, real files, no FAKE mark) and a gate content that passes check and check_nguon; the
     session's files in its folder sub of the C8 folder (CODE 22/11; '' the C8 folder itself)."""
@@ -664,7 +685,8 @@ def build_c8(tmp_path, levels=LEVELS, u_t=0.014, two=False, sub=''):
     md = d['camera']['c8b']['moc_dich']
     md['nguon']['car_pose']['phien_ban'] = 'v_test'
     d['camera']['c8b']['mien_car_pose']['phien_ban'] = 'v_test'
-    ngm = {k: md['nguon'][k] for k in GC.MOC_NGUON}
+    md['nguon']['luat_lich'] = dict(version=GC.LICH_VERSION, luat=LUAT_LICH)     # CODE 22/11: the rule of lich
+    ngm = dict({k: md['nguon'][k] for k in GC.MOC_NGUON}, **_lich(goc, 'doan2', clips[0], [[1, 2, 3]]))
     for x in plan:
         rid = 'R_' + x['o']
         tt = _score_tt(goc, rid, x)
@@ -1636,6 +1658,11 @@ def _hai_doan(goc, d):
                 x['file_so_h'] = dict(dr2)
                 lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
                 _relink_nodes(goc, d, x, lu, file_so_h=dict(dr2))
+    ng3 = _lich(goc, 'doan3', new[0], [[1, 2], [3]])                 # CODE 22/11: its own mark set, the same rule
+    for c in d['o_c8']:
+        if c['controller'] == 'LADRC':
+            for x in c['chuoi']:
+                _man_nguon(goc, d, x, ng3)
     lines += rows['PID'] + ['IMG_9002,H_m,,,,,', 'IMG_9004,H_c,,,,,', 'IMG_9005,H_d,,,,,'] + rows['LADRC'] \
         + ['IMG_9006,H_z,,,,,']
     p = os.path.join(goc, 'thu_tu_clip.csv')
@@ -1891,8 +1918,9 @@ def test_ghep_cli_and_refusals(tmp_path):
         _ghep(goc)
     # the U manifests disagree on their source block
     d, goc = build_c8(tmp_path / 'e')
-    _rewrite(goc, d['camera']['c8b']['moc_dich']['nguon']['manifests'][0], lambda y: y['nguon'].update(tap_moc='0' * 64))
-    with pytest.raises(GC.GateFileError, match='one nguon'):
+    _rewrite(goc, d['camera']['c8b']['moc_dich']['nguon']['manifests'][0],
+             lambda y: y['nguon'].update(bo_lay_mau='blm_v2'))
+    with pytest.raises(GC.GateFileError, match='do not share one bo_lay_mau, car_pose'):
         _ghep(goc)
     # above eps_H without the second scoring
     d, goc = build_c8(tmp_path / 'f')
@@ -2609,6 +2637,7 @@ def _buoi3(goc, d, o):
     lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
     _relink_nodes(goc, d, x, lu, file_so_h=dict(dr))
     x['file_so_h'] = dict(dr)
+    _man_nguon(goc, d, x, _lich(goc, 'doan1', clips[0], [[2, 3]]))
     lines = ['clip,buoc,gio_pc_bam_quay,gio_pc_dung_quay,created_utc,log_pi,ghi_chu', 'IMG_9100,H_e,,,,,',
              'IMG_9101,H_f,,,,,', f'{x["clip"]},{o}_lai1,,,,pi/{lg},', 'IMG_9102,H_y,,,,,']
     p = os.path.join(goc, 'b3', 'thu_tu_clip.csv')
@@ -2698,3 +2727,60 @@ def test_code_22_11_the_log_by_name_in_its_session(tmp_path):
     g = _ghep_hai_buoi(goc)
     assert g['o_c8'][0]['chuoi'][0]['file_log']['duong_dan'] == lost['file_log']['duong_dan']
     GC.write_gate(str(tmp_path / 'g.json'), g, goc)
+
+
+def test_code_22_11_tap_moc_per_segment_one_lich_rule(tmp_path):
+    """CODE 22/11 (after CAM): tap_moc is the result of lich per camera segment; the gate keeps one rule of lich for
+    every segment and session, a tap_moc per segment, made with a session at the start of the run's segment."""
+    d, goc = build_c8(tmp_path / 'a')
+    _hai_doan(goc, d)                                     # two segments, two tap_moc, one rule: accepted
+    GC.check_nguon(d, goc)
+    seg2 = d['tien_de_c8'][0]['doan'][1]
+    lad = [x for c in d['o_c8'] if c['controller'] == 'LADRC' for x in c['chuoi']]
+    pid = [x for c in d['o_c8'] if c['controller'] == 'PID' for x in c['chuoi']]
+    cases = [
+        (lad, dict(luat=dict(LUAT_LICH, win_s=0.6)), 'its lich has the rule'),
+        (lad, dict(version='c7_lich_v2'), 'converged'),
+        (lad, dict(hoi_tu=False), 'converged'),
+        (lad, dict(tap_moc_file_sha256='0' * 64), 'converged'),
+        (lad[:1], dict(session_sha256=seg2['cuoi']['sha256']), 'no clip H at the start'),
+        (pid[:1], dict(session_sha256=d['tien_de_c8'][0]['doan'][0]['dau'][0]['sha256']), 'another tap_moc'),
+    ]
+    mans = d['camera']['c8b']['moc_dich']['nguon']['manifests']
+    orig = {m['duong_dan']: open(os.path.join(goc, m['duong_dan']), 'rb').read() for m in mans}
+    for i, (xs, kw, msg) in enumerate(cases):
+        h = copy.deepcopy(d)
+        s0 = dict(sha256=kw.pop('session_sha256', seg2['dau'][0]['sha256']))
+        ng = _lich(goc, f'x{i}', s0, [[9, i]], **kw)
+        for x in xs:
+            _man_nguon(goc, h, x, ng)
+        with pytest.raises(GC.GateFileError, match=msg):
+            GC.check_nguon(h, goc)
+        for rel, raw in orig.items():                     # back to the segment's own lich
+            with open(os.path.join(goc, rel), 'wb') as f:
+                f.write(raw)
+    GC.check_nguon(d, goc)
+    for edit, msg in ((lambda y: y['nguon'].pop('lich'), 'nguon {bo_lay_mau, car_pose, tap_moc, lich}'),
+                      (lambda y: y['nguon'].update(u_so='a' * 64), 'nguon {bo_lay_mau, car_pose, tap_moc, lich}'),
+                      (lambda y: y['nguon'].update(bo_lay_mau='blm_v2'), 'bo_lay_mau, car_pose are not those')):
+        h = copy.deepcopy(d)
+        _rewrite(goc, h['camera']['c8b']['moc_dich']['nguon']['manifests'][0], edit)
+        with pytest.raises(GC.GateFileError, match=msg):
+            GC.check_nguon(h, goc)
+        for rel, raw in orig.items():
+            with open(os.path.join(goc, rel), 'wb') as f:
+                f.write(raw)
+    # ghep: one rule over every manifest
+    d, goc = build_c8(tmp_path / 'b')
+    _hai_doan(goc, d)
+    for x in [x for c in d['o_c8'] if c['controller'] == 'LADRC' for x in c['chuoi']]:
+        _man_nguon(goc, d, x, _lich(goc, 'doan3b', d['tien_de_c8'][0]['doan'][1]['dau'][0], [[1]],
+                                    luat=dict(LUAT_LICH, win_s=0.6)))
+    with pytest.raises(GC.GateFileError, match='lich files of 2 rules'):
+        GC.ghep(goc, 'ke_hoach_c8.json', 'thu_tu_clip.csv', 'c8b_khoa_v5.json',
+                ['tien_de_c8_doan3.json', 'tien_de_c8.json'], 'kiem_cheo.json', dict(BANG_CHUNG),
+                'chuan_u/ho_so_ghep.json')
+    g = copy.deepcopy(d)
+    g['camera']['c8b']['moc_dich']['nguon']['luat_lich']['luat'] = {}
+    with pytest.raises(GC.GateFileError, match='rule constants of lich'):
+        GC.check(g)
