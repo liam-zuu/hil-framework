@@ -54,10 +54,15 @@ there = refused. Condition 12 rules (C3-19): a run_error is run once more in a n
 both attempts go to chay_lai.csv, a success after an error replaces the row in bang.csv and
 is listed in meta.json loi_chua_ro_nguyen_nhan; every grid key, reference run and pair is
 checked (completeness(), meta.json kiem_cap): still failing, missing or duplicated =
-ket_luan 'chưa kết luận' (report to Liam). The build origin is verified only when
-fwsim_build.json dll_sha256 equals the DLL sha256 (C3-20, meta.json dll.nguon_build); an
-unverified build or an inconclusive grid is not a confirmation run before S03 main
-(meta.json dung_lam_luot_xac_nhan). This script does not compare with run01.
+ket_luan 'chưa kết luận' (report to Liam). A pair counts only when both runs hold Y1
+(completed), the gate outcome and finite Y2 (e_perp_max), Y3 (tv_duty) (C3-29; meta.json
+kiem_cap cap_khong_so_duoc, khoa_thieu_dai_luong). An exception raised by a worker or the
+pool iterator does not stop the script: its key goes to meta.json loi_worker, ket_luan
+'chưa kết luận' (C3-19). The build origin is verified only when fwsim_build.json dll_sha256
+equals the DLL sha256 and the json holds the ESP32 source (esp32.commit, esp32.dirty) (C3-20,
+meta.json dll.sidecar_khop_sha, dll.nguon_esp32_du, nguon_build); an unverified build or an
+inconclusive grid is not a confirmation run before S03 main (meta.json
+dung_lam_luot_xac_nhan). This script does not compare with run01.
 
 LADRC run after S06 (condition 12 (ii)): when the measured HIL loop delay is >= 2 ms, the
 same grid for LADRC only (3 delays x 3 omega_s x 9 conditions = 81 runs):
@@ -179,6 +184,15 @@ def _job(job):
     return row
 
 
+def _job_safe(job):
+    """_job, or {'_loi_worker': reason, '_khoa': job} when it raises (C3-19): the exception
+    stays tied to its grid key instead of leaving the pool iterator."""
+    try:
+        return _job(job)
+    except Exception as exc:                 # noqa: BLE001 (recorded in meta.json loi_worker)
+        return dict(_loi_worker=f'{type(exc).__name__}: {exc}', _khoa=tuple(job))
+
+
 # ── summaries ───────────────────────────────────────────────────────────────────────
 
 def _hieu(g, gm):
@@ -224,11 +238,33 @@ def _ks(k):
     return f'{k[0]};io_delay_ms={k[1]};slip_omega_s={k[2]};mu={k[3]};v={k[4]}'
 
 
-def completeness(rows, ctrls):
+Y1_VALUES = ('true', 'false', 'inconclusive')          # o1_feasibility evaluate_v7 'completed'
+GATE_VALUES = ('dat', 'khong_dat', 'chua_ket_luan')     # o1_gate.run_outcome
+Y_FINITE = ('e_perp_max', 'tv_duty')                    # S03 Y2, Y3: the differences compared
+
+
+def missing_quantities(r):
+    """Fields a condition 12 comparison needs that row r lacks (C3-29): Y1 ('completed' one
+    of Y1_VALUES), the gate outcome (one of GATE_VALUES), finite Y2 and Y3; [] = comparable."""
+    bad = [f for f, vals in (('completed', Y1_VALUES), ('gate_outcome', GATE_VALUES))
+           if r.get(f) not in vals]
+    for f in Y_FINITE:
+        try:
+            x = float(r.get(f))
+        except (TypeError, ValueError):
+            x = math.nan
+        if not math.isfinite(x):
+            bad.append(f)
+    return bad
+
+
+def completeness(rows, ctrls, loi_worker=()):
     """S03 section 8 condition 12 check of the final rows (C3-19): every key of make_jobs(ctrls)
     exactly once, no key outside the grid, no run_error left, every reference run and every pair
     (comparison run + reference run of the same controller, mu, v) present without run_error.
-    Any failure: ket_luan 'chưa kết luận'."""
+    C3-29: a present pair counts only when both runs hold Y1, the gate outcome and finite Y2, Y3
+    (missing_quantities; else cap_khong_so_duoc, the runs in khoa_thieu_dai_luong). loi_worker:
+    exceptions of the pool (main run_pool). Any failure: ket_luan 'chưa kết luận'."""
     want = [tuple(j) for j in make_jobs(ctrls)]
     wset = set(want)
     cnt = Counter(key_of(r) for r in rows)
@@ -237,6 +273,9 @@ def completeness(rows, ctrls):
     def ok(k):
         return cnt[k] == 1 and got[k].get('status') != 'run_error'
 
+    def moc(k):
+        return (k[0], REF[0], REF[1], k[3], k[4])
+
     ref = [k for k in want if (k[1], k[2]) == REF]
     so = [k for k in want if (k[1], k[2]) != REF]
     thieu = [k for k in want if cnt[k] == 0]
@@ -244,15 +283,23 @@ def completeness(rows, ctrls):
     la = [k for k in cnt if k not in wset]
     loi = [k for k in want if cnt[k] and got[k].get('status') == 'run_error']
     moc_thieu = [k for k in ref if not ok(k)]
-    cap_thieu = [k for k in so if not (ok(k) and ok((k[0], REF[0], REF[1], k[3], k[4])))]
-    bad = thieu or trung or la or loi or moc_thieu or cap_thieu
+    cap_thieu = [k for k in so if not (ok(k) and ok(moc(k)))]
+    dl = {k: missing_quantities(got[k]) for k in want if ok(k)}
+    dl = {k: f for k, f in dl.items() if f}
+    cap_ks = [k for k in so if k not in cap_thieu and (k in dl or moc(k) in dl)]
+    bad = thieu or trung or la or loi or moc_thieu or cap_thieu or cap_ks or loi_worker
     return dict(ket_luan='chưa kết luận' if bad else 'đủ cặp',
                 n_khoa_can=len(want), n_khoa_co=len(want) - len(thieu),
                 n_moc_can=len(ref), n_moc_thieu=len(moc_thieu),
-                n_cap_can=len(so), n_cap_du=len(so) - len(cap_thieu), n_cap_thieu=len(cap_thieu),
+                n_cap_can=len(so), n_cap_du=len(so) - len(cap_thieu) - len(cap_ks),
+                n_cap_thieu=len(cap_thieu), n_cap_khong_so_duoc=len(cap_ks),
                 khoa_thieu=[_ks(k) for k in thieu], khoa_trung=[_ks(k) for k in trung],
                 khoa_la=[_ks(k) for k in la], khoa_run_error=[_ks(k) for k in loi],
-                moc_thieu=[_ks(k) for k in moc_thieu], cap_thieu=[_ks(k) for k in cap_thieu])
+                moc_thieu=[_ks(k) for k in moc_thieu], cap_thieu=[_ks(k) for k in cap_thieu],
+                cap_khong_so_duoc=[_ks(k) for k in cap_ks],
+                khoa_thieu_dai_luong=[dict(khoa=_ks(k), truong=dl[k]) for k in want if k in dl],
+                n_loi_worker=len(loi_worker),
+                khoa_loi_worker=[e['khoa'] for e in loi_worker if e.get('khoa')])
 
 
 def merge_retries(rows, retry_rows):
@@ -381,7 +428,10 @@ def dll_info(dll):
     warnings; never exits (a sensitivity trial continues on an unknown or dirty build).
     The build origin is verified (build_verified, nguon_build 'đã xác minh') only when the
     json's dll_sha256 equals the sha256 of this DLL (C3-20); otherwise 'chưa xác minh' and
-    esp32_dirty is None (the json's fields stay in fwsim_build, as read, not as a result)."""
+    esp32_dirty is None (the json's fields stay in fwsim_build, as read, not as a result).
+    Two states (C3-20, round 2): sidecar_khop_sha (= build_verified, the json is tied to this
+    DLL) and nguon_esp32_du (that json also holds esp32.commit and a boolean esp32.dirty);
+    nguon_build 'đã xác minh' needs both, 'khớp SHA, thiếu nguồn ESP32' when only the first."""
     path = os.path.abspath(dll)
     sha = s03.sha256_file(dll)
     build_json = os.path.join(os.path.dirname(path), 'fwsim_build.json')
@@ -421,9 +471,23 @@ def dll_info(dll):
     verified = build is not None and build.get('dll_sha256') == sha
     if not verified:
         esp32_dirty = None
+    esp32 = (build or {}).get('esp32') or {}
+    commit = esp32.get('commit')
+    esp32_commit = commit if verified and isinstance(commit, str) and commit.strip() \
+        and commit != 'UNKNOWN' else None
+    # C3-20: the ESP32 source of a sidecar tied to this DLL is complete with a commit and a
+    # boolean dirty state (dirty true still counts: no "clean build" rule is decided)
+    esp32_ok = esp32_commit is not None and isinstance(esp32_dirty, bool)
+    if verified and not esp32_ok:
+        warnings.append('fwsim_build.json matches the DLL sha256 but lacks the ESP32 source '
+                        '(esp32.commit, esp32.dirty): the firmware the DLL was built from is '
+                        'unknown; sensitivity trial, run continues')
     return dict(path=path, sha256=sha, fwsim_build_json=build_json, fwsim_build=build,
                 esp32_dirty=esp32_dirty, build_verified=verified,
-                nguon_build='đã xác minh' if verified else 'chưa xác minh', warnings=warnings)
+                sidecar_khop_sha=verified, esp32_commit=esp32_commit, nguon_esp32_du=esp32_ok,
+                nguon_build=('đã xác minh' if verified and esp32_ok else
+                             'khớp SHA, thiếu nguồn ESP32' if verified else 'chưa xác minh'),
+                warnings=warnings)
 
 
 def main(argv=None):
@@ -447,10 +511,31 @@ def main(argv=None):
     jobs = make_jobs(ctrls)
     n_workers = min(args.workers, 8)
 
-    def run_pool(js, tag=''):
-        out = []
+    loi_worker = []          # C3-19: exceptions out of the pool, recorded instead of exiting
+
+    def run_pool(js, tag='', lan=1):
+        out, n_exc = [], 0
         with mp.Pool(processes=n_workers, initializer=_init, initargs=(args.dll,)) as pool:
-            for i, row in enumerate(pool.imap_unordered(_job, js), 1):
+            it = pool.imap_unordered(_job_safe, js)
+            i = 0
+            while True:
+                try:
+                    row = next(it)
+                except StopIteration:
+                    break
+                except Exception as exc:     # noqa: BLE001 (raised by the iterator itself)
+                    n_exc += 1
+                    loi_worker.append(dict(khoa='', lan=lan,
+                                           error=f'{type(exc).__name__}: {exc}'))
+                    print(f'{tag}WARNING: pool iterator raised {type(exc).__name__}', flush=True)
+                    if n_exc > len(js):
+                        break
+                    continue
+                i += 1
+                if '_loi_worker' in row:
+                    loi_worker.append(dict(khoa=_ks(row['_khoa']), lan=lan, error=row['_loi_worker']))
+                    print(f'{tag}[{i}/{len(js)}] {_ks(row["_khoa"])} worker exception', flush=True)
+                    continue
                 out.append(row)
                 print(f"{tag}[{i}/{len(js)}] {row['controller']} delay={row['io_delay_ms']} "
                       f"omega_s={row['slip_omega_s']} mu={row['mu']} v={row['v']} "
@@ -460,12 +545,12 @@ def main(argv=None):
     rows = run_pool(jobs)
     # S03 section 8 condition 12: a run_error is run once more, in a new pool (new processes)
     retry_jobs = [key_of(r) for r in rows if r.get('status') == 'run_error']
-    retry_rows = run_pool(retry_jobs, 'rerun ') if retry_jobs else []
+    retry_rows = run_pool(retry_jobs, 'rerun ', 2) if retry_jobs else []
     rows, attempts, loi_chua_ro = merge_retries(rows, retry_rows)
     rows.sort(key=lambda r: (CONTROLLERS.index(r['controller']), r['io_delay_ms'],
                              r['slip_omega_s'], r['mu'], r['v']))
     refs = {(r['controller'], r['mu'], r['v']): r for r in rows if r['la_moc']}
-    kiem_cap = completeness(rows, ctrls)
+    kiem_cap = completeness(rows, ctrls, loi_worker)
 
     s03.write_csv(bang, rows, BANG_COLS)
     s03.write_csv(os.path.join(args.out, 'tom_tat_theo_dieu_kien.csv'),
@@ -474,6 +559,8 @@ def main(argv=None):
                   TT_COLS)
     s03.write_csv(os.path.join(args.out, 'chay_lai.csv'), attempts, BANG_COLS + ['attempt'])
     ly_do = ([] if info['build_verified'] else ['nguon build chua xac minh (C3-20)']) + \
+        ([] if not info['build_verified'] or info['nguon_esp32_du']
+         else ['nguon ESP32 chua du: esp32.commit, esp32.dirty (C3-20)']) + \
         ([] if kiem_cap['ket_luan'] == 'đủ cặp' else ['chua ket luan: thieu cap hay loi (C3-19)'])
 
     root = os.path.join(HERE, '..')
@@ -489,7 +576,7 @@ def main(argv=None):
         esp32_dirty=info['esp32_dirty'], warnings=info['warnings'],
         nguon_build=info['nguon_build'],
         kiem_cap=kiem_cap, n_run_error_lan_1=len(retry_jobs),
-        loi_chua_ro_nguyen_nhan=loi_chua_ro, chay_lai_csv='chay_lai.csv',
+        loi_chua_ro_nguyen_nhan=loi_chua_ro, chay_lai_csv='chay_lai.csv', loi_worker=loi_worker,
         dung_lam_luot_xac_nhan=not ly_do, ly_do_khong_dung=ly_do,
         gains=gains,
         seeds=dict(plant=SEED, imu_noise=s03.IMU['noise_seed'],
@@ -510,7 +597,9 @@ def main(argv=None):
     if kiem_cap['ket_luan'] != 'đủ cặp':
         print(f"WARNING: inconclusive (S03 section 8 condition 12): {kiem_cap['n_cap_thieu']} of "
               f"{kiem_cap['n_cap_can']} pairs missing, {len(kiem_cap['khoa_thieu'])} keys missing, "
-              f"{len(kiem_cap['khoa_run_error'])} run_error left; see meta.json kiem_cap; "
+              f"{len(kiem_cap['khoa_run_error'])} run_error left, "
+              f"{kiem_cap['n_cap_khong_so_duoc']} pairs not comparable, "
+              f"{kiem_cap['n_loi_worker']} worker exceptions; see meta.json kiem_cap; "
               'report to Liam', flush=True)
     if loi_chua_ro:
         print(f'WARNING: {len(loi_chua_ro)} run_error rerun ok (cause unknown): rerun values used, '

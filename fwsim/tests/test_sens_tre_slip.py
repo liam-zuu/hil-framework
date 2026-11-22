@@ -187,9 +187,10 @@ def test_dll_info_no_json(tmp_path):
 
 
 def test_dll_info_clean(tmp_path):
-    """A clean build json that matches the DLL: no warning."""
+    """A clean build json that matches the DLL: no warning. (C3-20 round 2: 'clean' includes
+    the ESP32 commit; without it a warning, see test_c3_20_esp32_source.)"""
     dll, data = _mk_dll(tmp_path, build=dict(
-        esp32=dict(dirty=False), hil_framework=dict(dirty=False),
+        esp32=dict(commit='5bde4c5', dirty=False), hil_framework=dict(dirty=False),
         dll_sha256=hashlib.sha256(b'fake-dll').hexdigest()))
     info = sens.dll_info(dll)
     assert info['warnings'] == []
@@ -275,7 +276,7 @@ def _fake_job(job):
                 e_perp_max=0.01 + 0.001 * delay, e_perp_max_cens=0.02,
                 tv_duty=1.0 + v, sat_frac=0.0, sat_any_frac=0.0,
                 e_perp_global_max=0.03, e_perp_rms=0.005, pos_reset_mid=0,
-                gate_outcome='pass', error='', t_chay_s=0.0)
+                gate_outcome='dat', error='', t_chay_s=0.0)
 
 
 class _FakeFW:
@@ -347,6 +348,7 @@ def test_main_ctrl_and_meta(tmp_path, monkeypatch, capsys):
 
 X_SO = ('ADRC', 1, 0.05, 0.413, 0.2)          # a comparison key of the --ctrl ADRC grid
 X_MOC = ('ADRC', 0, 0.1, 0.436, 0.5)          # a reference key
+_SHA = hashlib.sha256(b'fake-dll').hexdigest()   # sha256 of the _mk_dll default DLL
 
 
 def _err_row(job):
@@ -365,16 +367,21 @@ def _drop_pool(drop):
 
 
 def _main_fakes(monkeypatch, tmp_path, job=_fake_job, pool=_FakePool, build='match'):
-    """main with fakes, --ctrl ADRC; build: 'match' (json with the DLL sha256), 'nosha'
-    ({"esp32": {"dirty": false}}) or 'badsha'. Returns the out folder."""
+    """main with fakes, --ctrl ADRC; build: 'match' (json with the DLL sha256 and the ESP32
+    commit, dirty), 'nosha' ({"esp32": {"dirty": false}}), 'badsha', 'shaonly'
+    ({"dll_sha256": <right>}, C3-20 round 2) or a dict (written as is). Returns the out folder."""
     monkeypatch.setattr(sens.fwsim, 'FirmwareSim', _FakeFW)
     monkeypatch.setattr(sens.s03, 'defaults', lambda fw, c: {'g': c})
     monkeypatch.setattr(sens.mp, 'Pool', pool)
     monkeypatch.setattr(sens, '_job', job)
     monkeypatch.setitem(sens.s03.THRESH, 'tv_duty', 0.4)
     b = dict(esp32=dict(dirty=False))
-    if build == 'match':
-        b['dll_sha256'] = hashlib.sha256(b'fake-dll').hexdigest()
+    if isinstance(build, dict):
+        b = build
+    elif build == 'match':
+        b = dict(esp32=dict(commit='5bde4c5', dirty=False), dll_sha256=_SHA)
+    elif build == 'shaonly':
+        b = dict(dll_sha256=_SHA)
     elif build == 'badsha':
         b['dll_sha256'] = '0' * 64
     dll, _ = _mk_dll(tmp_path, build=b)
@@ -499,7 +506,8 @@ def test_c3_20_sidecar_wrong_sha(tmp_path):
     assert info['build_verified'] is False and info['nguon_build'] == 'chưa xác minh'
     (tmp_path / 'ok').mkdir()
     dll2, _ = _mk_dll(tmp_path / 'ok', build=dict(
-        esp32=dict(dirty=False), dll_sha256=hashlib.sha256(b'fake-dll').hexdigest()))
+        esp32=dict(commit='5bde4c5', dirty=False),
+        dll_sha256=hashlib.sha256(b'fake-dll').hexdigest()))
     info2 = sens.dll_info(dll2)
     assert info2['build_verified'] is True and info2['nguon_build'] == 'đã xác minh'
     assert info2['esp32_dirty'] is False
@@ -566,3 +574,271 @@ def test_c3_21_refuse_without_tv_threshold(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match='tv_duty'):
         sens.main(['--out', str(out), '--dll', str(tmp_path / 'fwsim.dll'), '--ctrl', 'ADRC'])
     assert not out.exists()
+
+
+# ── review round 2 (C3-19/C3-29, C3-20) ─────────────────────────────────────────────
+
+Y3_DONG = 'chua ket luan: thieu cap hay loi (C3-19)'
+ESP_DONG = 'nguon ESP32 chua du: esp32.commit, esp32.dirty (C3-20)'
+
+
+def _job_with(key, **fields):
+    """_fake_job, with fields overridden in the row of key (status stays 'ok')."""
+    def job(j):
+        r = _fake_job(j)
+        if tuple(j) == key:
+            r.update(fields)
+        return r
+    return job
+
+
+@pytest.mark.parametrize('bad', [float('nan'), '', None, float('inf'), float('-inf'), 'abc',
+                                 np.float32('nan')])
+def test_c3_29_main_y3_bad_in_ok_run(bad, tmp_path, monkeypatch):
+    """C3-29 (Codex): all 81 keys present, one comparison run status 'ok' with tv_duty NaN or
+    empty. Old code: kiem_cap 'đủ cặp' with 72 pairs and dung_lam_luot_xac_nhan true while
+    tom_tat holds 8 conditions there. Now 'chưa kết luận', the pair and the field named."""
+    out = _main_fakes(monkeypatch, tmp_path, job=_job_with(X_SO, tv_duty=bad))
+    meta = _meta(out)
+    kc = meta['kiem_cap']
+    assert kc['n_khoa_can'] == 81 and kc['n_khoa_co'] == 81 and kc['khoa_thieu'] == []
+    assert kc['khoa_run_error'] == [] and kc['n_cap_thieu'] == 0
+    assert kc['ket_luan'] == 'chưa kết luận'
+    assert kc['n_cap_du'] == 71 and kc['n_cap_khong_so_duoc'] == 1
+    assert kc['cap_khong_so_duoc'] == [sens._ks(X_SO)]
+    assert kc['khoa_thieu_dai_luong'] == [dict(khoa=sens._ks(X_SO), truong=['tv_duty'])]
+    assert meta['dung_lam_luot_xac_nhan'] is False and meta['ly_do_khong_dung'] == [Y3_DONG]
+    bang = _read_csv(out / 'bang.csv')
+    assert len(bang) == 81 and all(r['status'] == 'ok' for r in bang)
+    tt = [r for r in _read_csv(out / 'tom_tat.csv')
+          if (r['io_delay_ms'], r['slip_omega_s'], r['dap_ung']) == ('1', '0.05', 'tv_duty')]
+    assert len(tt) == 1 and tt[0]['n_dieu_kien'] == '8'
+
+
+def test_c3_29_main_y3_nan_reference(tmp_path, monkeypatch):
+    """tv_duty NaN in a reference run: its 8 pairs are not comparable, the run is named once."""
+    out = _main_fakes(monkeypatch, tmp_path, job=_job_with(X_MOC, tv_duty=float('nan')))
+    kc = _meta(out)['kiem_cap']
+    assert kc['ket_luan'] == 'chưa kết luận' and kc['n_moc_thieu'] == 0
+    assert kc['n_cap_khong_so_duoc'] == 8 and kc['n_cap_du'] == 64
+    assert all(';mu=0.436;v=0.5' in k for k in kc['cap_khong_so_duoc'])
+    assert kc['khoa_thieu_dai_luong'] == [dict(khoa=sens._ks(X_MOC), truong=['tv_duty'])]
+
+
+@pytest.mark.parametrize('fields, truong', [
+    (dict(completed=''), ['completed']),
+    (dict(completed='True'), ['completed']),
+    (dict(gate_outcome=''), ['gate_outcome']),
+    (dict(gate_outcome='pass'), ['gate_outcome']),
+    (dict(e_perp_max=float('nan')), ['e_perp_max']),
+    (dict(e_perp_max=float('inf'), tv_duty=''), ['e_perp_max', 'tv_duty']),
+])
+def test_c3_29_main_each_quantity(fields, truong, tmp_path, monkeypatch):
+    """Each quantity of a pair (Y1, gate outcome, finite Y2, Y3) missing in one 'ok' run:
+    'chưa kết luận', the fields listed."""
+    meta = _meta(_main_fakes(monkeypatch, tmp_path, job=_job_with(X_SO, **fields)))
+    kc = meta['kiem_cap']
+    assert kc['ket_luan'] == 'chưa kết luận' and kc['n_cap_khong_so_duoc'] == 1
+    assert kc['khoa_thieu_dai_luong'] == [dict(khoa=sens._ks(X_SO), truong=truong)]
+    assert meta['dung_lam_luot_xac_nhan'] is False
+
+
+@pytest.mark.parametrize('fields', [
+    dict(tv_duty=0.0), dict(tv_duty=5e-324), dict(tv_duty=1.7976931348623157e308),
+    dict(tv_duty=np.float32(3.4028235e38)), dict(tv_duty=np.float32(0.4)),
+    dict(tv_duty=0.4 + 1e-9), dict(tv_duty='1.25'),
+    dict(completed='false'), dict(completed='inconclusive'),
+    dict(gate_outcome='khong_dat'), dict(gate_outcome='chua_ket_luan'),
+    dict(e_perp_max_cens=float('nan')), dict(sat_frac=float('nan'))])
+def test_c3_29_comparable_edges(fields, tmp_path, monkeypatch):
+    """Edge values that still compare: finite extremes (0, smallest subnormal, largest double,
+    largest float32), values at / 1e-9 above the Y3 threshold, a numeric string, every Y1 and
+    gate value; NaN in e_perp_max_cens or sat_frac (not a quantity of the pair). 'đủ cặp'."""
+    meta = _meta(_main_fakes(monkeypatch, tmp_path, job=_job_with(X_SO, **fields)))
+    kc = meta['kiem_cap']
+    assert kc['ket_luan'] == 'đủ cặp' and kc['n_cap_du'] == 72
+    assert kc['cap_khong_so_duoc'] == [] and kc['khoa_thieu_dai_luong'] == []
+    assert meta['dung_lam_luot_xac_nhan'] is True and meta['ly_do_khong_dung'] == []
+
+
+def test_c3_29_missing_quantities_unit():
+    """missing_quantities on a full row, a run_error row and float32 NaN / inf."""
+    r = _fake_job(X_SO)
+    assert sens.missing_quantities(r) == []
+    assert sens.missing_quantities(_err_row(X_SO)) == ['completed', 'gate_outcome',
+                                                       'e_perp_max', 'tv_duty']
+    assert sens.missing_quantities(dict(r, tv_duty=np.float32('inf'))) == ['tv_duty']
+    assert sens.missing_quantities(dict(r, e_perp_max=np.float32('nan'))) == ['e_perp_max']
+
+
+def _raise_on(key, exc=RuntimeError('boom')):
+    def job(j):
+        if tuple(j) == key:
+            raise exc
+        return _fake_job(j)
+    return job
+
+
+class _RaisingIter:
+    """IMapIterator stand-in: next() raises exc in place of the result of a job in bad (as
+    multiprocessing re-raises an unpicklable result), the other results still follow (CPython
+    IMapIterator goes on after a raised item)."""
+
+    def __init__(self, func, jobs, bad, exc):
+        self.func, self.jobs, self.bad, self.exc = func, iter(jobs), bad, exc
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        j = next(self.jobs)
+        if tuple(j) in self.bad:
+            raise self.exc
+        return self.func(j)
+
+
+def _raising_pool(bad, exc=ValueError('result not picklable')):
+    class P(_FakePool):
+        def imap_unordered(self, func, jobs):
+            return _RaisingIter(func, jobs, bad, exc)
+    return P
+
+
+def test_c3_19_worker_exception_recorded(tmp_path, monkeypatch, capsys):
+    """C3-19 (Codex): _job raises in the worker for one key. Old code: the exception left
+    main through the pool iterator, no meta.json. Now every file is written, meta.json
+    loi_worker holds the key and the error, 'chưa kết luận', not a confirmation run."""
+    out = _main_fakes(monkeypatch, tmp_path, job=_raise_on(X_SO))
+    meta = _meta(out)
+    assert meta['loi_worker'] == [dict(khoa=sens._ks(X_SO), lan=1, error='RuntimeError: boom')]
+    kc = meta['kiem_cap']
+    assert kc['ket_luan'] == 'chưa kết luận'
+    assert kc['n_loi_worker'] == 1 and kc['khoa_loi_worker'] == [sens._ks(X_SO)]
+    assert kc['khoa_thieu'] == [sens._ks(X_SO)] and kc['cap_thieu'] == [sens._ks(X_SO)]
+    assert meta['dung_lam_luot_xac_nhan'] is False and meta['ly_do_khong_dung'] == [Y3_DONG]
+    assert meta['n_run_error_lan_1'] == 0                 # a worker exception is not rerun
+    assert len(_read_csv(out / 'bang.csv')) == 80
+    for f in ('tom_tat.csv', 'tom_tat_theo_dieu_kien.csv', 'chay_lai.csv'):
+        assert (out / f).exists()
+    assert 'worker exceptions' in capsys.readouterr().out
+
+
+def test_c3_19_worker_exception_reference(tmp_path, monkeypatch):
+    """A reference run raising: its 8 pairs are missing, recorded, no crash."""
+    kc = _meta(_main_fakes(monkeypatch, tmp_path, job=_raise_on(X_MOC)))['kiem_cap']
+    assert kc['ket_luan'] == 'chưa kết luận' and kc['moc_thieu'] == [sens._ks(X_MOC)]
+    assert kc['n_cap_thieu'] == 8 and kc['khoa_loi_worker'] == [sens._ks(X_MOC)]
+
+
+def test_c3_19_iterator_exception_recorded(tmp_path, monkeypatch):
+    """The pool iterator itself raises (no key known): the remaining results are still read,
+    meta.json loi_worker holds the error with an empty key, the key is missing in kiem_cap."""
+    out = _main_fakes(monkeypatch, tmp_path, pool=_raising_pool({X_SO}))
+    meta = _meta(out)
+    assert meta['loi_worker'] == [dict(khoa='', lan=1, error='ValueError: result not picklable')]
+    kc = meta['kiem_cap']
+    assert kc['ket_luan'] == 'chưa kết luận' and kc['n_loi_worker'] == 1
+    assert kc['khoa_loi_worker'] == [] and kc['khoa_thieu'] == [sens._ks(X_SO)]
+    assert kc['n_khoa_co'] == 80 and len(_read_csv(out / 'bang.csv')) == 80
+    assert meta['dung_lam_luot_xac_nhan'] is False
+
+
+def test_c3_19_rerun_exception(tmp_path, monkeypatch):
+    """A run_error whose rerun raises: lan 2 in loi_worker, the run_error row stays,
+    'chưa kết luận'."""
+    calls = []
+
+    def job(j):
+        calls.append(tuple(j))
+        if tuple(j) == X_SO:
+            if calls.count(X_SO) == 1:
+                return _err_row(j)
+            raise OSError('worker died')
+        return _fake_job(j)
+
+    meta = _meta(_main_fakes(monkeypatch, tmp_path, job=job))
+    assert calls.count(X_SO) == 2 and meta['n_run_error_lan_1'] == 1
+    assert meta['loi_worker'] == [dict(khoa=sens._ks(X_SO), lan=2, error='OSError: worker died')]
+    kc = meta['kiem_cap']
+    assert kc['ket_luan'] == 'chưa kết luận' and kc['khoa_run_error'] == [sens._ks(X_SO)]
+    assert meta['dung_lam_luot_xac_nhan'] is False
+
+
+def test_c3_19_no_exception_meta_empty(tmp_path, monkeypatch):
+    """Nothing raises: loi_worker [] and kiem_cap n_loi_worker 0 (the new fields always present)."""
+    meta = _meta(_main_fakes(monkeypatch, tmp_path))
+    assert meta['loi_worker'] == [] and meta['kiem_cap']['n_loi_worker'] == 0
+    assert meta['kiem_cap']['ket_luan'] == 'đủ cặp' and meta['dung_lam_luot_xac_nhan'] is True
+
+
+def test_c3_20_main_sidecar_sha_only(tmp_path, monkeypatch, capsys):
+    """C3-20 (Codex round 2): sidecar {"dll_sha256": <right sha>} only. Old code:
+    nguon_build 'đã xác minh', dung_lam_luot_xac_nhan true. Now the two states are apart:
+    sidecar_khop_sha true, nguon_esp32_du false, not a confirmation run, a warning."""
+    meta = _meta(_main_fakes(monkeypatch, tmp_path, build='shaonly'))
+    assert meta['kiem_cap']['ket_luan'] == 'đủ cặp'
+    assert meta['nguon_build'] != 'đã xác minh'                       # old code: 'đã xác minh'
+    assert meta['dung_lam_luot_xac_nhan'] is False                    # old code: True
+    assert meta['ly_do_khong_dung'] == [ESP_DONG]
+    assert meta['nguon_build'] == 'khớp SHA, thiếu nguồn ESP32'
+    d = meta['dll']
+    assert d['sidecar_khop_sha'] is True and d['build_verified'] is True
+    assert d['nguon_esp32_du'] is False and d['esp32_commit'] is None
+    assert any('ESP32 source' in w for w in meta['warnings'])
+    assert 'ESP32 source' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('esp32, du', [
+    (dict(commit='5bde4c5', dirty=False), True),
+    (dict(commit='5bde4c5', dirty=True), True),          # dirty does not block (no rule decided)
+    (dict(dirty=False), False),
+    (dict(commit='', dirty=False), False),
+    (dict(commit='  ', dirty=False), False),
+    (dict(commit='UNKNOWN', dirty=True), False),          # build_fwsim.git_state on a git error
+    (dict(commit=None, dirty=False), False),
+    (dict(commit='5bde4c5'), False),
+    (dict(commit='5bde4c5', dirty='false'), False),       # not a boolean
+    (dict(commit='5bde4c5', dirty=None), False),
+    (None, False),
+])
+def test_c3_20_esp32_source(esp32, du, tmp_path):
+    """dll_info with a sidecar tied to the DLL: nguon_esp32_du needs esp32.commit (non-empty,
+    not 'UNKNOWN') and a boolean esp32.dirty; nguon_build 'đã xác minh' only then."""
+    b = dict(dll_sha256=_SHA)
+    if esp32 is not None:
+        b['esp32'] = esp32
+    dll, _ = _mk_dll(tmp_path, build=b)
+    info = sens.dll_info(dll)
+    assert info['sidecar_khop_sha'] is True
+    assert info['nguon_esp32_du'] is du
+    assert info['nguon_build'] == ('đã xác minh' if du else 'khớp SHA, thiếu nguồn ESP32')
+    assert info['esp32_commit'] == ('5bde4c5' if (esp32 or {}).get('commit') == '5bde4c5'
+                                    else None)
+    assert any('ESP32 source' in w for w in info['warnings']) is (not du)
+
+
+def test_c3_20_esp32_commit_wrong_sha(tmp_path):
+    """A sidecar with the ESP32 commit but a wrong dll_sha256: no state taken from it."""
+    dll, _ = _mk_dll(tmp_path, build=dict(esp32=dict(commit='5bde4c5', dirty=False),
+                                          dll_sha256='0' * 64))
+    info = sens.dll_info(dll)
+    assert info['sidecar_khop_sha'] is False and info['nguon_esp32_du'] is False
+    assert info['esp32_commit'] is None and info['nguon_build'] == 'chưa xác minh'
+
+
+def test_c3_20_main_dirty_with_commit_confirms(tmp_path, monkeypatch):
+    """SHA match, ESP32 commit, dirty true: still a confirmation run (no 'not dirty' rule is
+    added); the dirty warning stays."""
+    meta = _meta(_main_fakes(monkeypatch, tmp_path, build=dict(
+        esp32=dict(commit='5bde4c5', dirty=True), dll_sha256=_SHA)))
+    assert meta['nguon_build'] == 'đã xác minh' and meta['esp32_dirty'] is True
+    assert meta['dung_lam_luot_xac_nhan'] is True and meta['ly_do_khong_dung'] == []
+    assert any('dirty' in w for w in meta['warnings'])
+
+
+def test_c3_20_main_both_reasons(tmp_path, monkeypatch):
+    """SHA-only sidecar and a non-comparable pair: both reasons listed."""
+    meta = _meta(_main_fakes(monkeypatch, tmp_path, job=_job_with(X_SO, tv_duty=''),
+                             build='shaonly'))
+    assert meta['dung_lam_luot_xac_nhan'] is False
+    assert meta['ly_do_khong_dung'] == [ESP_DONG, Y3_DONG]
