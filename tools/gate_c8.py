@@ -77,7 +77,8 @@ LOST_KINDS = ('thao_tac', 'he_do', 'cua_so_tham_chieu', 'duong_lenh')
 THAO_TAC = ('boot', 'khoa_sieu_am', 'loi_nap_gain')     # J v6 section 5 operations (score.json thao_tac, c8b_gio)
 D1_STATES = ('dat', 'truot', 'khong_kiem')                              # F11: c8b_gio_v1.kiem_gio_d1.trang_thai
 RERUNS_MAX = 3                          # J v6 section 5: the first run + 3 reruns per kind
-CELL_STATES = ('co_luot', 'dong_tran', 'thieu_u_t')   # thieu_u_t: GC9-6 (Liam 20/11), the last run has no U_t
+CELL_STATES = ('co_luot', 'dong_tran', 'thieu_u_t',   # thieu_u_t: GC9-6 (Liam 20/11), the last run has no U_t
+               'hong_theo_liam')   # Liam 22/11 (C8 contract section 3): last run lost to the measurement, not rerun
 EVID_KEYS = ('e_do_lo_vuot_D_moi_nut', 'e_do_xac_dinh_moi_nut', 'g4_can_huu_han_mien_hop_moi_nut')
 
 # U standard (design section 8; J v6 section 6)
@@ -676,12 +677,16 @@ def _chain_entry(x, w: str) -> dict:
     return x
 
 
-def count_chain(chain: list) -> Tuple[str, Dict[str, int]]:
+def count_chain(chain: list, hong_theo_liam: bool = False) -> Tuple[str, Dict[str, int]]:
     """The reruns cap of one C8 cell (J v6 section 5, O1 3.5 line 342, M2 in force): two counters in chain order,
     never reset: time check (a lost run whose time file says dem_truot_kiem_gio: a slip, not lost by a boot unless
     the locked check slipped on the whole window before the boot; CODE_C8B design v7 7a, counted by the field, not
     inferred) and reference window (cua_so_tham_chieu without thao_tac). The fourth of a kind closes the cell (dong_tran) and must
-    be the last run; otherwise the last run must not be lost (co_luot). GateFileError when neither."""
+    be the last run; otherwise the last run must not be lost (co_luot). GateFileError when neither.
+    hong_theo_liam (Liam 22/11, C8 contract section 3 (a): PID F08-1, F08-2 of session 2 recorded lost, not saved):
+    the cell's last run is lost to the measurement (he_do, no operation) and Liam's recorded choice keeps it so, not
+    rerun (hong_theo_liam: no eligible run in the cell); the chain is checked as above, the flag on a cell whose last
+    run is not lost is refused."""
     n = {'kiem_gio': 0, 'cua_so': 0}
     for i, x in enumerate(chain):
         if x['ket_qua'] != 'hong':
@@ -700,8 +705,15 @@ def count_chain(chain: list) -> Tuple[str, Dict[str, int]]:
                 raise GateFileError(f'run {chain[i + 1]["run_id"]!r} after the cell was closed by the '
                                     f'{RERUNS_MAX + 1}th lost run of one kind ({x["run_id"]!r}; J v6 section 5)')
             return 'dong_tran', n
-    if chain[-1]['ket_qua'] == 'hong':
-        raise GateFileError(f'the last run {chain[-1]["run_id"]!r} is lost and the cell is not at its cap: run it '
+    x = chain[-1]
+    if hong_theo_liam:
+        if x['ket_qua'] != 'hong' or 'he_do' not in x['loai_hong'] or 'thao_tac' in x['loai_hong']:
+            raise GateFileError(f'Liam\'s record keeps the cell lost (hong_theo_liam) but its last run {x["run_id"]!r} '
+                                f'is {x["ket_qua"]} {x["loai_hong"]}: only a run lost to the measurement (he_do, no '
+                                'operation) is kept lost without a rerun (Liam 22/11)')
+        return 'hong_theo_liam', n
+    if x['ket_qua'] == 'hong':
+        raise GateFileError(f'the last run {x["run_id"]!r} is lost and the cell is not at its cap: run it '
                             'again (C8 is not done; a missing run may hide a larger U_t)')
     return 'co_luot', n
 
@@ -750,7 +762,10 @@ def _check_cells(d: dict) -> list:
     seen, runs_seen, clips_seen, files_seen = set(), set(), set(), {}
     for i, c in enumerate(cells):
         w = f'o_c8[{i}]'
-        _obj(c, ('o', 'muc', 'controller', 'trang_thai', 'chuoi'), w)
+        liam = isinstance(c, dict) and c.get('trang_thai') == 'hong_theo_liam'     # Liam 22/11: his record in the cell
+        _obj(c, ('o', 'muc', 'controller', 'trang_thai', 'chuoi') + (('liam',) if liam else ()), w)
+        if liam:
+            _liam(c['liam'], f'{w}.liam')
         _text(c['o'], f'{w}.o')
         if c['o'] in seen:
             raise GateFileError(f'{w}.o {c["o"]!r}: each cell once')
@@ -779,7 +794,7 @@ def _check_cells(d: dict) -> list:
                                         'files of a run belong to that run only (GC6-1)')
                 files_seen[h] = f'{c["o"]} run {x["run_id"]} {k}'
         try:
-            st, _ = count_chain(ch)
+            st, _ = count_chain(ch, hong_theo_liam=liam)
         except GateFileError as exc:
             raise GateFileError(f'{w} ({c["o"]}): {exc}')
         if st == 'co_luot' and ch[-1]['thieu_u_t'] and ch[-1]['ket_qua'] != 'hong':
@@ -2581,7 +2596,7 @@ def ghep_va_ghi(out: str, goc: str, *args, **kw) -> str:
 
 def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem_cheo: str,
          bang_chung: Dict[str, str], ho_so: str, muc_bo_theo_liam: Optional[dict] = None,
-         quyet_liam: Optional[dict] = None) -> dict:
+         quyet_liam: Optional[dict] = None, o_hong_theo_liam: Optional[dict] = None) -> dict:
     """The gate content of C8 assembled from its sources under the C8 folder goc (paths relative to it; F10-F19, the
     contract of 19/11 with C8B: the gate reads the C8B files, C8B does not call the gate):
       cells        the plan (ke_hoach_c8_v1) and thu_tu_clip.csv: every physical run of a cell in clip order, run_id =
@@ -2593,6 +2608,9 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
                    comparison; the time check state and slip counter of the time file; the cell state recounted
       levels       the three kinds of evidence, Liam's drops (muc_bo_theo_liam), the closed terms and speed bands of the
                    C8b lock (hang_dong, hang_theo_u), U_t,C8 and Uhat (level_block), Liam's choices (quyet_liam)
+      kept lost    o_hong_theo_liam {cell: Liam's record}: the cells whose last run is lost to the measurement and Liam
+                   keeps lost without a rerun (Liam 22/11, C8 contract section 3 (a)); hong_theo_liam, the record in
+                   the cell, no eligible run there (a level then lacks that controller unless Liam drops it)
       U standard   the four evidence files (bang_chung {condition: path}) and the dossier ho_so_c8_v1 written to ho_so
                    (cham_luc = the first scoring time of every run, _scoring_times; giu_ngoai = every C8 run, CODE
                    20/11, GC9-2; khoa_kiem_luc = the khoa_s7 record of kiem_cheo.json, its file by the path it names)
@@ -2615,6 +2633,11 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
         raise GateFileError('ghep: the C8b lock has no muc_kha_thi')
     rows = _csv_rows(kho.goc, tt_ref, 'thu_tu_clip')
     plan = {x['o']: x for x in kh.get('o') or []}
+    giu_hong = o_hong_theo_liam or {}
+    if not isinstance(giu_hong, dict) or any(o not in plan for o in giu_hong):
+        raise GateFileError(f'ghep: o_hong_theo_liam {giu_hong!r}: an object keyed by cells of the plan')
+    for o, x in giu_hong.items():
+        _liam(x, f'ghep: o_hong_theo_liam.{o}')
     order = {o: [] for o in plan}
     for r in rows:
         b = re.sub(r'_lai\d+$', '', (r.get('buoc') or '').strip())
@@ -2705,10 +2728,16 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
             last = (ent, fc, fg, cc_ref)
         if not chain:
             raise GateFileError(f'ghep: cell {o}: no run in thu_tu_clip.csv')
-        st, _ = count_chain(chain)
+        try:
+            st, _ = count_chain(chain, hong_theo_liam=o in giu_hong)
+        except GateFileError as exc:
+            raise GateFileError(f'ghep: cell {o}: {exc}')
+        if o in giu_hong and st != 'hong_theo_liam':
+            raise GateFileError(f'ghep: cell {o}: Liam\'s record keeps it lost but the chain gives {st!r}')
         if st == 'co_luot' and chain[-1]['thieu_u_t']:
             st = 'thieu_u_t'                                  # GC9-6: no eligible run in the cell
-        cells.append(dict(o=o, muc=x['muc'], controller=x['controller'], trang_thai=st, chuoi=chain))
+        cells.append(dict(o=o, muc=x['muc'], controller=x['controller'], trang_thai=st, chuoi=chain,
+                          **({'liam': dict(giu_hong[o])} if o in giu_hong else {})))
         if st == 'co_luot':
             ent, fc, fg, cc_ref = last
             if fg is None or cc_ref is None:
@@ -2850,7 +2879,8 @@ def main(argv=None) -> int:
     g.add_argument('--kiem-cheo', required=True, help='kiem_cheo.json (c7_kiem_cheo_v7) with its khoa_s7 record')
     g.add_argument('--bang-chung', action='append', required=True, help='CONDITION=path, once for each of the four')
     g.add_argument('--ho-so', required=True, help='the dossier ho_so_c8_v1 to write (new, or the same bytes)')
-    g.add_argument('--liam', default=None, help='JSON {muc_bo_theo_liam, quyet_liam} of Liam\'s recorded choices')
+    g.add_argument('--liam', default=None, help='JSON {muc_bo_theo_liam, quyet_liam, o_hong_theo_liam} of Liam\'s '
+                   'recorded choices')
     g.add_argument('--out', required=True, help='the gate file (new, never replaced; not under the C8 folder)')
     a = ap.parse_args(argv)
     try:
@@ -2869,8 +2899,11 @@ def main(argv=None) -> int:
         if a.liam:
             with open(a.liam, encoding='utf-8') as f:
                 liam = json.load(f)
+            keys = ('muc_bo_theo_liam', 'quyet_liam', 'o_hong_theo_liam')
+            if not isinstance(liam, dict) or not set(liam) <= set(keys):
+                raise GateFileError(f'--liam {a.liam}: a JSON object with keys among {list(keys)}')
         sha = ghep_va_ghi(a.out, a.goc, a.ke_hoach, a.thu_tu_clip, a.khoa_c8b, a.tien_de, a.kiem_cheo, bc, a.ho_so,
-                          liam.get('muc_bo_theo_liam'), liam.get('quyet_liam'))
+                          liam.get('muc_bo_theo_liam'), liam.get('quyet_liam'), liam.get('o_hong_theo_liam'))
         print('gate_c8_v2', a.out, sha)
     except (OSError, ValueError, GateFileError) as exc:
         print(f'gate_c8: {exc}', file=sys.stderr)

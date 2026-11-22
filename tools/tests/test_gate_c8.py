@@ -2479,3 +2479,94 @@ def test_rt4_1_worst_case_slope_needs_the_window_ends(monkeypatch):
     lip = dict(L_V=L, L_W=0.0, L_u=L, L_r=0.0)
     _, (ta, tb), res = GC._grid_bounds(sch, [tm], lip, blk['a_m'], u_t, -u_t, 0.05, 1e-3)
     assert np.all(res[0][0] >= u_t * L * np.maximum(tb + u_t, 0.0) - 1e-15)
+
+
+# ── Liam 22/11 (C8 contract section 3 (a)): PID F08-1, F08-2 of session 2 recorded lost, not saved ───────────────
+
+LIAM_HONG = dict(ngay='2026-11-22', phien='local_x', nguyen_van='FAKE ghi hong, khong cuu')
+
+
+def _only_lost(goc, d, o, **kw):
+    """Cell o with one run only, lost to the measurement (time file lost: ok false, hong_he_do), no rerun."""
+    ci = next(i for i, c in enumerate(d['o_c8']) if c['o'] == o)
+    gk = dict(ok=False, ket_luan='hong_he_do')
+    gk.update(kw.pop('gio_kw', {}))
+    _add_lost(goc, d, ci, 1, kw.pop('lh', ['he_do']), gio_kw=gk, **kw)
+    d['o_c8'][ci]['chuoi'] = d['o_c8'][ci]['chuoi'][:1]
+    _write_csv(goc, d)
+    _fix_ho_so(goc, d)
+    return ci
+
+
+def test_liam_22_11_a_cell_kept_lost_without_a_rerun(tmp_path):
+    o = 'O1-F08_PID'
+    d, goc = build_c8(tmp_path / 'a')
+    _only_lost(goc, d, o)
+    with pytest.raises(GC.GateFileError, match='run it again'):         # without Liam's record: C8 is not done
+        _ghep(goc)
+    g = _ghep(goc, o_hong_theo_liam={o: LIAM_HONG})
+    with pytest.raises(GC.GateFileError, match=r"O1-F08: no eligible run of \['PID'\]"):   # J v6: C8 not done there
+        GC.write_gate(str(tmp_path / 'x.json'), g, goc)
+    assert not os.path.exists(str(tmp_path / 'x.json'))
+    g = _ghep(goc, o_hong_theo_liam={o: dict(LIAM_HONG)}, muc_bo_theo_liam={'O1-F08': dict(LIAM_HONG)})
+    c = next(c for c in g['o_c8'] if c['o'] == o)
+    assert c['trang_thai'] == 'hong_theo_liam' and c['liam'] == LIAM_HONG and c['chuoi'][-1]['ket_qua'] == 'hong'
+    assert g['levels'] == ['O1-F02', 'O1-F05'] and [r['controller'] for r in g['runs_c8']['O1-F08']] == ['LADRC']
+    p = str(tmp_path / 'gate.json')
+    GC.write_gate(p, g, goc)                                            # check and check_nguon both pass
+    assert GC.read_gate_c8(p).levels == ['O1-F02', 'O1-F05']
+    # the gate file: the record only on a hong_theo_liam cell, and needed there
+    for edit, msg in ((lambda c_: c_.pop('liam'), 'keys'),
+                      (lambda c_: c_['liam'].pop('nguyen_van'), r'o_c8\[\d+\]\.liam'),
+                      (lambda c_: c_.update(trang_thai='co_luot'), 'keys'),
+                      (lambda c_: c_.update(trang_thai='co_luot') or c_.pop('liam'), 'run it again')):
+        h = copy.deepcopy(g)
+        edit(next(c_ for c_ in h['o_c8'] if c_['o'] == o))
+        with pytest.raises(GC.GateFileError, match=msg):
+            GC.check(h)
+    # Liam's record on a cell whose last run is not lost, or a cell of no plan
+    with pytest.raises(GC.GateFileError, match='only a run lost to the measurement'):
+        _ghep(goc, o_hong_theo_liam={o: LIAM_HONG, 'O1-F05_PID': LIAM_HONG}, muc_bo_theo_liam={'O1-F08': LIAM_HONG})
+    with pytest.raises(GC.GateFileError, match='cells of the plan'):
+        _ghep(goc, o_hong_theo_liam={'O1-F11_PID': LIAM_HONG})
+    with pytest.raises(GC.GateFileError, match='ngay'):
+        _ghep(goc, o_hong_theo_liam={o: dict(LIAM_HONG, ngay='22/11')})
+    # a cell closed at its cap (dong_tran) is no cell kept lost by Liam
+    d, goc = build_c8(tmp_path / 'c')
+    tb = dict(co_boot=False, t_boot_log_s=None, du_cua_so=False, trang_thai=None, thao_tac=[])
+    ci = next(i for i, c_ in enumerate(d['o_c8']) if c_['o'] == o)
+    for k in range(1, 5):
+        _add_lost(goc, d, ci, k, ['he_do'], d1='truot', dem=True,
+                  gio_kw=dict(ok=False, ket_luan='hong_he_do', dem_truot_kiem_gio=True,
+                              kiem_gio_d1=dict(trang_thai='truot', truoc_boot=tb)))
+    d['o_c8'][ci]['chuoi'] = d['o_c8'][ci]['chuoi'][:4]
+    _write_csv(goc, d)
+    _fix_ho_so(goc, d)
+    assert next(c_ for c_ in _ghep(goc, ho_so='chuan_u/ho_so_c.json')['o_c8'] if c_['o'] == o)['trang_thai'] == 'dong_tran'
+    with pytest.raises(GC.GateFileError, match="chain gives 'dong_tran'"):
+        _ghep(goc, ho_so='chuan_u/ho_so_c2.json', o_hong_theo_liam={o: LIAM_HONG})
+    # a run lost to an operation is run again whatever the record (J v6 section 5)
+    d, goc = build_c8(tmp_path / 'b')
+    _only_lost(goc, d, o, lh=['thao_tac', 'he_do'], ops=('boot',))
+    with pytest.raises(GC.GateFileError, match='only a run lost to the measurement'):
+        _ghep(goc, o_hong_theo_liam={o: LIAM_HONG}, muc_bo_theo_liam={'O1-F08': LIAM_HONG})
+
+
+def test_liam_22_11_count_chain_and_cli_keys(tmp_path):
+    assert GC.count_chain([_e('a', 'hong', ['he_do'])], hong_theo_liam=True)[0] == 'hong_theo_liam'
+    for ch in ([_e('a')], [_e('a', 'hong', ['thao_tac', 'he_do'])], [_e('a', 'hong', ['cua_so_tham_chieu'])]):
+        with pytest.raises(GC.GateFileError, match='only a run lost to the measurement'):
+            GC.count_chain(ch, hong_theo_liam=True)
+    assert GC.count_chain([_slip(c) for c in 'abcd'], hong_theo_liam=True)[0] == 'dong_tran'   # the cap first
+    d, goc = build_c8(tmp_path)
+    lj = str(tmp_path / 'liam.json')
+    with open(lj, 'w', encoding='utf-8') as f:
+        json.dump(dict(o_hong=LIAM_HONG), f)
+    args = ['ghep', '--goc', goc, '--ke-hoach', 'ke_hoach_c8.json', '--thu-tu-clip', 'thu_tu_clip.csv',
+            '--khoa-c8b', 'c8b_khoa_v5.json', '--tien-de', 'tien_de_c8.json', '--kiem-cheo', 'kiem_cheo.json',
+            '--ho-so', 'chuan_u/ho_so_cli.json', '--out', str(tmp_path / 'gate.json'), '--liam', lj] + \
+        sum((['--bang-chung', f'{k}={p}'] for k, p in BANG_CHUNG.items()), [])
+    assert GC.main(args) == 1                                           # an unknown key of the --liam file
+    with open(lj, 'w', encoding='utf-8') as f:
+        json.dump(dict(o_hong_theo_liam={}), f)
+    assert GC.main(args) == 0
