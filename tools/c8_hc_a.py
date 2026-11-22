@@ -940,11 +940,24 @@ def imu_drift_fit(W, L, skip=(), trong_tai=True):
                 du_ngoai={k: res[k] for k in ks if k in skip}, se_ce=se, doc_ce=float(pe[0]))
 
 
-def analyse(A, F, k_info, min_frames=MIN_FRAMES_TINH):
-    """Windows, legs, a_l of one attempt (12b part). Returns dict; raises AError when not computable."""
+def analyse(A, F, k_info, min_frames=MIN_FRAMES_TINH, F_gio=None):
+    """Windows, legs, a_l of one attempt (12b part). Returns dict; raises AError when not computable.
+    F_gio (CODE 22/11 option B, change made because of real data: session 2 K1, the far end of the 12b legs is up to
+    15 mm outside the A6 domain, CAM drops those frames 'a6_khung:ngoai_mien', a 6.3 s hole, and the camera motion
+    intervals no longer matched the log): the frames of the same frames.csv BEFORE the chain (frames_basic: tag
+    centre, raw tag heading). When the chain F has fewer usable frames than F_gio, the time alignment and the motion
+    intervals (align) run on F_gio (they need no A6: only when the car moves); windows and leg values stay on F, so a
+    window without enough chain frames makes its legs 'thieu' (the place chua_ket_luan) instead of an error. Same
+    frame count (no frame lost by the chain) or no F_gio: align on F, bit for bit as before."""
     L = A['log']
     blocks, wins = k_info['blocks'], k_info['windows']
-    D, u_D, diffs = align(L, blocks, F)
+    F_al, mat = F, None
+    if F_gio is not None:
+        n_f, n_g = int(np.sum(F['ok'])), int(np.sum(F_gio['ok']))
+        if n_f < n_g:
+            F_al, mat = F_gio, n_g - n_f
+    D, u_D, diffs = align(L, blocks, F_al)
+    can_gio = dict(khung='chua_A6' if F_al is not F else 'chuoi', n_khung_chuoi_mat=mat)
     if u_D > U_D_MAX_S:
         raise AError(f'u_D {u_D:.3f} s > {U_D_MAX_S}')
     n12 = sum(1 for s in plan_moves(A['segs']) if s['loai'] == 'tien')
@@ -1011,7 +1024,7 @@ def analyse(A, F, k_info, min_frames=MIN_FRAMES_TINH):
         du_khop_max_deg=math.degrees(tr_all['du_max']), doc_ce_deg_s=math.degrees(tr_all['doc_ce']),
         se_ce_deg_s=math.degrees(tr_all['se_ce'])))
     return dict(D=D, u_D=u_D, diffs=diffs, windows=W, legs=legs, chuoi=F['chuoi'], troi_imu=troi, truot_cheo=tc,
-                thang_hang_m=th, neo_san=bool(F.get('neo_san', False)))
+                thang_hang_m=th, neo_san=bool(F.get('neo_san', False)), can_gio=can_gio)
 
 
 def slip_compensate(legs):
@@ -1121,6 +1134,7 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
         res['luot_thu'].append(dict(thu_id=tid, cap=tid == cap_id, trang_thai='thieu' if an is None else 'tinh_duoc',
                                     ly_do=list(why) if why else [],
                                     D_s=None if an is None else an['D'], u_D_s=None if an is None else an['u_D'],
+                                    can_gio=None if an is None else an.get('can_gio'),
                                     doan=[] if an is None else [_deg_leg(lg) for lg in an['legs']]))
     cap = {tid: an for tid, an, _ in attempts}.get(cap_id)
 
@@ -1461,7 +1475,7 @@ def cmd_cua_so(a):
     if 'windows' not in info:
         raise AError('kiem: no windows (log checks failed before the windows)')
     F = frames_of(a, A)
-    an = analyse(A, F, info)
+    an = analyse(A, F, info, F_gio=frames_basic(a.frames, a.track))      # option B (CODE 22/11): align off-A6
     clip_sha = sha256(a.clip) if a.clip else None
     tj0 = json.load(open(a.track, encoding='utf-8'))
     ses_sha = sha256(a.session) if a.session else a.session_sha256
@@ -1531,7 +1545,8 @@ def cmd_cua_so(a):
                 car_pose_cfg=dict(side_m=S.get('car_side_m'), h_m=S.get('tag_h_m'), tag_offset=tj.get('tag_offset'),
                                   q_m=xq, du_m=xu, q_ly_do=x_why, q_nguon=x_ng),
                 xoay_sha256=sha256(a.xoay) if a.xoay else None, a6_sha256=sha256(a.a6) if a.a6 else None,
-                chuoi=an['chuoi'], dets_sha256=sha256(a.dets) if a.dets else None, dets_fp=dets_fingerprint(a.dets),
+                chuoi=an['chuoi'], can_gio=an.get('can_gio'),
+                dets_sha256=sha256(a.dets) if a.dets else None, dets_fp=dets_fingerprint(a.dets),
                 nguon=nguon, doan=[])
     for lg in an['legs']:
         d = dict(i=lg['i'], dai=lg['dai'], trang_thai=lg['trang_thai'], ly_do=lg.get('ly_do'),
@@ -2030,9 +2045,10 @@ def cmd_tinh(a):
         F = None
         if a.a6 and a.xoay:
             F = frames_chain(frames, a.a6, a.xoay, track=track, cho=A['cho'])          # HCC7-6, CT2-10
-        F = F or frames_basic(frames, track)
+        F_gio = frames_basic(frames, track)
+        F = F or F_gio
         try:
-            an = analyse(A, F, info)
+            an = analyse(A, F, info, F_gio=F_gio)          # option B (CODE 22/11): align off-A6 when frames lost
         except AError as exc:
             attempts.append((A['thu_id'], None, failed + [str(exc)]))
             continue
