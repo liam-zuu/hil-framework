@@ -17,7 +17,11 @@ of a file must carry the session_sha256 of ITS segment (sha256 of that session.j
 segment is refused. Without --doan: one session in the whole file, as before.
 
 Binding: each file -> the clip_sha256 of its rows (one clip per file) -> the clip name in manifest_usb.csv -> the
-thu_tu_clip.csv row of that clip. Rows of thu_tu_clip.csv that need a window file ("required"): `buoc` a run code
+thu_tu_clip.csv row of that clip. A row with an empty clip (no recording: C8 session 2 'KHONG CO CLIP', later corrected
+by a row of the same thu_id with the clip) is not a required row.
+Order (C8 session 2: a correction row was written below a later clip): the files are joined in recording order =
+created_utc of the manifest (iPhone clock); a source without created_utc is refused. With --doan the clip of every source
+must be recorded at or after the clip H opening its segment and before the one opening the next segment. Rows of thu_tu_clip.csv that need a window file ("required"): `buoc` a run code
 C8-<P|L>-<F02|F05|F08|K1|K2>-<n>[_lai<n>] or a HC place HC_<goc|K1|K2>. Key of a required row = `thu_id` when set,
 else `buoc`; it must equal the luot_id of the rows of its file (c7_score cua-so --luot-id <run code>; c8_hc_a sets
 luot_id = thu_id = the attempt folder HC_<cho>_<n>).
@@ -25,8 +29,7 @@ luot_id = thu_id = the attempt folder HC_<cho>_<n>).
 Refused (exit 2, nothing written): a required row without a file and not given in --bo; a --bo of a key that is not
 a required row, or that has a file; two files of one clip, a file whose clip is in no required row or in several; a
 file with rows of several clips, rows without luot_id / clip_sha256 / session_sha256, another schema, or a luot_id not the key of its
-row; the same luot_id in two files; clips not in recording order (created_utc of the manifest decreasing along
-thu_tu_clip.csv); rows of several session_sha256 (one session per session: the H clip at the start, guide 33); the
+row; the same luot_id in two files; a source clip without created_utc in the manifest; rows of several session_sha256 (one session per session: the H clip at the start, guide 33); the
 order check of the readers failing on the joined rows (inside each clip the first PTS of every window increases with
 the raw row order, and post after pre of a run: NHACTAM LLC1-15, else every run gets thu_tu_mau_thuan). With --doan:
 a --doan whose <buoc> is not exactly one thu_tu_clip.csv row, two segments opened on one row, a repeated name or
@@ -226,7 +229,7 @@ def ghep(thu_tu_path, manifest_path, files, bo, out_path, doan=()):
     man = read_manifest(manifest_path)
     doans = parse_doan(doan, tt)
     pos = {id(r): i for i, r in enumerate(tt)}
-    req = [r for r in tt if is_required(r['buoc'])]
+    req = [r for r in tt if is_required(r['buoc']) and r['clip']]
     if doans:
         tren = [r['buoc'] for r in req if doan_of_row(doans, pos[id(r)]) is None]
         if tren:
@@ -304,14 +307,24 @@ def ghep(thu_tu_path, manifest_path, files, bo, out_path, doan=()):
         raise GhepError(f'luot trong thu_tu_clip.csv khong co file cua so (them file hay --bo KEY=LY_DO): {thieu}')
     if len(sess) > 1 and not doans:
         raise GhepError(f'nhieu session_sha256 trong buoi: {sorted(s[:12] for s in sess)} (nhieu doan camera: --doan)')
-    src.sort(key=lambda it: pos[id(it['r'])])
-    prev = None
     for it in src:
-        cu = man[it['r']['clip']][1]
-        if prev is not None and cu and prev[1] and cu < prev[1]:
-            raise GhepError(f'thu tu ghi hinh nguoc: {it["r"]["clip"]} ({cu}) sau {prev[0]} ({prev[1]}) trong '
-                            f'thu_tu_clip.csv')
-        prev = (it['r']['clip'], cu)
+        it['cu'] = man[it['r']['clip']][1]
+        if not it['cu']:
+            raise GhepError(f'{it["duong_dan"]}: clip {it["r"]["clip"]} khong co created_utc trong manifest')
+    src.sort(key=lambda it: (it['cu'], pos[id(it['r'])]))
+    if doans:
+        mo = []
+        for d in doans:
+            c = tt[d['pos']]['clip']
+            if c not in man or not man[c][1]:
+                raise GhepError(f'--doan {d["ten"]}: clip mo doan {c!r} khong co created_utc trong manifest')
+            mo.append(man[c][1])
+        for i, d in enumerate(doans):
+            lo, hi = mo[i], (mo[i + 1] if i + 1 < len(mo) else None)
+            for it in src:
+                if it['doan'] == d['ten'] and (it['cu'] < lo or (hi is not None and it['cu'] >= hi)):
+                    raise GhepError(f'{it["r"]["clip"]} ({it["cu"]}) ngoai khoang gio cua doan {d["ten"]} '
+                                    f'[{lo}, {hi or "het"})')
     rows = [w for it in src for _, w in it['rows']]
     sai = check_order(rows)
     if sai:
@@ -328,7 +341,7 @@ def ghep(thu_tu_path, manifest_path, files, bo, out_path, doan=()):
         manifest=dict(duong_dan=os.path.abspath(manifest_path), sha256=sha256_file(manifest_path)),
         nguon=[dict(thu_tu_dong=it['r']['_dong'], clip=it['r']['clip'], buoc=it['r']['buoc'],
                     thu_id=it['r']['thu_id'] or None, luot_id=it['rows'][0][1]['luot_id'],
-                    clip_sha256=it['clip_sha256'], duong_dan=it['duong_dan'], sha256=it['sha256'],
+                    clip_sha256=it['clip_sha256'], created_utc=it['cu'], duong_dan=it['duong_dan'], sha256=it['sha256'],
                     so_dong=len(it['rows']), session_sha256=it['session_sha256'], doan=it['doan']) for it in src],
         doan=[dict(ten=d['ten'], session=dict(duong_dan=d['session'], sha256=d['sha256']), buoc_dau=d['buoc_dau'],
                    thu_tu_dong=d['dong']) for d in doans],

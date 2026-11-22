@@ -121,11 +121,33 @@ def test_thu_tu_trong_clip_sai_bi_tu_choi(buoi):
     assert run(buoi, [buoi['hc'], rev, buoi['k1']]) == 2
 
 
-def test_created_utc_nguoc_bi_tu_choi(buoi):
+def test_thu_tu_theo_created_utc_khong_theo_dong(buoi):
+    """C8 session 2: a correction row written below a later clip; the join follows the recording time (manifest)."""
     rows = list(csv.reader(open(buoi['man'], encoding='utf-8')))
     for r in rows:
         if r[2] == 'IMG_4':
-            r[5] = '2026-11-20T04:00:00'
+            r[5] = '2026-11-20T04:55:00'                                  # recorded before IMG_1 .. IMG_3
+    with open(buoi['man'], 'w', encoding='utf-8', newline='') as f:
+        csv.writer(f).writerows(rows)
+    assert run(buoi, [buoi['hc'], buoi['f02'], buoi['k1']]) == 0
+    n = json.load(open(str(buoi['d'] / 'ra' / 'cua_so_v1.jsonl') + '.nguon.json', encoding='utf-8'))
+    assert [s['luot_id'] for s in n['nguon']] == ['C8-P-K1-1', 'HC_goc_1', 'C8-P-F02-1']
+
+
+def test_dong_khong_clip_khong_can_file(buoi):
+    """A 'KHONG CO CLIP' row of the same thu_id as a later row with the clip is not required (no duplicate key)."""
+    rows = list(csv.reader(open(buoi['tt'], encoding='utf-8')))
+    rows.insert(2, ['', 'HC_goc', 'HC_goc_1', '', '', '', '', 'KHONG CO CLIP'])
+    with open(buoi['tt'], 'w', encoding='utf-8', newline='') as f:
+        csv.writer(f).writerows(rows)
+    assert run(buoi, [buoi['hc'], buoi['f02'], buoi['k1']]) == 0
+
+
+def test_thieu_created_utc_bi_tu_choi(buoi):
+    rows = list(csv.reader(open(buoi['man'], encoding='utf-8')))
+    for r in rows:
+        if r[2] == 'IMG_2':
+            r[5] = ''
     with open(buoi['man'], 'w', encoding='utf-8', newline='') as f:
         csv.writer(f).writerows(rows)
     assert run(buoi, [buoi['hc'], buoi['f02'], buoi['k1']]) == 2
@@ -214,3 +236,14 @@ def test_doan_sai_bi_tu_choi(buoi, kieu):
             'session_trung': [d1, f'doan2={pa}@C8-P-K1-1_khoa'], 'cung_dong': [d1, f'doan2={pb}@H0a'],
             'thieu_at': [d1, f'doan2={pb}'], 'luot_tren_doan_dau': [f'doan1={pa}@C8-P-F02-1', d2]}[kieu]
     assert run_doan(buoi, files, doan) == 2
+
+
+def test_clip_ngoai_khoang_gio_doan_bi_tu_choi(buoi):
+    pa, sa, pb, sb, files = _hai_doan(buoi)
+    rows = list(csv.reader(open(buoi['man'], encoding='utf-8')))
+    for r in rows:
+        if r[2] == 'IMG_4':
+            r[5] = '2026-11-20T05:15:00'                 # K1 run (segment 2) recorded before IMG_3 that opens segment 2
+    with open(buoi['man'], 'w', encoding='utf-8', newline='') as f:
+        csv.writer(f).writerows(rows)
+    assert run_doan(buoi, files, [f'doan1={pa}@H0a', f'doan2={pb}@C8-P-K1-1_khoa']) == 2
