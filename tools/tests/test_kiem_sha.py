@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -307,7 +308,8 @@ def test_json_sai_repo_dung(tmp_path):
     (jdir / 'a.csv').write_bytes(b'sai\n')
     (repo / 'a.csv').write_bytes(b'dung\n')
     kq, cach, _ = KS.kiem_cap('a.csv', sha(b'dung\n'), jdir, repo)
-    assert (kq, cach) == ('tho', 'goc_repo')
+    # C3-23: phan giai khoa theo thu_muc_json (phuong an Codex), khong thu goc_repo
+    assert (kq, cach) == ('khong_khop', 'thu_muc_json')
 
 
 def test_tuyet_doi(tmp_path):
@@ -448,10 +450,13 @@ def test_cli_json_loi(tmp_path):
     (goc / 'bad.json').write_text('{ loi roi', encoding='utf-8')
     ma = KS.main(['--goc', str(goc), '--goc-repo', str(repo),
                   '--ra', str(out)])
-    assert ma == 0
+    # C3-22: json_loi tinh la chua xac minh nen ma 3 thay cho 0
+    assert ma == 3
     kh = _doc_csv(out / 'khong_hieu.csv')
     assert any(e['ly_do'] == 'json_loi' and e['file_ghi'] == 'bad.json'
                for e in kh)
+    tt = json.loads((out / 'tom_tat.json').read_text(encoding='utf-8'))
+    assert tt['so_chua_xac_minh'] == 1
 
 
 def test_cli_ra_trong_repo(tmp_path):
@@ -471,3 +476,317 @@ def test_cli_goc_khong_ton_tai(tmp_path):
     ma = KS.main(['--goc', str(tmp_path / 'khong_co'),
                   '--ra', str(tmp_path / 'o')])
     assert ma == 2
+
+
+# ---------- C3-22 ----------
+
+def test_c3_22_manifest_sha256_hash_sai():
+    cap, kh, _ = KS.tim_cap({'sha256': {'a.csv': 'bad'}})
+    assert not cap
+    assert len(kh) == 1
+    assert kh[0]['khoa'] == 'sha256["a.csv"]'
+    assert kh[0]['ly_do'] == 'sha_khong_hop_le'
+
+
+def test_c3_22_manifest_thuong_mot_hash_sai():
+    cap, kh, _ = KS.tim_cap({'anh': {'x.png': H_A, 'y.png': 'bad'}})
+    assert len(cap) == 1
+    assert cap[0]['duong_dan'] == 'x.png'
+    assert cap[0]['dang'] == 'manifest'
+    assert len(kh) == 1
+    assert kh[0]['khoa'] == 'anh["y.png"]'
+    assert kh[0]['ly_do'] == 'sha_khong_hop_le'
+
+
+def test_c3_22_manifest_none_va_kieu_la():
+    cap, kh, rong = KS.tim_cap({'sha256': {'a.csv': None, 'b.csv': 5}})
+    assert not cap
+    assert rong == 1
+    assert len(kh) == 1
+    assert kh[0]['khoa'] == 'sha256["b.csv"]'
+    assert kh[0]['ly_do'] == 'kieu_khong_ho_tro'
+
+
+def test_c3_22_cli_manifest_hash_sai(tmp_path):
+    repo, goc = _lam_repo(tmp_path)
+    out = tmp_path / 'out'
+    (goc / 'a.csv').write_bytes(b'dung\n')
+    (goc / 'r.json').write_text('{"sha256": {"a.csv": "bad"}}',
+                               encoding='utf-8')
+    ma = KS.main(['--goc', str(goc), '--goc-repo', str(repo),
+                  '--ra', str(out)])
+    assert ma == 3
+    lines = (out / 'bang.csv').read_text(encoding='utf-8').splitlines()
+    assert lines[-1] == '#ket_qua,ma=3'
+    tt = json.loads((out / 'tom_tat.json').read_text(encoding='utf-8'))
+    assert tt['so_chua_xac_minh'] == 1 and tt['ma'] == 3
+
+
+def test_c3_22_cli_uu_tien_ma_1(tmp_path):
+    repo, goc = _lam_repo(tmp_path)
+    out = tmp_path / 'out'
+    (goc / 'c.txt').write_bytes(b'abc')
+    (goc / 'r.json').write_text(json.dumps(
+        {'file': 'c.txt', 'sha256': H_A}), encoding='utf-8')
+    (goc / 'bad.json').write_text('{ loi roi', encoding='utf-8')
+    ma = KS.main(['--goc', str(goc), '--goc-repo', str(repo),
+                  '--ra', str(out)])
+    assert ma == 1
+
+
+def test_c3_22_cli_chi_thong_tin_ma_0(tmp_path):
+    repo, goc = _lam_repo(tmp_path)
+    out = tmp_path / 'out'
+    (goc / 'b.txt').write_bytes(b'bb')
+    (goc / 'r.json').write_text(json.dumps(
+        {'file': 'b.txt', 'sha256': sha(b'bb')}), encoding='utf-8')
+    (goc / 'r2.json').write_text(json.dumps({'sha256': H_A}),
+                                encoding='utf-8')
+    ma = KS.main(['--goc', str(goc), '--goc-repo', str(repo),
+                  '--ra', str(out)])
+    assert ma == 0
+    tt = json.loads((out / 'tom_tat.json').read_text(encoding='utf-8'))
+    assert tt['so_chua_xac_minh'] == 0
+
+
+def test_c3_22_cli_manifest_khoa_khong_phai_file(tmp_path):
+    repo, goc = _lam_repo(tmp_path)
+    out = tmp_path / 'out'
+    (goc / 'b.txt').write_bytes(b'bb')
+    (goc / 'r.json').write_text(json.dumps(
+        {'file': 'b.txt', 'sha256': sha(b'bb')}), encoding='utf-8')
+    (goc / 'r2.json').write_text(json.dumps(
+        {'sha256': {'esp32': H_A}}), encoding='utf-8')
+    ma = KS.main(['--goc', str(goc), '--goc-repo', str(repo),
+                  '--ra', str(out)])
+    assert ma == 3
+
+
+# ---------- C3-23 ----------
+
+def test_c3_23_codex_ten_tran(tmp_path):
+    repo = tmp_path / 'repo'
+    jdir = repo / 'results' / 'run'
+    jdir.mkdir(parents=True)
+    (jdir / 'a.csv').write_bytes(b'sai\n')
+    (repo / 'a.csv').write_bytes(b'dung\n')
+    kq, cach, thuc = KS.kiem_cap('a.csv', sha(b'dung\n'), jdir, repo)
+    assert (kq, cach) == ('khong_khop', 'thu_muc_json')
+    assert os.path.normpath(thuc) == os.path.normpath(str(jdir / 'a.csv'))
+
+
+def test_c3_23_codex_co_thu_muc(tmp_path):
+    repo = tmp_path / 'repo'
+    jdir = repo / 'results' / 'run'
+    (jdir / 'd').mkdir(parents=True)
+    (jdir / 'd' / 'a.csv').write_bytes(b'sai\n')
+    (repo / 'd').mkdir(parents=True)
+    (repo / 'd' / 'a.csv').write_bytes(b'dung\n')
+    kq, cach, thuc = KS.kiem_cap('d/a.csv', sha(b'dung\n'), jdir, repo)
+    assert (kq, cach) == ('khong_khop', 'thu_muc_json')
+    assert os.path.normpath(thuc) == os.path.normpath(
+        str(jdir / 'd' / 'a.csv'))
+
+
+def test_c3_23_cli_codex(tmp_path):
+    repo, goc = _lam_repo(tmp_path)
+    rund = goc / 'run'
+    rund.mkdir()
+    (rund / 'a.csv').write_bytes(b'sai\n')
+    (repo / 'a.csv').write_bytes(b'dung\n')
+    (rund / 'r.json').write_text(json.dumps(
+        {'sha256': {'a.csv': sha(b'dung\n')}}), encoding='utf-8')
+    out = tmp_path / 'out'
+    ma = KS.main(['--goc', str(goc), '--goc-repo', str(repo),
+                  '--ra', str(out)])
+    assert ma == 1
+    rows = _doc_csv(out / 'bang.csv')
+    assert rows[0]['ket_qua'] == 'khong_khop'
+    assert rows[0]['cach'] == 'thu_muc_json'
+
+
+def test_c3_23_tuyet_doi_ton_tai_thang(tmp_path):
+    repo = tmp_path / 'repo'
+    (repo / 'data').mkdir(parents=True)
+    (repo / 'data' / 'a.csv').write_bytes(b'dung\n')
+    khac = tmp_path / 'khac' / 'repo' / 'data'
+    khac.mkdir(parents=True)
+    f_sai = khac / 'a.csv'
+    f_sai.write_bytes(b'sai\n')
+    kq, cach, thuc = KS.kiem_cap(str(f_sai), sha(b'dung\n'),
+                                 tmp_path, repo)
+    assert (kq, cach) == ('khong_khop', 'tuyet_doi')
+    assert os.path.normpath(thuc) == os.path.normpath(str(f_sai))
+
+
+def test_c3_23_ten_tran_khong_tim_goc_repo(tmp_path):
+    repo = tmp_path / 'repo'
+    jdir = repo / 'j'
+    jdir.mkdir(parents=True)
+    (repo / 'a.csv').write_bytes(b'dung\n')
+    kq, cach, thuc = KS.kiem_cap('a.csv', sha(b'dung\n'), jdir, repo)
+    assert (kq, cach, thuc) == ('thieu_file', '', '')
+
+
+def test_c3_23_thu_muc_luot(tmp_path):
+    repo = tmp_path / 'repo'
+    run = repo / 'so_lieu' / '2026-11-20_run02'
+    jdir = run / 'sub'
+    jdir.mkdir(parents=True)
+    f = run / 'F2' / 'a.jsonl'
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b'x\n')
+    out = KS.ung_vien('F2/a.jsonl', jdir, repo)
+    assert [c for c, _ in out] == ['thu_muc_json', 'goc_repo',
+                                 'thu_muc_luot']
+    kq, cach, thuc = KS.kiem_cap('F2/a.jsonl', sha(b'x\n'), jdir, repo)
+    assert (kq, cach) == ('tho', 'thu_muc_luot')
+    assert os.path.normpath(thuc) == os.path.normpath(str(f))
+
+
+def test_c3_23_goc_repo_truoc_thu_muc_luot(tmp_path):
+    repo = tmp_path / 'repo'
+    run = repo / 'so_lieu' / '2026-11-20_run02'
+    jdir = run / 'sub'
+    jdir.mkdir(parents=True)
+    f = repo / 'F2' / 'a.jsonl'
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b'x\n')
+    kq, cach, _ = KS.kiem_cap('F2/a.jsonl', sha(b'x\n'), jdir, repo)
+    assert (kq, cach) == ('tho', 'goc_repo')
+
+
+def test_c3_23_mo_ho(tmp_path, monkeypatch):
+    repo = tmp_path / 'repo'
+    run = repo / 'so_lieu' / '2026-11-20_run02'
+    jdir = run / 'sub'
+    jdir.mkdir(parents=True)
+    (repo / 'F2').mkdir(parents=True)
+    (repo / 'F2' / 'a.jsonl').write_bytes(b'x\n')
+    (run / 'F2').mkdir(parents=True)
+    (run / 'F2' / 'a.jsonl').write_bytes(b'x\n')
+
+    def cam(p, s):
+        raise AssertionError('khong duoc bam khi mo ho')
+
+    monkeypatch.setattr(KS, 'kiem', cam)
+    kq, cach, thuc = KS.kiem_cap('F2/a.jsonl', H_A, jdir, repo)
+    assert kq == 'mo_ho_phan_giai'
+    assert cach == 'goc_repo;thu_muc_luot'
+
+
+def test_c3_23_mo_ho_cli(tmp_path):
+    repo, goc = _lam_repo(tmp_path)
+    run = goc / '2026-11-20_run02'
+    jdir = run / 'sub'
+    jdir.mkdir(parents=True)
+    (repo / 'F2').mkdir(parents=True)
+    (repo / 'F2' / 'a.jsonl').write_bytes(b'x\n')
+    (run / 'F2').mkdir(parents=True)
+    (run / 'F2' / 'a.jsonl').write_bytes(b'x\n')
+    (jdir / 'k.json').write_text(json.dumps(
+        {'sha256': {'F2/a.jsonl': H_A}}), encoding='utf-8')
+    out = tmp_path / 'out'
+    ma = KS.main(['--goc', str(goc), '--goc-repo', str(repo),
+                  '--ra', str(out)])
+    kh = _doc_csv(out / 'khong_hieu.csv')
+    assert any(e['ly_do'] == 'mo_ho_phan_giai' for e in kh)
+    assert ma == 3
+
+
+def test_c3_23_thu_muc_luot_trung_thu_muc_json(tmp_path):
+    repo = tmp_path / 'repo'
+    run = repo / 'so_lieu' / '2026-11-20_run02'
+    run.mkdir(parents=True)
+    kq, cach, thuc = KS.kiem_cap('F2/a.jsonl', H_A, run, repo)
+    assert (kq, cach, thuc) == ('thieu_file', '', '')
+
+
+def test_c3_23_khong_co_thu_muc_luot(tmp_path):
+    repo = tmp_path / 'repo'
+    jdir = repo / 'j'
+    jdir.mkdir(parents=True)
+    out = KS.ung_vien('F2/a.jsonl', jdir, repo)
+    assert [c for c, _ in out] == ['thu_muc_json', 'goc_repo']
+
+
+# ---------- C3-24 ----------
+
+def test_c3_24_cli_goc_la_sealed(tmp_path):
+    repo, goc = _lam_repo(tmp_path)
+    sealed = goc / 'sealed'
+    sealed.mkdir()
+    (sealed / 'a.txt').write_bytes(b'ok')
+    (sealed / 'r.json').write_text(json.dumps(
+        {'file': 'a.txt', 'sha256': sha(b'ok')}), encoding='utf-8')
+    out = tmp_path / 'out'
+    ma = KS.main(['--goc', str(sealed), '--goc-repo', str(repo),
+                  '--ra', str(out)])
+    assert ma == 2
+    assert not out.exists()
+    st2 = goc / 'sealed_test' / 'sub'
+    st2.mkdir(parents=True)
+    (st2 / 'r.json').write_text('{}', encoding='utf-8')
+    ma = KS.main(['--goc', str(st2), '--goc-repo', str(repo),
+                  '--ra', str(out)])
+    assert ma == 2
+    assert not out.exists()
+
+
+def test_c3_24_quet_goc_sealed_khong_mo_json(tmp_path, monkeypatch):
+    repo = tmp_path / 'repo'
+    sealed = repo / 'sealed'
+    sealed.mkdir(parents=True)
+    (sealed / 'x.json').write_text('{ hong', encoding='utf-8')
+    read_goc = Path.read_text
+
+    def chan(self, *a, **kw):
+        if any(p.lower() in ('sealed', 'sealed_test')
+               for p in self.parts):
+            raise AssertionError('doc file trong sealed')
+        return read_goc(self, *a, **kw)
+
+    monkeypatch.setattr(Path, 'read_text', chan)
+    rows, kh, tt = KS.quet(sealed, repo)
+    assert rows == []
+    assert not any(e['ly_do'] == 'json_loi' for e in kh)
+    assert any(e['ly_do'] == 'json_trong_sealed_khong_doc' for e in kh)
+
+
+def test_c3_24_alias_thu_muc(tmp_path):
+    if os.name != 'nt':
+        pytest.skip('chi Windows')
+    import _winapi
+    repo, goc = _lam_repo(tmp_path)
+    sealed = repo / 'sealed'
+    sealed.mkdir()
+    (sealed / 'x.json').write_text('{ hong', encoding='utf-8')
+    try:
+        _winapi.CreateJunction(str(sealed), str(goc / 'alias'))
+    except OSError as e:
+        pytest.skip(f'khong tao duoc junction: {e}')
+    out = tmp_path / 'out'
+    KS.main(['--goc', str(goc), '--goc-repo', str(repo),
+             '--ra', str(out)])
+    kh = _doc_csv(out / 'khong_hieu.csv')
+    assert not any(e['ly_do'] == 'json_loi' for e in kh)
+    assert not any(e['file_ghi'].startswith('alias') for e in kh)
+
+
+def test_c3_24_alias_file(tmp_path):
+    repo, goc = _lam_repo(tmp_path)
+    sealed = repo / 'sealed'
+    sealed.mkdir()
+    (sealed / 'x.json').write_text('{ hong', encoding='utf-8')
+    try:
+        os.symlink(str(sealed / 'x.json'), str(goc / 'y.json'))
+    except OSError as e:
+        pytest.skip(f'khong tao duoc symlink: {e}')
+    out = tmp_path / 'out'
+    KS.main(['--goc', str(goc), '--goc-repo', str(repo),
+             '--ra', str(out)])
+    kh = _doc_csv(out / 'khong_hieu.csv')
+    e = [e for e in kh if e['file_ghi'] == 'y.json']
+    assert len(e) == 1
+    assert e[0]['ly_do'] == 'json_trong_sealed_khong_doc'
+    assert not any(e['ly_do'] == 'json_loi' for e in kh)
