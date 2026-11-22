@@ -427,7 +427,7 @@ def kiem_ok_rows(omega_hi=48.0):
 
 
 def s03_run(tmp, name='2026-11-20_run03', meta=None, speeds=('0.2', '0.5', '0.8'), drop=None, extra=None,
-            omega_hi=48.0, lev_edit=None, sw_edit=None, kiem_edit=None):
+            omega_hi=48.0, lev_edit=None, sw_edit=None, kiem_edit=None, lcols=None, scols=None):
     run = tmp / '05_DATA' / 'results' / 'S03' / name
     run.mkdir(parents=True)
     sw, lv = [], []
@@ -457,8 +457,9 @@ def s03_run(tmp, name='2026-11-20_run03', meta=None, speeds=('0.2', '0.5', '0.8'
         lev_edit(lv)
     if sw_edit:
         sw_edit(sw)
-    wcsv(run / 'sweep.csv', SCOLS, sw)
-    wcsv(run / 'levels.csv', LCOLS, lv)
+    lcols = lcols or LCOLS
+    wcsv(run / 'sweep.csv', scols or SCOLS, sw)
+    wcsv(run / 'levels.csv', lcols, [{k: r.get(k, '') for k in lcols} for r in lv])
     kr = kiem_ok_rows(omega_hi)
     if kiem_edit:
         kr = kiem_edit(kr)
@@ -489,13 +490,16 @@ def test_mien_domain(w0, capsys):
     rows = list(csv.DictReader(open(w0['tmp'] / 'A' / 'mien_A.csv', encoding='utf-8')))
     d = {(r['controller'], r['gain']): r for r in rows}
     assert len(rows) == 14
-    # S03 v8.4 / S05 v3.41: the original grid up to b; the extension point 8.0 (luoi noi) is not in the domain
-    assert (d[('PID', 'kp_xy')]['lo'], d[('PID', 'kp_xy')]['hi'], d[('PID', 'kp_xy')]['nguon_hi']) == ('0.0', '4.0', 'b')
-    assert d[('PID', 'kp_xy')]['n_diem'] == '5' and {r['nguon_hi'] for r in rows} == {'b', 'tran_omega_o'}
-    assert d[('LADRC', 'omega_o_xy')]['hi'] == '48.0' and d[('LADRC', 'omega_o_xy')]['nguon_hi'] == 'tran_omega_o'
+    # S03 v8.6 / S05 v3.48: the whole grid after the cut, up to b_n — the extension point 8.0 IS in the domain
+    kp = d[('PID', 'kp_xy')]
+    assert (kp['lo'], kp['hi'], kp['nguon_hi']) == ('0.0', '8.0', 'b_n')
+    assert d[('PID', 'kp_xy')]['n_diem'] == '6' and {r['nguon_hi'] for r in rows} == {'b_n', 'b'}
+    assert d[('LADRC', 'omega_o_xy')]['hi'] == '48.0' and d[('LADRC', 'omega_o_xy')]['nguon_hi'] == 'b'
+    assert d[('LADRC', 'omega_o_xy')]['n_diem'] == '5'                       # omega_o: up to b, no extension
     js = json.load(open(w0['tmp'] / 'A' / 'mien_A.json', encoding='utf-8'))
     assert js['sha256']['sweep.csv'] == sha(run / 'sweep.csv') and js['s03_run'] == '05_DATA/results/S03/2026-11-20_run03'
-    assert js['sha256']['kiem_ngoai_mien.csv'] == sha(run / 'kiem_ngoai_mien.csv') and 'S03 v8.4' in js['spec']
+    assert js['sha256']['kiem_ngoai_mien.csv'] == sha(run / 'kiem_ngoai_mien.csv')
+    assert 'S03 v8.6' in js['spec'] and 'S05 v3.48' in js['spec']
     assert C.main(mien_args(w0, run)) == 2                                   # no overwrite without --thay
     assert C.main(mien_args(w0, run, None, '--thay')) == 0
     assert len([n for n in os.listdir(w0['tmp'] / 'A') if '__cu_' in n]) == 2
@@ -525,15 +529,21 @@ def rename_gain(sw):
     (dict(omega_hi=60.0), '> 48'),
     (dict(lev_edit=lambda lv: lv[0].update(default='99')), 'default'),
     (dict(lev_edit=lambda lv: lv[0].update(H='50')), '[L, H]'),
-    # S03 v8.4: hi = b, the extension is not the domain
-    (dict(lev_edit=lambda lv: lv[1].update(b='8.0', b_n='')), 'is not b'),
-    (dict(lev_edit=lambda lv: lv[0].update(H='8.0')), '[L, H]'),                    # a level on the extension
+    # S03 v8.6 / S05 v3.48: hi = b_n (the cut grid's end); the original grid still ends at min(b, b_n)
+    (dict(lev_edit=lambda lv: lv[1].update(b='8.0', b_n='')), 'no b_n'),
+    (dict(lev_edit=lambda lv: lv[0].update(b_n='16.0')), 'is not b_n'),
+    (dict(lev_edit=lambda lv: lv[0].update(b_n='4.0')), 'is not b_n'),
+    (dict(lev_edit=lambda lv: [r.update(b_n='40.0') for r in lv if r['factor'].startswith('omega_o')]), 'is not b'),
+    (dict(lcols=[c for c in LCOLS if c != 'b_n']), 'columns missing'),
+    (dict(lev_edit=lambda lv: lv[0].update(H='8.0')), '[L, H]'),                    # a level above the original grid
     (dict(sw_edit=lambda sw: [r.update(luoi='log') for r in sw if r['factor'] == 'kp_xy' and r['value'] == '8.0']),
      'is not b'),
     (dict(sw_edit=lambda sw: [r.update(luoi='noi') for r in sw if r['factor'] == 'kp_xy' and r['value'] == '4.0']),
      'is not b'),
     (dict(sw_edit=lambda sw: next(r for r in sw if r['factor'] == 'kp_xy' and r['value'] == '8.0').update(luoi='log')),
      'differs'),
+    (dict(sw_edit=lambda sw: sw.extend(dict(controller='PID', factor='kp_xy', value='16.0', v=v, luoi='noi',
+                                            completed='true') for v in ('0.2', '0.5', '0.8'))), 'is not b_n'),
     (dict(sw_edit=lambda sw: sw.extend(dict(controller='PID', factor='kp_xy', value='3.0', v=v, luoi='noi',
                                             completed='true') for v in ('0.2', '0.5', '0.8'))), 'not above b'),
     (dict(sw_edit=lambda sw: sw.extend(dict(controller='ADRC', factor='omega_o_xy', value='96.0', v=v, luoi='noi',
@@ -544,7 +554,8 @@ def rename_gain(sw):
                                 else r for r in kr]), 'checked in full'),
     (dict(kiem_edit=lambda kr: [dict(r, ket_qua='không kiểm') if r['dong'] == 'tong' else r for r in kr]),
      'checked in full'),
-    (dict(kiem_edit=lambda kr: [dict(kr[0], ket_qua='cờ')] + kr[1:]), 'flagged'),
+    # S05 v3.47 / S03 v8.5 K6: 'cờ' itself no longer refuses — only the totals disagreeing with the rows does
+    (dict(kiem_edit=lambda kr: [dict(kr[0], ket_qua='cờ')] + kr[1:]), 'do not agree'),
     (dict(kiem_edit=lambda kr: [r for r in kr if not (r['dong'] == 'tong' and r['controller'] == 'ADRC')]),
      'total rows for'),
     (dict(kiem_edit=lambda kr: kr + [dict(dong='tong', controller='PID', ket_qua='đã kiểm đủ')]), 'two total rows'),
@@ -657,6 +668,158 @@ def test_mien_refuses_after_first_A_run(w0, capsys):
     assert C.main(mien_args(w0, run)) == 2 and 'no column' in capsys.readouterr().out
 
 
+def test_mien_flag_does_not_refuse(w0, capsys):
+    """S03 v8.5 K6 / S05 v3.47: a flagged point no longer refuses the domain, as long as the controller's
+    total row agrees with its point rows (one 'cờ', one less 'không cờ')."""
+    def flag(kr):
+        out = [dict(kr[0], ket_qua='cờ')] + kr[1:]
+        for r in out:
+            if r['dong'] == 'tong' and r['controller'] == kr[0]['controller']:
+                r['n_co'] = '1'
+                r['n_khong_co'] = str(int(r['n_khong_co']) - 1)
+        return out
+    run = s03_run(w0['tmp'], kiem_edit=flag)
+    assert C.main(mien_args(w0, run)) == 0
+    assert (w0['tmp'] / 'A' / 'mien_A.csv').is_file()
+
+
+def test_mien_omega_o_b_n_equal_to_b_is_accepted(w0, capsys):
+    """Codex C3-5: S03 v8.6 writes b_n = b for omega_o (no extension); the empty cell of older runs is still
+    read (test_mien_domain, test_c3_5_omega_o_nguon_hi_is_b). nguon_hi is b (S03 §11 item 5 (c2))."""
+    run = s03_run(w0['tmp'],
+                  lev_edit=lambda lv: [r.update(b_n=r['b']) for r in lv if r['factor'] in C.OMEGA_O])
+    assert C.main(mien_args(w0, run)) == 0
+    rows = list(csv.DictReader(open(w0['tmp'] / 'A' / 'mien_A.csv', encoding='utf-8')))
+    d = {(r['controller'], r['gain']): r for r in rows}
+    assert len(rows) == 14
+    assert d[('LADRC', 'omega_o_xy')]['hi'] == '48.0' and d[('LADRC', 'omega_o_xy')]['nguon_hi'] == 'b'
+    assert (d[('PID', 'kp_xy')]['hi'], d[('PID', 'kp_xy')]['nguon_hi']) == ('8.0', 'b_n')
+
+
+def test_mien_grid_cut_in_the_original_grid(w0, capsys):
+    """S03 v8.6 §3.1 / S05 v3.48 §2.5: PID kp_wz cut inside its original grid — the ceiling 3.0 is a 'log'
+    point, b stays 4.0, b_n = 3.0; the domain is the cut grid up to b_n."""
+    def sw_edit(sw):
+        sw[:] = [r for r in sw if not (r['factor'] == 'kp_wz' and r['value'] in ('4.0', '8.0'))]
+        sw.extend(dict(controller='PID', factor='kp_wz', value='3.0', v=v, mu='0.5', luoi='log',
+                       completed='true') for v in ('0.2', '0.5', '0.8'))
+    def lev_edit(lv):
+        next(r for r in lv if r['controller'] == 'PID' and r['factor'] == 'kp_wz').update(b='4.0', b_n='3.0')
+    def kiem_edit(kr):
+        out = [r for r in kr if not (r['dong'] == 'diem' and r['controller'] == 'PID'
+                                     and r['factor'] == 'kp_wz' and r['can'] == 'H')]
+        out.insert(2, dict(dong='diem', controller='PID', factor='kp_wz', value='3.0', luoi='log',
+                           can='H', can_value='2.0', ket_qua='không cờ'))
+        for r in out:
+            if r['dong'] == 'tong' and r['controller'] == 'PID':
+                for k in ('n_diem_ngoai', 'n_da_kiem', 'n_khong_co'):
+                    r[k] = str(int(r[k]) - 1)
+        return out
+    run = s03_run(w0['tmp'], sw_edit=sw_edit, lev_edit=lev_edit, kiem_edit=kiem_edit)
+    assert C.main(mien_args(w0, run)) == 0
+    rows = list(csv.DictReader(open(w0['tmp'] / 'A' / 'mien_A.csv', encoding='utf-8')))
+    d = {(r['controller'], r['gain']): r for r in rows}
+    assert (d[('PID', 'kp_wz')]['hi'], d[('PID', 'kp_wz')]['nguon_hi'], d[('PID', 'kp_wz')]['n_diem']) == \
+        ('3.0', 'b_n', '5')
+
+
+# ── Codex C3 round 1: C3-3 (b within 1e-9 below the ceiling), C3-5 (omega_o: nguon_hi b) ──────────────────────────
+
+SCOLS_TRAN = SCOLS + ['tran']                                  # sweep.csv of S03 v8.6
+
+
+def c33_run(tmp, b='199.9999999', H='2.0', tran='true', tran_col=True, one_row_false=False, extra_noi=False):
+    """Codex C3-3 on PID pos_kp: the files S03 v8.6 writes when b = 199.9999999 is within 1e-9 below the ceiling
+    T = 200 and the first extension point is above T (the same numbers as fwsim/tests/test_s03_doe.py
+    test_c3_3_b_within_1e9_below_the_ceiling_is_the_end_of_the_original_grid): the extension is dropped, the point b
+    becomes T and keeps its part of the grid. sweep.csv: original grid 0, 0.5, 1, 2, 200 (luoi log, tran true at
+    200), no extension; levels.csv: b = 199.9999999 (its definition), b_n = 200."""
+    me = ('PID', 'pos_kp')
+
+    def sw_edit(sw):
+        sw[:] = [r for r in sw if not ((r['controller'], r['factor']) == me and r['value'] in ('4.0', '8.0'))]
+        sw.extend(dict(controller='PID', factor='pos_kp', value='200.0', v=v, mu='0.5', luoi='log',
+                       completed='true') for v in ('0.2', '0.5', '0.8'))
+        if extra_noi:                                                        # T would not be the largest point
+            sw.extend(dict(controller='PID', factor='pos_kp', value='300.0', v=v, mu='0.5', luoi='noi',
+                           completed='true') for v in ('0.2', '0.5', '0.8'))
+        if tran_col:
+            for r in sw:
+                r['tran'] = tran if (r['controller'], r['factor'], r['value']) == me + ('200.0',) else 'false'
+            if one_row_false:
+                next(r for r in sw if (r['controller'], r['factor'], r['value']) == me + ('200.0',)).update(tran='false')
+
+    def lev_edit(lv):
+        r = next(r for r in lv if (r['controller'], r['factor']) == me)
+        r.update(b=b, b_n='300.0' if extra_noi else '200.0', H=H)
+        if H == '200.0':
+            r.update(H_nguon='trần bảng chặn')
+
+    def kiem_edit(kr):
+        out = [r for r in kr if not (r['dong'] == 'diem' and (r['controller'], r['factor']) == me
+                                     and r['can'] == 'H')]                   # the points 4.0, 8.0 are gone
+        if H != '200.0':                                                     # the point T is outside [L, H]
+            out.insert(0, dict(dong='diem', controller='PID', factor='pos_kp', value='200.0', luoi='log', can='H',
+                               can_value=H, ket_qua='không cờ'))
+        for r in out:
+            if r['dong'] == 'tong' and r['controller'] == 'PID':
+                for k in ('n_diem_ngoai', 'n_da_kiem', 'n_khong_co'):
+                    r[k] = str(int(r[k]) - (1 if H != '200.0' else 2))
+        return out
+    return s03_run(tmp, sw_edit=sw_edit, lev_edit=lev_edit, kiem_edit=kiem_edit,
+                   scols=SCOLS_TRAN if tran_col else None)
+
+
+@pytest.mark.parametrize('kw', [
+    dict(),                                       # Codex C3-3: b = 199.9999999, T = 200 (refused before the fix)
+    dict(H='200.0'),                              # the level H itself at T, 'trần bảng chặn' (refused before)
+    dict(b='199.9999998'),                        # 200 (1 - 1e-9): the edge of the tolerance, inclusive (refused before)
+    dict(b='200.0'),                              # b exactly T: min(b, b_n), accepted before too
+    dict(b='200.0000001'),                        # b just above T: dropped, T added to the original grid (before too)
+])
+def test_c3_3_mien_accepts_the_original_grid_ending_at_the_ceiling(w0, capsys, kw):
+    """Codex C3-3: mien agrees with s03_doe.cut_grid when the cut made the last original point, b within 1e-9 below
+    T, equal to T: the original grid ends at T = b_n (tran true), the domain goes up to b_n."""
+    run = c33_run(w0['tmp'], **kw)
+    assert C.main(mien_args(w0, run)) == 0
+    rows = list(csv.DictReader(open(w0['tmp'] / 'A' / 'mien_A.csv', encoding='utf-8')))
+    d = {(r['controller'], r['gain']): r for r in rows}
+    r = d[('PID', 'pos_kp')]
+    assert (r['lo'], r['hi'], r['n_diem'], r['nguon_hi']) == ('0.0', '200.0', '5', 'b_n')
+    assert len(rows) == 14 and d[('PID', 'kp_xy')]['hi'] == '8.0'           # the other gains as before
+
+
+@pytest.mark.parametrize('kw', [
+    dict(tran='false'),                           # the last original point is not marked as the ceiling
+    dict(tran_col=False),                         # sweep.csv of a tool before v8.6: no tran column
+    dict(one_row_false=True),                     # tran not true on every row of the point
+    dict(b='199.9999997'),                        # 1.5e-9 below T: outside the tolerance
+    dict(b='199.999999'),                         # float32 of b is 200.0 but the binary64 is 5e-9 away
+    dict(b='100.0'),                              # far below T
+    dict(extra_noi=True),                         # an extension point above T: T is not b_n
+])
+def test_c3_3_mien_still_refuses_an_original_grid_not_ending_at_b(w0, capsys, kw):
+    """Codex C3-3: the exception is only for the point marked tran, equal to b_n, within 1e-9 above b."""
+    run = c33_run(w0['tmp'], **kw)
+    assert C.main(mien_args(w0, run)) == 2
+    assert 'highest point of the original grid 200.0 is not b = ' in capsys.readouterr().out
+    assert not (w0['tmp'] / 'A' / 'mien_A.csv').exists()
+
+
+@pytest.mark.parametrize('omega_hi, b_n', [(48.0, ''), (48.0, '48.0'), (40.0, ''), (40.0, '40.0')])
+def test_c3_5_omega_o_nguon_hi_is_b(w0, capsys, omega_hi, b_n):
+    """Codex C3-5 (S03 §11 item 5 (c2)): nguon_hi of omega_o is b, at 48 too; b_n = b of the new S03 output and
+    the empty b_n of older runs are both read."""
+    run = s03_run(w0['tmp'], omega_hi=omega_hi,
+                  lev_edit=lambda lv: [r.update(b_n=b_n) for r in lv if r['factor'] in C.OMEGA_O])
+    assert C.main(mien_args(w0, run)) == 0
+    rows = list(csv.DictReader(open(w0['tmp'] / 'A' / 'mien_A.csv', encoding='utf-8')))
+    d = {(r['controller'], r['gain']): r for r in rows}
+    for g in C.OMEGA_O:
+        assert (d[('LADRC', g)]['hi'], d[('LADRC', g)]['nguon_hi']) == (repr(omega_hi), 'b')
+    assert {r['nguon_hi'] for r in rows} == {'b_n', 'b'}
+
+
 def test_them_mien_A(w0, capsys):
     run = s03_run(w0['tmp'])
     assert C.main(mien_args(w0, run)) == 0
@@ -665,7 +828,7 @@ def test_them_mien_A(w0, capsys):
     assert C.main(base) == 2 and '--tuning-log' in capsys.readouterr().out
     base += ['--tuning-log', str(w0['tl0'])]
     t = p.read_bytes()
-    p.write_bytes(t.replace(b'4.0', b'5.0', 1))
+    p.write_bytes(t.replace(b'8.0', b'5.0', 1))   # S05 v3.48: hi is now b_n (8.0), not b (4.0)
     assert C.main(base) == 2 and 'differs' in capsys.readouterr().out
     p.write_bytes(t)
     assert C.main(base) == 0

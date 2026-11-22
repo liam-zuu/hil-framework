@@ -27,9 +27,10 @@ Steps, as the spec orders them (section numbers of S03 v6):
   5    effects (mean at + minus mean at -) of every term (7 main, 21 two-factor, higher
        orders flagged by 'order') on Y2 (as measured and censored), Y3, Y4 per speed and
        per mu, 'worst' (max over mu) and 'range' (max - min over mu); significant against
-       the thresholds of 5.2 (Y3: 20 % of Y3 of the default-gain run at the middle mu, same
-       speed, from the sweep); y2_versions.csv: whether the two Y2 versions give the same
-       significant set and signs (5.1); curvature.csv (5.4); fail_counts.csv (5.3).
+       the thresholds of 5.2 (v8.6: Y3 is the absolute 0.4 s^-1 at every speed and mu, no
+       longer a share of the default-gain run); y2_versions.csv: whether the two Y2
+       versions give the same significant set and signs (5.1); curvature.csv (5.4);
+       fail_counts.csv (5.3).
 Outputs (section 7) in --out: sweep.csv, sweep_counts.csv, levels.csv, design.csv (centre,
 outer and inner box), logs_sweep/, meta.yaml; in --out/sealed/ (L56): runs.csv, effects.csv,
 fail_counts.csv, curvature.csv, y2_versions.csv, determinism_check.csv, notes.json,
@@ -69,6 +70,24 @@ points, the default, 0); H_nguon 'hết lưới' (H = b), 'trần ω_o' first fo
 middle mu, gate speeds, in the order of section 3.1 (không cờ / chưa kết luận / cờ / không cờ), writes
 kiem_ngoai_mien.csv (one row per point, one total row per controller: đã kiểm đủ / kiểm dở / không kiểm) and
 stops S03 before the main design when a point is 'cờ' (Liam decides).
+
+S03 v8.5 K6 and v8.6 (Liam 21-22/11; partial: section 3.1b screening not in this script):
+  * K6: a flagged or inconclusive out-of-range point no longer stops S03; it is written in
+    kiem_ngoai_mien.csv, printed and kept in meta.yaml kiem_ngoai_mien.
+  * v8.6 section 3.1: the sweep grid is sweep_grid_n cut at the ceiling T of the gain in
+    tools/gain_table.py (sweep_grid_cut): points above T are dropped; when a point was dropped,
+    a remaining point within the relative error 1e-9 of T becomes T, else T is added. b_n is the
+    largest point after the cut (T when cut; else the extension end; for omega_o, which has no
+    extension, the end b of its grid: Codex C3-5); sweep.csv adds tran (true at value == T);
+    H_nguon 'trần bảng chặn' when H = T. A default the cut made T (within 1e-9 below T, the same
+    float32) is run at the grid point T, which stands for the default run (default_node, C3-4).
+  * v8.6 section 3.2: a design point outside the LADRC triangle omega_c + 2 omega_o < 200 on an
+    axis runs like any point and carries the column ngoai_tam_giac in design.csv and in
+    sealed/runs.csv, sealed_test/runs_test.csv; before the main design the float32 of every
+    gain of every point is also compared with the gain table (a failure stops S03; the screening
+    step itself of section 3.1b is not in this script, w_nodes and check_candidate are ready).
+  * v8.6 section 5.2: the Y3 significance threshold is the absolute 0.4 s^-1 (four wheels, one
+    PWM step per 10 ms tick), exact as a decimal; y3_reference is only reported.
 
 L56 / S03 v6 section 1: the main design results (runs.csv, effects.csv and the tables of
 section 5) are NOT looked at before campaign A ends. Nothing derived from them leaves
@@ -116,6 +135,10 @@ import o1_feasibility as o1                             # noqa: E402
 import o1_gate as G                                     # noqa: E402  (S03 v8.2: G1-G5)
 import o1_gate_eval as E                                # noqa: E402  (G4 e_bao; evaluate_v7 inside, unchanged)
 import tune_ga                                          # noqa: E402
+_TOOLS = os.path.join(HERE, '..', 'tools')              # as o1_gate_eval puts it on sys.path
+if _TOOLS not in sys.path:
+    sys.path.insert(0, _TOOLS)
+import gain_table                                       # noqa: E402  (tools/: the PC gain table, S03 v8.6 2.1)
 
 CONTROLLERS = ('PID', 'ADRC')
 SPEEDS = (0.2, 0.5, 0.8)
@@ -130,8 +153,9 @@ SEED = 1                                      # plant seed (no random plant inpu
 # S03/2026-11-09_run01 is dict(rate_hz=20.0, boot_reset=-1.0): re-run it from script 6f93607.
 IMU = dict(rate_hz=20.0, boot_reset=-1.0, noise='replay', noise_seed=SEED)
 DET_SEED = 20261106                           # S03 section 3.4: seed that draws the 3 corners, fixed before running
-THRESH = {'e_perp_max': 0.01, 'e_perp_max_cens': 0.01, 'sat_frac': 0.01}   # S03 section 5.2; tv_duty: 20 %
-Y3_REL = 0.20
+Y3_ABS = 0.4            # s^-1, S03 v8.6 section 5.2: four wheels one PWM step (1/1000) per 10 ms tick,
+                        # 4 x 0.001 x 100; every speed, every mu, worst, range
+THRESH = {'e_perp_max': 0.01, 'e_perp_max_cens': 0.01, 'sat_frac': 0.01, 'tv_duty': Y3_ABS}   # S03 5.2
 RESPONSES = ('e_perp_max', 'e_perp_max_cens', 'tv_duty', 'sat_frac')
 OLD_COLS = ['controller', 'point_id', 'box', 'mu', 'v', 'status', 'completed', 'e_perp_max', 'e_perp_max_cens',
             'e_perp_global_max', 'tv_duty', 'sat_frac', 'sat_any_frac', 'e_theta_lane_max_deg',
@@ -153,9 +177,11 @@ G1_RUN_COLS = ([f'{c}_{x}_chung' for c in G.MEASURED for x in ('q', 'lo', 'hi', 
                + ['g1_ways', 'g1_t_deadline', 'g1_t_done_1', 'g1_t_done_2', 'g1_t1', 'g1_prog_before_t1',
                   'g1_cond25_before_deadline', 'g1_cat_t1'])
 RUN_COLS = OLD_COLS + GATE_RUN_COLS + G1_RUN_COLS
+TRIANGLE_COL = 'ngoai_tam_giac'          # S03 v8.6 section 3.2: design point outside the LADRC triangle
+RUNS_FILE_COLS = RUN_COLS + [TRIANGLE_COL]     # header of sealed/runs.csv and sealed_test/runs_test.csv only
 LEVEL_COLS = ['controller', 'factor', 'L', 'H', 'centre', 'scale', 'default', 'rule_note',     # S03 v8
               'a', 'b', 'b_n', 'L_nguon', 'H_nguon']                                          # S03 v8.3 (S83-1: fixed)
-SWEEP_ID_COLS = ('controller', 'factor', 'value', 'is_default', 'luoi', 'v', 'mu')   # sweep.csv identifiers (section 7; luoi: v8.3)
+SWEEP_ID_COLS = ('controller', 'factor', 'value', 'is_default', 'luoi', 'tran', 'v', 'mu')   # sweep.csv identifiers (section 7; luoi: v8.3, tran: v8.6)
 GATE_U_T = 0.0                # s: fwsim knows the command start exactly (o1_gate docstring; as C12, S04)
 SCALE_RTOL = 1e-14            # H/L >= 4 within float rounding of the log grid (S3C-6; S3D-7: about 45 ULP)
 # S03 v8 (L67): axial points and the test set for the RSM comparison of S04; not analysed here
@@ -298,6 +324,7 @@ def sweep_grid(name, default, lo, hi):
 
 
 GRID_N_TOL = 1e-9             # S03 v8.3 section 3.1: K smallest with r^K >= 10 (1 - 1e-9)
+TRAN_RTOL = 1e-9              # S03 v8.6 section 3.1: a remaining point this near the ceiling T becomes T
 
 
 def sweep_grid_n(name, default, lo, hi):
@@ -325,6 +352,101 @@ def sweep_grid_n(name, default, lo, hi):
     return base + noi, info
 
 
+def ceiling(ctrl, name):
+    """T of S03 v8.6 section 3.1: the gain-table upper bound of the gain (tools/gain_table.py);
+    S03Stop when the factor is not a gain of the table."""
+    try:
+        return float(gain_table.upper(ctrl, name))
+    except ValueError as exc:
+        raise S03Stop(f'{ctrl} {name}: no ceiling in the gain table ({exc})') from None
+
+
+def cut_at_ceiling(points, T):
+    """Rules (1), (2) of S03 v8.6 section 3.1 on an ascending list of points: drop every point
+    above T; when a point was dropped, a remaining point within the relative error TRAN_RTOL of T
+    becomes T (two such points is an error), else T is appended. Returns (points, n_bo, them):
+    n_bo points dropped; them True when T was appended as a new point. Nothing dropped: the
+    points as given (same floats), 0, False."""
+    keep = [x for x in points if not x > T]
+    n_bo = len(points) - len(keep)
+    if n_bo == 0:
+        return keep, 0, False
+    near = [i for i, x in enumerate(keep) if math.isclose(x, T, rel_tol=TRAN_RTOL)]
+    if len(near) > 1:
+        raise S03Stop(f'{len(near)} grid points within {TRAN_RTOL} of the ceiling {T!r} (S03 v8.6 3.1)')
+    if near:
+        keep[near[0]] = T
+        return keep, n_bo, False
+    keep.append(T)
+    return keep, n_bo, True
+
+
+def cut_grid(grid, info, T):
+    """The (grid, info) of sweep_grid_n cut at the ceiling T (S03 v8.6 section 3.1). a, b, r, K,
+    n_log keep their definitions (b may no longer be a grid point when the cut is inside the
+    original grid); noi, n_noi, n_points describe the grid after the cut; n_bo is the number of
+    points dropped (0 = not cut: the grid and every old info key exactly as sweep_grid_n gave
+    them, but b_n of omega_o); b_n is the largest point after the cut (= T when cut; else the
+    extension end; omega_o has no extension, so its b_n is the end of its grid, b: Codex C3-5)."""
+    base = base_grid(grid, info)
+    pts, n_bo, them = cut_at_ceiling(grid, T)
+    if n_bo == 0:
+        return grid, dict(info, T=float(T), n_bo=0, b_n=grid[-1] if info['b_n'] is None else info['b_n'])
+    n_base = sum(1 for x in base if not x > T)          # a point made equal to T keeps its part of the grid
+    if them and T < info['b']:
+        n_base += 1                                     # the added T belongs to the original grid
+    elif them and not T > info['b']:
+        raise S03Stop(f'ceiling {T!r} equals b but b is not a grid point (S03 v8.6 3.1)')
+    noi = pts[n_base:]
+    return pts, dict(info, T=float(T), n_bo=n_bo, noi=noi, n_noi=len(noi), n_points=len(pts), b_n=pts[-1])
+
+
+def default_node(grid, info, default):
+    """The point of the cut grid that stands for the firmware default in the level rule, is_default
+    and luoi (S03 v8.6 section 3.1; Codex C3-4): the default itself when it is a grid point. When
+    rule (2) of the cut made the default, within TRAN_RTOL below the ceiling T, equal to T, the
+    point T stands for it if both are the same float32 (the firmware receives one value: the run
+    at T is the default-gain run). S03Stop otherwise: the default is above T (dropped), or T is
+    another float32."""
+    if default in grid:
+        return default
+    T = info.get('T')
+    if info.get('n_bo') and not default > T and math.isclose(default, T, rel_tol=TRAN_RTOL):
+        if float(np.float32(default)) == float(np.float32(T)):
+            return T
+        raise S03Stop(f'the default {default!r} became the ceiling {T!r} in the cut (within {TRAN_RTOL}) but is '
+                      f'another float32, {float(np.float32(default))!r} not {float(np.float32(T))!r} (S03 v8.6 3.1)')
+    raise S03Stop(f'the default {default!r} is not a point of the grid cut at the ceiling {T!r} (S03 v8.6 3.1)')
+
+
+def sweep_grid_cut(ctrl, name, default, lo, hi):
+    """The sweep grid of S03 v8.6 section 3.1: sweep_grid_n cut at ceiling(ctrl, name); the
+    firmware default must still have its grid point (default_node: itself, or T when the cut made
+    it T and both are one float32; a default above its ceiling stops S03)."""
+    grid, info = cut_grid(*sweep_grid_n(name, default, lo, hi), ceiling(ctrl, name))
+    try:
+        default_node(grid, info, default)
+    except S03Stop as exc:
+        raise S03Stop(f'{ctrl} {name}: {exc}') from None
+    return grid, info
+
+
+def w_nodes(ctrl, name, default, lo, hi):
+    """Nodes of the reference box W for one gain (S03 v8.6 section 3.1b item 2), ascending: the 11
+    values of numpy.geomspace(a, b, 11) (the one within 1e-9 of the default is the default itself,
+    as sweep_grid does) plus the extension points b r^k, then rules (1), (2) of section 3.1
+    (cut_at_ceiling). Not nodes: the 0 point and the default when it was added as a point of its
+    own. The nodes are taken from the grid lists, never from the luoi label of sweep.csv; first
+    node a, last node w (b_n; b for omega_o, which has no extension)."""
+    grid, info = sweep_grid_n(name, default, lo, hi)
+    logs = [x for x in base_grid(grid, info) if x != 0.0]
+    if len(logs) == N_GRID + 1:                         # the default was added beside the 11 log points
+        logs.remove(default)
+    if len(logs) != N_GRID:
+        raise S03Stop(f'{ctrl} {name}: {len(logs)} log points in the grid, not {N_GRID}')
+    return cut_at_ceiling(logs + info['noi'], ceiling(ctrl, name))[0]
+
+
 def grid_label(x, default, noi):
     """sweep.csv 'luoi' of a grid value (S03 v8.3; agreed with CODE_C13 15/11): the default first (even on a
     log point), then 0, then the extension, else log."""
@@ -336,7 +458,7 @@ def grid_label(x, default, noi):
 
 
 L_SOURCES = ('0', 'hết lưới dưới', 'điểm kế tiếp không hoàn thành')
-H_SOURCES = ('hết lưới', 'trần ω_o', 'điểm kế tiếp không hoàn thành')     # S03 v8.4 ('hết lưới nối' of v8.3 gone)
+H_SOURCES = ('hết lưới', 'trần ω_o', 'trần bảng chặn', 'điểm kế tiếp không hoàn thành')   # 'trần bảng chặn': v8.6
 
 
 def base_grid(grid, info):
@@ -358,7 +480,12 @@ def level_sources(base, L, H, info, name):
     else:
         ls = 'điểm kế tiếp không hoàn thành'
     if H == base[-1]:
-        hs = 'trần ω_o' if name.startswith('omega_o') and info['b'] == OMEGA_O_MAX else 'hết lưới'
+        # v8.6: H = T, the end of the cut original grid, first over 'hết lưới'; the info of
+        # sweep_grid_n (no T, n_bo keys) keeps working
+        if info.get('n_bo') and H == info.get('T'):
+            hs = 'trần bảng chặn'
+        else:
+            hs = 'trần ω_o' if name.startswith('omega_o') and info['b'] == OMEGA_O_MAX else 'hết lưới'
     else:
         hs = 'điểm kế tiếp không hoàn thành'
     return ls, hs
@@ -442,11 +569,11 @@ def lower_by_at_least(x, ref, thr):
     return exact(ref) - exact(x) >= exact(thr)
 
 
-def y3_threshold(ref):
-    """S84V3-1: the Y3 threshold of the check, Y3_REL x tv_duty of the default-gain run (section 5.2), exactly
-    (0.2 x 0.9 is 0.18; the binary64 product is 0.18000000000000002). A non-finite tv_duty gives a non-finite
-    threshold (the point is inconclusive, step 2)."""
-    return exact(Y3_REL) * exact(ref) if math.isfinite(ref) else Y3_REL * ref
+def y3_threshold():
+    """S03 v8.6 section 5.2: the Y3 threshold of the check and of the analysis, the absolute
+    0.4 s^-1 at every speed and every mu, worst and range (the exact decimal, Fraction(2, 5));
+    no longer a share of the default-gain run (v8.4 and before)."""
+    return exact(Y3_ABS)
 
 
 def classify_point(pt, bd, gate, thr):
@@ -477,8 +604,10 @@ def classify_point(pt, bd, gate, thr):
 
 def out_of_range_check(sweep_rows, levels, grids, defaults_by, controllers, gate, mu_mid, y3_ref, stop_case):
     """S03 v8.4 section 3.1 'Kiểm ngoài miền'. levels: {ctrl: {factor: (L, H, scale)}} (factors whose level rule
-    ran); grids: {(ctrl, factor): (grid, info)} of sweep_grid_n (original + extension); defaults_by: {ctrl:
-    {factor: default}}; stop_case: '(i)' / '(ii)' when S03 stopped there (then 'không kiểm' for every controller).
+    ran); grids: {(ctrl, factor): (grid, info)} of sweep_grid_cut (original + extension after the cut, S03
+    v8.6); defaults_by: {ctrl: {factor: default}}; stop_case: '(i)' / '(ii)' when S03 stopped there (then
+    'không kiểm' for every controller). y3_ref is not used since v8.6 (the Y3 threshold is the absolute
+    0.4 s^-1 of section 5.2); the signature is kept so callers do not change.
     A controller is 'đã kiểm đủ' when every factor has levels (every point outside them gets a result), else
     'kiểm dở' (the sweep stopped part way): the factors with levels are checked, every grid point of a factor
     without levels counts as not checked (which of them would be outside is not known). Returns (rows for
@@ -508,7 +637,7 @@ def out_of_range_check(sweep_rows, levels, grids, defaults_by, controllers, gate
                 L, H = lv[0], lv[1]
                 grid, info = grids[(ctrl, name)]
                 dflt = defaults_by[ctrl][name]
-                thr = {v: y3_threshold(y3_ref[(ctrl, v)]) if (ctrl, v) in y3_ref else float('nan') for v in SPEEDS}
+                thr = {v: y3_threshold() for v in SPEEDS}
                 for x in grid:
                     if L <= x <= H:
                         continue
@@ -791,6 +920,21 @@ def check_design_map(rows, test_pts):
                 raise S03Stop(f'{ctrl}: point {pid} is {r["box"]} {codes}, expected {box} {want} (S03 v8 11.4)')
 
 
+def check_candidate(ctrl, g):
+    """S03 v8.6 section 3.1b item 4, for the screening step (not written yet): the
+    gain_table.Verdict of one gain set {factor: binary64 value}; trong_bang False: a float32 gain
+    is outside the table (a bounds failure, S03 stops); trong_bang True and trong_tam_giac False:
+    the LADRC triangle is broken on an axis, the set does not run and is flagged ngoai_bang."""
+    return gain_table.classify(ctrl, g)
+
+
+def outside_triangle(ctrl, g):
+    """Column ngoai_tam_giac of a design point (S03 v8.6 section 3.2 last item): True when the set
+    {factor: binary64 value} breaks the LADRC triangle omega_c + 2 omega_o < 200 on an axis
+    (binary64 sum of the float32 values). PID: always False."""
+    return not gain_table.classify(ctrl, g).trong_tam_giac
+
+
 def check_bounds(ctrl, lv, points, gains_at):
     """S03 v8 section 11 item 4: (i) every binary64 value after decode is finite and within
     [L - 1e-12 (H - L), H + 1e-12 (H - L)]; (ii) the float32 value the firmware uses is compared
@@ -804,6 +948,20 @@ def check_bounds(ctrl, lv, points, gains_at):
             if name.startswith('omega_o') and float(np.float32(x)) > OMEGA_O_MAX:
                 raise S03Stop(f'{ctrl} point {pid}: {name} float32 {float(np.float32(x))!r} > {OMEGA_O_MAX} '
                               f'(S03 v8 11.4 (ii))')
+
+
+def check_table(ctrl, points, gains_at):
+    """S03 v8.6 section 3.1b item 4 (section 11 item 6 (a)), the bounds check before the main design: the
+    float32 of every gain of every point is within the gain table, lower and upper bound (0 accepted where
+    the lower bound is 0; gain_table.classify, the same check as before sending a gain). The LADRC triangle
+    is NOT checked here: a design point outside it runs, flagged ngoai_tam_giac (section 3.2). Kept apart
+    from check_bounds, which other scripts call (rsm_compare) and which keeps its v8 behaviour. Raises
+    S03Stop."""
+    for pid, _box, codes in points:
+        v = gain_table.classify(ctrl, gains_at(codes))
+        if not v.trong_bang:
+            raise S03Stop(f'{ctrl} point {pid}: {"; ".join(v.vi_pham_bang)}: outside the gain table '
+                          f'{gain_table.TABLE_VERSION} (S03 v8.6 3.1b item 4)')
 
 
 def term_names(k=7):
@@ -914,6 +1072,14 @@ def write_csv(path, rows, cols=None):
         _write_csv_to(f, rows, cols)
 
 
+def design_cols(rows):
+    """design.csv header (S03 v8.6): the old columns in row order, ngoai_tam_giac last; None for
+    no rows (write_csv then writes nothing, the file is empty)."""
+    if not rows:
+        return None
+    return [k for k in dict.fromkeys(k for r in rows for k in r) if k != TRIANGLE_COL] + [TRIANGLE_COL]
+
+
 def npz_bytes(log):
     """The compressed npz of a log, in memory."""
     buf = io.BytesIO()
@@ -955,7 +1121,8 @@ def analyse(ctrl, box, pts, runs, mu_levels, speeds, y3_ref, notes=None, no_conc
     notes: {(box, v): text} written in the 'note' column of every effect of that box and speed
     (S03 3.2: outer box mostly not completed). no_conclusion: speeds where the inner box is
     also mostly not completed: no effects, curvature or Y2 versions there, only the fail counts
-    (S03 3.2, S3C-11)."""
+    (S03 3.2, S3C-11). y3_ref is not used since v8.6 (the Y3 threshold is the absolute 0.4 s^-1
+    of section 5.2); the signature is kept so callers do not change."""
     notes = notes or {}
     eff, curv, ver, fails = [], [], [], []
     mu_mid = mu_levels[len(mu_levels) // 2]
@@ -980,11 +1147,8 @@ def analyse(ctrl, box, pts, runs, mu_levels, speeds, y3_ref, notes=None, no_conc
                     y = agg(lambda a: max(a) - min(a), resp)
                 else:
                     y = [runs[(i, float(cond), v)][resp] for i in ids]
-                thr = THRESH.get(resp, Y3_REL * y3_ref[(ctrl, v)])
+                thr = THRESH[resp]
                 note = notes.get((box, v), '')
-                if resp == 'tv_duty' and thr == 0.0:            # S03 5.2: reference Y3 = 0 (S3C-13)
-                    note = '; '.join(x for x in (note, 'Y3 reference run is 0: every non-zero effect '
-                                                 'is reported') if x)
                 e = effects(codes, y)
                 sig_sets[resp] = {t: math.copysign(1.0, x) for t, x in e.items() if abs(x) > thr}
                 for t, x in e.items():
@@ -1162,16 +1326,18 @@ def main():
         """One run; a run_error is recorded (S3C-12), rerun once in a new process for diagnosis
         (B8b-20), then S03 stops. ids = (point_id, box) for a main-design run (sealed). The test
         set (v8) passes its own sink (rows), work folder and notes list, all under sealed_test/.
-        sweep = (factor, value, is_default) of a sweep run: its run_error row goes to sweep.csv (S3G-2)."""
+        sweep = (factor, value, is_default, luoi, tran) of a sweep run: its run_error row goes to
+        sweep.csv (S3G-2)."""
         row, log = safe_run(fw, path, ctrl, g, v, mu)
         if row['status'] != 'run_error':
             return row, log
         if ids is not None:
             (all_runs if sink is None else sink).append(dict(controller=ctrl, point_id=ids[0], box=ids[1],
-                                                             mu=mu, v=v, **row))
+                                                             mu=mu, v=v,
+                                                             ngoai_tam_giac=outside_triangle(ctrl, g), **row))
         elif sweep is not None:
-            sweep_rows.append(dict(controller=ctrl, factor=sweep[0], value=sweep[1], is_default=sweep[2], luoi=sweep[3],
-                                   v=v, mu=mu, **row))
+            sweep_rows.append(dict(controller=ctrl, factor=sweep[0], value=sweep[1], is_default=sweep[2],
+                                   luoi=sweep[3], tran=sweep[4], v=v, mu=mu, **row))
         note = dict(controller=ctrl, gains=g, v=v, mu=mu, point=ids, first=row.get('error'))
         (rerun_notes if notes_to is None else notes_to).append(note)
         try:
@@ -1188,10 +1354,11 @@ def main():
         for ctrl in a.controllers:
             dflts[ctrl] = defaults(fw, ctrl)
             for v in SPEEDS:
-                row, log = checked(ctrl, dflts[ctrl], v, mu_mid, sweep=('(default check)', '', True, 'mac_dinh'))
+                row, log = checked(ctrl, dflts[ctrl], v, mu_mid,
+                                   sweep=('(default check)', '', True, 'mac_dinh', False))
                 # recorded and logged before the stop test (S3D-4); public like the sweep
                 sweep_rows.append(dict(controller=ctrl, factor='(default check)', value='', is_default=True,
-                                       luoi='mac_dinh', v=v, mu=mu_mid, **row))
+                                       luoi='mac_dinh', tran=False, v=v, mu=mu_mid, **row))
                 if row['completed'] != 'true':
                     save_log(os.path.join(a.out, 'logs_sweep'), f'{ctrl}_default_check_v{v}', log)
                 if v in gate and row['completed'] != 'true':
@@ -1202,7 +1369,7 @@ def main():
         for ctrl in a.controllers:
             lo_b, hi_b = tune_ga.BOUNDS[ctrl]
             for j, name in enumerate(FACTORS[ctrl]):
-                grids[(ctrl, name)] = sweep_grid_n(name, dflts[ctrl][name], lo_b[j], hi_b[j])   # with the extension
+                grids[(ctrl, name)] = sweep_grid_cut(ctrl, name, dflts[ctrl][name], lo_b[j], hi_b[j])  # v8.6: the cut
                 grid_info[(ctrl, name)] = grids[(ctrl, name)][1]
         # 3.1 sweep and levels, every controller (S3C-9: a stop ends S03)
         for ctrl in a.controllers:
@@ -1211,16 +1378,19 @@ def main():
             for j, name in enumerate(FACTORS[ctrl]):
                 grid, ginfo = grids[(ctrl, name)]
                 base = base_grid(grid, ginfo)                  # S03 v8.4: the level rule runs on it only
+                d_node = default_node(grid, ginfo, dflt[name])   # C3-4: the default, or T standing for it
                 ok = []
                 for x in grid:
                     g = dict(dflt, **{name: x})
                     done = True
                     for v in SPEEDS:
-                        row, log = checked(ctrl, g, v, mu_mid, sweep=(name, x, x == dflt[name], grid_label(x, dflt[name], ginfo['noi'])))
-                        sweep_rows.append(dict(controller=ctrl, factor=name, value=x, is_default=x == dflt[name],
-                                               luoi=grid_label(x, dflt[name], ginfo['noi']), v=v, mu=mu_mid,
-                                               **row))
-                        if x == dflt[name]:
+                        row, log = checked(ctrl, g, v, mu_mid, sweep=(name, x, x == d_node,
+                                                                      grid_label(x, d_node, ginfo['noi']),
+                                                                      x == ginfo['T']))
+                        sweep_rows.append(dict(controller=ctrl, factor=name, value=x, is_default=x == d_node,
+                                               luoi=grid_label(x, d_node, ginfo['noi']), tran=(x == ginfo['T']),
+                                               v=v, mu=mu_mid, **row))
+                        if x == d_node:
                             y3_ref[(ctrl, v)] = row['tv_duty']
                         if row['completed'] != 'true':          # sweep is public: its failed logs too (S3C-20)
                             save_log(os.path.join(a.out, 'logs_sweep'), f'{ctrl}_{name}_{x:.6g}_v{v}', log)
@@ -1229,7 +1399,7 @@ def main():
                     ok.append(done)
                     print(f'[sweep {ctrl}] {name} = {x:.4g}: completes at gate speeds = {done}', flush=True)
                 try:
-                    L, H = levels_from_sweep(base, dflt[name], ok[:len(base)])    # S03 v8.4: original grid only
+                    L, H = levels_from_sweep(base, d_node, ok[:len(base)])    # S03 v8.4: original grid only
                 except S03Stop as exc:
                     raise S03Stop(f'{ctrl} {name}: {exc}', case=exc.case) from None
                 sc, centre = scale_of(L, H)
@@ -1248,9 +1418,9 @@ def main():
                 if mu == mu_mid:
                     continue
                 for v in SPEEDS:
-                    row, log = checked(ctrl, dflt, v, mu, sweep=('(default)', '', True, 'mac_dinh'))
+                    row, log = checked(ctrl, dflt, v, mu, sweep=('(default)', '', True, 'mac_dinh', False))
                     sweep_rows.append(dict(controller=ctrl, factor='(default)', value='', is_default=True,
-                                           luoi='mac_dinh', v=v, mu=mu, **row))
+                                           luoi='mac_dinh', tran=False, v=v, mu=mu, **row))
                     if row['completed'] != 'true':                      # S3C-20
                         save_log(os.path.join(a.out, 'logs_sweep'), f'{ctrl}_default_mu{mu}_v{v}', log)
         t_sweep_end = time.time()
@@ -1270,13 +1440,12 @@ def main():
             print(f'[out-of-range check {ctrl}] e_perp_max lower by >= 0.01 m at one speed, not flagged: '
                   f'{" ".join(s["bao_rieng"])}', flush=True)
     flagged = {c: s['co'] for c, s in kiem_sum.items() if s['co']}
-    if flagged and stop_public is None:
-        stop_public = ('out-of-range check (S03 v8.4 3.1): flagged points ' +
-                       '; '.join(f'{c}: {" ".join(p)}' for c, p in flagged.items()) +
-                       ': Liam decides, no main design')
-        print(f'[STOP] {stop_public}', flush=True)
-    elif not flagged and any(s['chua_ket_luan'] for s in kiem_sum.values()):
-        print('WARNING: out-of-range check has inconclusive points (S03 v8.4 3.1: report to Liam, S03 goes on): ' +
+    if flagged:                                     # S03 v8.5 3.1 (K6): reported and kept, S03 goes on
+        print('[out-of-range check] flagged points (S03 v8.5 3.1, K6: written in kiem_ngoai_mien.csv and '
+              'meta.yaml, S03 goes on): ' +
+              '; '.join(f'{c}: {" ".join(p)}' for c, p in flagged.items()), flush=True)
+    if any(s['chua_ket_luan'] for s in kiem_sum.values()):
+        print('WARNING: out-of-range check has inconclusive points (S03 v8.5 3.1: reported, S03 goes on): ' +
               '; '.join(f'{c}: {" ".join(s["chua_ket_luan"])}' for c, s in kiem_sum.items() if s['chua_ket_luan']),
               flush=True)
 
@@ -1299,10 +1468,12 @@ def main():
                           [(p, 'inner', c) for p, c in inner] + [(p, 'axial', c) for p, c in axial] +
                           [(p, 'test', c) for p, c in test_pts])
                 check_bounds(ctrl, lv, points, gains_at)                 # section 11 item 4 (i), (ii)
+                check_table(ctrl, points, gains_at)                      # v8.6 section 3.1b item 4: the gain table
                 for pid, box, codes in points:
                     design_rows.append(dict(controller=ctrl, point_id=pid, box=box,
                                             **{f'X{k + 1}': c for k, c in enumerate(codes)},
-                                            **{f'{n}_value': v_ for n, v_ in gains_at(codes).items()}))
+                                            **{f'{n}_value': v_ for n, v_ in gains_at(codes).items()},
+                                            ngoai_tam_giac=outside_triangle(ctrl, gains_at(codes))))
                 plan[ctrl] = (gains_at, centre_codes, outer, inner, axial, test_pts)
             check_design_map(design_rows, test_pts)                      # section 11 item 4: id - box - codes
         except S03Stop as exc:
@@ -1310,7 +1481,7 @@ def main():
             tp_info = getattr(exc, 'tp_info', tp_info)                  # R2-4: what was read, if any
             print(f'[STOP] {stop_public}', flush=True)
     if stop_public is None:
-        write_csv(os.path.join(a.out, 'design.csv'), design_rows)      # S3E-2: on disk before any run
+        write_csv(os.path.join(a.out, 'design.csv'), design_rows, cols=design_cols(design_rows))   # S3E-2: on disk
         try:
             for ctrl in a.controllers:
                 gains_at, centre_codes, outer, inner, axial, _test = plan[ctrl]
@@ -1327,7 +1498,8 @@ def main():
                             for v in SPEEDS:
                                 row, log = checked(ctrl, g, v, mu, ids=(pid, box))
                                 runs[(pid, mu, v)] = row
-                                all_runs.append(dict(controller=ctrl, point_id=pid, box=box, mu=mu, v=v, **row))
+                                all_runs.append(dict(controller=ctrl, point_id=pid, box=box, mu=mu, v=v,
+                                     ngoai_tam_giac=outside_triangle(ctrl, g), **row))
                                 name = f'{ctrl}_p{pid}_mu{mu}_v{v}'
                                 # v8: the determinism points are the centre and 3 OUTER corners,
                                 # chosen by box, not only by point_id (section 11 item 4)
@@ -1391,7 +1563,7 @@ def main():
             os.rmdir(d)
     # sealed outputs, with their own manifest (no hash of a sealed file outside sealed/, S3C-1)
     sealed_files = {}
-    for name, rows, cols in (('runs.csv', all_runs, RUN_COLS), ('effects.csv', eff_rows, None),
+    for name, rows, cols in (('runs.csv', all_runs, RUNS_FILE_COLS), ('effects.csv', eff_rows, None),
                              ('curvature.csv', curv_rows, None), ('y2_versions.csv', ver_rows, None),
                              ('fail_counts.csv', fail_rows, None), ('determinism_check.csv', det_rows, None)):
         p = os.path.join(sealed, name)
@@ -1400,6 +1572,11 @@ def main():
     with open(os.path.join(sealed, 'notes.json'), 'w', encoding='utf-8') as f:
         json.dump(dict(inner_rule_speeds=inner_rule, no_conclusion_speeds=no_concl, stop=stop_sealed,
                        run_error_reruns=[n for n in rerun_notes if n['point'] is not None],
+                       ngoai_tam_giac_points=({c: sum(1 for r in design_rows
+                                                     if r['controller'] == c
+                                                     and r['box'] in ('centre', 'outer', 'inner', 'axial')
+                                                     and r[TRIANGLE_COL])
+                                              for c in a.controllers} if design_rows else {}),
                        elapsed_s_total=round(t_end - t0),
                        elapsed_s_main_design=round(t_end - t_sweep_end) if t_sweep_end else None),
                   f, indent=1, default=str)
@@ -1440,7 +1617,7 @@ def main():
                             row, log = checked(ctrl, g, v, mu_mid, ids=(pid, 'test'), sink=test_rows,
                                                work=work_test, notes_to=test_notes)
                             test_rows.append(dict(controller=ctrl, point_id=pid, box='test', mu=mu_mid, v=v,
-                                                  **row))
+                                                  ngoai_tam_giac=outside_triangle(ctrl, g), **row))
                             data = npz_bytes(log)             # same work for every run (S3E-1)
                             if row['completed'] != 'true':    # logs kept by the rule of section 7
                                 save_log(test_logs, f'{ctrl}_p{pid}_mu{mu_mid}_v{v}', log, data)
@@ -1467,9 +1644,15 @@ def main():
                     os.rmdir(work_test)
                 if stop_test:
                     put('stop.json', lambda f_: json.dump(dict(stop=stop_test), f_, indent=1))
-                put('runs_test.csv', lambda f_: _write_csv_to(f_, test_rows, RUN_COLS))
+                put('runs_test.csv', lambda f_: _write_csv_to(f_, test_rows, RUNS_FILE_COLS))
                 put('notes.json', lambda f_: json.dump(dict(stop=stop_test, rows_run=len(test_rows),
-                                                            run_error_reruns=test_notes, elapsed_s_test=test_s),
+                                                            run_error_reruns=test_notes, elapsed_s_test=test_s,
+                                                            ngoai_tam_giac_points={
+                                                                c: sum(1 for r in design_rows
+                                                                       if r['controller'] == c
+                                                                       and r['box'] == 'test'
+                                                                       and r[TRIANGLE_COL])
+                                                                for c in a.controllers}),
                                                        f_, indent=1, default=str))
                 put('diag.txt', lambda f_: f_.write(diag_text()))
                 with open(os.path.join(sealed_test, 'manifest.json'), 'w', encoding='utf-8') as f_:
@@ -1494,7 +1677,8 @@ def main():
                        ('levels.csv', level_rows), ('kiem_ngoai_mien.csv', kiem_rows), ('design.csv', design_rows)):
         p = os.path.join(a.out, name)
         cols = (LEVEL_COLS if name == 'levels.csv' else      # S83-1: the header even when S03 stops early
-                KIEM_COLS if name == 'kiem_ngoai_mien.csv' else None)   # S03 v8.4: fixed header too
+                KIEM_COLS if name == 'kiem_ngoai_mien.csv' else   # S03 v8.4: fixed header too
+                design_cols(rows) if name == 'design.csv' else None)  # v8.6: ngoai_tam_giac last
         if name == 'sweep.csv':     # S3G-2, S3G2-3: one fixed header (identifiers, run columns), other keys after
             cols = list(dict.fromkeys(list(SWEEP_ID_COLS) + RUN_COLS[5:] + [k for r in rows for k in r]))
         write_csv(p, rows, cols)
@@ -1552,10 +1736,10 @@ gate_speeds: {json.dumps(gate)}
 controllers: {json.dumps(a.controllers)}
 factors: {json.dumps(FACTORS)}
 temporary_bounds_for_the_grid: {json.dumps({m: tune_ga.BOUNDS[m] for m in a.controllers})}   # tune_ga.BOUNDS (S03 3.1)
-thresholds: {json.dumps(dict(THRESH, tv_duty=f'{Y3_REL:.0%} of the default-gain run, middle mu, same speed'))}
+thresholds: {json.dumps(THRESH)}   # S03 v8.6 section 5.2: tv_duty 0.4 s^-1 absolute, every speed and mu, worst and range (y3_reference below is reported beside it, not a base)
 y3_reference: {json.dumps({f'{c} v={v}': y for (c, v), y in y3_ref.items()})}
 o1: {json.dumps(dict(A=o1.A, a_r=o1.A_R, D=o1.D, D_d=o1.D, t_d=o1.T_D, t_late=o1.T_LATE, delta=o1.DELTA, v_d=o1.V_D, c_cens=o1.C_CENS))}
-grid: {json.dumps({f'{c} {n}': {k: v_ for k, v_ in i.items() if k != 'noi'} for (c, n), i in grid_info.items()})}   # S03 v8.3 section 3.1: a, b, r, K, b_n (extension end; null for omega_o), points per gain
+grid: {json.dumps({f'{c} {n}': {k: v_ for k, v_ in i.items() if k != 'noi'} for (c, n), i in grid_info.items()})}   # S03 v8.3 section 3.1: a, b, r, K, b_n, points per gain; from v8.6 the grid is cut at the gain-table ceiling T: T, n_bo (points dropped), noi / n_noi / n_points after the cut, b_n = the largest point after the cut (T when cut, else the extension end; for omega_o, which has no extension, the end b of its grid)
 kiem_ngoai_mien: {json.dumps(kiem_sum, ensure_ascii=False)}   # S03 v8.4 section 3.1: total per controller (đã kiểm đủ / kiểm dở / không kiểm), counts, flagged (co), inconclusive (chua_ket_luan) and bao_rieng points; detail in kiem_ngoai_mien.csv
 gate: {json.dumps(gate_meta())}   # S03 v8.2 section 7: G1-G5 per run (o1_gate.gate), U = 0 on fwsim
 evaluator_sha256: {json.dumps(EVAL_SHA_AT_IMPORT)}   # S03 v8.2 section 8 condition 8: S03 and S04 on the same evaluator; the files as hashed when the script was imported (S3G-1, S3G2-1)
@@ -1583,21 +1767,25 @@ interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THES
   - "v8.2: a failure of the gate scoring (e.g. the rebuilt nearest distance of G4 not the row e_perp) is a run_error, so S03 stops (B8b-20) as for a DLL error"
   - "B81-3 (15/11, Liam CODE_FEAS 'code di'): the G1 fields of O1 3.5 last block and the common domain are written (G1_RUN_COLS after gate_outcome): t_done = t_end when completed 'true', t1 = first tracking-error frame, prog_before_t1 = progress strictly before t1, cond25_before_deadline = cond2_5_ever (o1_gate_eval.g1_fields_v7, from the evaluate_v7 summary, which is unchanged); G1 recomputed from them must agree with the state from completed (o1_gate.gate raises, so a run_error); one way of using the frames: g1_ways 1, g1_t_done_2 and g1_cat_t1 empty, _chung the same as the union; gate_version stays gate_v3.2 (tools/rq3_log.py accepts only that version)"
   - "v8.3: the sweep grid is the v8 grid (sweep_grid, unchanged; C12 keeps it for its box [a, b]) plus b r^k, k = 1..K, r = (b/a)^(1/10), K the smallest integer with r^K >= 10 (1 - 1e-9), found by a loop on r**k; omega_o is not extended (cap 48); v8.4: the extension still runs with the sweep, only for the out-of-range check; the level rule runs on the original grid (11 log points, the default, 0)"
-  - "v8.3 (agreed with CODE_C13 15/11): luoi of the default value is mac_dinh even when it is on a log point, the (default check) and (default) rows are mac_dinh; L_nguon 'hết lưới dưới' when L is the lowest grid point and L > 0; v8.4: H_nguon 'hết lưới' when H = b, 'trần ω_o' instead for omega_o when b = 48; levels.csv keeps b_n (the extension end) for reference only"
-  - "v8.4 out-of-range check: a run is comparable when it exists, completed 'true', status 'ok' and its e_perp_max and tv_duty are finite; a point below L is put against the run at L, above H against H; the Y2 threshold is 0.01 m and the Y3 threshold 20 % of the default-gain run at the middle mu, same speed (section 5.2), a non-finite Y3 threshold makes the point inconclusive; the bounds are inclusive and compared exactly, with no tolerance, on the decimal of each number as written in the CSV (repr of the float), the Y3 threshold an exact product (S84-1, S84V2-1, S84V3-1: 0.03 - 0.02 is 0.01, not the binary64 0.009999999999999998; two identical responses never count as lower by a positive threshold; a point a few ULP past a bound is past it; the column nguong_tv holds the threshold as a float); bao_rieng = not flagged and, at one gate speed where both are comparable, e_perp_max lower by >= 0.01 m; buoc is the step of section 3.1 that matched"
-  - "v8.4 out-of-range check totals: 'không kiểm' for every controller when S03 stopped at 3.1 (i) or (ii); 'đã kiểm đủ' when every factor of the controller has levels; else 'kiểm dở' (the sweep stopped part way): factors with levels are checked, every grid point (original and extension) of a factor without levels counts in n_chua_kiem, n_gain_chua_kiem counts those factors; every grid is computed before the first sweep run. A flagged point in any controller stops S03 before design.csv (exit code 2); inconclusive points without a flag are printed as a WARNING and S03 goes on"
+  - "v8.3 (agreed with CODE_C13 15/11): luoi of the default value is mac_dinh even when it is on a log point, the (default check) and (default) rows are mac_dinh; L_nguon 'hết lưới dưới' when L is the lowest grid point and L > 0; v8.4: H_nguon 'hết lưới' when H = b, 'trần ω_o' instead for omega_o when b = 48; levels.csv b_n: see v8.6"
+  - "v8.4 out-of-range check: a run is comparable when it exists, completed 'true', status 'ok' and its e_perp_max and tv_duty are finite; a point below L is put against the run at L, above H against H; the Y2 threshold is 0.01 m and the Y3 threshold is the absolute 0.4 s^-1 of section 5.2 (v8.6; before: 20 % of the default-gain run), compared exactly as a decimal; the bounds are inclusive and compared exactly, with no tolerance, on the decimal of each number as written in the CSV (repr of the float) (S84-1, S84V2-1, S84V3-1: 0.03 - 0.02 is 0.01, not the binary64 0.009999999999999998; two identical responses never count as lower by a positive threshold; a point a few ULP past a bound is past it; the column nguong_tv holds the threshold as a float); bao_rieng = not flagged and, at one gate speed where both are comparable, e_perp_max lower by >= 0.01 m; buoc is the step of section 3.1 that matched"
+  - "v8.4 out-of-range check totals: 'không kiểm' for every controller when S03 stopped at 3.1 (i) or (ii); 'đã kiểm đủ' when every factor of the controller has levels; else 'kiểm dở' (the sweep stopped part way): factors with levels are checked, every grid point (original and extension) of a factor without levels counts in n_chua_kiem, n_gain_chua_kiem counts those factors; every grid is computed before the first sweep run. v8.5 (K6): a flagged or inconclusive point does not stop S03, it is written in kiem_ngoai_mien.csv, printed and kept in meta.yaml kiem_ngoai_mien"
+  - "v8.6 section 3.1: the sweep grid is sweep_grid_n cut at the ceiling T of the gain in tools/gain_table.py (table {gain_table.TABLE_VERSION}; the factor names are the table's names): points above T are dropped; when a point was dropped, a remaining point within the relative error 1e-9 of T becomes T, else T is added, to the original grid when T < b and to the extension when T > b; sweep.csv tran is true at value == T; an added T has luoi log (original grid) or noi (extension); a, b, r, K keep their definitions; b_n is the largest point after the cut (omega_o has no extension: its b_n is the end b of its grid); H_nguon 'trần bảng chặn' when H = T is the end of the cut original grid (first over 'hết lưới'); a firmware default above its ceiling stops S03; a default the cut made T (within 1e-9 below T) is run at the grid point T when both are the same float32: that point stands for the default run (is_default true, luoi mac_dinh, tran true, the level rule starts from it; levels.csv default keeps the firmware value); another float32 stops S03"
+  - "v8.6 section 5.2: tv_duty threshold 0.4 s^-1 absolute for every speed, mu, worst and range; y3_reference is only reported"
+  - "v8.6 sections 3.1b item 4, 3.2: before the main design the float32 of every gain of every design point is also compared with the gain table (0 accepted where the lower bound is 0), a failure stops S03; a design point with omega_c + 2 omega_o >= 200 on an axis (binary64 sum of the float32 values) runs like any point and has ngoai_tam_giac true in design.csv, runs.csv, runs_test.csv (PID always false); the number of such points per controller is in sealed/notes.json (centre, outer, inner, axial) and sealed_test/notes.json (test points)"
+  - "not in this script yet: S03 v8.5 section 3.1b (screening, sealed/levels_sangloc.csv, sealed/design.csv): the spec line above stays v8.4, design.csv is still at the root and the levels of the main design are the sweep levels; w_nodes and check_candidate are ready for that step"
   - "v8.2: the public sweep carries the G columns too (Liam 14/11 CODE_FEAS 'Co, mot cach cham'); G3-G5 are not responses of section 5"
 elapsed_s: {sweep_s}
 file_sha256: {json.dumps(files)}
 files:
-  - sweep.csv: "one line per sweep run (section 3.1) and default gains at the other mu levels; v8.3: luoi = log | mac_dinh | 0 | noi (the extension)"
+  - sweep.csv: "one line per sweep run (section 3.1) and default gains at the other mu levels; v8.3: luoi = log | mac_dinh | 0 | noi (the extension); v8.6: tran = true at the point of value T, the gain-table ceiling"
   - sweep_counts.csv: "section 5.3 for the sweep: runs not completed, inconclusive, saturated per factor, speed, mu"
-  - levels.csv: "L, H, centre, scale per factor (v8.4: on the original grid); v8.3: a, b (ends of the 11 log points), b_n (end of the extension, empty for omega_o; reference only from v8.4), L_nguon, H_nguon (source of each level, S03 v8.4 section 3.1)"
+  - levels.csv: "L, H, centre, scale per factor (v8.4: on the original grid); v8.3: a, b (ends of the 11 log points), b_n (v8.6: the largest point of the grid after the cut at the gain-table ceiling, T when the grid is cut, else the end of the extension; for omega_o, which has no extension, the end b of its grid; from v8.5 the upper end of campaign A's domain and of the reference box W), L_nguon, H_nguon (source of each level, S03 v8.4 section 3.1; v8.6: 'trần bảng chặn' when H = T ends the cut original grid)"
   - kiem_ngoai_mien.csv: "S03 v8.4 section 3.1: one row (dong diem) per original or extension point outside [L, H]: luoi, level compared (can L or H, can_value), ket_qua (không cờ / chưa kết luận / cờ), buoc, bao_rieng, per speed: in the gate, y1, status, e_perp_max, tv_duty of the point and of the level, Y3 threshold; one total row (dong tong) per controller: đã kiểm đủ / kiểm dở / không kiểm and counts"
-  - design.csv: "371 rows per controller: centre, outer box, inner box, axial points, test points (all run, L41, L67)"
+  - design.csv: "371 rows per controller: centre, outer box, inner box, axial points, test points (all run, L41, L67); v8.6: ngoai_tam_giac (outside the LADRC triangle, runs anyway)"
   - logs_sweep/: "npz of the sweep runs not completed"
-  - sealed/: "SEALED (L56): runs.csv (section 4 responses; centre, outer, inner, axial), effects.csv (every term, per box, response, speed, mu / worst / range; outer and inner only), curvature.csv (5.4), y2_versions.csv (5.1), fail_counts.csv (5.3), determinism_check.csv (3.4), notes.json, stop.json, manifest.json, logs/"
-  - sealed_test/: "SEALED separately (S03 v8 section 7): runs_test.csv, logs/, notes.json, stop.json, diag.txt (warnings, prints, traceback of the test phase), manifest.json; opened only after the RSM coefficients at the middle mu are saved and committed"
+  - sealed/: "SEALED (L56): runs.csv (section 4 responses; centre, outer, inner, axial), effects.csv (every term, per box, response, speed, mu / worst / range; outer and inner only), curvature.csv (5.4), y2_versions.csv (5.1), fail_counts.csv (5.3), determinism_check.csv (3.4), notes.json (v8.6: ngoai_tam_giac_points per controller), stop.json, manifest.json, logs/"
+  - sealed_test/: "SEALED separately (S03 v8 section 7): runs_test.csv, logs/, notes.json (v8.6: ngoai_tam_giac_points per controller, test points), stop.json, diag.txt (warnings, prints, traceback of the test phase), manifest.json; opened only after the RSM coefficients at the middle mu are saved and committed"
 """)
     print(f'S03 finished -> {a.out}; status: {status}')
     return 0 if not (stop_public or stop_sealed or stop_test or src_changed) else 2
