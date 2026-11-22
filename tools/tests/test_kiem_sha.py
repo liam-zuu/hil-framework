@@ -1205,3 +1205,58 @@ def test_c3_30_kiem_hard_link(tmp_path):
     f.write_bytes(b'x\n')
     _hard_link(f, tmp_path / 'b.txt')
     assert KS.kiem(f, sha(b'x\n')) == 'hard_link'
+
+
+# CODE 23/11: duong bat dau bang '05_DATA/' tinh tu goc repo, mot dich duy nhat
+def test_05_data_goc_repo_mot_dich(tmp_path):
+    repo, goc = _lam_repo(tmp_path)
+    run = goc / '2026-11-20_run02'
+    jdir = run / 'sub'
+    jdir.mkdir(parents=True)
+    f = repo / '05_DATA' / 'r' / 'a.csv'
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b'x\n')
+    out = KS.ung_vien('05_DATA/r/a.csv', jdir, repo)
+    assert [c for c, _ in out] == ['goc_repo_05_data']
+    (jdir / 'k.json').write_text(json.dumps(
+        {'sha256': {'05_DATA/r/a.csv': sha(b'x\n')}}), encoding='utf-8')
+    ra = tmp_path / 'out'
+    assert KS.main(['--goc', str(goc), '--goc-repo', str(repo), '--ra', str(ra)]) == 0
+    rows = _doc_csv(ra / 'bang.csv')
+    assert (rows[0]['ket_qua'], rows[0]['cach']) == ('tho', 'goc_repo_05_data')
+
+
+def test_05_data_ban_sao_o_goc_luot_khong_dung(tmp_path):
+    # file o goc repo da doi, ban cu khop SHA nam duoi goc luot: phai khong_khop
+    repo, goc = _lam_repo(tmp_path)
+    run = goc / '2026-11-20_run02'
+    run.mkdir(parents=True)
+    f = repo / '05_DATA' / 'r' / 'a.csv'
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b'moi\n')
+    cu = run / '05_DATA' / 'r' / 'a.csv'
+    cu.parent.mkdir(parents=True)
+    cu.write_bytes(b'x\n')
+    (run / 'k.json').write_text(json.dumps(
+        {'sha256': {'05_DATA/r/a.csv': sha(b'x\n')}}), encoding='utf-8')
+    ra = tmp_path / 'out'
+    assert KS.main(['--goc', str(goc), '--goc-repo', str(repo), '--ra', str(ra)]) == 1
+    rows = _doc_csv(ra / 'bang.csv')
+    assert rows[0]['ket_qua'] == 'khong_khop'
+
+
+def test_05_data_thieu_o_goc_repo(tmp_path):
+    repo, goc = _lam_repo(tmp_path)
+    run = goc / '2026-11-20_run02'
+    run.mkdir(parents=True)
+    (run / 'k.json').write_text(json.dumps(
+        {'sha256': {'05_DATA/r/a.csv': sha(b'x\n')}}), encoding='utf-8')
+    ra = tmp_path / 'out'
+    assert KS.main(['--goc', str(goc), '--goc-repo', str(repo), '--ra', str(ra)]) == 1
+    rows = _doc_csv(ra / 'bang.csv')
+    assert rows[0]['ket_qua'] == 'thieu_file'
+
+
+def test_05_data_khong_co_goc_repo(tmp_path):
+    assert KS.ung_vien('05_DATA/r/a.csv', tmp_path, None) == []
+    assert KS.kiem_cap('05_DATA/r/a.csv', sha(b'x\n'), tmp_path, None)[0] == 'khong_co_goc_luot'

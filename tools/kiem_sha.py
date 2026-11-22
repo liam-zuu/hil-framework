@@ -17,7 +17,10 @@ Phan giai duong tuong doi: ten tran -> chi thu muc chua JSON; duong co thu
 muc (ke ca './a.csv', 'F2\\a.jsonl') -> chi goc luot: --goc-luot neu khai
 bao, khong thi thu muc to tien gan nhat cua thu muc JSON (ke ca chinh no)
 co ten khop YYYY-MM-DD_runNN; khong co goc luot -> khong_co_goc_luot
-(ma 3); dich khong ton tai -> thieu_file, khong thu goc repo. Duong tuyet
+(ma 3); dich khong ton tai -> thieu_file, khong thu goc repo. Ngoai le
+duy nhat (CODE 23/11): duong bat dau bang '05_DATA/' la duong tinh tu goc
+repo, chi mot dich goc_repo/<duong> (khong co goc repo -> khong_co_goc_luot,
+ma 3); thu muc luot khong bao gio chua thu muc con 05_DATA. Duong tuyet
 doi giu luat cu. File co st_nlink > 1 (JSON hay file tham chieu) khong mo:
 hard_link (ma 3).
 """
@@ -350,6 +353,12 @@ def ung_vien(duong_dan, thu_muc_json, goc_repo, goc_luot=None):
                             Path(goc_repo, *tach[cuoi + 1:])))
     else:
         rel = s.replace('\\', '/')
+        if '/' in rel and rel.split('/', 1)[0].lower() == '05_data':
+            # duong tinh tu goc repo (vd. khoa_u_h_chung.json cua C8B): mot dich
+            # duy nhat la goc_repo/<duong>; khong thu goc luot hay thu muc JSON
+            if goc_repo is not None:
+                out.append(('goc_repo_05_data', Path(goc_repo) / rel))
+            return out
         if '/' not in rel:
             out.append(('thu_muc_json', Path(thu_muc_json) / rel))
         elif goc_luot is not None:
