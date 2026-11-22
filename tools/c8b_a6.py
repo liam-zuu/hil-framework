@@ -1348,6 +1348,52 @@ def _su_chung(su):
     return {k: v for k, v in su.items() if k not in SU_THEO_SESSION}
 
 
+def rho_max_of(rho_khung, C, side):
+    """The radius domain (23/11, Liam at CODE_C8B, box, verbatim: "Mo theo du lieu (Recommended)", after HIEUCHUAN
+    found the far ends of K1 at corners up to about 1.615 m > the 1.6 m [DE XUAT] of design v2 with no data basis):
+    rho_max = the largest tag centre distance to the plumb point C over EVERY valid frame of the given frames.csv
+    (the clips of the session that the file serves) + side / sqrt 2, the same expression as _rho_ok, so every given
+    frame is inside. None -> RHO_MAX_M (the old proposal). Returns (rho_max, block for mien.rho_theo_khung or None)."""
+    if not rho_khung:
+        return RHO_MAX_M, None
+    files, top = [], -1.0
+    for f in rho_khung:
+        xy = np.asarray(f['xy'], float).reshape(-1, 2)
+        if not len(xy) or not np.all(np.isfinite(xy)):
+            raise A6Error(f'{f["file"]}: no valid frame or non-finite tag centre (rho domain)')
+        r = max(float(np.linalg.norm(p - C)) for p in xy)
+        files.append(dict(file=f['file'], sha256=f['sha256'], n_khung=int(len(xy)), rho_tam_max_m=r))
+        top = max(top, r)
+    rm = top + float(side) / math.sqrt(2.0)
+    return rm, dict(quy_tac='rho_max = max tam ma - diem doi tren moi khung valid cua cac frames.csv + canh / sqrt 2 '
+                            '(cung bieu thuc _rho_ok); Liam 23/11 o CODE_C8B local_31d56744, hop chon: "Mo theo du lieu '
+                            '(Recommended)"; thay 1.6 m [DE XUAT] thiet ke v2',
+                    rho_tam_max_m=top, n_file=len(files), file=files,
+                    gioi_han='do doc g_b do tren clip E toi goc 1.576 m (K1); phan ngoai do la ngoai suy tuyen tinh cua '
+                             'mo hinh mat phang, e_bc tinh tren luoi toi rho_max')
+
+
+def read_rho_khung(paths):
+    """Valid tag centres (tag_x, tag_y; else x, y) of each frames.csv for rho_max_of."""
+    out = []
+    for p in paths:
+        cu.check_path(p)
+        xy = []
+        with open(p, newline='', encoding='utf-8') as f:
+            for row in csv.DictReader(f):
+                if row.get('valid') != '1':
+                    continue
+                kx, ky = ('tag_x', 'tag_y') if row.get('tag_x') not in (None, '') else ('x', 'y')
+                try:
+                    x, y = float(row[kx]), float(row[ky])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if math.isfinite(x) and math.isfinite(y):
+                    xy.append((x, y))
+        out.append(dict(file=os.path.abspath(p), sha256=cu.sha256(p), xy=xy))
+    return out
+
+
 def _cam_list(places, cam_cham, s0):
     """Distinct cameras {session_sha256, cam_tam_m, vai} of the E places and of the scoring sessions (cam_cham, from
     gop --session-cham; same L125 set-up as the places, else A6Error): e_bc is taken over all of them (da session)."""
@@ -1376,7 +1422,7 @@ def set_up_of_session(ses):
 
 def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=None, khoa_truoc_sha256=None,
         script=None, cho_sha=(), nguon=(), with_ebc=True, lan_lap_cal_id=None, giu_ngoai_rows=None, khoa=None,
-        cam_cham=(), kiem_imu=None):
+        cam_cham=(), kiem_imu=None, rho_khung=None):
     """c8b_a6_v2 of one plate from the place results (design 2c, 3, 10); the sources are parsed dicts (CLI: files);
     giu_ngoai_rows the rows of the held-out cells (c8b_a6_o.read_rows), khoa the parsed lock JSON (A6C2-2).
     cam_cham: set-ups (set_up_of_session) of the sessions where the file is used for scoring; e_bc is the largest
@@ -1466,6 +1512,7 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
         why.append('khoa_truoc_sha256 missing (the lock before the checks, design 0.3, A6C1-4)')
     if not isinstance(script, dict) or not script.get('commit') or script.get('dirty') is not False:
         why.append(f'script commit not recorded or dirty ({script!r}): no code SHA (A6C1-4)')
+    rho_max, rho_tt = rho_max_of(rho_khung, C, side)
     cams = _cam_list(places, cam_cham, s0)                            # da session (A): every camera of use
     cam_c = cams[0]['cam_tam_m'] if len(cams) == 1 else None
     ebc, ebc_lv, ebc_ses = None, [], []
@@ -1477,7 +1524,8 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
         else:
             vals = []
             for c in cams:
-                v, lv = e_bc(g_hat, eps if eps is not None else (s_norm + uc_norm), C, H, hb, side, c['cam_tam_m'])
+                v, lv = e_bc(g_hat, eps if eps is not None else (s_norm + uc_norm), C, H, hb, side, c['cam_tam_m'],
+                             rho_max=rho_max)
                 ebc_ses.append(dict(c, e_bc_rad=v, e_bc_lan_chia=lv))
                 vals.append((v, lv))
             if any(v is None for v, _ in vals):
@@ -1492,9 +1540,9 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
         # 22/11 (Liam at CODE_C8B, box, after the first official gop gave 2.46 deg: "Mien theo du lieu (Recommended)"):
         # no fixed tilt cap. The tilt domain is the set the e_bc grid covers (g_b + eps_g in every direction, v within
         # v_max), usable when that grid converged; a grid that did not converge already has its own reason above.
-        mien_ok = bool(rho <= RHO_MAX_M and (ebc is not None or not with_ebc))
-        if not rho <= RHO_MAX_M:
-            why.append(f'outside the A6 domain: a corner at rho {rho:.3f} m (<= {RHO_MAX_M})')
+        mien_ok = bool(rho <= rho_max and (ebc is not None or not with_ebc))
+        if not rho <= rho_max:
+            why.append(f'outside the A6 domain: a corner at rho {rho:.3f} m (<= {rho_max})')
     imu_ok, w_imu, imu_b = kiem_imu_gop(kiem_imu, places, g_hat, eps, ebc, H, hb, tam_id, khoa_truoc_sha256, khoa)
     why += w_imu
     st_a6 = 'dat' if (not why and eps is not None and ebc is not None and imu_ok and o_ok is not False) else 'thieu'
@@ -1534,7 +1582,7 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
                 session=[dict(session_sha256=c['session_sha256'], cam_tam_m=c['cam_tam_m'], vai=c['vai']) for c in cams],
                 a6du_rad_per_m=None if eps is None else float(eps / (2.0 * (H - hb))),
                 H_m=float(H), h_m=float(hb), plumb_xy_m=[float(x) for x in C], side_m=float(side), cam_tam_m=cam_c,
-                mien=dict(rho_max_m=RHO_MAX_M,
+                mien=dict(rho_max_m=rho_max, rho_theo_khung=rho_tt, rho_de_xuat_cu_m=RHO_MAX_M,
                           nghieng_max_rad=None if g_hat is None else float(math.atan(float(np.linalg.norm(g_hat))
                                                                                      + (eps or 0.0))),
                           nghieng_quy_tac='mien nghieng = vung luoi e_bc da hoi tu: atan(|g_b| + eps_g); khong tran co '
@@ -2374,6 +2422,9 @@ def main(argv=None):
     a2.add_argument('--session-cham', action='append', default=[],
                     help='session.json of a camera session where the file is used for scoring (repeat; e_bc is the '
                          'largest over the E places and these, da session (A))')
+    a2.add_argument('--rho-max-khung', action='append', default=[],
+                    help='frames.csv of a clip the file serves (repeat): rho_max = largest centre rho + side/sqrt2 '
+                         '(Liam 23/11); none: the old 1.6 m')
     a2.add_argument('--out', required=True)
     a3 = sub.add_parser('kiem_imu', help='heading channel (camera - IMU) of a held-out E clip')
     a3.add_argument('--frames', required=True)
@@ -2547,7 +2598,11 @@ def main(argv=None):
                 nguon.append(dict(vai='kiem_imu', file=os.path.abspath(ip), sha256=cu.sha256(ip)))
             out = gop(places, a.tam_id, a.tam_cal_id, src['lap'], src['dong'], src['giu_ngoai'], src['u_h'], khoa,
                       script_state(), shas, nguon, lan_lap_cal_id=a.lan_lap_cal_id, giu_ngoai_rows=rows,
-                      khoa=khoa_d, cam_cham=cam_cham, kiem_imu=imu)
+                      khoa=khoa_d, cam_cham=cam_cham, kiem_imu=imu,
+                      rho_khung=read_rho_khung(a.rho_max_khung) if a.rho_max_khung else None)
+            for f in (out['mien'].get('rho_theo_khung') or {}).get('file') or []:
+                nguon.append(dict(vai='rho_max_khung', file=f['file'], sha256=f['sha256']))
+            out['nguon'] = list(nguon)
             out.update(script=script_state(), luc=datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
             _write(a.out, out)
             print(f'A6 {out["trang_thai"]}; g_b {out["g_b"]} eps_g {out["eps_g"]} e_bc {out["e_bc_rad"]}; '
