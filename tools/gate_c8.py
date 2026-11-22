@@ -39,6 +39,7 @@ import csv
 import io
 import math
 import os
+import posixpath
 import re
 import sys
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -954,35 +955,58 @@ def _check_luot_k(d: dict) -> list:
 
 
 def _check_tien_de(d: dict) -> List[dict]:
-    """tien_de_c8 {buoi, doan: [{ten, dau [two clips H], cuoi, file, kiem_cheo}]}: one entry per camera segment that
-    holds C8 runs, in session order (CODE 20/11 after C8 session 2: three camera segments, each mounting with its own
-    sessions; J v6 section 5 J3-5 read per segment: two clips H at its start, one at its end; a segment without C8 runs
-    is not listed; KIEMCHEO fix/c8-kiemcheo-doan: one kiem_cheo.json and one premise per segment, its name doan.ten).
-    Returns [{ten, clips [dau1, dau2, cuoi], file, kiem_cheo}]."""
-    t = _obj(d['tien_de_c8'], ('buoi', 'doan'), 'tien_de_c8')
-    _text(t['buoi'], 'tien_de_c8.buoi')                 # GC6-4: the C8 session the premise belongs to
-    ds = t['doan']
-    if not isinstance(ds, list) or not ds:
-        raise GateFileError('tien_de_c8.doan: a non-empty list of the camera segments that hold C8 runs')
-    out, shas, names = [], set(), set()
-    for i, s in enumerate(ds):
-        w = f'tien_de_c8.doan[{i}]'
-        _obj(s, ('ten', 'dau', 'cuoi', 'file', 'kiem_cheo'), w)
-        ten = _text(s['ten'], f'{w}.ten')
-        if ten in names:
-            raise GateFileError(f'{w}.ten {ten!r}: each segment once')
-        names.add(ten)
-        if not isinstance(s['dau'], list) or len(s['dau']) != 2 or s['cuoi'] is None:
-            raise GateFileError(f'{w}: two clips H at the start of the segment (dau), one at its end (cuoi); missing '
-                                'one, C8 is not locked: CAN LIAM QUYET (J v6 section 5 J3-5, section 0b)')
-        clips = [_ref(x, f'{w}.dau[{j}]') for j, x in enumerate(s['dau'])] + [_ref(s['cuoi'], f'{w}.cuoi')]
-        for x in clips:
-            if x['sha256'] in shas:
-                raise GateFileError(f'{w}: a clip H used twice (every clip H of the session is a different clip)')
-            shas.add(x['sha256'])
-        _ref(s['file'], f'{w}.file')
-        _ref(s['kiem_cheo'], f'{w}.kiem_cheo')
-        out.append(dict(ten=ten, clips=clips, file=s['file'], kiem_cheo=s['kiem_cheo']))
+    """The C8 sessions (CODE 22/11, C8 contract section 3: a lost run rerun in a later floor session; one folder per
+    session): thu_tu_clip [one reference per session, in session order; the folder of the session is the folder of its
+    file] and tien_de_c8 [{buoi, doan: [{ten, dau [two clips H], cuoi, file, kiem_cheo}]}, same order]. The folders
+    differ, none inside another; the files of a segment lie in the folder of its session. doan: one entry per camera
+    segment that holds C8 runs, in session order (CODE 20/11 after C8 session 2: three camera segments, each mounting
+    with its own sessions; J v6 section 5 J3-5 read per segment: two clips H at its start, one at its end; a segment
+    without C8 runs is not listed; KIEMCHEO fix/c8-kiemcheo-doan: one kiem_cheo.json and one premise per segment, its
+    name doan.ten, once in its session). Returns [{ten, clips [dau1, dau2, cuoi], file, kiem_cheo, buoi, k}] of every
+    session in order (k the session index)."""
+    tts, tds = d['thu_tu_clip'], d['tien_de_c8']
+    if not isinstance(tts, list) or not tts or not isinstance(tds, list) or len(tds) != len(tts):
+        raise GateFileError('thu_tu_clip, tien_de_c8: one entry for each C8 session, in session order, as many of one '
+                            'as of the other (CODE 22/11)')
+    out, shas, ids, folders = [], set(), set(), []
+    for k, (tt, t) in enumerate(zip(tts, tds)):
+        f = _folder_of(_ref(tt, f'thu_tu_clip[{k}]'))
+        if any(f == g or _under(f, g) or _under(g, f) for g in folders):
+            raise GateFileError(f'thu_tu_clip[{k}] {tt["duong_dan"]!r}: one folder for each C8 session, none inside '
+                                'another (CODE 22/11)')
+        folders.append(f)
+        w0 = f'tien_de_c8[{k}]'
+        _obj(t, ('buoi', 'doan'), w0)
+        b = _text(t['buoi'], f'{w0}.buoi')               # GC6-4: the C8 session the premise belongs to
+        if b in ids:
+            raise GateFileError(f'{w0}.buoi {b!r}: each C8 session once')
+        ids.add(b)
+        ds = t['doan']
+        if not isinstance(ds, list) or not ds:
+            raise GateFileError(f'{w0}.doan: a non-empty list of the camera segments that hold C8 runs')
+        names = set()
+        for i, s in enumerate(ds):
+            w = f'{w0}.doan[{i}]'
+            _obj(s, ('ten', 'dau', 'cuoi', 'file', 'kiem_cheo'), w)
+            ten = _text(s['ten'], f'{w}.ten')
+            if ten in names:
+                raise GateFileError(f'{w}.ten {ten!r}: each segment once in its session')
+            names.add(ten)
+            if not isinstance(s['dau'], list) or len(s['dau']) != 2 or s['cuoi'] is None:
+                raise GateFileError(f'{w}: two clips H at the start of the segment (dau), one at its end (cuoi); missing '
+                                    'one, C8 is not locked: CAN LIAM QUYET (J v6 section 5 J3-5, section 0b)')
+            clips = [_ref(x, f'{w}.dau[{j}]') for j, x in enumerate(s['dau'])] + [_ref(s['cuoi'], f'{w}.cuoi')]
+            for x in clips:
+                if x['sha256'] in shas:
+                    raise GateFileError(f'{w}: a clip H used twice (every clip H of C8 is a different clip)')
+                shas.add(x['sha256'])
+            _ref(s['file'], f'{w}.file')
+            _ref(s['kiem_cheo'], f'{w}.kiem_cheo')
+            for x in clips + [s['file'], s['kiem_cheo']]:
+                if not _under(x['duong_dan'], f):
+                    raise GateFileError(f'{w}: {x["duong_dan"]!r} is not in the folder {f!r} of its session (a session '
+                                        'computes its own premise, sessions and checks; CODE 22/11)')
+            out.append(dict(ten=ten, clips=clips, file=s['file'], kiem_cheo=s['kiem_cheo'], buoi=b, k=k))
     return out
 
 
@@ -1063,7 +1087,6 @@ def check(d) -> dict:
         raise GateFileError(f'lich_doi_chieu {d["lich_doi_chieu"]!r}: {LICH!r} (the schedule Uhat is computed on)')
     _check_bo_cham(d)
     _ref(d['ke_hoach_c8'], 'ke_hoach_c8')
-    _ref(d['thu_tu_clip'], 'thu_tu_clip')
     _ref(d['khoa_c8b'], 'khoa_c8b')
     cells = _check_cells(d)
     runs = _check_runs(d, cells)
@@ -1187,6 +1210,30 @@ def _csv_rows(goc: str, ref: dict, what: str) -> List[dict]:
     if rd.fieldnames is None or any(c not in rd.fieldnames for c in THU_TU_COLS):
         raise GateFileError(f'{what} {ref["duong_dan"]!r}: a CSV with the columns {THU_TU_COLS} (F18 (1))')
     return list(rd)
+
+
+def _folder_of(ref: dict) -> str:
+    """The folder of a C8 session: the folder of its thu_tu_clip.csv, relative to the C8 folder ('' for the folder
+    itself)."""
+    return posixpath.dirname(ref['duong_dan'])
+
+
+def _under(path: str, folder: str) -> bool:
+    return folder == '' or path.startswith(folder + '/')
+
+
+def _buoi_rows(goc: str, refs: list) -> Tuple[List[dict], List[Tuple[int, int]]]:
+    """The rows of the thu_tu_clip.csv of every C8 session, session after session (CODE 22/11, C8 contract section 3:
+    a rerun of a lost run in a later floor session; the chain of a cell runs through the sessions in order), and
+    [(first, end) row index of each session]. Each row carries _buoi (the session index) and _vt (file and row)."""
+    rows, slices = [], []
+    for k, ref in enumerate(refs):
+        lo = len(rows)
+        for i, r in enumerate(_csv_rows(goc, ref, f'thu_tu_clip[{k}]')):
+            r['_buoi'], r['_vt'] = k, f'{ref["duong_dan"]} row {i + 2}'
+            rows.append(r)
+        slices.append((lo, len(rows)))
+    return rows, slices
 
 
 def _time_file(goc: str, ref: dict, w: str, cell: dict) -> Tuple[dict, str, list]:
@@ -1513,17 +1560,21 @@ def _clip_row(goc: str, ref: dict, w: str, rows: List[dict]) -> int:
     return hit[0]
 
 
-def _doan_spans(goc: str, segs: List[dict], rows: List[dict]) -> List[Tuple[int, int]]:
+def _doan_spans(goc: str, segs: List[dict], rows: List[dict], slices: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     """[(row of its last clip H at the start, row of its clip H at the end)] of each camera segment (CODE 20/11 after
-    C8 session 2): its runs are the rows strictly between; the segments in session order, never overlapping."""
+    C8 session 2), row indices of rows (_buoi_rows): its runs are the rows strictly between; the clips H of a segment
+    are rows of its own session (CODE 22/11); the segments of a session in session order, never overlapping."""
     spans = []
-    for k, s in enumerate(segs):
-        w = f'tien_de_c8.doan[{k}] ({s["ten"]})'
-        lo = max(_clip_row(goc, x, f'{w} clip {r}', rows) for x, r in zip(s['clips'][:2], TD_ROLES[:2]))
-        hi = _clip_row(goc, s['clips'][2], f'{w} clip cuoi', rows)
-        if not lo < hi or (spans and not spans[-1][1] < min(_clip_row(goc, x, w, rows) for x in s['clips'][:2])):
+    for n, s in enumerate(segs):
+        w = f'tien_de_c8[{s["k"]}] segment {s["ten"]!r}'
+        b0, b1 = slices[s['k']]
+        sub = rows[b0:b1]
+        at = [b0 + _clip_row(goc, x, f'{w} clip {r}', sub) for x, r in zip(s['clips'], TD_ROLES)]
+        lo, hi = max(at[:2]), at[2]
+        if not lo < hi or (n and segs[n - 1]['k'] == s['k'] and not spans[-1][1] < min(at[:2])):
             raise GateFileError(f'{w}: its clips H at the start come before its clip H at the end, after the end of the '
-                                'segment before it in thu_tu_clip.csv (segments in session order, not overlapping)')
+                                'segment before it in the thu_tu_clip.csv of its session (segments in session order, '
+                                'not overlapping)')
         spans.append((lo, hi))
     return spans
 
@@ -1623,7 +1674,8 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
     eligible run: mien_phai_phu of its kept nodes}, {run_id: time of its first scoring (script.luc_chay)}, {scorer
     commits of the scored grids})."""
     plan_cells = {c['o'] for c in d['o_c8']}
-    rows = _csv_rows(goc, d['thu_tu_clip'], 'thu_tu_clip')
+    segs = _check_tien_de(d)                             # CODE 20/11 after C8 session 2: the camera segments
+    rows, slices = _buoi_rows(goc, d['thu_tu_clip'])     # CODE 22/11: every C8 session, in session order
     by_clip, order = {}, {o: [] for o in plan_cells}
     for i, r in enumerate(rows):
         full = (r.get('buoc') or '').strip()
@@ -1631,25 +1683,24 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
         if b in plan_cells:
             j = len(order[b])                            # GC9-4: the run itself first, then _lai1, _lai2, ... in turn
             if full != (b if j == 0 else f'{b}_lai{j}'):
-                raise GateFileError(f'thu_tu_clip row {i + 2}: buoc {full!r}; the {j + 1}th row of cell {b} must be '
+                raise GateFileError(f'thu_tu_clip {r["_vt"]}: buoc {full!r}; the {j + 1}th row of cell {b} must be '
                                     f'{b if j == 0 else f"{b}_lai{j}"!r} (the run first, then its reruns in turn; GC9-4)')
             order[b].append(r['clip'])
         elif RUN_CODE.match(b):
-            raise GateFileError(f'thu_tu_clip row {i + 2}: run {b!r} (clip {r.get("clip")!r}) is no cell of the plan '
+            raise GateFileError(f'thu_tu_clip {r["_vt"]}: run {b!r} (clip {r.get("clip")!r}) is no cell of the plan '
                                 '(a figure-8 run outside the locked list)')
         elif full.startswith('C8-') and not RUN_CODE_K.match(full) and not CLIP_KHOA_K.match(full):
             # CODE 20/11 (the luot_c8 check of c8b_u cong, C8BU4-R1-3, now here): a mistyped run code would drop a run
-            raise GateFileError(f'thu_tu_clip row {i + 2}: buoc {full!r} (clip {r.get("clip")!r}) reads as a C8 run '
+            raise GateFileError(f'thu_tu_clip {r["_vt"]}: buoc {full!r} (clip {r.get("clip")!r}) reads as a C8 run '
                                 'code but is neither a run of the plan (or its _lai<n>) nor a K run: a mistyped code '
                                 'would leave a run out of the gate')
         else:
             continue
         if r['clip'] in by_clip:
-            raise GateFileError(f'thu_tu_clip: clip {r["clip"]!r} twice')
+            raise GateFileError(f'thu_tu_clip: clip {r["clip"]!r} twice ({by_clip[r["clip"]]["_vt"]}, {r["_vt"]})')
         by_clip[r['clip']] = r
     eligible, cham_luc, logs_seen, clip_shas, scorers = {}, {}, {}, {}, set()
-    segs = _check_tien_de(d)                             # CODE 20/11 after C8 session 2: the camera segments
-    spans = _doan_spans(goc, segs, rows)
+    spans = _doan_spans(goc, segs, rows, slices)
     part_drift = {}                                      # GC6-3 (round 3): one comparison per camera segment
     for c in d['o_c8']:
         got = [x['clip'] for x in c['chuoi']]
@@ -1698,6 +1749,10 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
                                         'carries it (file_log; GC6-1)')
             else:
                 _ref_bytes(goc, x['file_log'], f'{w}: file_log')
+                bf = _folder_of(d['thu_tu_clip'][row['_buoi']])
+                if not _under(x['file_log']['duong_dan'], bf):
+                    raise GateFileError(f'{w}: file_log {x["file_log"]["duong_dan"]!r} is not in the folder {bf!r} of '
+                                        'the session of its row (CODE 22/11)')
                 if os.path.basename(x['file_log']['duong_dan']) != lp:
                     raise GateFileError(f'{w}: file_log {x["file_log"]["duong_dan"]!r}: thu_tu_clip.csv names '
                                         f'{row.get("log_pi")!r} for clip {x["clip"]!r} (GC6-1)')
@@ -2095,8 +2150,8 @@ def _check_premise(d: dict, goc: str, hs: dict, rec: dict) -> None:
     # premise of the C8 lock (design section 9; GC6-4: by role, of this session, readable session files), one premise
     # file per camera segment that holds C8 runs (CODE 20/11 after C8 session 2; KIEMCHEO: roles dau1, dau2, cuoi)
     models, tmods, kc_segs = set(), set(), set()
-    for k, seg in enumerate(_check_tien_de(d)):
-        w = f'tien_de_c8.doan[{k}] ({seg["ten"]})'
+    for seg in _check_tien_de(d):
+        w = f'tien_de_c8[{seg["k"]}] segment {seg["ten"]!r}'
         clips = seg['clips']
         for role, x in zip(TD_ROLES, clips):
             _check_session(_open_ref(goc, x, f'{w} clip {role}'), f'{w} clip {role}')
@@ -2106,9 +2161,9 @@ def _check_premise(d: dict, goc: str, hs: dict, rec: dict) -> None:
                                 f'ket_qua {td.get("ket_qua")!r}: C8 is not locked, CAN LIAM QUYET (J v6 section 5 J3-5, '
                                 'section 0b)')
         dn = td.get('doan') if isinstance(td.get('doan'), dict) else {}
-        if td.get('session_id') != d['tien_de_c8']['buoi'] or dn.get('ten') != seg['ten']:
+        if td.get('session_id') != seg['buoi'] or dn.get('ten') != seg['ten']:
             raise GateFileError(f'{w}.file: the premise of session {td.get("session_id")!r}, segment {dn.get("ten")!r}; '
-                                f'the gate is of {d["tien_de_c8"]["buoi"]!r}, segment {seg["ten"]!r} (GC6-4)')
+                                f'the gate has it in session {seg["buoi"]!r}, segment {seg["ten"]!r} (GC6-4)')
         # the kiem_cheo.json of the segment: the one its premise names, of that segment, locked by the S7 manifest and
         # commit of the dossier (KCJ1-14; CODE 20/11 after C8 session 2: one kiem_cheo result per segment)
         kcg = _open_ref(goc, seg['kiem_cheo'], f'{w}.kiem_cheo')
@@ -2142,7 +2197,7 @@ def _check_premise(d: dict, goc: str, hs: dict, rec: dict) -> None:
                 raise GateFileError(f'{w}: the clip of role {role} is not the session the premise gives for it (GC6-4)')
     if hs['khoa_kiem_luc']['kiem_cheo']['sha256'] not in kc_segs:
         raise GateFileError('chuan_u.ho_so_c8: khoa_kiem_luc.kiem_cheo is the kiem_cheo.json of no segment of '
-                            'tien_de_c8.doan (GC10-5)')
+                            'tien_de_c8 (GC10-5)')
     if len(models) != 1 or not tmods <= models:
         raise GateFileError(f'tien_de_c8: the clip H sessions of every segment use the models '
                             f'{sorted(map(str, models))} (premise models {sorted(map(str, tmods))}): one locked model '
@@ -2381,13 +2436,14 @@ def is_fake(d: dict) -> bool:
 
 
 def has_fake_sign(d: dict) -> bool:
-    """GC6-14 (round 3): any one FAKE mark (c8_dir, written_by.script, bo_cham.phien_ban, tien_de_c8.buoi, a source
+    """GC6-14 (round 3): any one FAKE mark (c8_dir, written_by.script, bo_cham.phien_ban, tien_de_c8[].buoi, a source
     path under FAKE/, a car_pose version): a real gate carries none; the real reading paths refuse it unless the whole
     content is FAKE (is_fake) and FAKE is allowed (tests, demo)."""
     wb = d.get('written_by') if isinstance(d.get('written_by'), dict) else {}
     bc = d.get('bo_cham') if isinstance(d.get('bo_cham'), dict) else {}
-    td = d.get('tien_de_c8') if isinstance(d.get('tien_de_c8'), dict) else {}
-    return ('FAKE' in (d.get('c8_dir'), wb.get('script'), bc.get('phien_ban'), td.get('buoi'))
+    tds = d.get('tien_de_c8') if isinstance(d.get('tien_de_c8'), list) else []
+    return ('FAKE' in (d.get('c8_dir'), wb.get('script'), bc.get('phien_ban'))
+            or any(isinstance(t, dict) and t.get('buoi') == 'FAKE' for t in tds)
             or any(str(r.get('duong_dan', '')).startswith('FAKE/') for r in _refs(d))
             or '"FAKE"' in json.dumps(d.get('camera'), ensure_ascii=False))
 
@@ -2469,10 +2525,10 @@ def fake_gate(levels=('O1-F05',), u_p_m=0.002, u_psi_deg=2.0, u_t_s=0.010) -> di
                 levels=lv, muc_kha_thi=lv, muc_bo_theo_liam={}, quyet_liam={}, u_t_branch='bo_tick',
                 lich_doi_chieu=LICH,
                 bo_cham=dict(phien_ban='FAKE', bang_man_trap={k: dict(nhanh='mot_khung') for k in lv + [TASK_K]}),
-                ke_hoach_c8=ref('ke_hoach_c8.json'), thu_tu_clip=ref('thu_tu_clip.csv'),
+                ke_hoach_c8=ref('ke_hoach_c8.json'), thu_tu_clip=[ref('thu_tu_clip.csv')],
                 khoa_c8b=ref('c8b_khoa_v5.json'), o_c8=cells, chuan_u=cu,
-                tien_de_c8=dict(buoi='FAKE', doan=[dict(ten='FAKE', dau=[clip(1), clip(2)], cuoi=clip(3),
-                                                        file=ref('tien_de_c8.json'), kiem_cheo=ref('kiem_cheo.json'))]),
+                tien_de_c8=[dict(buoi='FAKE', doan=[dict(ten='FAKE', dau=[clip(1), clip(2)], cuoi=clip(3),
+                                                         file=ref('tien_de_c8.json'), kiem_cheo=ref('kiem_cheo.json'))])],
                 runs_c8=runs, muc_loai_e_do={k: [] for k in lv},
                 chung_cu_muc={k: dict(e_do={c: [f'FAKE_{k}_{c}'] for c in CONTROLLERS},
                                       g4={c: [f'FAKE_{k}_{c}'] for c in CONTROLLERS}) for k in lv},
@@ -2532,9 +2588,11 @@ class _Kho:
             raise GateFileError(f'ghep: {rel!r} is no file under the C8 folder {self.goc!r}')
         return dict(duong_dan=os.path.relpath(p, self.goc).replace(os.sep, '/'), sha256=sha256_file(p))
 
-    def by(self, sha, what: str, name: Optional[str] = None) -> dict:
-        """The reference of the file of sha256 sha (the one named `name` when several files have those bytes)."""
-        rels = [r for r in self.by_sha.get(sha, []) if name is None or os.path.basename(r) == name]
+    def by(self, sha, what: str, name: Optional[str] = None, under: Optional[str] = None) -> dict:
+        """The reference of the file of sha256 sha (the one named `name` when several files have those bytes; one in
+        the folder `under`, CODE 22/11: a session's own copy)."""
+        rels = [r for r in self.by_sha.get(sha, []) if (name is None or os.path.basename(r) == name)
+                and (under is None or _under(r, under))]
         if not _hex64(sha) or not rels:
             raise GateFileError(f'ghep: {what}: no file with sha256 {str(sha)[:12]}... under the C8 folder'
                                 + (f' named {name!r}' if name else ''))
@@ -2599,6 +2657,8 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
          quyet_liam: Optional[dict] = None, o_hong_theo_liam: Optional[dict] = None) -> dict:
     """The gate content of C8 assembled from its sources under the C8 folder goc (paths relative to it; F10-F19, the
     contract of 19/11 with C8B: the gate reads the C8B files, C8B does not call the gate):
+      sessions     thu_tu_clip: the thu_tu_clip.csv of one C8 session (a path) or of each, in session order (a list;
+                   CODE 22/11: a lost run rerun in a later floor session; the folder of a session is that of its file)
       cells        the plan (ke_hoach_c8_v1) and thu_tu_clip.csv: every physical run of a cell in clip order, run_id =
                    the buoc of its row; its scoring luoi.json is the one of that clip (clip.ten) that is no second
                    scoring of another (file_cham_h1); the time file, log, score.json of its operations, clip H
@@ -2615,7 +2675,8 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
                    (cham_luc = the first scoring time of every run, _scoring_times; giu_ngoai = every C8 run, CODE
                    20/11, GC9-2; khoa_kiem_luc = the khoa_s7 record of kiem_cheo.json, its file by the path it names)
       premise      one tien_de_buoi_v1 file per camera segment that holds C8 runs (tien_de: a path or a list) and
-                   the three session files each names by sha256, by role (dau1, dau2, cuoi; CODE 20/11)
+                   the three session files each names by sha256, by role (dau1, dau2, cuoi; CODE 20/11); each with the
+                   session whose folder holds it, its files and the logs of its rows found in that folder (CODE 22/11)
       camera       khoa_sha256, mien_car_pose, eps_H of the C8b lock; the U manifests of the eligible scorings, the
                    largest of each of their four numbers and their common nguon
     The content is checked by write_gate (check and check_nguon) before anything is written; ho_so is written first
@@ -2623,7 +2684,8 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
     if _bad_rel(ho_so):                                  # GC9-8: never a file outside the C8 folder
         raise GateFileError(f'ghep: --ho-so {ho_so!r}: a path relative to the C8 folder, inside it')
     kho = _Kho(goc)
-    kh_ref, tt_ref, kc8_ref, kcj_ref = (kho.ref(p) for p in (ke_hoach, thu_tu_clip, khoa_c8b, kiem_cheo))
+    kh_ref, kc8_ref, kcj_ref = (kho.ref(p) for p in (ke_hoach, khoa_c8b, kiem_cheo))
+    tt_refs = [kho.ref(p) for p in ([thu_tu_clip] if isinstance(thu_tu_clip, str) else list(thu_tu_clip))]
     kh, khoa, kcj = kho.json(kh_ref), kho.json(kc8_ref), kho.json(kcj_ref)
     td_refs = [kho.ref(p) for p in ([tien_de] if isinstance(tien_de, str) else list(tien_de))]   # one per segment
     if set(bang_chung) != set(CHUAN_U_DK):
@@ -2631,7 +2693,7 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
     kt = khoa.get('muc_kha_thi')
     if not isinstance(kt, list) or not kt:
         raise GateFileError('ghep: the C8b lock has no muc_kha_thi')
-    rows = _csv_rows(kho.goc, tt_ref, 'thu_tu_clip')
+    rows, slices = _buoi_rows(kho.goc, tt_refs)          # CODE 22/11: one thu_tu_clip.csv per C8 session, in order
     plan = {x['o']: x for x in kh.get('o') or []}
     giu_hong = o_hong_theo_liam or {}
     if not isinstance(giu_hong, dict) or any(o not in plan for o in giu_hong):
@@ -2661,18 +2723,19 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
             fg_ref = None if fc.get('gio_sha256') is None else kho.by(fc['gio_sha256'], f'{w}: time file')
             fg = None if fg_ref is None else kho.json(fg_ref)
             log_ref = tt_src = None
+            bf = _folder_of(tt_refs[r['_buoi']])                        # CODE 22/11: the log in its session's folder
             if fg is not None:
                 esp = (fg.get('sha256') or {}).get('esp32')
                 name = next((n.get('file') for n in fg.get('nguon') or [] if isinstance(n, dict)
                              and n.get('sha256') == esp), None)
-                log_ref = kho.by(esp, f'{w}: ESP32 log', name)
+                log_ref = kho.by(esp, f'{w}: ESP32 log', name, under=bf)
                 tt_src = _ref_of(kho, fg.get('thao_tac_nguon'), f'{w}: thao_tac_nguon')
             if fg is None and (r.get('log_pi') or '').strip():          # GC6-1 (round 5): by the name the CSV gives
                 ln = os.path.basename(r['log_pi'].strip().replace('\\', '/'))
-                hits = [q for qs in kho.by_sha.values() for q in qs if os.path.basename(q) == ln]
+                hits = [q for qs in kho.by_sha.values() for q in qs if os.path.basename(q) == ln and _under(q, bf)]
                 if len(hits) != 1:
-                    raise GateFileError(f'{w}: the log {ln!r} thu_tu_clip.csv names is on {len(hits)} files under the C8 '
-                                        'folder; one needed')
+                    raise GateFileError(f'{w}: the log {ln!r} thu_tu_clip.csv names is on {len(hits)} files in the '
+                                        f'folder {bf!r} of its session; one needed')
                 log_ref = kho.ref(hits[0])
             fc1_ref = _ref_of(kho, fc.get('file_cham_h1'), f'{w}: file_cham_h1')
             fg1_ref = _ref_of(kho, fc.get('file_gio_h1'), f'{w}: file_gio_h1')
@@ -2806,9 +2869,14 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
         with open(p, 'xb') as f:
             f.write(raw)
     # premise: one tien_de file per camera segment, its three session files by role (CODE 20/11 after C8 session 2);
-    # the segments in session order (row of their clip H at the end in thu_tu_clip.csv)
-    doan, buoi = [], set()
+    # each in the folder of its session (CODE 22/11), the segments of a session in order (row of their clip H at the end
+    # in its thu_tu_clip.csv)
+    per_buoi = [[] for _ in tt_refs]
     for td_ref in td_refs:
+        ks = [k for k, t in enumerate(tt_refs) if _under(td_ref['duong_dan'], _folder_of(t))]
+        if len(ks) != 1:
+            raise GateFileError(f'ghep: tien_de file {td_ref["duong_dan"]!r} is in the folder of {len(ks)} C8 sessions '
+                                '(the folders of the thu_tu_clip files); one needed')
         td = kho.json(td_ref)
         roles = td.get('vai_tro_clip_h') or {}
         ses = (td.get('sha256') or {}).get('sessions') or {}
@@ -2816,13 +2884,21 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
         if sorted(by_role) != sorted(TD_ROLES) or len(by_role) != len(roles):
             raise GateFileError(f'ghep: tien_de file {td_ref["duong_dan"]!r}: vai_tro_clip_h gives {sorted(roles.values())}'
                                 f', the roles {TD_ROLES} once each needed')
-        cr = [kho.by(ses.get(by_role[role]), f'session of {role} ({td_ref["duong_dan"]})') for role in TD_ROLES]
-        kcr = kho.by((td.get('sha256') or {}).get('kiem_cheo'), f'kiem_cheo.json of {td_ref["duong_dan"]}')
-        doan.append(dict(ten=(td.get('doan') or {}).get('ten'), dau=cr[:2], cuoi=cr[2], file=td_ref, kiem_cheo=kcr))
-        buoi.add(td.get('session_id'))
-    doan.sort(key=lambda s: _clip_row(kho.goc, s['cuoi'], f'ghep: clip H at the end of {s["ten"]!r}', rows))
-    if len(buoi) != 1:
-        raise GateFileError(f'ghep: the premise files are of the sessions {sorted(map(str, buoi))}; one C8 session')
+        bf = _folder_of(tt_refs[ks[0]])
+        cr = [kho.by(ses.get(by_role[role]), f'session of {role} ({td_ref["duong_dan"]})', under=bf) for role in TD_ROLES]
+        kcr = kho.by((td.get('sha256') or {}).get('kiem_cheo'), f'kiem_cheo.json of {td_ref["duong_dan"]}', under=bf)
+        per_buoi[ks[0]].append((td.get('session_id'), dict(ten=(td.get('doan') or {}).get('ten'), dau=cr[:2],
+                                                            cuoi=cr[2], file=td_ref, kiem_cheo=kcr)))
+    tien_de_c8 = []
+    for k, segs in enumerate(per_buoi):
+        ids = {b for b, _ in segs}
+        if len(ids) != 1:
+            raise GateFileError(f'ghep: the premise files of the session of {tt_refs[k]["duong_dan"]!r} are of the '
+                                f'sessions {sorted(map(str, ids))}; one C8 session (one premise per camera segment)')
+        b0, b1 = slices[k]
+        doan = sorted((s_ for _, s_ in segs), key=lambda s_: _clip_row(
+            kho.goc, s_['cuoi'], f'ghep: clip H at the end of {s_["ten"]!r}', rows[b0:b1]))
+        tien_de_c8.append(dict(buoi=next(iter(ids)), doan=doan))
     # camera: the U manifests of the eligible scorings
     mans = kho.all_json(lambda m, rel: isinstance(m, dict) and m.get('format') == MANIFEST_FORMAT
                         and m.get('file_cham_sha256') in eligible)
@@ -2852,10 +2928,10 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
                 bo_cham=dict(phien_ban=phien or kc8_ref['sha256'],
                              bang_man_trap={k: _man_trap_rel(kho.goc, (khoa.get('bang_man_trap') or {}).get(k))
                                             for k in list(kt) + [TASK_K]}),
-                ke_hoach_c8=kh_ref, thu_tu_clip=tt_ref, khoa_c8b=kc8_ref, o_c8=cells,
+                ke_hoach_c8=kh_ref, thu_tu_clip=tt_refs, khoa_c8b=kc8_ref, o_c8=cells,
                 chuan_u=dict(loai=CHUAN_U_LOAI, le=CHUAN_U_LE, ho_so_c8=kho.ref(ho_so),
                              dieu_kien={k: dict(trang_thai='dat', bang_chung=bc_refs[k]) for k in CHUAN_U_DK}),
-                tien_de_c8=dict(buoi=next(iter(buoi)), doan=doan),
+                tien_de_c8=tien_de_c8,
                 runs_c8=runs, muc_loai_e_do=loai,
                 chung_cu_muc={k: {q: v for q, v in evidence_of(runs[k]).items() if q != 'loai'} for k in kt if not loai[k]},
                 dieu_2b=dict(thresholds={c: o1_gate.THRESHOLDS[c] for c in MASKABLE}, per_level=per), camera=cam,
@@ -2872,7 +2948,9 @@ def main(argv=None) -> int:
     g = sub.add_parser('ghep', help='the gate file gate_c8_v2 from the sources under the C8 folder (see ghep())')
     g.add_argument('--goc', required=True, help='the C8 folder (every other path relative to it)')
     g.add_argument('--ke-hoach', required=True)
-    g.add_argument('--thu-tu-clip', required=True)
+    g.add_argument('--thu-tu-clip', action='append', required=True,
+                   help='the thu_tu_clip.csv of a C8 session, once per session in session order (the folder of the '
+                        'session is its folder; CODE 22/11)')
     g.add_argument('--khoa-c8b', required=True, help='c8b_khoa_v5')
     g.add_argument('--tien-de', action='append', required=True,
                    help='tien_de_buoi_v1 of KIEMCHEO, once per camera segment that holds C8 runs')
