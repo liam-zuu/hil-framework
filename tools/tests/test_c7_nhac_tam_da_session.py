@@ -78,9 +78,10 @@ def test_v4_14_same_session_pairs_as_one_session(files):
 
 
 def test_v4_14_cross_session_du_zero_changes_nothing(files, monkeypatch):
-    """Every run in session 2, every fit window in session 1, du_m = 0: the band and the beta term are 0. With the
-    tag-edge gate off every number equals the one-session result; with the gate on (default, CODE_KHUNG sec 5) the
-    scale / c_B comparisons across sessions are khong_xac_dinh: no lan_lap_id, delta_c_B chua_ket_luan."""
+    """Every run in session 2, every fit window in session 1, du_m = 0: the band and the beta term are 0. Default (Liam
+    23/11, way i): the scale is not compared across sessions (khong_so), c_B raw: same placements as one session,
+    delta_c_B = the raw one, Dh part of U 0, the assumption written. With KHAC_SESSION_BO_THANG off every number equals
+    the one-session result."""
     rows, recs = T.build()
     _, _, _, L1 = T.run(files, rows, recs, tag='z1')
     rows, recs = T.build()
@@ -90,9 +91,15 @@ def test_v4_14_cross_session_du_zero_changes_nothing(files, monkeypatch):
         assert b['beta_deg'] == a['beta_deg'] and b['u_beta_deg'] == a['u_beta_deg']
         assert b['khung_giua_session']['u_beta_deg'] == 0.0 and b['khung_giua_session']['cach'] == 'tho_du_m'
         assert set(b['khung_giua_session']['session_sha256']) == {sha1, sha2}
-        assert b['lan_lap_id'] is None and b['lan_lap_id_ly_do'] == 'lan_lap_khong_xac_dinh'
-        assert 'vien_ma_khac_session' in b['ly_do']['delta_c_B'] and b['trang_thai']['delta_c_B'] == 'chua_ket_luan'
-    monkeypatch.setattr(nt, 'VIEN_MA_KHAC_SESSION_CHAN', False)
+        assert b['lan_lap_id'] == a['lan_lap_id'] and b['chuan_12b'] == a['chuan_12b']
+        assert b['delta_c_B_m'] == a['delta_c_B_tho_m'] and b['delta_h_uoc_m'] is None and b['gia_dinh_khac_doan']
+        if b['u_delta_c_B_phan'] is not None:
+            assert b['u_delta_c_B_phan']['dh'] == 0.0 and b['u_delta_c_B_phan']['lech_cho'] == 0.0
+        assert b['trang_thai']['delta_c_B'] == a['trang_thai']['delta_c_B']
+        cl = b.get('cung_lan_lap_chi_so')
+        if cl is not None:
+            assert cl['s']['trang_thai'] == 'khong_so'
+    monkeypatch.setattr(nt, 'KHAC_SESSION_BO_THANG', False)
     rows, recs = T.build()
     _, _, L3, _ = run_ds(files, rows, recs, 'z3', lambda i, w: w['loai'] in nt.LOAI_GIU, du=0.0)
     for lid, a in L1.items():
@@ -106,7 +113,8 @@ PHYS = dict(du_xoay_rad=1e-4, du_thang=2e-5, du_bien_dang_rad=5e-5, xoay_bien_th
 def test_v4_14_phys_per_place(files, monkeypatch):
     """theo_cho (phys, Liam 20/11 at CODE_KHUNG): beta + (du_xoay + du_bien_dang) of the run's place (not the coarse
     asin(2 du_m / L_AB) of du_m = 0.3 mm); a place missing from theo_cho -> inf, chua_ket_luan (thieu_cho_<cho>).
-    Gate off: the small phys band keeps the placement of the one-session run (lan_lap_id given across sessions)."""
+    With all places in theo_cho the small phys band keeps the placement of the one-session run (lan_lap_id given
+    across sessions; Liam 23/11 way i: raw c_B, no scale)."""
     rows, recs = T.build()
     _, _, _, L1 = T.run(files, rows, recs, tag='p1')
     tc = {'goc': dict(PHYS), 'K1': dict(PHYS, du_xoay_rad=2e-4)}
@@ -121,7 +129,6 @@ def test_v4_14_phys_per_place(files, monkeypatch):
         ub = math.degrees(tc[cho]['du_xoay_rad'] + PHYS['du_bien_dang_rad'])
         assert b['khung_giua_session']['cach'] == 'phys'
         assert b['u_beta_deg'] == pytest.approx(a['u_beta_deg'] + ub, abs=1e-12)
-    monkeypatch.setattr(nt, 'VIEN_MA_KHAC_SESSION_CHAN', False)
     rows, recs = T.build()
     _, _, L3, _ = run_ds(files, rows, recs, 'p3', lambda i, w: w['loai'] in nt.LOAI_GIU, du=3e-4,
                          theo_cho=dict(tc, K2=dict(PHYS)))
@@ -155,7 +162,7 @@ def test_v4_14_cross_session_index_and_missing_file(files):
             ph = b['u_delta_c_B_phan']
             assert ph['khung_giua_session'] >= 2e-4
             assert b['u_delta_c_B_m'] == pytest.approx(sum(ph.values()), rel=1e-12)
-            assert b['u_delta_c_B_m'] > a['u_delta_c_B_m'] + ph['khung_giua_session']
+            assert ph['dh'] == 0.0 and ph['lech_cho'] == 0.0                       # Liam 23/11 (i): Dh not corrected
     assert co_u                                                     # the check ran on at least one run
     rows, recs = T.build()
     _, _, L3, _ = run_ds(files, rows, recs, 'c3', lambda i, w: w['loai'] in nt.LOAI_GIU, du=None)
@@ -264,7 +271,8 @@ def test_v4_14_measure_camera_of_each_clip(tmp_path, monkeypatch):
 
 def test_v4_14_so_sanh_phys_terms(monkeypatch):
     """so_sanh across sessions with a phys file: theta band du_bien_dang + xoay_bien_thien, scale du_thang +
-    du_bien_dang of the place (gate off); gate on: scale and c_B khong_xac_dinh (vien_ma_khac_session), theta kept."""
+    du_bien_dang of the place when the scale is compared (KHAC_SESSION_BO_THANG off); default (Liam 23/11 way i):
+    scale khong_so (out of tong_doi), theta kept."""
     e = dict(du_m=3e-4, theo_cho={'K1': dict(PHYS)})
     cmap = nt.CtxMap({'a': None, 'b': None}, [], {frozenset(('a', 'b')): e}, L_AB=0.2)
     ctx = type('X', (), dict(side=0.145, tag_h=0.12))()
@@ -273,9 +281,36 @@ def test_v4_14_so_sanh_phys_terms(monkeypatch):
     r = nt.so_sanh(w, v, ctx, None, ng, cmap)
     assert r['theta']['u_khung_giua_session'] == pytest.approx(math.degrees(8e-5))
     assert r['theta']['trang_thai'] == 'khong_doi'
-    assert r['s']['ly_do'] == 'vien_ma_khac_session' and r['c_B']['ly_do'] == 'vien_ma_khac_session'
-    monkeypatch.setattr(nt, 'VIEN_MA_KHAC_SESSION_CHAN', False)
+    assert r['s']['trang_thai'] == 'khong_so' and r['s']['ly_do'] == 'khac_session_bo_so_thang'
+    assert nt.tong_doi(dict(theta=r['theta'], s=r['s'])) is False                 # khong_so is out of tong_doi
+    monkeypatch.setattr(nt, 'KHAC_SESSION_BO_THANG', False)
     r = nt.so_sanh(w, v, ctx, None, ng, cmap)
     assert r['s']['u_khung_giua_session'] == pytest.approx(7e-5) and 'ly_do' not in r['s']
     r = nt.so_sanh(w, dict(v, cho='K2'), ctx, None, ng, cmap)                   # K2 not in theo_cho
     assert r['theta']['trang_thai'] == 'khong_xac_dinh' and r['theta']['ly_do'] == 'thieu_cho_K2'
+
+
+def test_liam_23_11_i_scale_bias_between_sessions(files, monkeypatch):
+    """The tag scale of session 2 off by +80e-4 (the edge bias measured between camera segments on 20/11): way (i)
+    (default) keeps the one-session placements (raw c_B, theta; scale not compared); comparing the scale and the
+    Dh-corrected c_B across sessions (flag off) would refuse them."""
+    rows, recs = T.build()
+    _, _, _, L1 = T.run(files, rows, recs, tag='b1')
+
+    def bias(rows, recs):
+        for i, w in enumerate(rows):
+            if w['loai'] in nt.LOAI_GIU:
+                for r in recs[i]:
+                    r['tag'] = dict(r['tag'], s=r['tag']['s'] * (1 + 80e-4))
+    rows, recs = T.build()
+    bias(rows, recs)
+    _, _, L2, _ = run_ds(files, rows, recs, 'b2', lambda i, w: w['loai'] in nt.LOAI_GIU, du=0.0)
+    assert any(a['lan_lap_id'] is not None for a in L1.values())
+    for lid, a in L1.items():
+        assert L2[lid]['lan_lap_id'] == a['lan_lap_id'], lid
+        assert L2[lid]['delta_c_B_m'] == pytest.approx(a['delta_c_B_tho_m'], abs=1e-12)
+    monkeypatch.setattr(nt, 'KHAC_SESSION_BO_THANG', False)
+    rows, recs = T.build()
+    bias(rows, recs)
+    _, _, L3, _ = run_ds(files, rows, recs, 'b3', lambda i, w: w['loai'] in nt.LOAI_GIU, du=0.0)
+    assert all(v['lan_lap_id'] is None for v in L3.values())
