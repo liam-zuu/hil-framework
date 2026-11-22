@@ -97,8 +97,18 @@ WS_COLS = ['ws_res', 'ws_th', 'ws_eval', 'ws_flag', 'ws_on_count']
 # PID integral clamp indicator "tick cham kep" (spec S03 v8.6 section 2.1; fw_sim.c fwsim_kep_last): only with
 # a DLL that has it. kep_<axis>: 1 when, right after the clamp of pid.c, |integral| equals integral_limit (also
 # when the sum lands on the limit without being cut); kep_I_<axis>: that integral; kep_lech: self-check of the
-# DLL, must be 0. All 0 on a tick where the PID did not run (motor off, ADRC).
+# DLL, must be 0: it is set when the replay of kep_step differs from the firmware PID state, or when, on a
+# standstill hold tick, the firmware PID is not in its reset state. All 0 on a tick where the PID did not
+# run (motor off, ADRC).
 KEP_COLS = ['kep_vx', 'kep_vy', 'kep_wz', 'kep_I_vx', 'kep_I_vy', 'kep_I_wz', 'kep_lech']
+# Bit-exact channels (Codex C3-13): every channel of simulate() except 'kep'. With the same firmware, compiler,
+# build flags, plant sources and arguments, a DLL with the integral clamp export and one without it (fw_sim.c
+# before the export, or built with -DFWSIM_NO_KEP) give these arrays bit for bit the same (dtype, shape, bytes),
+# in this order ('pos', 'ws' only with a DLL that has them). 'kep' is the only other key and comes last, so
+# whole-log outputs of the two DLLs (npz, s03_doe.log_digest, log.csv columns, hashes made of them) differ by
+# the 'kep' entry only: compare them on these keys.
+BIT_EXACT_KEYS = ('t', 'sp', 'v_true', 'v_fw', 'duty', 'pwm', 'rpm', 'omega', 'pose', 'en', 'count', 'tick',
+                  'dpwm', 'sat', 'imu', 'r_true', 'inj', 'pos', 'ws')
 
 
 class FirmwareSim:
@@ -459,7 +469,8 @@ def kep_indicator(log, t_end):
     if not np.all((flag == 0) | (flag == 1)) or np.any(flag[~on] != 0):
         raise ValueError('kep flag not 0 / 1, or set on a tick with the motor off')
     if np.any(kep[:, KEP_COLS.index('kep_lech')] != 0):
-        raise ValueError('kep_lech set: the replay of fw_sim.c kep_step differs from the firmware PID state')
+        raise ValueError('kep_lech set: the replay of fw_sim.c kep_step differs from the firmware PID state,'
+                         ' or the firmware PID is not in its reset state on a standstill hold tick')
     m = on & (t <= t_end + 1e-9)
     mau = int(np.count_nonzero(m))
     n = [int(np.count_nonzero(flag[m, i])) for i in range(3)]

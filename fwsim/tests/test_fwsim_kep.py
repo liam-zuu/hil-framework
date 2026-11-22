@@ -2,13 +2,18 @@
 fw_sim.c fwsim_kep_last, fwsim.py KEP_COLS / log['kep'] / kep_indicator.
 Run: python -m pytest -q fwsim/tests/test_fwsim_kep.py   (needs fwsim/build/fwsim.dll)
      python fwsim/tests/test_fwsim_kep.py --digest       (old channels of the golden run, as recorded in GOLDEN)
-     python fwsim/tests/test_fwsim_kep.py --scan         (cross-check against phan_tich_kep_pid, one JSON line per run)"""
+     python fwsim/tests/test_fwsim_kep.py --scan         (cross-check against phan_tich_kep_pid, one JSON line per run)
+     python fwsim/tests/test_fwsim_kep.py --pair <dll>   (old / new DLL pair on the bit-exact channels, one JSON line per run)"""
 import argparse
 import csv
+import ctypes
 import hashlib
+import io
 import json
 import math
 import os
+import shutil
+import subprocess
 import sys
 import time
 
@@ -18,6 +23,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import fwsim  # noqa: E402
 import o1_feasibility as o1  # noqa: E402
+import build_fwsim  # noqa: E402
+import s03_doe as s3  # noqa: E402
 
 _DLL = os.path.join(fwsim.HERE, 'build', 'fwsim.dll')
 pytestmark = pytest.mark.skipif(not os.path.isfile(_DLL), reason='fwsim.dll not built')
@@ -547,12 +554,564 @@ def test_port_gives_the_counts_of_the_original_script(fw, tmp_path, name):
     assert [goc[f'I_max_{a}'] for a in AXES] == [round(float(np.abs(post[:, i]).max()), 4) for i in range(3)]
 
 
+# Codex C3-12 / C3-13: trace DLL, hold-branch mutants of vel_ctrl.c, kep-free pair
+
+TRACE_C = r"""/* TEST only (fwsim/tests/test_fwsim_kep.py): traces the real pid_update_* calls of vel_ctrl_step
+ * on the firmware PID (vel_ctrl_pid()): per call the axis count, the integral right after the clamp
+ * of pid.c and integral_limit. fwtest_trace_clear() before a tick, fwtest_trace_last() reads the
+ * 9 doubles. With TRACE_WRAP the symbols come from -Wl,--wrap=pid_update_*; else vel_ctrl.c alone is
+ * compiled with -Dpid_update_*=fwtest_pid_update_* and this file defines them. The replay of fw_sim.c
+ * kep_step runs the same functions on a copy: excluded by the pointer test c == vel_ctrl_pid(). */
+#include "vel_ctrl.h"
+#include <string.h>
+#ifdef TRACE_WRAP
+#define T_REAL(x) __real_##x
+#define T_WRAP(x) __wrap_##x
+float __real_pid_update_vx(pid_controller_t *c, float sp, float actual, float dt);
+float __real_pid_update_vy(pid_controller_t *c, float sp, float actual, float dt);
+float __real_pid_update_wz(pid_controller_t *c, float sp, float actual, float dt);
+#else
+#define T_REAL(x) x
+#define T_WRAP(x) fwtest_##x
+#endif
+/* calls vx, vy, wz; integral right after the real clamp vx, vy, wz; integral_limit vx, vy, wz */
+static double tr[9];
+__declspec(dllexport) void fwtest_trace_clear(void) { memset(tr, 0, sizeof(tr)); }
+__declspec(dllexport) void fwtest_trace_last(double out[9]) { memcpy(out, tr, sizeof(tr)); }
+#define DEF_TRACE(ax, i) \
+    float T_WRAP(pid_update_##ax)(pid_controller_t *c, float sp, float actual, float dt) { \
+        float u = T_REAL(pid_update_##ax)(c, sp, actual, dt); \
+        if (c == vel_ctrl_pid()) { tr[i] += 1; tr[3 + i] = c->ax.integral; tr[6 + i] = c->ax.integral_limit; } \
+        return u; \
+    }
+DEF_TRACE(vx, 0)
+DEF_TRACE(vy, 1)
+DEF_TRACE(wz, 2)
+"""
+
+_BUILD_JSON = os.path.join(fwsim.HERE, 'build', 'fwsim_build.json')
+_WRAP_OK = None     # None: --wrap untried; True: it records calls; False: renamed symbols needed
+
+
+def _fw_tree():
+    """The AGV_FIRMWARE tree (read-only): the first candidate with src/controller/vel_ctrl.c."""
+    for d in (os.path.join(fwsim.HERE, '..', '..', 'AGV_FIRMWARE'),
+              'D:/CLAUDE_THESIS/03_CODE/AGV_FIRMWARE'):
+        if os.path.isfile(os.path.join(d, 'src', 'controller', 'vel_ctrl.c')):
+            return d
+    return None
+
+
+def _gcc(cmd):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f'gcc failed ({r.returncode}): {r.stderr[-1500:]}')
+
+
+def build_variant(out_dll, fw_sim_c=None, defines=(), trace=False, vel_ctrl_c=None):
+    """One gcc build of a variant DLL, mirroring build_fwsim.main(): flags and the firmware source
+    list from fwsim/build/fwsim_build.json, -I fwsim/shim then the firmware include dirs; sources are
+    that list (controller/vel_ctrl.c replaced by vel_ctrl_c when given) + shim/fw_shim.c + fw_sim_c
+    (default fwsim/fw_sim.c); a -D per define. trace=True also links the TRACE_C unit, with --wrap of
+    the three pid_update symbols while _WRAP_OK allows it, else vel_ctrl.c alone is compiled with
+    -Dpid_update_*=fwtest_pid_update_* (the trace unit then defines them). RuntimeError on failure."""
+    fw = _fw_tree()
+    info = json.load(open(_BUILD_JSON))
+    flags = info['flags'].split()
+    inc = ['-I', os.path.join(fwsim.HERE, 'shim')]
+    for d in build_fwsim.FW_INCLUDES:
+        inc += ['-I', os.path.join(fw, 'src', d)]
+    vc = vel_ctrl_c or os.path.join(fw, 'src', 'controller/vel_ctrl.c')
+    srcs = [vc if s == 'controller/vel_ctrl.c' else os.path.join(fw, 'src', s) for s in info['sources']]
+    srcs += [os.path.join(fwsim.HERE, 'shim', 'fw_shim.c'),
+             fw_sim_c or os.path.join(fwsim.HERE, 'fw_sim.c')]
+    cmd = ['gcc'] + flags + inc + ['-D' + str(x) for x in defines]
+    if trace:
+        trace_c = os.path.splitext(out_dll)[0] + '_trace.c'
+        with open(trace_c, 'w') as f:
+            f.write(TRACE_C)
+        srcs.append(trace_c)
+        if _WRAP_OK is not False:
+            cmd += ['-DTRACE_WRAP',
+                    '-Wl,--wrap=pid_update_vx,--wrap=pid_update_vy,--wrap=pid_update_wz']
+        else:
+            i = srcs.index(vc)
+            obj = os.path.splitext(out_dll)[0] + '_vel_ctrl.o'
+            _gcc(['gcc'] + [x for x in flags if x != '-shared'] + inc +
+                 ['-Dpid_update_vx=fwtest_pid_update_vx', '-Dpid_update_vy=fwtest_pid_update_vy',
+                  '-Dpid_update_wz=fwtest_pid_update_wz', '-c', srcs[i], '-o', obj])
+            srcs[i] = obj
+    _gcc(cmd + srcs + ['-o', out_dll])
+    return out_dll
+
+
+class TraceSim(fwsim.FirmwareSim):
+    """FirmwareSim on a trace DLL: tick() clears the trace, runs the tick and appends trace_last()
+    to self.vet (per tick: calls vx, vy, wz; integral after the real clamp; integral_limit)."""
+
+    def __init__(self, dll):
+        super().__init__(dll)
+        self.lib.fwtest_trace_clear.argtypes = []
+        self.lib.fwtest_trace_last.argtypes = [ctypes.POINTER(ctypes.c_double)]
+        self.vet = []
+
+    def trace_last(self):
+        out = (ctypes.c_double * 9)()
+        self.lib.fwtest_trace_last(out)
+        return list(out)
+
+    def tick(self, t_us, counts, sp):
+        self.lib.fwtest_trace_clear()
+        r = super().tick(t_us, counts, sp)
+        self.vet.append(self.trace_last())
+        return r
+
+
+def _trace_works(dll):
+    """True when one PID tick on the DLL records the three pid_update calls: a trace build that
+    records nothing is useless, so the fixture rebuilds it with the renamed-symbol fallback."""
+    sim = TraceSim(dll)
+    sim.reset()
+    sim.set_mode('PID')
+    sim.tick(DT_US, [0, 0, 0, 0], (0.0, 0.0, 0.0))
+    return sim.vet[-1][:3] == [1.0, 1.0, 1.0]
+
+
+@pytest.fixture(scope='module')
+def variants(tmp_path_factory):
+    """Lazy build-and-cache of variant DLLs (trace, FWSIM_NO_KEP, vel_ctrl.c mutants), each get() one
+    gcc run of build_variant into a private dir; every variant has a different base name (several are
+    loaded in one process). A trace DLL is probed once: when --wrap left no calls the same name is
+    rebuilt with the renamed-symbol fallback (_WRAP_OK = False)."""
+    if shutil.which('gcc') is None:
+        pytest.skip('gcc not on PATH')
+    if _fw_tree() is None:
+        pytest.skip('AGV_FIRMWARE tree not found')
+    if not os.path.isfile(_BUILD_JSON):
+        pytest.skip('fwsim/build/fwsim_build.json not found')
+    out_dir = str(tmp_path_factory.mktemp('c3dll'))
+    cache = {}
+
+    def get(name, **kw):
+        global _WRAP_OK
+        if name in cache:
+            return cache[name]
+        dll = os.path.join(out_dir, name + '.dll')
+        try:
+            build_variant(dll, **kw)
+        except RuntimeError:
+            if not kw.get('trace') or _WRAP_OK is False:
+                raise
+            _WRAP_OK = False                         # this ld cannot --wrap into the DLL: fallback
+            build_variant(dll, **kw)
+        if kw.get('trace'):
+            if not _trace_works(dll):
+                if _WRAP_OK is False:
+                    raise RuntimeError('the trace records no pid_update calls')
+                _WRAP_OK = False                     # --wrap linked but intercepts nothing: fallback
+                build_variant(dll, **kw)
+                if not _trace_works(dll):
+                    raise RuntimeError('the trace records no pid_update calls (renamed symbols too)')
+            else:
+                _WRAP_OK = True
+        cache[name] = dll
+        return dll
+    return get
+
+
+def kep_theo_vet(tr):
+    """The KEP_COLS row a trace row implies: calls (0, 0, 0) -> seven zeros (the PID did not run);
+    calls (1, 1, 1) -> flag |I| == lim per axis, the three integrals after the real clamp, 0.0.
+    Anything else (a partial update) is an assertion failure: the DLL cannot model it either."""
+    calls, integ, lim = tr[:3], tr[3:6], tr[6:9]
+    if calls == [0.0, 0.0, 0.0]:
+        return [0.0] * len(fwsim.KEP_COLS)
+    assert calls == [1.0, 1.0, 1.0], f'trace calls {calls}'
+    return [float(abs(integ[i]) == lim[i]) for i in range(3)] + list(integ) + [0.0]
+
+
+def boot_trace(sim, mode='PID', **params):
+    """boot() on a trace DLL: tick(sp, counts=(0, 0, 0, 0)) -> (kep row, still flag, trace row, v_fw).
+    counts: cumulative quadrature counts per wheel (1320 counts/rev, wheel radius 0.0485 m,
+    FK vx = r/4 * sum(omega): the same step on all four wheels is pure vx; -54 on each in one
+    62.5 ms tick is vx ~ -0.2 m/s, read from v_fw)."""
+    sim.reset()
+    sim.set_mode(mode)
+    for n, v in dict(pos_on=0, **params).items():
+        sim.set_param(n, v)
+    t_us = [0]
+
+    def tick(sp, counts=(0, 0, 0, 0)):
+        t_us[0] += DT_US
+        _, v_fw, _, _, _ = sim.tick(t_us[0], list(counts), sp)
+        return sim.kep_last(), sim.pos_last()[P['still']], sim.vet[-1], v_fw
+    return tick
+
+
+def codex_ticks(t):
+    """The scenario of Codex C3-12 (I_vx = 0.49, then the hold entry while moving), direct ticks at
+    dt = 0.0625 s, PID defaults, params still_v=0.5. Returns the (kep, still, trace, v_fw) rows."""
+    out = []
+    for _ in range(7):
+        out.append(t((1.0, 0.0, 0.0)))                     # I_vx = 0.4375 exactly
+    out.append(t((0.84, 0.0, 0.0)))                        # I_vx ~ 0.49 (the reviewer's value)
+    for _ in range(8):
+        out.append(t((0.0, 0.0, 0.0)))                     # integral unchanged, still 0
+    out.append(t((0.0, 0.0, 0.0), (-54,) * 4))             # ENTRY: still 1, the sum crosses 0.5
+    out.append(t((0.0, 0.0, 0.0), (-54,) * 4))             # hold, wheels stopped
+    out.append(t((0.0, 0.0, 0.0), (-108,) * 4))            # hold while moving
+    out.append(t((1.0, 0.0, 0.0), (-108,) * 4))            # EXIT
+    return out
+
+
+# hold-branch mutants of vel_ctrl.c for C3-12 (test-only patched copies; each anchor must occur once)
+HOLD = "    if (g_still) {\n        pid_reset(&g_pid);\n        adrc_reset(&g_adrc);\n"
+CTRL = "    float wz_meas = o.imu.wz_meas;\n"
+MODE = "    if (g_mode == CTRL_ADRC) {\n"
+_MUTANTS = {
+    'reset_truoc_cap_nhat':      # the hold branch resets the PID BEFORE the update, never after
+        [(HOLD, "    if (g_still) {\n"),
+         (CTRL, "    if (g_still) { pid_reset(&g_pid); adrc_reset(&g_adrc); }\n" + CTRL)],
+    'bo_qua_khong_reset':        # the hold branch skips the update and never resets (integral frozen)
+        [(HOLD, "    if (g_still) {\n"),
+         (MODE, "    if (g_still) {\n    } else if (g_mode == CTRL_ADRC) {\n")],
+    'reset_roi_bo_qua':          # the hold branch skips the update; the reset after it is kept
+        [(MODE, "    if (g_still) {\n    } else if (g_mode == CTRL_ADRC) {\n")],
+}
+
+
+def mutant_vel_ctrl(name, out_dir):
+    """The patched copy of the firmware vel_ctrl.c of one mutant, written into out_dir; skips when an
+    anchor does not occur exactly once (the firmware changed under this test)."""
+    src = open(os.path.join(_fw_tree(), 'src', 'controller', 'vel_ctrl.c'), encoding='utf-8').read()
+    for old, new in _MUTANTS[name]:
+        if src.count(old) != 1:
+            pytest.skip(f'vel_ctrl.c changed: anchor {old!r} occurs {src.count(old)} times')
+        src = src.replace(old, new)
+    path = os.path.join(str(out_dir), 'vel_ctrl.c')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(src)
+    return path
+
+
+def _bits_eq(a, b):
+    """dtype, shape and raw bytes equal."""
+    a, b = np.asarray(a), np.asarray(b)
+    return a.dtype == b.dtype and a.shape == b.shape \
+        and np.ascontiguousarray(a).tobytes() == np.ascontiguousarray(b).tobytes()
+
+
+def test_trace_dll_gives_the_log_of_the_production_dll(fw, glog, variants):
+    """The trace instrumentation records without disturbing: the golden run through the trace DLL of
+    the real firmware is the production log bit for bit (every key, 'kep' too)."""
+    log = golden_run(TraceSim(variants('fwsim_trace', trace=True)))
+    assert list(log) == list(glog)
+    for k in glog:
+        assert _bits_eq(log[k], glog[k]), k
+
+
+def test_trace_enter_hold_exit_still(variants):
+    """C3-12 on the real firmware: the hold entry / hold / exit ticks of the scenario, each against
+    the trace of the same tick."""
+    sim = TraceSim(variants('fwsim_trace', trace=True))
+    rows = codex_ticks(boot_trace(sim, still_v=0.5))
+    for kep, still, tr, v_fw in rows:
+        assert kep == kep_theo_vet(tr)
+    assert rows[7][0][K['kep_vx']] == 0.0 and 0.4899 < rows[7][0][K['kep_I_vx']] < 0.4901
+    kep, still, tr, v_fw = rows[16]                          # entry: the update ran, then the reset
+    assert still == 1.0 and tr[:3] == [1.0, 1.0, 1.0]
+    assert -0.21 < v_fw[0] < -0.19                           # vx ~ -0.2 m/s: e crosses the 0.5 limit
+    assert tr[3] == tr[6] == 0.5
+    assert (kep[K['kep_vx']], kep[K['kep_I_vx']], kep[K['kep_lech']]) == (1.0, 0.5, 0.0)
+    kep, still, tr, _ = rows[17]                             # hold, wheels stopped
+    assert still == 1.0 and kep[K['kep_I_vx']] == 0.0 and kep[K['kep_vx']] == 0.0
+    kep, still, tr, _ = rows[18]                             # hold while moving (update ran, reset after)
+    assert still == 1.0 and tr[3] != 0.0 and kep[K['kep_I_vx']] == tr[3]
+    kep, still, tr, _ = rows[19]                             # exit
+    assert still == 0.0 and kep[K['kep_I_vx']] == 0.0625
+
+
+def test_trace_motor_off_on(variants):
+    """Motor off/on: the edge reset of vel_ctrl_step is what kep_step replays (on_prev), the trace
+    agrees on every tick; a hold entry with the integral on the limit and zero error too."""
+    sim = TraceSim(variants('fwsim_trace', trace=True))
+    t = boot_trace(sim)
+    for _ in range(9):
+        kep, _, tr, _ = t((1.0, 0.0, 0.0))
+        assert kep == kep_theo_vet(tr)
+    assert kep[K['kep_vx']] == 1.0 and kep[K['kep_I_vx']] == 0.5
+    sim.motor_enable(False)
+    for _ in range(2):
+        kep, _, tr, _ = t((1.0, 0.0, 0.0))
+        assert kep == kep_theo_vet(tr) == [0.0] * len(fwsim.KEP_COLS)
+    sim.motor_enable(True)
+    kep, _, tr, _ = t((1.0, 0.0, 0.0))
+    assert kep == kep_theo_vet(tr) and kep[K['kep_I_vx']] == 0.0625 and kep[K['kep_vx']] == 0.0
+    t = boot_trace(sim)
+    for _ in range(9):
+        kep, still, tr, _ = t((1.0, 0.0, 0.0))
+        assert kep == kep_theo_vet(tr)
+    for _ in range(20):
+        kep, still, tr, _ = t((0.0, 0.0, 0.0))
+        assert kep == kep_theo_vet(tr)
+        if still == 1.0:
+            break
+    else:
+        pytest.fail('no standstill hold within 20 zero-setpoint ticks')
+    assert kep[K['kep_vx']] == 1.0 and kep[K['kep_I_vx']] == 0.5    # the entry tick reports the hit
+    kep, still, tr, _ = t((0.0, 0.0, 0.0))
+    assert kep == kep_theo_vet(tr) and still == 1.0
+    sim.motor_enable(False)
+    kep, _, tr, _ = t((0.0, 0.0, 0.0))
+    assert kep == kep_theo_vet(tr) == [0.0] * len(fwsim.KEP_COLS)
+    sim.motor_enable(True)
+    kep, _, tr, _ = t((1.0, 0.0, 0.0))
+    assert kep == kep_theo_vet(tr) and kep[K['kep_I_vx']] == 0.0625
+
+
+def test_trace_pid_adrc_pid(variants):
+    """PID -> ADRC -> PID between ticks: no pid_update calls under ADRC, the integrals restart
+    from 0 after vel_ctrl_set_mode; the trace agrees on every tick."""
+    sim = TraceSim(variants('fwsim_trace', trace=True))
+    t = boot_trace(sim)
+    for _ in range(9):
+        kep, _, tr, _ = t((1.0, -1.0, 1.0))
+        assert kep == kep_theo_vet(tr)
+    sim.set_mode('ADRC')
+    for _ in range(3):
+        kep, _, tr, _ = t((1.0, -1.0, 1.0))
+        assert kep == kep_theo_vet(tr) == [0.0] * len(fwsim.KEP_COLS)
+    sim.set_mode('PID')
+    for k in range(1, 4):
+        kep, _, tr, _ = t((1.0, -1.0, 1.0))
+        assert kep == kep_theo_vet(tr)
+        assert kep[3:6] == [0.0625 * k, -0.0625 * k, 0.0625 * k]
+
+
+def test_trace_gain_change_mid_run(variants):
+    """fwsim_set_pid between ticks: the clamp follows integral_limit immediately, on both sides of
+    the exact limit; the trace agrees on every tick and kep_lech stays 0."""
+    sim = TraceSim(variants('fwsim_trace', trace=True))
+    t = boot_trace(sim)
+    for _ in range(7):
+        kep, _, tr, _ = t((1.0, 0.0, 0.0))
+        assert kep == kep_theo_vet(tr)
+    g = sim.get_pid(0)
+    sim.set_pid(0, g['kp'], g['ki'], g['kd'], 0.25, g['out_limit'])
+    kep, _, tr, _ = t((1.0, 0.0, 0.0))
+    assert kep == kep_theo_vet(tr) and (kep[K['kep_vx']], kep[K['kep_I_vx']]) == (1.0, 0.25)
+    sim.set_pid(0, g['kp'], g['ki'], g['kd'], 1.0, g['out_limit'])
+    kep, _, tr, _ = t((1.0, 0.0, 0.0))
+    assert kep == kep_theo_vet(tr) and (kep[K['kep_vx']], kep[K['kep_I_vx']]) == (0.0, 0.3125)
+    sim.set_pid(0, 3.0, 2.0, g['kd'], 1.0, g['out_limit'])
+    kep, _, tr, _ = t((1.0, 0.0, 0.0))
+    assert kep == kep_theo_vet(tr) and (kep[K['kep_vx']], kep[K['kep_I_vx']]) == (0.0, 0.375)
+    sim.set_pid(0, 3.0, 2.0, g['kd'], 0.375, g['out_limit'])
+    kep, _, tr, _ = t((0.0, 0.0, 0.0))
+    assert kep == kep_theo_vet(tr) and (kep[K['kep_vx']], kep[K['kep_I_vx']]) == (1.0, 0.375)
+    nxt = float(np.nextafter(np.float32(0.375), np.float32(1.0)))
+    sim.set_pid(0, 3.0, 2.0, g['kd'], nxt, g['out_limit'])
+    kep, _, tr, _ = t((0.0, 0.0, 0.0))
+    assert kep == kep_theo_vet(tr) and kep[K['kep_vx']] == 0.0
+    assert kep[K['kep_lech']] == 0.0
+
+
+def test_trace_simulate_runs(variants):
+    """kep == kep_theo_vet(trace) on every tick of full simulate() runs: a run with a standstill
+    hold (entry, hold, exit ticks) and the S03-like run that flags."""
+    sim = TraceSim(variants('fwsim_trace', trace=True))
+    sim.vet.clear()
+
+    def sp(t_):
+        return (0.3, 0.0, 0.3) if t_ < 1.5 or t_ >= 3.5 else (0.0, 0.0, 0.0)
+    log = fwsim.simulate(sim, sp, 5.0, mode='PID', imu={}, pid=GOLDEN_PID)
+    assert len(sim.vet) == len(log['t'])
+    for k in range(len(log['t'])):
+        assert list(log['kep'][k]) == kep_theo_vet(sim.vet[k])
+    still, d = log['pos'][:, P['still']], np.diff(log['pos'][:, P['still']])
+    assert np.any(d == 1) and np.any(d == -1) and np.count_nonzero(still == 1) > 1   # entry, exit, hold
+    sim.vet.clear()
+    d0 = s03_defaults(sim)
+    log, ilim, res = s03_run(sim, 0.8, (d0[0], 1500.0) + d0[2:])
+    assert len(sim.vet) == len(log['t'])
+    for k in range(len(log['t'])):
+        assert list(log['kep'][k]) == kep_theo_vet(sim.vet[k])
+    assert np.any(log['kep'][:, :3] == 1)
+
+
+@pytest.mark.parametrize('mutant', ['reset_truoc_cap_nhat', 'bo_qua_khong_reset'])
+def test_mutant_hold_is_flagged(variants, tmp_path, mutant):
+    """Codex C3-12: a hold branch that resets the PID before the update, or never resets it, leaves
+    the firmware PID state not in the reset state on the entry tick: kep_lech must be set there."""
+    vc = mutant_vel_ctrl(mutant, tmp_path)
+    sim = TraceSim(variants('fwsim_m_' + mutant, trace=True, vel_ctrl_c=vc))
+    rows = codex_ticks(boot_trace(sim, still_v=0.5))[:17]
+    kep, still, tr, _ = rows[16]
+    assert still == 1.0
+    assert tr[:3] == [0.0, 0.0, 0.0] or abs(tr[3]) != tr[6]        # the real PID made no hit on vx
+    # the hit the replay claims in the reviewer's example (the real PID made none):
+    assert (kep[K['kep_vx']], kep[K['kep_I_vx']]) == (1.0, 0.5)
+    assert kep[K['kep_lech']] == 1.0
+    log = dict(t=np.arange(len(rows)) * 0.0625, en=np.ones(len(rows)),
+               kep=np.array([r[0] for r in rows], dtype=float))
+    with pytest.raises(ValueError, match='kep_lech'):
+        fwsim.kep_indicator(log, 1.0)
+
+
+def test_mutant_reset_then_skip_is_seen_by_the_trace(variants, tmp_path):
+    """reset_roi_bo_qua: the update is skipped but the reset kept, so the state after the step is the
+    real one's and kep_lech cannot see it; the trace comparison of the other tests is what does."""
+    vc = mutant_vel_ctrl('reset_roi_bo_qua', tmp_path)
+    sim = TraceSim(variants('fwsim_m_reset_roi_bo_qua', trace=True, vel_ctrl_c=vc))
+    rows = codex_ticks(boot_trace(sim, still_v=0.5))
+    kep, still, tr, _ = rows[16]
+    assert still == 1.0 and tr[:3] == [0.0, 0.0, 0.0]
+    assert kep[:6] != kep_theo_vet(tr)[:6]
+
+
+def test_bit_exact_keys_definition(glog):
+    """C3-13: the explicit bit-exact channel list is every channel of simulate() but 'kep'."""
+    assert fwsim.BIT_EXACT_KEYS == OLD_KEYS
+    assert list(glog) == list(OLD_KEYS) + ['kep']
+
+
+def _cap_runs(fw_cu, fw_moi):
+    """The four run pairs of test_dll_pair_without_and_with_kep and of the --pair CLI:
+    (label, old log, new log); old = the DLL without the kep channel, new = the production one."""
+    sp = lambda t: (0.3, 0.0, 0.0)      # noqa: E731
+    return [('golden', golden_run(fw_cu), golden_run(fw_moi)),
+            ('adrc', fwsim.simulate(fw_cu, sp, 1.0, mode='ADRC'),
+                     fwsim.simulate(fw_moi, sp, 1.0, mode='ADRC')),
+            ('motor_tat', fwsim.simulate(fw_cu, sp, 0.5, mode='PID', motor_on=False),
+                          fwsim.simulate(fw_moi, sp, 0.5, mode='PID', motor_on=False)),
+            ('s03', s03_run(fw_cu, 0.8, s03_defaults(fw_cu))[0],
+                    kiem_cheo_run(fw_moi, 'v08_mac_dinh')[0])]
+
+
+def so_cap(old_log, new_log):
+    """C3-13 pair check of an old log (no kep channel) and a new one: the key lists, the number of
+    BIT_EXACT channels differing in dtype/shape/bytes, whether s03_doe.log_digest of the new log
+    restricted to BIT_EXACT_KEYS equals the old digest, whether the full digests differ by exactly
+    'kep', and the npz comparison (old keys bit-equal, 'kep' the only extra file)."""
+    keys = list(fwsim.BIT_EXACT_KEYS)
+    d_cu, d_moi = s3.log_digest(old_log), s3.log_digest(new_log)
+    z_cu = np.load(io.BytesIO(s3.npz_bytes(old_log)))
+    z_moi = np.load(io.BytesIO(s3.npz_bytes(new_log)))
+    return dict(old_keys=list(old_log), new_keys=list(new_log),
+                n_lech=int(sum(not _bits_eq(old_log[k], new_log[k]) for k in keys)),
+                digest_win_bang=bool(d_cu == {k: d_moi[k] for k in keys}),
+                digest_khac_chi_kep=bool(set(d_moi) - set(d_cu) == {'kep'}
+                                         and all(d_cu[k] == d_moi[k] for k in d_cu)),
+                npz=bool(sorted(z_cu.files) == sorted(keys) and sorted(z_moi.files) == sorted(keys + ['kep'])
+                         and all(_bits_eq(z_cu[k], z_moi[k]) for k in keys)))
+
+
+def test_dll_pair_without_and_with_kep(fw, variants, tmp_path):
+    """C3-13: a DLL built with -DFWSIM_NO_KEP is the DLL without the counter (no fwsim_kep_last):
+    on the BIT_EXACT channels its logs equal the production DLL's bit for bit, and the whole-log
+    outputs differ by the 'kep' entry only."""
+    ref = fwsim.FirmwareSim(variants('fwsim_nokep', defines=('FWSIM_NO_KEP',)))
+    assert ref.kep_cols == 0 and not hasattr(ref.lib, 'fwsim_kep_last')
+    runs = _cap_runs(ref, fw)
+    for name, old_log, new_log in runs:
+        r = so_cap(old_log, new_log)
+        assert r['old_keys'] == list(fwsim.BIT_EXACT_KEYS), name
+        assert r['new_keys'] == r['old_keys'] + ['kep'], name
+        assert r['n_lech'] == 0 and r['digest_win_bang'] and r['digest_khac_chi_kep'] and r['npz'], name
+    _, old_log, new_log = runs[0]          # the golden pair, written by save_log_csv and compared as text
+    s3.save_log_csv(str(tmp_path), 'cap_cu', old_log)
+    s3.save_log_csv(str(tmp_path), 'cap_moi', new_log)
+    cu = [r.split(',') for r in open(tmp_path / 'cap_cu.csv', encoding='utf-8').read().splitlines()]
+    moi = [r.split(',') for r in open(tmp_path / 'cap_moi.csv', encoding='utf-8').read().splitlines()]
+    ik = [i for i, c in enumerate(moi[0]) if c.startswith('kep_')]
+    assert [c for i, c in enumerate(moi[0]) if i not in ik] == cu[0]
+    assert [[x for i, x in enumerate(r) if i not in ik] for r in moi[1:]] == cu[1:]
+
+
+def _eval_rows(log, v):
+    """(res, rows) of o1.evaluate_v7 on an S03-like log at level v, the same call s03_run makes."""
+    if not _PATH:
+        _PATH.append(o1.Path8())
+    sch = o1.Schedule(v)
+    p = fwsim.plant_params(argparse.Namespace(ground='traction', mu=MU_GIUA))
+    res, rows = o1.evaluate_v7(log, _PATH[0], sch, lsum=p.lx + p.ly)
+    return res, rows
+
+
+def s03_motor_tat(fw, v=0.8):
+    """One s03_run at level v and the default gains, with the driver (SWA) off while
+    3.0 <= t < 3.5: the log holds en == 0 ticks inside the evaluator window."""
+    if not _PATH:
+        _PATH.append(o1.Path8())
+    sch = o1.Schedule(v)
+    p = fwsim.plant_params(argparse.Namespace(ground='traction', mu=MU_GIUA))
+    g = s03_defaults(fw)
+    fw.reset()
+    fw.set_mode('PID')
+    base = [fw.get_pid(i) for i in range(3)]
+    pid = {i: (*((g[2], g[3]) if i == 2 else (g[0], g[1])), 0.0, base[i]['int_limit'], base[i]['out_limit'])
+           for i in range(3)}
+
+    def sp(t):
+        fw.motor_enable(not (3.0 <= t < 3.5))
+        return sch.setpoint(t)
+
+    log = fwsim.simulate(fw, sp, sch.Tcmd + o1.T_LATE, p, seed=1, mode='PID', imu=dict(S03_IMU),
+                         pid=pid, fw_params=dict(pos_kp=g[4], pos_ki=g[5], k_psi=g[6]))
+    res, rows = o1.evaluate_v7(log, _PATH[0], sch, lsum=p.lx + p.ly)
+    return log, res, rows
+
+
+@pytest.mark.parametrize('case', ['v08_mac_dinh', 'v08_ki_xy_1500', 'motor_tat'])
+def test_denominator_is_the_evaluator_window(fw, case):
+    """C3-13: kep_mau is the evaluator's own window [0, t_end] restricted to motor-on ticks. The
+    window is the first n = len(rows) frames of the log: evaluate_v7 iterates from the first frame
+    and stops at t_end (early) or at the last frame before the deadline."""
+    if case == 'motor_tat':
+        log, res, rows = s03_motor_tat(fw)
+    else:
+        log = kiem_cheo_run(fw, case)[0]
+        res, rows = _eval_rows(log, 0.8)
+    n = len(rows)
+    mask = np.arange(len(log['t'])) < n
+    assert [r['t'] for r in rows] == list(log['t'][:n])
+    assert rows[-1]['t'] == res['t_end']
+    assert np.array_equal(log['t'] <= res['t_end'] + 1e-9, mask)
+    assert res['sat_frac'] == float(np.mean(np.abs(log['pwm'][mask]) >= 1000))   # mask is m of v7
+    ind = fwsim.kep_indicator(log, res['t_end'])
+    assert ind['kep_mau'] == int((mask & (log['en'] == 1)).sum())
+    for i, a in enumerate(AXES):
+        assert ind[f'kep_n_{a}'] == int(log['kep'][mask, i].sum())
+    # the tick at t_end is inside the window: masking to t[n-2] drops it and its en from kep_mau
+    assert ind['kep_mau'] - fwsim.kep_indicator(log, float(log['t'][n - 2]))['kep_mau'] \
+        == int(log['en'][n - 1])
+    if res['completed'] == 'true':          # the window closed early: ticks after t_end exist
+        assert n < len(log['t'])
+    else:                                   # the run reached the deadline without completing
+        assert res['t_end'] == log['t'][n - 1]
+        if n < len(log['t']):
+            assert log['t'][n] >= res['t_deadline'] - 1e-9    # the deadline tick is outside
+        else:
+            assert log['t'][-1] < res['t_deadline'] - 1e-9    # the log ends before it
+    if case == 'motor_tat':
+        n_off = int((mask & (log['en'] == 0)).sum())
+        assert n_off > 0 and ind['kep_mau'] == n - n_off
+        assert np.all(log['kep'][log['en'] == 0] == 0)
+
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--digest', action='store_true')
     ap.add_argument('--scan', action='store_true')
+    ap.add_argument('--pair', metavar='DLL',
+                    help='a DLL without the kep channel: print the so_cap JSON of the four run pairs')
     a = ap.parse_args()
     fw_ = fwsim.FirmwareSim()
+    if a.pair:
+        ref_ = fwsim.FirmwareSim(a.pair)
+        for name_, old_log_, new_log_ in _cap_runs(ref_, fw_):
+            print(json.dumps(dict(run=name_, **so_cap(old_log_, new_log_))))
+        sys.exit(0)
     if a.digest:
         log_ = golden_run(fw_)
         print(json.dumps(dict(identity=identity(fw_), kep_cols=getattr(fw_, 'kep_cols', None),
