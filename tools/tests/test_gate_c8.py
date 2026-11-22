@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import sys
 
@@ -717,11 +718,15 @@ def build_c8(tmp_path, levels=LEVELS, u_t=0.014, two=False, sub=''):
                                  U_moc_dong_xy_m=0.004, U_moc_tham_xy_m=0.003, U_moc_dong_psi_rad=0.002,
                                  U_moc_tham_psi_rad=0.001, nguon=ngm)))
     pl = d['dieu_2b']['per_level']
+    a6 = _jw(goc, 'c8b/a6/c8b_a6_v2.json', dict(version='c8b_a6_v2', tam_id='T1'))        # CODE 23/11: the A6 of the lock
+    _jw(goc, 'c8b/xoay/xoay_v1.json', dict(schema='xoay_v1', a6_sha256=a6['sha256']))     # F4 made with it
+    _jw(goc, 'nhac_tam/lan_lap.json', dict(schema='lan_lap_v1', a6=dict(sha256=a6['sha256'], tam_id='T1')))   # F8
     d['bo_cham']['phien_ban'] = 'tools/c8b_khoa_v5.py@' + 'c' * 40
     kv5 = _jw(goc, 'c8b_khoa_v5.json', dict(
         version=GC.KHOA_FORMAT, trang_thai='khoa', nhanh_tick=d['u_t_branch'], bang_man_trap=d['bo_cham']['bang_man_trap'],
         muc_kha_thi=list(levels), mien_car_pose=d['camera']['c8b']['mien_car_pose'], eps_H=d['camera']['c8b']['eps_H'],
-        khoa_truoc=dict(nguon=[dict(vai='ke_hoach_c8', file='ke_hoach_c8.json', sha256=kh['sha256'])],
+        khoa_truoc=dict(nguon=[dict(vai='ke_hoach_c8', file='ke_hoach_c8.json', sha256=kh['sha256']),
+                               dict(vai='a6', file='a6.json', sha256=a6['sha256'])],
                         script=dict(file='tools/c8b_khoa_v5.py', commit='c' * 40, dirty=False), luc=LUC_KHOA_C8B),
         muc={lv: dict(chi_bao_cao=['g5'] if lv == 'O1-F08' else [],
                       hang_dong=dict(a_m=pl[lv]['a_m'], hang_m=pl[lv]['u_p']['hang_m'],
@@ -2784,3 +2789,36 @@ def test_code_22_11_tap_moc_per_segment_one_lich_rule(tmp_path):
     g['camera']['c8b']['moc_dich']['nguon']['luat_lich']['luat'] = {}
     with pytest.raises(GC.GateFileError, match='rule constants of lich'):
         GC.check(g)
+
+
+# ── CODE 23/11: one A6 for the C8b lock and every F file (A6 sha 2aa8c970 -> d6bef847, same numbers) ─────────────
+
+def test_code_23_11_one_a6_for_the_lock_and_the_f_files(tmp_path):
+    d, goc = build_c8(tmp_path / 'a', sub='b2')                        # F4, F8 with the A6 of the lock: accepted
+    old = _h('A6 cu')
+    for rel, obj, field in (('b2/c8b/xoay_cu/xoay_v1.json', dict(schema='xoay_v1', a6_sha256=old), 'a6_sha256'),
+                            ('b2/nhac_tam/lan_lap_cu.json', dict(schema='lan_lap_v1', a6=dict(sha256=old)), 'a6.sha256')):
+        p = os.path.join(goc, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(obj, f)
+        with pytest.raises(GC.GateFileError, match=re.escape(rel[3:]) + ' ' + re.escape(field)):
+            GC.check_nguon(d, goc)
+        q = os.path.join(goc, 'b2', '_archive', os.path.basename(os.path.dirname(rel)), os.path.basename(rel))
+        os.makedirs(os.path.dirname(q), exist_ok=True)
+        os.replace(p, q)                                               # superseded: kept in _archive, skipped
+        GC.check_nguon(d, goc)
+    # a later session's F file with another A6 is refused too
+    d, goc = build_c8(tmp_path / 'b', sub='b2')
+    _buoi3(goc, d, 'O1-F08_PID')
+    GC.check_nguon(d, goc)
+    with open(os.path.join(goc, 'b3', 'xoay_b3.json'), 'w', encoding='utf-8') as f:
+        json.dump(dict(schema='xoay_v1', a6_sha256=old), f)
+    with pytest.raises(GC.GateFileError, match='b3/xoay_b3.json a6_sha256'):
+        GC.check_nguon(d, goc)
+    # the lock names no A6, or two
+    for nguon_edit in (lambda n: [x for x in n if x['vai'] != 'a6'], lambda n: n + [dict(vai='a6', sha256=old)]):
+        d, goc = build_c8(tmp_path / f'c{len(os.listdir(tmp_path))}')
+        _rewrite_khoa(goc, d, lambda k: k['khoa_truoc'].update(nguon=nguon_edit(k['khoa_truoc']['nguon'])))
+        with pytest.raises(GC.GateFileError, match='A6 file'):
+            GC.check_nguon(d, goc)
