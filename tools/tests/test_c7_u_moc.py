@@ -118,3 +118,19 @@ def test_cli_refuses_a_schedule_not_converged(sess, run, tmp_path, monkeypatch):
     assert info['format'] == um.FORMAT_KHUNG and info['bo_lay_mau'] == um.SAMPLER and info['n_loi'] == 0
     assert info['n_khung'] == len(lines) - 1 == 2 and info['huong_ma'] == 'tag_psi'     # frames.csv of c7_measure since 10043dc
     assert info['car_pose']['side_m'] == CAR_SIDE
+
+
+def test_only_gate_2a_is_a_dependence(sess, run, tmp_path):
+    """The floor-fit rms under an alternative map is not a dependence (the observed rms does not move): it is
+    reported only. Gate (2a) res_sim is: with car_res_sim_m set just above the base value, the worst poses flip it."""
+    frames, rows = run
+    cfg = _cfg(sess, frames, tmp_path)
+    cfg['gates'] = dict(GATES, rms_extra_px=0.0)
+    um._init(cfg)
+    out = um.khung_mot(_task(rows, 10))
+    assert out['loi'] == '' and out['rms_max_px'] > out['rms_goc_px'] and out['doi_cong_cuc_dai'] == []
+    base_res = min(out['xau_xy']['res_sim_m'], out['xau_psi']['res_sim_m'])
+    cfg['gates'] = dict(GATES, car_res_sim_m=base_res * 0.999999)
+    um._init(cfg)
+    out2 = um.khung_mot(_task(rows, 10))
+    assert out2['doi_cong_bat_ky'] > 0

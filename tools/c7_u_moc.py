@@ -20,9 +20,14 @@ Step 'khung' (this file, the heavy part; one run, every valid frame in [tu_s, de
   The bound on the centre p = t - R(psi') q (step 4 of the chain, q known only at scoring time: lan_lap of NHACTAM)
   is taken in 'manifest' by |dp| <= |dt| + 2 sin(|dpsi'| / 2) |q| (exact identity |(R(a+d) - R(a)) q| = 2|sin(d/2)||q|
   plus the triangle inequality: an upper bound of the design quantity, never below it).
-  Gate flips (TC3-12): for every refit the frame gates (1) rms, (2a) res_sim, (2b) scale vs the frame's scale_ref are
-  evaluated on the perturbed pose; flips of the worst refits ('doi_cong_cuc_dai') make the manifest ok=false, flips of
-  any refit are reported ('doi_cong_bat_ky').
+  Gate flips (TC3-12): only gate (2a) (res_sim of the car tag, a function of the camera pose the anchors give) is
+  re-evaluated on the perturbed pose; flips of the worst refits ('doi_cong_cuc_dai') make the manifest ok=false, flips
+  of any refit are reported ('doi_cong_bat_ky'). Gate (1) (floor-fit rms) is NOT a dependence: the shift models a true
+  mark position off the map while the image and the map the scorer uses stay the same, so the observed rms does not
+  move (the refit rms under the alternative map is reported only, rms_px of the worst poses; on C8 session 2 it rose
+  above rms_H + 0.5 px in 2458 of 4676 worst poses of C8-P-F02-1_lai1 while res_sim and scale never flipped). Gate
+  (2b) (scale vs the median of the neighbours) is reported only (doi_ti_le_bat_ky): an anchor shift is common to the
+  neighbour frames, so it moves their scales together and the ratio to the median to first order not at all.
   A frame is blocked (loi) when the base refit does not reproduce frames.csv (tag_x, tag_y, tag_psi to 1e-5), a refit
   is not ok (refit_pose_checked flags) or a number is not finite: the run has no U (design: 'chan, khong xuat so').
 
@@ -88,16 +93,14 @@ def _init(cfg):
     _W['a6'] = ck.doc_a6(cfg['a6']) if cfg.get('a6') else None
 
 
-def _gates(rms, res_sim, scale, scale_ref, g, rms_h):
-    """Verdict of gates (1) rms, (2a) res_sim, (2b) scale of one pose (c7_measure.apply_gates, without the moc_it and
-    neighbour-count parts that do not move with an anchor shift)."""
-    if not rms <= rms_h + g['rms_extra_px']:
-        return False
-    if not res_sim <= g['car_res_sim_m']:
-        return False
-    if math.isfinite(scale_ref) and not abs(scale / scale_ref - 1.0) <= g['scale_rel']:
-        return False
-    return True
+def _gate_2a(res_sim, g):
+    """Verdict of gate (2a) (c7_measure.apply_gates: res_sim_m <= car_res_sim_m) of one pose (module docstring)."""
+    return bool(res_sim <= g['car_res_sim_m'])
+
+
+def _scale_ok(scale, scale_ref, g):
+    """Gate (2b) against the frame's own scale_ref (reported only, module docstring)."""
+    return (not math.isfinite(scale_ref)) or abs(scale / scale_ref - 1.0) <= g['scale_rel']
 
 
 def _a6_of(xy, psi):
@@ -114,7 +117,7 @@ def khung_mot(task):
     ctx, sess = _W['ctx'], _W['session_obj']
     side, kappa, plumb = sess['car_side_m'], sess['kappa'], sess['plumb_xy_m']
     off = (0.0, 0.0, 0.0)
-    D, g, rms_h = _W['D'], _W['gates'], sess['rms_px_H']
+    D, g = _W['D'], _W['gates']
     idx, t, d = _W['frames'][k]
     out = dict(k=k, idx=int(idx), t_s=float(t), loi='')
     anchors = sorted(int(x) for x in str(row['moc_neo_xe']).split(';') if x)
@@ -169,9 +172,11 @@ def khung_mot(task):
     t8, p8 = dt[:n8].reshape(-1, N_DIR), dpsi[:n8].reshape(-1, N_DIR)
     mt, mp = t8.max(axis=1), p8.max(axis=1)
     sref = float(row['scale_ref'])
-    verdict = [_gates(f[5], f[3], f[4], sref, g, rms_h) for f in F]
+    verdict = [_gate_2a(f[3], g) for f in F]
     base_ok = verdict[0]
     flips = [i for i in range(1, len(F)) if verdict[i] != base_ok]
+    sc = [_scale_ok(f[4], sref, g) for f in F]
+    flips_sc = sum(1 for i in range(1, len(F)) if sc[i] != sc[0])
     i_xy = 1 + int(np.argmax(dt))                       # worst refits (xy, psi) over (a) and (b)
     i_psi = 1 + int(np.argmax(dpsi))
     worst_dir_xy = [1 + m * N_DIR + int(np.argmax(t8[m])) for m in range(len(anchors))]
@@ -187,7 +192,8 @@ def khung_mot(task):
                C_t_m=float(dt[n8:].max()), C_psi_rad=float(dpsi[n8:].max()),
                s_t_max_m=float(mt.max()), s_psi_max_rad=float(mp.max()),
                xau_xy=pose(i_xy), xau_psi=pose(i_psi),
-               doi_cong_cuc_dai=sorted(i for i in flips if i in cuc_dai), doi_cong_bat_ky=len(flips))
+               doi_cong_cuc_dai=sorted(i for i in flips if i in cuc_dai), doi_cong_bat_ky=len(flips),
+               doi_ti_le_bat_ky=flips_sc, rms_goc_px=float(F[0, 5]), rms_max_px=float(F[1:, 5].max()))
     return out
 
 
@@ -246,6 +252,7 @@ def run_khung(a):
                 max_C_psi_rad=max((r['C_psi_rad'] for r in ok), default=None),
                 n_doi_cong_cuc_dai=sum(bool(r['doi_cong_cuc_dai']) for r in ok),
                 n_doi_cong_bat_ky=sum(bool(r['doi_cong_bat_ky']) for r in ok),
+                n_doi_ti_le_bat_ky=sum(bool(r['doi_ti_le_bat_ky']) for r in ok), cong_phu_thuoc='(2a) res_sim',
                 car_pose=dict(tag_offset=[0.0, 0.0, 0.0], side_m=sess['car_side_m'], kappa=sess['kappa'],
                               plumb_xy_m=sess['plumb_xy_m'], phien_ban=sess.get('car_pose_version')),
                 a6_chuoi=dict(plumb=list(ck.PLUMB_16_11), zc=ck.ZC_16_11),
