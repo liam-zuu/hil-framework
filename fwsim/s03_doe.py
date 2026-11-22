@@ -31,10 +31,12 @@ Steps, as the spec orders them (section numbers of S03 v6):
        longer a share of the default-gain run); y2_versions.csv: whether the two Y2
        versions give the same significant set and signs (5.1); curvature.csv (5.4);
        fail_counts.csv (5.3).
-Outputs (section 7) in --out: sweep.csv, sweep_counts.csv, levels.csv, design.csv (centre,
-outer and inner box), logs_sweep/, meta.yaml; in --out/sealed/ (L56): runs.csv, effects.csv,
-fail_counts.csv, curvature.csv, y2_versions.csv, determinism_check.csv, notes.json,
-stop.json, manifest.json (SHA-256 of the sealed files), logs/.
+Outputs (section 7) in --out: sweep.csv, sweep_counts.csv, levels.csv, kiem_ngoai_mien.csv,
+logs_sweep/, meta.yaml; in --out/sealed/ (L56): levels_sangloc.csv, design.csv (centre, outer,
+inner box, axial, test points), sangloc/, sangloc_thu/ (the screening step of section 3.1b),
+runs.csv, effects.csv, fail_counts.csv, curvature.csv, y2_versions.csv,
+determinism_check.csv, notes.json, stop.json, diag.txt, manifest.json (SHA-256 of the sealed
+files), logs/.
 
 S03 v8 (L67, Liam 07/11; spec section 11 item 4): 14 face-centred axial points (point_id
 257-270, box 'axial', 3 mu x 3 speeds) run with the main design and go to sealed/runs.csv;
@@ -71,7 +73,7 @@ middle mu, gate speeds, in the order of section 3.1 (không cờ / chưa kết l
 kiem_ngoai_mien.csv (one row per point, one total row per controller: đã kiểm đủ / kiểm dở / không kiểm) and
 stops S03 before the main design when a point is 'cờ' (Liam decides).
 
-S03 v8.5 K6 and v8.6 (Liam 21-22/11; partial: section 3.1b screening not in this script):
+S03 v8.5 K6 and v8.6 (Liam 21-22/11):
   * K6: a flagged or inconclusive out-of-range point no longer stops S03; it is written in
     kiem_ngoai_mien.csv, printed and kept in meta.yaml kiem_ngoai_mien.
   * v8.6 section 3.1: the sweep grid is sweep_grid_n cut at the ceiling T of the gain in
@@ -81,20 +83,27 @@ S03 v8.5 K6 and v8.6 (Liam 21-22/11; partial: section 3.1b screening not in this
     extension, the end b of its grid: Codex C3-5); sweep.csv adds tran (true at value == T);
     H_nguon 'trần bảng chặn' when H = T. A default the cut made T (within 1e-9 below T, the same
     float32) is run at the grid point T, which stands for the default run (default_node, C3-4).
+  * v8.5/v8.6 section 3.1b: the random multi-gain screening step (fwsim/s03_sangloc.py
+    run_step) runs after the sweep of every controller, inside the sealed window: S0 (item
+    10, sealed/sangloc_thu/), S1, S2, S2b with their lock files (sealed/sangloc/), its
+    determinism check (item 12), then sealed/levels_sangloc.csv (the accepted box or the
+    sweep levels as fallback) and sealed/design.csv, then the main design of every
+    controller. The numbers are the committed file fwsim/s03_screen_u.csv
+    (make_s03_screen_u.py, run once); every check of it runs before the sweep.
   * v8.6 section 3.2: a design point outside the LADRC triangle omega_c + 2 omega_o < 200 on an
-    axis runs like any point and carries the column ngoai_tam_giac in design.csv and in
+    axis runs like any point and carries the column ngoai_tam_giac in sealed/design.csv and in
     sealed/runs.csv, sealed_test/runs_test.csv; before the main design the float32 of every
-    gain of every point is also compared with the gain table (a failure stops S03; the screening
-    step itself of section 3.1b is not in this script, w_nodes and check_candidate are ready).
+    gain of every point is also compared with the gain table (a failure stops S03).
   * v8.6 section 5.2: the Y3 significance threshold is the absolute 0.4 s^-1 (four wheels, one
     PWM step per 10 ms tick), exact as a decimal; y3_reference is only reported.
 
 L56 / S03 v6 section 1: the main design results (runs.csv, effects.csv and the tables of
 section 5) are NOT looked at before campaign A ends. Nothing derived from them leaves
 sealed/ (Codex S3C-1..S3C-3): no hash of a sealed file outside it, no child-process job file
-outside it, a stop in the main design prints only that S03 stopped, the determinism check
-is only 'passed' there, design.csv holds every point of every controller before the main
-design starts, and the inner box always runs (L41). Every spec stop ends S03
+outside it, a stop after the sweep prints only that S03 stopped (the reason and its phase
+are in sealed/stop.json, prints and warnings in sealed/diag.txt), the determinism check
+is only 'passed' there, sealed/design.csv holds every point of every controller before the
+main design starts, and the inner box always runs (L41). Every spec stop ends S03
 for both controllers (S3C-9). The sweep (section 3.1) is a source of campaign A's domain and
 is printed.
 
@@ -131,6 +140,10 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import fwsim                                            # noqa: E402
+if 'FirmwareSim' not in vars(fwsim):                    # 'python -m fwsim.s03_doe': fwsim is the
+    import importlib                                  #  namespace package; the module is fwsim.fwsim
+    fwsim = importlib.import_module('fwsim.fwsim')    # noqa: E402
+    sys.modules['fwsim'] = fwsim                       # every later `import fwsim` gets the module
 import o1_feasibility as o1                             # noqa: E402
 import o1_gate as G                                     # noqa: E402  (S03 v8.2: G1-G5)
 import o1_gate_eval as E                                # noqa: E402  (G4 e_bao; evaluate_v7 inside, unchanged)
@@ -178,7 +191,8 @@ G1_RUN_COLS = ([f'{c}_{x}_chung' for c in G.MEASURED for x in ('q', 'lo', 'hi', 
                   'g1_cond25_before_deadline', 'g1_cat_t1'])
 RUN_COLS = OLD_COLS + GATE_RUN_COLS + G1_RUN_COLS
 TRIANGLE_COL = 'ngoai_tam_giac'          # S03 v8.6 section 3.2: design point outside the LADRC triangle
-RUNS_FILE_COLS = RUN_COLS + [TRIANGLE_COL]     # header of sealed/runs.csv and sealed_test/runs_test.csv only
+KEP_FRAC_COLS = ['kep_frac_vx', 'kep_frac_vy', 'kep_frac_wz']   # S03 v8.6 2.1, 7, 11 item 6 (c)
+RUNS_FILE_COLS = RUN_COLS + [TRIANGLE_COL] + KEP_FRAC_COLS   # sealed/runs.csv, sealed_test/runs_test.csv only
 LEVEL_COLS = ['controller', 'factor', 'L', 'H', 'centre', 'scale', 'default', 'rule_note',     # S03 v8
               'a', 'b', 'b_n', 'L_nguon', 'H_nguon']                                          # S03 v8.3 (S83-1: fixed)
 SWEEP_ID_COLS = ('controller', 'factor', 'value', 'is_default', 'luoi', 'tran', 'v', 'mu')   # sweep.csv identifiers (section 7; luoi: v8.3, tran: v8.6)
@@ -920,12 +934,36 @@ def check_design_map(rows, test_pts):
                 raise S03Stop(f'{ctrl}: point {pid} is {r["box"]} {codes}, expected {box} {want} (S03 v8 11.4)')
 
 
-def check_candidate(ctrl, g):
-    """S03 v8.6 section 3.1b item 4, for the screening step (not written yet): the
-    gain_table.Verdict of one gain set {factor: binary64 value}; trong_bang False: a float32 gain
-    is outside the table (a bounds failure, S03 stops); trong_bang True and trong_tam_giac False:
-    the LADRC triangle is broken on an axis, the set does not run and is flagged ngoai_bang."""
-    return gain_table.classify(ctrl, g)
+def check_candidate(ctrl, g, w):
+    """S03 v8.6 section 3.1b item 4, Codex C3-2: the bounds check of one gain set of the screening
+    step, in this order. g = {factor: binary64 value} with exactly the keys FACTORS[ctrl];
+    w = {factor: (a_i, w_i)}, the reference box W; a wrong key set of g or w is malformed input
+    (ValueError).
+      1. every binary64 value finite and a_i <= x <= w_i (exact comparison, no tolerance);
+      2. the float32 of every omega_o* gain <= OMEGA_O_MAX (48);
+      3. the float32 of every gain inside the gain table (gain_table.classify, trong_bang; lower
+         and upper bound, 0 accepted where the lower bound is 0);
+      4. the LADRC triangle (classify, trong_tam_giac).
+    A failure of 1-3 is a bounds failure: S03Stop (S03 stops; the caller keeps it sealed). Only a
+    broken triangle is classifiable: returns 'ngoai_bang'; 'ok' otherwise."""
+    want = set(FACTORS[ctrl])
+    if set(g) != want or set(w) != want:
+        raise ValueError(f'{ctrl}: gains {sorted(g)} and box {sorted(w)} must be exactly {sorted(want)}')
+    for name in FACTORS[ctrl]:
+        x, (a_i, w_i) = g[name], w[name]
+        if not (math.isfinite(x) and a_i <= x <= w_i):
+            raise S03Stop(f'{ctrl} {name}: {x!r} is not finite or outside the box [{a_i!r}, {w_i!r}] '
+                          f'(S03 v8.6 3.1b item 4 step 1: a bounds failure, S03 stops)')
+    for name in FACTORS[ctrl]:
+        if name.startswith('omega_o') and float(np.float32(g[name])) > OMEGA_O_MAX:
+            raise S03Stop(f'{ctrl} {name}: float32 {float(np.float32(g[name]))!r} > {OMEGA_O_MAX} '
+                          f'(S03 v8.6 3.1b item 4 step 2: a bounds failure, S03 stops)')
+    v = gain_table.classify(ctrl, g)
+    if not v.trong_bang:
+        raise S03Stop(f'{ctrl}: {"; ".join(v.vi_pham_bang)}: outside the gain table '
+                      f'{gain_table.TABLE_VERSION} (S03 v8.6 3.1b item 4 step 3: a bounds failure, '
+                      f'S03 stops)')
+    return 'ok' if v.trong_tam_giac else 'ngoai_bang'
 
 
 def outside_triangle(ctrl, g):
@@ -933,6 +971,24 @@ def outside_triangle(ctrl, g):
     {factor: binary64 value} breaks the LADRC triangle omega_c + 2 omega_o < 200 on an axis
     (binary64 sum of the float32 values). PID: always False."""
     return not gain_table.classify(ctrl, g).trong_tam_giac
+
+
+def kep_frac_fields(ctrl, row, log):
+    """{kep_frac_vx, kep_frac_vy, kep_frac_wz} of one run (S03 v8.6 section 2.1 last item, 7,
+    11 item 6 (c)): for PID with a log holding the 'kep' channel, the fractions of
+    fwsim.kep_indicator on the O1 window up to row['t_end'] (ticks at the PID integral clamp over
+    ticks with the motor on; NaN when no such tick). ADRC, a run_error row (log None) and a DLL
+    without the kep channel: the three columns stay empty. A ValueError of the indicator
+    (kep_lech set, a bad flag) is a tool error: S03Stop."""
+    out = dict.fromkeys(KEP_FRAC_COLS, '')
+    if ctrl == 'ADRC' or log is None or 'kep' not in log:
+        return out
+    try:
+        ind = fwsim.kep_indicator(log, row['t_end'])
+    except ValueError as exc:
+        raise S03Stop(f'{ctrl}: the kep_indicator self-check failed: {exc} (S03 v8.6 2.1)') from None
+    out.update({k: ind[k] for k in KEP_FRAC_COLS})
+    return out
 
 
 def check_bounds(ctrl, lv, points, gains_at):
@@ -1267,7 +1323,10 @@ def sweep_counts(rows):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    import s03_sangloc as sl              # lazy: s03_sangloc imports this module (circular at top level)
+    # the docstring holds Vietnamese; --help must print on every console encoding
+    ap = argparse.ArgumentParser(description=__doc__.encode('ascii', 'replace').decode(),
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--out', required=True)
     ap.add_argument('--dll', default=os.path.join(HERE, 'build', 'fwsim.dll'))
     ap.add_argument('--mu', type=float, nargs='+', required=True, help='mu levels low [mid high]; one level = --trial only')
@@ -1278,6 +1337,18 @@ def main():
     ap.add_argument('--controllers', nargs='+', default=list(CONTROLLERS), choices=CONTROLLERS)
     ap.add_argument('--test-points', default=TEST_POINTS,
                     help='committed test-set file (S03 v8 section 7); default fwsim/s03_test_points.csv')
+    ap.add_argument('--screen-u', default=None,
+                    help='screening numbers file (S03 v8.5 8.9); default the committed fwsim/s03_screen_u.csv')
+    ap.add_argument('--screen-r', type=int, default=0,
+                    help='rerun index r of the numbers file (S03 3.1b item 3), recorded only')
+    ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 2) - 2),
+                    help='worker processes of the screening step (S03 3.1b item 5)')
+    ap.add_argument('--sangloc-thu', action='store_true',
+                    help='tool check of section 3.1b (S03 8.11): its own numbers file; trial: true')
+    ap.add_argument('--sangloc-thu-n0', type=int, default=None,
+                    help='S0 rows of --sangloc-thu (S03 8.11)')
+    ap.add_argument('--sangloc-thu-n', type=int, default=None,
+                    help='N of --sangloc-thu (S03 8.11); the formula is reported, not applied')
     ap.add_argument('--child', default=None, help=argparse.SUPPRESS)
     a = ap.parse_args()
     if len(a.mu) not in (1, 3) or (len(a.mu) == 1 and not a.trial):
@@ -1287,6 +1358,42 @@ def main():
     if not a.gate_speeds or any(not any(math.isclose(g, s) for s in SPEEDS) for g in a.gate_speeds):
         sys.exit(f'--gate-speeds must be a non-empty subset of {list(SPEEDS)} (S3C-10)')
     gate = [s for s in SPEEDS if any(math.isclose(g, s) for g in a.gate_speeds)]
+    is_trial = a.trial or a.sangloc_thu
+    # S03 3.1b: --trial (one mu level) cannot run the step; --sangloc-thu is its tool check (8.11);
+    # every other run is 'chinh' (three mu levels)
+    screening = None if a.trial else ('thu' if a.sangloc_thu else 'chinh')
+    if a.sangloc_thu:
+        if a.trial:
+            sys.exit('--sangloc-thu is not run with --trial (S03 8.11: the three measured mu levels)')
+        if not a.screen_u:
+            sys.exit('--sangloc-thu needs --screen-u, its own screening numbers file (S03 8.11)')
+        if os.path.basename(a.screen_u) == os.path.basename(sl.SCREEN_U) or \
+                os.path.abspath(a.screen_u) == os.path.abspath(sl.SCREEN_U):
+            sys.exit('--sangloc-thu --screen-u must be another file than fwsim/s03_screen_u.csv '
+                     '(S03 8.11)')
+        if a.sangloc_thu_n0 is None or not 1 <= a.sangloc_thu_n0 <= sl.SET_ROWS['S0']:
+            sys.exit(f'--sangloc-thu-n0 must be in 1..{sl.SET_ROWS["S0"]} (S03 8.11)')
+        if a.sangloc_thu_n is None or not 1 <= a.sangloc_thu_n <= sl.SET_ROWS['S1']:
+            sys.exit(f'--sangloc-thu-n must be in 1..{sl.SET_ROWS["S1"]} (S03 8.11)')
+        if a.screen_r != 0:
+            sys.exit('--screen-r is 0 with --sangloc-thu (S03 8.11)')
+    elif a.sangloc_thu_n0 is not None or a.sangloc_thu_n is not None:
+        sys.exit('--sangloc-thu-n0 and --sangloc-thu-n only with --sangloc-thu')
+    if a.screen_r < 0:
+        sys.exit('--screen-r must be >= 0 (S03 3.1b item 3)')
+    if a.jobs < 1:
+        sys.exit('--jobs must be >= 1')
+    if a.trial and (a.screen_u is not None or a.screen_r != 0):
+        sys.exit('--trial runs no screening step: --screen-u and a --screen-r other than 0 are refused')
+    if a.screen_r >= 1:
+        # S03 3.1b item 3: a rerun index r >= 1 runs on a NEW numbers file (never the committed r = 0)
+        if not a.screen_u:
+            sys.exit('--screen-r >= 1 needs --screen-u, the numbers file of that rerun '
+                     '(S03 3.1b item 3)')
+        if os.path.basename(a.screen_u) == os.path.basename(sl.SCREEN_U) or \
+                os.path.abspath(a.screen_u) == os.path.abspath(sl.SCREEN_U):
+            sys.exit('--screen-r >= 1 --screen-u must be another file than '
+                     'fwsim/s03_screen_u.csv (S03 3.1b item 3)')
     if os.path.isdir(a.out) and os.listdir(a.out):
         sys.exit(f'{a.out} already holds data: use a new folder.')
     sealed = os.path.join(a.out, 'sealed')
@@ -1318,9 +1425,15 @@ def main():
     levels, dflts = {}, {}
     stop_case = None                                  # S03 v8.4: '(i)' / '(ii)' when the sweep stopped there
     kiem_rows, kiem_sum = [], {}
-    stop_public, stop_sealed = None, None
+    stop_before, stop_public, stop_sealed = None, None, None   # before the sweep / sweep / sealed window
+    stop_test, test_rows, test_notes, test_s = None, [], [], None
     t_sweep_end = None
-    tp_info = None                                    # S3V8-3: set when the test file is read (once)
+    tp_info, test_pts = None, []                      # S3V8-3: the test file is read once, at the start
+    screen, screen_info = None, None                  # S03 3.1b: sets and info of the numbers file
+    pha_notes, sweep_planned = [], None               # sealed/notes.json 'pha' (section 7 [v8.5])
+    plan = {}
+    files = {}                                        # sha256 of the public files (empty before the sweep)
+    meta_state = {}                                   # what write_meta(final=True) computed (status, src)
 
     def checked(ctrl, g, v, mu, ids=None, sink=None, work=None, notes_to=None, sweep=None):
         """One run; a run_error is recorded (S3C-12), rerun once in a new process for diagnosis
@@ -1334,7 +1447,8 @@ def main():
         if ids is not None:
             (all_runs if sink is None else sink).append(dict(controller=ctrl, point_id=ids[0], box=ids[1],
                                                              mu=mu, v=v,
-                                                             ngoai_tam_giac=outside_triangle(ctrl, g), **row))
+                                                             ngoai_tam_giac=outside_triangle(ctrl, g),
+                                                             **row, **kep_frac_fields(ctrl, row, log)))
         elif sweep is not None:
             sweep_rows.append(dict(controller=ctrl, factor=sweep[0], value=sweep[1], is_default=sweep[2],
                                    luoi=sweep[3], tran=sweep[4], v=v, mu=mu, **row))
@@ -1349,89 +1463,277 @@ def main():
         raise S03Stop(f'run_error at {ctrl} {g} v={v} mu={mu}: {note["first"]}; rerun in a new process: '
                       f'{note["second"]} (B8b-20: S03 stops, CODE finds the cause)')
 
+    def write_meta(final, running=None):
+        """meta.yaml (S03 section 7, 8.9, 8.10): written three times — at the start, before the
+        first run (final=False, running 'started': the SHA-256 of the numbers file is public from
+        the start), with the PLAN of section 3.1b before S0 runs (final=False, running 'the sweep
+        is done'), and again when S03 ends (final=True: status, source check, every count)."""
+        b = fw.build_info
+        dll_sha = sha256_file(a.dll)
+        sweep_s = round((t_sweep_end or time.time()) - t0)
+        if final:
+            # S3G-1: the sources the runs were made with are those taken at the start; the end must
+            # give the same (S3G2-1: and the evaluator files are those hashed at import; S3G2-2:
+            # untracked files do not count)
+            src_end = source_snapshot(os.path.join(HERE, '..'))
+            changed = (src_end['key'] != src_start['key']
+                       or src_start['key']['evaluator'] != EVAL_SHA_AT_IMPORT)
+            check = (dict(result='CHANGED during the run: not usable as a main result',
+                          start=src_start['key'], end=src_end['key'],
+                          evaluator_at_import=EVAL_SHA_AT_IMPORT) if changed
+                     else 'same at import, start and end of the run')
+            meta_state['src_changed'] = changed
+            det = ('not run' if (stop_before or stop_public)
+                   else 'see sealed/ (S03 stopped after the sweep)' if stop_sealed
+                   else 'passed (detail in sealed/determinism_check.csv)')
+            tset = ('not run (S03 stopped before it)' if (stop_before or stop_public or stop_sealed)
+                    else 'sealed in sealed_test/ (not looked at before the RSM coefficients are '
+                    'saved, S03 v8 section 7)')
+            stat = ('stopped before the sweep: ' + stop_before if stop_before else
+                    'stopped in the sweep: ' + stop_public if stop_public else
+                    'stopped after the sweep (the reason is in sealed/stop.json)' if stop_sealed
+                    else 'stopped in the test set (the reason is in sealed_test/stop.json)'
+                    if stop_test else 'ran to the end')
+            if changed:
+                stat += '; the script or evaluator sources changed during the run (S3G-1); ' \
+                        'see meta.yaml source_check'
+            meta_state['status'] = stat
+        else:
+            check = 'pending (checked at the end of the run)'
+            det, tset = 'pending', 'pending'
+            stat = running
+        # S3V8-3: what was read at the start, not a second read of the file now
+        tp_meta = tp_info if tp_info is not None else dict(
+            file=_rel_here(a.test_points), read='no (the test file was not read)')
+        # S03 3.1b item 10, 8.10: the PLAN only — no threshold, box, nguon_mien, branch, N used or
+        # count of the step ever leaves sealed/
+        sang_plan = dict(che_do=('khong_chay: --trial mot muc mu' if screening is None
+                                 else 'kiem_cong_cu' if screening == 'thu' else 'chinh'),
+                         m_min=sl.M_MIN, T_max_gio=sl.T_MAX_H, T_max_nhan=sl.T_MAX_LABEL,
+                         cong_thuc_N=('N = min(N_tk, N_gio); N_tk = the smallest multiple of 1000 '
+                                      'in [3000, 10000] with N q_min >= 2 m_min (10000 when none); '
+                                      'N_gio = the largest multiple of 1000, at most 10000, with '
+                                      '3 (N / 1000) t_S0 <= T_max (0 when none), t_S0 = wall-clock '
+                                      'seconds of the S0 phase; q_min = the smallest over '
+                                      'controller x mode of (S0 gain sets feasible with f1 <= '
+                                      'smallest feasible f1 + 0.01 m) / 1000; no screening when '
+                                      'N < 3000, when N q_min < m_min, or when S0 has more than '
+                                      '10 % unclassifiable gain sets in a controller and mode '
+                                      '(S03 3.1b item 10)'),
+                         ti_le_khong_phan_loai_toi_da=0.1, so_tien_trinh=a.jobs,
+                         seed='2026112100 + 10 r + t', r=a.screen_r, file_so=screen_info,
+                         kiem_cong_cu=(dict(n0=a.sangloc_thu_n0, n=a.sangloc_thu_n)
+                                       if screening == 'thu' else None))
+        kep_channel = bool(getattr(fw, 'kep_cols', 0))
+        with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
+            f.write(f"""spec: S03 v8.6 (06_SPECS/2026-11-05_Spec_S03_DOE_chon_gain.md)
+date: {time.strftime('%Y-%m-%d')}
+setup: sim                     # fwsim: ESP32 firmware C code (DLL) + rpi5/plant_step.py, NOT hardware
+operator: Claude (phiên CODE)
+trial: {str(is_trial).lower()}     # true: tool check (--trial mu 0.5, or --sangloc-thu, the tool check of section 3.1b with three mu levels), never main numbers
+sealed: "L56 / S03 section 1: everything derived from the main-design responses is in sealed/ (with its own manifest.json) and is not looked at before campaign A ends"
+status: {json.dumps(stat)}
+script: {json.dumps(src_start['script'])}   # taken before the first run (S3G-1)
+source_check: {json.dumps(check)}   # script and evaluator again at the end (S3G-1)
+firmware:
+  esp32: {json.dumps(b.get('esp32'))}
+  hil_framework_at_build: {json.dumps(b.get('hil_framework'))}
+  compiler: "{b.get('compiler')}"
+  dll_sha256: {dll_sha}
+  h7: null
+  rpi5: null
+plant: {fwsim.plant_meta(fwsim.plant_params(argparse.Namespace(ground='traction', mu=mu_mid)))}
+plant_check: chua_X3
+mu_levels: {json.dumps(mu_levels)}
+mu_source: "{a.mu_source or ('trial: fwsim assumption 0.5 (params.py), no MU_FLOOR measurement yet' if a.trial else '')}"
+imu: {json.dumps(IMU)}
+seed: {SEED}                       # plant has no random input; IMU noise replay seed (imu.noise_seed)
+determinism_seed: {DET_SEED}       # draws the 3 corners of the determinism check (S03 3.4)
+determinism: "{det}"
+speeds: {json.dumps(list(SPEEDS))}
+gate_speeds: {json.dumps(gate)}
+controllers: {json.dumps(a.controllers)}
+factors: {json.dumps(FACTORS)}
+temporary_bounds_for_the_grid: {json.dumps({m: tune_ga.BOUNDS[m] for m in a.controllers})}   # tune_ga.BOUNDS (S03 3.1)
+thresholds: {json.dumps(THRESH)}   # S03 v8.6 section 5.2: tv_duty 0.4 s^-1 absolute, every speed and mu, worst and range (y3_reference below is reported beside it, not a base)
+y3_reference: {json.dumps({f'{c} v={v}': y for (c, v), y in y3_ref.items()})}
+o1: {json.dumps(dict(A=o1.A, a_r=o1.A_R, D=o1.D, D_d=o1.D, t_d=o1.T_D, t_late=o1.T_LATE, delta=o1.DELTA, v_d=o1.V_D, c_cens=o1.C_CENS))}
+grid: {json.dumps({f'{c} {n}': {k: v_ for k, v_ in i.items() if k != 'noi'} for (c, n), i in grid_info.items()})}   # S03 v8.3 section 3.1: a, b, r, K, b_n, points per gain; from v8.6 the grid is cut at the gain-table ceiling T: T, n_bo (points dropped), noi / n_noi / n_points after the cut, b_n = the largest point after the cut (T when cut, else the extension end; for omega_o, which has no extension, the end b of its grid)
+kiem_ngoai_mien: {json.dumps(kiem_sum, ensure_ascii=False)}   # S03 v8.4 section 3.1: total per controller (đã kiểm đủ / kiểm dở / không kiểm), counts, flagged (co), inconclusive (chua_ket_luan) and bao_rieng points; detail in kiem_ngoai_mien.csv
+gate: {json.dumps(gate_meta())}   # S03 v8.2 section 7: G1-G5 per run (o1_gate.gate), U = 0 on fwsim
+evaluator_sha256: {json.dumps(EVAL_SHA_AT_IMPORT)}   # S03 v8.2 section 8 condition 8: S03 and S04 on the same evaluator; the files as hashed when the script was imported (S3G-1, S3G2-1)
+sweep_run_error_reruns: {json.dumps([n for n in rerun_notes if n['point'] is None], default=str)}
+planned_runs_per_controller: {json.dumps(PLANNED_RUNS)}   # S03 v8 3.2, 7 (rows actually run: sealed/, sealed_test/)
+test_points: {json.dumps(tp_meta)}   # S03 v8 3.2, 7, 8.7 (S3V8-3): read once at the start; sha256 of the bytes read, sha256_lf after CRLF -> LF, matches_head_blob_lf, generation from <name>.gen.json beside the file
+test_set: {json.dumps(tset)}
+sang_loc: {json.dumps(sang_plan, ensure_ascii=False)}   # PLAN of S03 3.1b (item 10, 8.10): mode, m_min, T_max, the formula of N, the numbers-file info; NOTHING of the results of the step
+kep_channel: {str(kep_channel).lower()}                 # fwsim.kep_cols of the DLL: the kep_frac columns are filled only when true
+interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THESIS correct if wrong
+  - "completion: conditions 1, 5 at the instant, conditions 2 and 3 together as the trailing unbroken t_d window (condition 2 over the window: L63 (2), Liam 07/11), condition 4 strictly before the deadline; after a tracking error that came before the progress, the window runs to the deadline (o1_feasibility.evaluate_v7)"
+  - "sweep level rule: a point is 'completing' only with y1 'true' at every gate speed (inconclusive breaks the run)"
+  - "inner box trigger: corners with y1 'false' only (inconclusive not counted)"
+  - "a stop of the spec (3.1 (i), (ii), 3.4, run_error) ends S03 for both controllers; the default gains of every controller are checked first"
+  - "logs: log.csv (%.17g) of the four determinism points and npz (exact bits) of the centre and every main-design run not completed, all in sealed/logs/; npz of every sweep run not completed in logs_sweep/ (public, as the sweep)"
+  - "the inner box (codes +-0.5) always runs for every controller (L41, Liam 06/11 'Chot B'), so the number of runs does not depend on the results; both boxes are always analysed (the same work), and the inner box is kept (effects, Y2 versions, fail counts; curvature is for the outer box only; at every speed, as before L41) only when the rule of S03 3.2 is on at one speed or more (> 64/128 corners 'false' at the middle mu); otherwise its runs are only rows of sealed/runs.csv"
+  - "elapsed_s here is the sweep only; the total and the main-design time are in sealed/notes.json (L56, Codex S3E-1; S03 section 7 asks elapsed_s in meta.yaml)"
+  - "public channels left (L56, S3C-3, S3E-1; Liam 06/11 'Chot B', 'Duyet khuyen nghi'): status, exit code and console say that S03 stopped after the sweep (the reason and its phase are in sealed/stop.json); the wall-clock time still varies a little with the results (scoring a run that does not complete is a little longer, evaluate_v7 closes the window early on completion; v8.2: the G4 scoring of o1_gate_eval works on the scored frames and their projection solutions, so it may add to this, S3G-7; writing the npz of the runs not completed; machine noise): accepted, not measured"
+  - "the upper-end tracking flag uses the 400 001-point path grid (about 15 um); at s = S the window is cut by the end of the path, not flagged (Codex S3C-5, deferred)"
+  - "v8: run order per controller centre, outer, inner, axial (3 mu x 3 speeds each), then determinism and analysis; sealed/ is written and closed after every controller; then the test set of every controller (middle mu x 3 speeds); a stop before the test set means the test set does not run"
+  - "v8: test-set logs follow the rule of section 7 (npz of every run not completed; there is no centre point in the test set); the compressed npz is made for every run (same work)"
+  - "v8: the test-points file is read once before the main design (S3V8-3); 'committed' (section 8.7) = tracked, unmodified for git status AND the bytes read match the blob in HEAD after CRLF -> LF of both; its generation record is <name>.gen.json beside the file read, with the sha256 of the bytes read or of their LF or CRLF form (R2-2: the committed record holds the SHA-256 of the CRLF file; a clean LF checkout is the same content); a stop at this check keeps what was read in test_points (R2-4); with --trial a failed check is allowed and recorded in test_points.problems"
+  - "v8 (S3V8-2): warnings, prints and tracebacks of the test phase go to sealed_test/diag.txt and any exception of the phase, writing its outputs included, is a stop recorded in sealed_test/stop.json (written first; R2-1); the warning policy in force is kept, a warning made an error stays an error (R2-3); the same channel now holds for the sealed window from the end of the sweep until sealed/ is closed (sealed/diag.txt)"
+  - "v8: n_upper_frames, n_back_frames count the frames evaluate_v7 kept for scoring (t_k <= t_end), as section 4 defines them; they are diagnostics, never responses"
+  - "v8.2: every run (sweep, main design, axial, test set, determinism reruns) is scored by o1_gate_eval.evaluate_fig8, which calls evaluate_v7 unchanged (the S03 v8 columns keep their values), then o1_gate.gate with u_t = 0 (fwsim knows the command start; the 50 Hz hold is a property of the command path, not added to U, o1_gate docstring), U_p = U_psi = 0 (true plant pose) and every condition deciding (DECIDE_ALL)"
+  - "v8.2: G1-G5 columns use the names of tools/rq3_log.py GATE_COLS (B81-3); gate_json_sha256 is not written; gate_outcome is the O1 3.5 outcome over G1-G5; with U = 0, lo = hi = q"
+  - "v8.2: a failure of the gate scoring (e.g. the rebuilt nearest distance of G4 not the row e_perp) is a run_error, so S03 stops (B8b-20) as for a DLL error"
+  - "B81-3 (15/11, Liam CODE_FEAS 'code di'): the G1 fields of O1 3.5 last block and the common domain are written (G1_RUN_COLS after gate_outcome): t_done = t_end when completed 'true', t1 = first tracking-error frame, prog_before_t1 = progress strictly before t1, cond25_before_deadline = cond2_5_ever (o1_gate_eval.g1_fields_v7, from the evaluate_v7 summary, which is unchanged); G1 recomputed from them must agree with the state from completed (o1_gate.gate raises, so a run_error); one way of using the frames: g1_ways 1, g1_t_done_2 and g1_cat_t1 empty, _chung the same as the union; gate_version stays gate_v3.2 (tools/rq3_log.py accepts only that version)"
+  - "v8.3: the sweep grid is the v8 grid (sweep_grid, unchanged; C12 keeps it for its box [a, b]) plus b r^k, k = 1..K, r = (b/a)^(1/10), K the smallest integer with r^K >= 10 (1 - 1e-9), found by a loop on r**k; omega_o is not extended (cap 48); v8.4: the extension still runs with the sweep, only for the out-of-range check; the level rule runs on the original grid (11 log points, the default, 0)"
+  - "v8.3 (agreed with CODE_C13 15/11): luoi of the default value is mac_dinh even when it is on a log point, the (default check) and (default) rows are mac_dinh; L_nguon 'hết lưới dưới' when L is the lowest grid point and L > 0; v8.4: H_nguon 'hết lưới' when H = b, 'trần ω_o' instead for omega_o when b = 48; levels.csv b_n: see v8.6"
+  - "v8.4 out-of-range check: a run is comparable when it exists, completed 'true', status 'ok' and its e_perp_max and tv_duty are finite; a point below L is put against the run at L, above H against H; the Y2 threshold is 0.01 m and the Y3 threshold is the absolute 0.4 s^-1 of section 5.2 (v8.6; before: 20 % of the default-gain run), compared exactly as a decimal; the bounds are inclusive and compared exactly, with no tolerance, on the decimal of each number as written in the CSV (repr of the float) (S84-1, S84V2-1, S84V3-1: 0.03 - 0.02 is 0.01, not the binary64 0.009999999999999998; two identical responses never count as lower by a positive threshold; a point a few ULP past a bound is past it; the column nguong_tv holds the threshold as a float); bao_rieng = not flagged and, at one gate speed where both are comparable, e_perp_max lower by >= 0.01 m; buoc is the step of section 3.1 that matched"
+  - "v8.4 out-of-range check totals: 'không kiểm' for every controller when S03 stopped at 3.1 (i) or (ii); 'đã kiểm đủ' when every factor of the controller has levels; else 'kiểm dở' (the sweep stopped part way): factors with levels are checked, every grid point (original and extension) of a factor without levels counts in n_chua_kiem, n_gain_chua_kiem counts those factors; every grid is computed before the first sweep run. v8.5 (K6): a flagged or inconclusive point does not stop S03, it is written in kiem_ngoai_mien.csv, printed and kept in meta.yaml kiem_ngoai_mien"
+  - "v8.6 section 3.1: the sweep grid is sweep_grid_n cut at the ceiling T of the gain in tools/gain_table.py (table {gain_table.TABLE_VERSION}; the factor names are the table's names): points above T are dropped; when a point was dropped, a remaining point within the relative error 1e-9 of T becomes T, else T is added, to the original grid when T < b and to the extension when T > b; sweep.csv tran is true at value == T; an added T has luoi log (original grid) or noi (extension); a, b, r, K keep their definitions; b_n is the largest point after the cut (omega_o has no extension: its b_n is the end b of its grid); H_nguon 'trần bảng chặn' when H = T is the end of the cut original grid (first over 'hết lưới'); a firmware default above its ceiling stops S03; a default the cut made T (within 1e-9 below T) is run at the grid point T when both are the same float32: that point stands for the default run (is_default true, luoi mac_dinh, tran true, the level rule starts from it; levels.csv default keeps the firmware value); another float32 stops S03"
+  - "v8.6 section 5.2: tv_duty threshold 0.4 s^-1 absolute for every speed, mu, worst and range; y3_reference is only reported"
+  - "v8.6 sections 3.1b item 4, 3.2: before the main design the float32 of every gain of every design point is also compared with the gain table (0 accepted where the lower bound is 0), a failure stops S03; a design point with omega_c + 2 omega_o >= 200 on an axis (binary64 sum of the float32 values) runs like any point and has ngoai_tam_giac true in sealed/design.csv, runs.csv, runs_test.csv (PID always false); the number of such points per controller is in sealed/notes.json (centre, outer, inner, axial) and sealed_test/notes.json (test points)"
+  - "v8.5/v8.6 section 3.1b: the screening step is fwsim/s03_sangloc.py (run_step); it runs after the sweep of every controller: S0, then S1, S2, S2b with their lock files, its determinism check, then sealed/levels_sangloc.csv and sealed/design.csv, then the main design of every controller, sealed/ is closed, then the test set"
+  - "v8.5 3.1b item 13: from the end of the sweep until sealed/ is closed every stop reason goes to sealed/stop.json (with the phase), every print, warning and traceback of those phases to sealed/diag.txt; the console prints one line when S03 ends; status says only 'stopped after the sweep'; exit code 0 or 2 as before"
+  - "the test-points file and the screening numbers file are read once at the start, before any run; a failed check of these committed input files is a public stop before the sweep (no result exists yet); S03 v8 read the test file after the sweep"
+  - "meta.yaml is written three times: at the start, before the first run (the plan of section 3.1b - m_min, T_max, the formula of N, the SHA-256 of the numbers file, 8.9 - is public from the start), again before S0 runs, and when S03 ends; the public sweep files are written when the sweep ends"
+  - "--trial (mu 0.5, one level): section 3.1b needs three mu levels and does not run; sealed/levels_sangloc.csv holds the sweep levels with nguon_mien du_phong and sealed/sangloc/ket_qua.json says khong_chay_sang_loc with that reason"
+  - "--sangloc-thu (S03 section 8 condition 11): tool check of section 3.1b with the three measured mu levels, its own numbers file (another name and content than fwsim/s03_screen_u.csv, seeds 2026112105..09 when made by make_s03_screen_u.py --thu), S0 on the first n0 rows and N given by --sangloc-thu-n; the formula of N is computed and kept in sealed/sangloc_thu/so_dem.json but does not set N; trial: true"
+  - "the main design decodes its points from sealed/levels_sangloc.csv read back from disk (S03 3.2 'Nguon muc'); levels.csv keeps the sweep levels"
+  - "kep_frac_vx, kep_frac_vy, kep_frac_wz (runs.csv, runs_test.csv; S03 2.1, 7, 11 item 6 (c)): fwsim.kep_indicator on the O1 window up to the t_end of the run, ticks at the PID integral clamp over ticks with the motor on, one column per axis as section 2.1 asks; empty for LADRC, for a run_error row and when the DLL has no kep channel; a failed self-check of the indicator stops S03"
+  - "screening files: evals_<set>.csv has the columns of the S04 evals.csv after controller, set, row (ga_seed, gen, cand_id empty); the ba_mu record of a gain set not feasible at the middle mu has no score numbers (step b not run); S0, S1, S2, S2b run both controllers in one worker pool, so sealed/notes.json has one common total per phase (controller all)"
+  - "sealed/notes.json pha: no entry with the label 'bo' (this script cannot resume a run; a new run needs a new folder)"
+  - "v8.2: the public sweep carries the G columns too (Liam 14/11 CODE_FEAS 'Co, mot cach cham'); G3-G5 are not responses of section 5"
+elapsed_s: {sweep_s}
+file_sha256: {json.dumps(files)}
+files:
+  - sweep.csv: "one line per sweep run (section 3.1) and default gains at the other mu levels; v8.3: luoi = log | mac_dinh | 0 | noi (the extension); v8.6: tran = true at the point of value T, the gain-table ceiling"
+  - sweep_counts.csv: "section 5.3 for the sweep: runs not completed, inconclusive, saturated per factor, speed, mu"
+  - levels.csv: "L, H, centre, scale per factor (v8.4: on the original grid); v8.3: a, b (ends of the 11 log points), b_n (v8.6: the largest point of the grid after the cut at the gain-table ceiling, T when the grid is cut, else the end of the extension; for omega_o, which has no extension, the end b of its grid; from v8.5 the upper end of campaign A's domain and of the reference box W), L_nguon, H_nguon (source of each level, S03 v8.4 section 3.1; v8.6: 'trần bảng chặn' when H = T ends the cut original grid)"
+  - kiem_ngoai_mien.csv: "S03 v8.4 section 3.1: one row (dong diem) per original or extension point outside [L, H]: luoi, level compared (can L or H, can_value), ket_qua (không cờ / chưa kết luận / cờ), buoc, bao_rieng, per speed: in the gate, y1, status, e_perp_max, tv_duty of the point and of the level, Y3 threshold; one total row (dong tong) per controller: đã kiểm đủ / kiểm dở / không kiểm and counts"
+  - logs_sweep/: "npz of the sweep runs not completed"
+  - sealed/: "SEALED (L56): levels_sangloc.csv (the screening or fallback levels, section 3.2 'Nguồn mức'), design.csv (371 rows per controller: centre, outer box, inner box, axial points, test points; v8.6: ngoai_tam_giac), sangloc/, sangloc_thu/ (the screening step of section 3.1b), runs.csv (section 4 responses; centre, outer, inner, axial; kep_frac_vx/vy/wz columns at the end), effects.csv (every term, per box, response, speed, mu / worst / range; outer and inner only), curvature.csv (5.4), y2_versions.csv (5.1), fail_counts.csv (5.3), determinism_check.csv (3.4), notes.json (v8.6: ngoai_tam_giac_points per controller, pha), stop.json, diag.txt (prints, warnings, tracebacks of the sealed phases), manifest.json, logs/"
+  - sealed_test/: "SEALED separately (S03 v8 section 7): runs_test.csv, logs/, notes.json (v8.6: ngoai_tam_giac_points per controller, test points), stop.json, diag.txt (warnings, prints, traceback of the test phase), manifest.json; opened only after the RSM coefficients at the middle mu are saved and committed"
+""")
+
+    # ── step 1 (S03 v8.5 section 7 'Thứ tự chạy khóa', 3.1b item 13): the committed input files
+    # are read ONCE, before any run; a failed check is a public stop BEFORE the sweep (no result
+    # exists yet): no firmware call is made for it.
     try:
-        # 3.1 (i) first, for every controller, so S03 stops before any sweep (S3C-9)
-        for ctrl in a.controllers:
-            dflts[ctrl] = defaults(fw, ctrl)
-            for v in SPEEDS:
-                row, log = checked(ctrl, dflts[ctrl], v, mu_mid,
-                                   sweep=('(default check)', '', True, 'mac_dinh', False))
-                # recorded and logged before the stop test (S3D-4); public like the sweep
-                sweep_rows.append(dict(controller=ctrl, factor='(default check)', value='', is_default=True,
-                                       luoi='mac_dinh', tran=False, v=v, mu=mu_mid, **row))
-                if row['completed'] != 'true':
-                    save_log(os.path.join(a.out, 'logs_sweep'), f'{ctrl}_default_check_v{v}', log)
-                if v in gate and row['completed'] != 'true':
-                    raise S03Stop(f'{ctrl}: default gains do not complete at gate speed {v} (y1 '
-                                  f'{row["completed"]}, S03 3.1 (i))', case='(i)')
-        # S03 v8.4: every grid is known before the first sweep run, so a sweep that stops part way can count
-        # the points it did not check (kiem_ngoai_mien.csv 'kiểm dở')
-        for ctrl in a.controllers:
-            lo_b, hi_b = tune_ga.BOUNDS[ctrl]
-            for j, name in enumerate(FACTORS[ctrl]):
-                grids[(ctrl, name)] = sweep_grid_cut(ctrl, name, dflts[ctrl][name], lo_b[j], hi_b[j])  # v8.6: the cut
-                grid_info[(ctrl, name)] = grids[(ctrl, name)][1]
-        # 3.1 sweep and levels, every controller (S3C-9: a stop ends S03)
-        for ctrl in a.controllers:
-            dflt = dflts[ctrl]
-            levels[ctrl] = {}
-            for j, name in enumerate(FACTORS[ctrl]):
-                grid, ginfo = grids[(ctrl, name)]
-                base = base_grid(grid, ginfo)                  # S03 v8.4: the level rule runs on it only
-                d_node = default_node(grid, ginfo, dflt[name])   # C3-4: the default, or T standing for it
-                ok = []
-                for x in grid:
-                    g = dict(dflt, **{name: x})
-                    done = True
-                    for v in SPEEDS:
-                        row, log = checked(ctrl, g, v, mu_mid, sweep=(name, x, x == d_node,
-                                                                      grid_label(x, d_node, ginfo['noi']),
-                                                                      x == ginfo['T']))
-                        sweep_rows.append(dict(controller=ctrl, factor=name, value=x, is_default=x == d_node,
-                                               luoi=grid_label(x, d_node, ginfo['noi']), tran=(x == ginfo['T']),
-                                               v=v, mu=mu_mid, **row))
-                        if x == d_node:
-                            y3_ref[(ctrl, v)] = row['tv_duty']
-                        if row['completed'] != 'true':          # sweep is public: its failed logs too (S3C-20)
-                            save_log(os.path.join(a.out, 'logs_sweep'), f'{ctrl}_{name}_{x:.6g}_v{v}', log)
-                        if v in gate:
-                            done &= row['completed'] == 'true'
-                    ok.append(done)
-                    print(f'[sweep {ctrl}] {name} = {x:.4g}: completes at gate speeds = {done}', flush=True)
-                try:
-                    L, H = levels_from_sweep(base, d_node, ok[:len(base)])    # S03 v8.4: original grid only
-                except S03Stop as exc:
-                    raise S03Stop(f'{ctrl} {name}: {exc}', case=exc.case) from None
-                sc, centre = scale_of(L, H)
-                levels[ctrl][name] = (L, H, sc)
-                l_src, h_src = level_sources(base, L, H, ginfo, name)          # S03 v8.4
-                level_rows.append(dict(controller=ctrl, factor=name, L=L, H=H, centre=centre, scale=sc,
-                                       default=dflt[name], rule_note='longest completing run of the original grid '
-                                       'with the default, gate speeds ' + ' '.join(map(str, gate)),
-                                       a=ginfo['a'], b=ginfo['b'], b_n='' if ginfo['b_n'] is None else ginfo['b_n'],
-                                       L_nguon=l_src, H_nguon=h_src))
-                print(f'[levels {ctrl}] {name}: L={L:.4g} H={H:.4g} scale={sc}', flush=True)
-            same = [n for n, (L, H, _) in levels[ctrl].items() if L == H]
-            if same:
-                raise S03Stop(f'{ctrl}: L = H for {same} (S03 3.1 (ii)): Liam decides, no main design', case='(ii)')
-            for mu in mu_levels:        # default gains at low / high mu too (5.2: reported, not the base)
-                if mu == mu_mid:
-                    continue
-                for v in SPEEDS:
-                    row, log = checked(ctrl, dflt, v, mu, sweep=('(default)', '', True, 'mac_dinh', False))
-                    sweep_rows.append(dict(controller=ctrl, factor='(default)', value='', is_default=True,
-                                           luoi='mac_dinh', tran=False, v=v, mu=mu, **row))
-                    if row['completed'] != 'true':                      # S3C-20
-                        save_log(os.path.join(a.out, 'logs_sweep'), f'{ctrl}_default_mu{mu}_v{v}', log)
-        t_sweep_end = time.time()
+        test_pts, tp_info = load_test_points(a.test_points, trial=is_trial)   # section 8 condition 7
+        if screening is not None:
+            screen, screen_info = sl.load_screen_u(a.screen_u or sl.SCREEN_U,
+                                                   trial=(screening == 'thu'))   # 8.9
+            if screening == 'thu' and os.path.isfile(sl.SCREEN_U):
+                with open(sl.SCREEN_U, 'rb') as f:
+                    ref_lf = hashlib.sha256(f.read().replace(b'\r\n', b'\n')).hexdigest()
+                if screen_info['sha256_lf'] == ref_lf:
+                    raise S03Stop('the --sangloc-thu numbers file has the same content as '
+                                  'fwsim/s03_screen_u.csv after CRLF -> LF (S03 8.11)')
     except S03Stop as exc:
-        stop_public = str(exc)                          # sweep phase: public (S03 3.1 is not sealed)
-        stop_case = exc.case
-        print(f'[STOP] {exc}', flush=True)
+        stop_before = f'before the sweep: {exc}'
+        tp_info = getattr(exc, 'tp_info', tp_info)
+        screen_info = getattr(exc, 'screen_info', screen_info)
+        print(f'[STOP] {stop_before}', flush=True)
+
+    if stop_before is None:
+        # S03 section 8 condition 9: the SHA-256 of the numbers file is in the public meta.yaml
+        # from the start of the run, before the first firmware run
+        write_meta(final=False, running='running: started; the sweep is not finished')
+        try:
+            # 3.1 (i) first, for every controller, so S03 stops before any sweep (S3C-9)
+            for ctrl in a.controllers:
+                dflts[ctrl] = defaults(fw, ctrl)
+                for v in SPEEDS:
+                    row, log = checked(ctrl, dflts[ctrl], v, mu_mid,
+                                       sweep=('(default check)', '', True, 'mac_dinh', False))
+                    # recorded and logged before the stop test (S3D-4); public like the sweep
+                    sweep_rows.append(dict(controller=ctrl, factor='(default check)', value='',
+                                           is_default=True, luoi='mac_dinh', tran=False, v=v,
+                                           mu=mu_mid, **row))
+                    if row['completed'] != 'true':
+                        save_log(os.path.join(a.out, 'logs_sweep'), f'{ctrl}_default_check_v{v}', log)
+                    if v in gate and row['completed'] != 'true':
+                        raise S03Stop(f'{ctrl}: default gains do not complete at gate speed {v} (y1 '
+                                      f'{row["completed"]}, S03 3.1 (i))', case='(i)')
+            # S03 v8.4: every grid is known before the first sweep run, so a sweep that stops part
+            # way can count the points it did not check (kiem_ngoai_mien.csv 'kiểm dở')
+            for ctrl in a.controllers:
+                lo_b, hi_b = tune_ga.BOUNDS[ctrl]
+                for j, name in enumerate(FACTORS[ctrl]):
+                    grids[(ctrl, name)] = sweep_grid_cut(ctrl, name, dflts[ctrl][name], lo_b[j], hi_b[j])  # v8.6: the cut
+                    grid_info[(ctrl, name)] = grids[(ctrl, name)][1]
+            sweep_planned = sum(3 + 3 * sum(len(grids[(ctrl, n)][0]) for n in FACTORS[ctrl])
+                                + 3 * (len(mu_levels) - 1) for ctrl in a.controllers)
+            # 3.1 sweep and levels, every controller (S3C-9: a stop ends S03)
+            for ctrl in a.controllers:
+                dflt = dflts[ctrl]
+                levels[ctrl] = {}
+                for j, name in enumerate(FACTORS[ctrl]):
+                    grid, ginfo = grids[(ctrl, name)]
+                    base = base_grid(grid, ginfo)              # S03 v8.4: the level rule runs on it only
+                    d_node = default_node(grid, ginfo, dflt[name])   # C3-4: the default, or T standing for it
+                    ok = []
+                    for x in grid:
+                        g = dict(dflt, **{name: x})
+                        done = True
+                        for v in SPEEDS:
+                            row, log = checked(ctrl, g, v, mu_mid, sweep=(name, x, x == d_node,
+                                                                          grid_label(x, d_node, ginfo['noi']),
+                                                                          x == ginfo['T']))
+                            sweep_rows.append(dict(controller=ctrl, factor=name, value=x,
+                                                   is_default=x == d_node,
+                                                   luoi=grid_label(x, d_node, ginfo['noi']),
+                                                   tran=(x == ginfo['T']), v=v, mu=mu_mid, **row))
+                            if x == d_node:
+                                y3_ref[(ctrl, v)] = row['tv_duty']
+                            if row['completed'] != 'true':      # sweep is public: failed logs too (S3C-20)
+                                save_log(os.path.join(a.out, 'logs_sweep'), f'{ctrl}_{name}_{x:.6g}_v{v}', log)
+                            if v in gate:
+                                done &= row['completed'] == 'true'
+                        ok.append(done)
+                        print(f'[sweep {ctrl}] {name} = {x:.4g}: completes at gate speeds = {done}', flush=True)
+                    try:
+                        L, H = levels_from_sweep(base, d_node, ok[:len(base)])    # S03 v8.4: original grid only
+                    except S03Stop as exc:
+                        raise S03Stop(f'{ctrl} {name}: {exc}', case=exc.case) from None
+                    sc, centre = scale_of(L, H)
+                    levels[ctrl][name] = (L, H, sc)
+                    l_src, h_src = level_sources(base, L, H, ginfo, name)          # S03 v8.4
+                    level_rows.append(dict(controller=ctrl, factor=name, L=L, H=H, centre=centre, scale=sc,
+                                           default=dflt[name], rule_note='longest completing run of the '
+                                           'original grid with the default, gate speeds '
+                                           + ' '.join(map(str, gate)),
+                                           a=ginfo['a'], b=ginfo['b'],
+                                           b_n='' if ginfo['b_n'] is None else ginfo['b_n'],
+                                           L_nguon=l_src, H_nguon=h_src))
+                    print(f'[levels {ctrl}] {name}: L={L:.4g} H={H:.4g} scale={sc}', flush=True)
+                same = [n for n, (L, H, _) in levels[ctrl].items() if L == H]
+                if same:
+                    raise S03Stop(f'{ctrl}: L = H for {same} (S03 3.1 (ii)): Liam decides, no main design',
+                                  case='(ii)')
+                for mu in mu_levels:    # default gains at low / high mu too (5.2: reported, not the base)
+                    if mu == mu_mid:
+                        continue
+                    for v in SPEEDS:
+                        row, log = checked(ctrl, dflt, v, mu, sweep=('(default)', '', True, 'mac_dinh', False))
+                        sweep_rows.append(dict(controller=ctrl, factor='(default)', value='',
+                                               is_default=True, luoi='mac_dinh', tran=False, v=v, mu=mu, **row))
+                        if row['completed'] != 'true':                      # S3C-20
+                            save_log(os.path.join(a.out, 'logs_sweep'), f'{ctrl}_default_mu{mu}_v{v}', log)
+            t_sweep_end = time.time()
+        except S03Stop as exc:
+            stop_public = str(exc)                          # sweep phase: public (S03 3.1 is not sealed)
+            stop_case = exc.case
+            print(f'[STOP] {exc}', flush=True)
 
     # S03 v8.4 section 3.1: the out-of-range check, from the public sweep only, before the main design
-    kiem_rows, kiem_sum = out_of_range_check(sweep_rows, levels, grids, dflts, a.controllers, gate, mu_mid, y3_ref,
-                                             stop_case)
+    if stop_before is not None:
+        kiem_rows, kiem_sum = [], {}                 # stopped before the sweep: nothing to check
+    else:
+        kiem_rows, kiem_sum = out_of_range_check(sweep_rows, levels, grids, dflts, a.controllers,
+                                                 gate, mu_mid, y3_ref, stop_case)
     for ctrl, s in kiem_sum.items():
         print(f'[out-of-range check {ctrl}] {s["ket_qua"]}: {s["n_diem_ngoai"]} points outside, cờ {s["n_co"]}, '
               f'chưa kết luận {s["n_chua_ket_luan"]}, không cờ {s["n_khong_co"]}, not checked {s["n_chua_kiem"]}',
@@ -1449,116 +1751,200 @@ def main():
               '; '.join(f'{c}: {" ".join(s["chua_ket_luan"])}' for c, s in kiem_sum.items() if s['chua_ket_luan']),
               flush=True)
 
-    plan = {}
-    if stop_public is None:
-        # every design point of every controller is public before any main-design run: the points
-        # follow from the public levels and the committed test file only, so design.csv does not
-        # depend on a stop (S3C-3 (c)); v8: 371 rows per controller incl. axial and test points
-        try:
-            # S3V8-3: the file is read once here; its SHA-256 is fixed from those bytes
-            test_pts, tp_info = load_test_points(a.test_points, trial=a.trial)   # section 8 condition 7
-            for ctrl in a.controllers:
-                lv = levels[ctrl]
+    # step 3 (v8.5 section 7): the public files of the sweep are written when the sweep ends;
+    # design.csv is not public any more (the design points are sealed with the screening)
+    for name, rows in (('sweep.csv', sweep_rows), ('sweep_counts.csv', sweep_counts(sweep_rows)),
+                       ('levels.csv', level_rows), ('kiem_ngoai_mien.csv', kiem_rows)):
+        p = os.path.join(a.out, name)
+        cols = (LEVEL_COLS if name == 'levels.csv' else     # S83-1: the header even when S03 stops early
+                KIEM_COLS if name == 'kiem_ngoai_mien.csv' else None)   # S03 v8.4: fixed header too
+        if name == 'sweep.csv':     # S3G-2, S3G2-3: one fixed header (identifiers, run columns), other keys after
+            cols = list(dict.fromkeys(list(SWEEP_ID_COLS) + RUN_COLS[5:] + [k for r in rows for k in r]))
+        write_csv(p, rows, cols)
+        files[name] = sha256_file(p)
 
-                def gains_at(codes, lv=lv, ctrl=ctrl):
-                    return {n: decode(c, *lv[n]) for n, c in zip(FACTORS[ctrl], codes)}
-                centre_codes = (0.0,) * 7
-                outer, inner, axial = design_points(1.0, 1), design_points(0.5, 129), axial_points()
-                points = ([(0, 'centre', centre_codes)] + [(p, 'outer', c) for p, c in outer] +
-                          [(p, 'inner', c) for p, c in inner] + [(p, 'axial', c) for p, c in axial] +
-                          [(p, 'test', c) for p, c in test_pts])
-                check_bounds(ctrl, lv, points, gains_at)                 # section 11 item 4 (i), (ii)
-                check_table(ctrl, points, gains_at)                      # v8.6 section 3.1b item 4: the gain table
-                for pid, box, codes in points:
-                    design_rows.append(dict(controller=ctrl, point_id=pid, box=box,
-                                            **{f'X{k + 1}': c for k, c in enumerate(codes)},
-                                            **{f'{n}_value': v_ for n, v_ in gains_at(codes).items()},
-                                            ngoai_tam_giac=outside_triangle(ctrl, gains_at(codes))))
-                plan[ctrl] = (gains_at, centre_codes, outer, inner, axial, test_pts)
-            check_design_map(design_rows, test_pts)                      # section 11 item 4: id - box - codes
-        except S03Stop as exc:
-            stop_public = f'before the main design: {exc}'
-            tp_info = getattr(exc, 'tp_info', tp_info)                  # R2-4: what was read, if any
-            print(f'[STOP] {stop_public}', flush=True)
-    if stop_public is None:
-        write_csv(os.path.join(a.out, 'design.csv'), design_rows, cols=design_cols(design_rows))   # S3E-2: on disk
-        try:
-            for ctrl in a.controllers:
-                gains_at, centre_codes, outer, inner, axial, _test = plan[ctrl]
-                runs, keep_logs = {}, {}
-                rng = np.random.default_rng(DET_SEED)
-                det_ids = [0] + sorted(int(x) for x in rng.choice(np.arange(1, 129), size=3, replace=False))
-                todo = [(0, 'centre', centre_codes)] + [(pid, 'outer', codes) for pid, codes in outer]
+    # step 4: the SEALED WINDOW (v8.5 section 7 'Thứ tự chạy khóa', 3.1b item 13): from the end of
+    # the sweep until sealed/ is closed nothing of these phases prints to the console; every stop
+    # reason goes to sealed/stop.json with its phase, prints, warnings and tracebacks to
+    # sealed/diag.txt.
+    diag = io.StringIO()
+    caught = ()
+    if stop_before is None and stop_public is None:
+        pha_name = 'meta_yaml'
+        with warnings.catch_warnings(record=True) as caught, contextlib.redirect_stdout(diag), \
+                contextlib.redirect_stderr(diag):
+            try:
+                # 4a: the public meta.yaml with the PLAN of section 3.1b on disk before S0
+                # (item 10 last item, 8.10)
+                write_meta(final=False, running='running: the sweep is done; the sealed phases '
+                                                '(screening, main design) and the test set are '
+                                                'not finished')
+                # 4b 'sang_loc': the screening step of section 3.1b (fwsim/s03_sangloc.py)
+                pha_name = 'sang_loc'
+                W = {ctrl: {} for ctrl in a.controllers}
+                for ctrl in a.controllers:
+                    lo_b, hi_b = tune_ga.BOUNDS[ctrl]
+                    for j, name in enumerate(FACTORS[ctrl]):
+                        W[ctrl][name] = w_nodes(ctrl, name, dflts[ctrl][name], lo_b[j], hi_b[j])
+                quet = {ctrl: {n: lv[:2] for n, lv in levels[ctrl].items()}
+                        for ctrl in a.controllers}
+                if screening is not None:
+                    tool = dict(n0=a.sangloc_thu_n0, n=a.sangloc_thu_n) \
+                        if screening == 'thu' else None
+                    res = sl.run_step(sealed, a.dll, a.controllers, gate, mu_levels, W, quet,
+                                      screen, a.jobs, tool_check=tool)
+                else:
+                    res = sl.skip_step(sealed, a.controllers,
+                                       'khong_chay_sang_loc: --trial with one mu level (S03 2.2); '
+                                       'section 3.1b needs three mu levels')
+                pha_notes += res['pha']
+                # 4c 'mien': sealed/levels_sangloc.csv — the accepted box or the sweep levels
+                pha_name = 'mien'
+                lv_sl_path = os.path.join(sealed, 'levels_sangloc.csv')
+                sl_rows = []
+                for ctrl in a.controllers:
+                    sl_rows += sl.levels_rows(ctrl, res['mien'][ctrl], W, grid_info, dflts[ctrl],
+                                              [r for r in level_rows if r['controller'] == ctrl],
+                                              res['nhanh'][ctrl], res['ly_do'][ctrl], gate)
+                write_csv(lv_sl_path, sl_rows, sl.LEVEL_SL_COLS)
+                # 4d 'thiet_ke': the points decode from the FILE (S03 3.2 'Nguồn mức'); every point
+                # of every controller is sealed but on disk before any main-design run; v8: 371
+                # rows per controller incl. axial and test points
+                pha_name = 'thiet_ke'
+                for ctrl in a.controllers:
+                    lv = sl.read_levels(lv_sl_path, ctrl)
+                    for name in FACTORS[ctrl]:
+                        if name not in lv or not lv[name][0] < lv[name][1]:
+                            raise S03Stop(f'{ctrl} {name}: sealed/levels_sangloc.csv holds no level '
+                                          f'with L < H (S03 3.2 Nguồn mức)')
 
-                def run_points(points):
-                    # L56: nothing about the main design goes to the console or outside sealed/
+                    def gains_at(codes, lv=lv, ctrl=ctrl):
+                        return {n: decode(c, *lv[n]) for n, c in zip(FACTORS[ctrl], codes)}
+                    centre_codes = (0.0,) * 7
+                    outer, inner, axial = design_points(1.0, 1), design_points(0.5, 129), axial_points()
+                    points = ([(0, 'centre', centre_codes)] + [(p, 'outer', c) for p, c in outer] +
+                              [(p, 'inner', c) for p, c in inner] + [(p, 'axial', c) for p, c in axial] +
+                              [(p, 'test', c) for p, c in test_pts])
+                    check_bounds(ctrl, lv, points, gains_at)             # section 11 item 4 (i), (ii)
+                    check_table(ctrl, points, gains_at)                  # v8.6 section 3.1b item 4: the gain table
                     for pid, box, codes in points:
-                        g = gains_at(codes)
-                        for mu in mu_levels:
-                            for v in SPEEDS:
-                                row, log = checked(ctrl, g, v, mu, ids=(pid, box))
-                                runs[(pid, mu, v)] = row
-                                all_runs.append(dict(controller=ctrl, point_id=pid, box=box, mu=mu, v=v,
-                                     ngoai_tam_giac=outside_triangle(ctrl, g), **row))
-                                name = f'{ctrl}_p{pid}_mu{mu}_v{v}'
-                                # v8: the determinism points are the centre and 3 OUTER corners,
-                                # chosen by box, not only by point_id (section 11 item 4)
-                                if pid in det_ids and box in ('centre', 'outer'):
-                                    keep_logs[(pid, mu, v)] = (g, box, row, log_digest(log))
-                                    save_log_csv(sealed_logs, name, log)          # S03 3.4: log.csv
-                                data = npz_bytes(log)      # S3E-1: compressed for every run, same work
-                                if box == 'centre' or row['completed'] != 'true':
-                                    save_log(sealed_logs, name, log, data)
-                print(f'[design {ctrl}] running the main design (results sealed, L56)', flush=True)
-                run_points(todo)
-                # L41 (Liam 06/11, 'Chot B'): the inner box always runs, so the run time does not tell
-                # whether the rule of S03 3.2 is on; it enters the analysis only when the rule is on
-                run_points([(p, 'inner', c) for p, c in inner])
-                # v8 (L67): axial points always run too, 3 mu x 3 speeds, sealed; S03 does not
-                # analyse them (section 5 and the rule of 3.2 use the outer / inner / centre runs)
-                run_points([(p, 'axial', c) for p, c in axial])
-                corner_ids = [p for p, _ in outer]
-                need_inner = [v for v in SPEEDS
-                              if sum(runs[(i, mu_mid, v)]['completed'] == 'false' for i in corner_ids) > 64]
-                inner_rule[ctrl] = need_inner
-                notes = {('outer', v): 'most corners not completed at the middle mu (S03 3.2): reported with this '
-                         'warning; see the inner box' for v in need_inner}
-                no_concl[ctrl] = [v for v in need_inner
-                                  if sum(runs[(p, mu_mid, v)]['completed'] == 'false' for p, _ in inner) > 64]
+                        design_rows.append(dict(controller=ctrl, point_id=pid, box=box,
+                                                **{f'X{k + 1}': c for k, c in enumerate(codes)},
+                                                **{f'{n}_value': v_ for n, v_ in gains_at(codes).items()},
+                                                ngoai_tam_giac=outside_triangle(ctrl, gains_at(codes))))
+                    plan[ctrl] = (gains_at, centre_codes, outer, inner, axial, test_pts)
+                check_design_map(design_rows, test_pts)                  # section 11 item 4: id - box - codes
+                write_csv(os.path.join(sealed, 'design.csv'), design_rows,
+                          cols=design_cols(design_rows))                 # before the first main run
+                # 4e 'thiet_ke_chinh': the main design of every controller
+                pha_name = 'thiet_ke_chinh'
+                for ctrl in a.controllers:
+                    gains_at, centre_codes, outer, inner, axial, _test = plan[ctrl]
+                    runs, keep_logs = {}, {}
+                    rng = np.random.default_rng(DET_SEED)
+                    det_ids = [0] + sorted(int(x) for x in rng.choice(np.arange(1, 129), size=3,
+                                                                            replace=False))
+                    todo = [(0, 'centre', centre_codes)] + [(pid, 'outer', codes)
+                                                          for pid, codes in outer]
 
-                # 3.4 determinism in a new process (job files under sealed/, S3C-2)
-                jobs = sorted(keep_logs)
-                res = run_in_new_process(a.dll, [(ctrl, keep_logs[j][0], j[2], j[1]) for j in jobs], work_sealed)
-                for j, r in zip(jobs, res):
-                    g, box, row0, dig0 = keep_logs[j]
-                    ids = (ctrl, j[0], box, j[1], j[2])
-                    det_rows.append(dict(controller=ctrl, point_id=j[0], mu=j[1], v=j[2],
-                                         log_arrays_equal=r['digest'] == dig0,
-                                         runs_fields_equal=row_text(r['row'], ids) == row_text(row0, ids),
-                                         n_arrays=len(dig0)))
-                if not all(d['log_arrays_equal'] and d['runs_fields_equal'] for d in det_rows):
-                    raise S03Stop('determinism check failed (S03 3.4): stop, tell CODE and THESIS')
+                    def run_points(points):
+                        # L56: nothing about the main design goes to the console or outside sealed/
+                        for pid, box, codes in points:
+                            g = gains_at(codes)
+                            for mu in mu_levels:
+                                for v in SPEEDS:
+                                    row, log = checked(ctrl, g, v, mu, ids=(pid, box))
+                                    runs[(pid, mu, v)] = row
+                                    all_runs.append(dict(controller=ctrl, point_id=pid, box=box,
+                                                         mu=mu, v=v,
+                                                         ngoai_tam_giac=outside_triangle(ctrl, g),
+                                                         **row, **kep_frac_fields(ctrl, row, log)))
+                                    name = f'{ctrl}_p{pid}_mu{mu}_v{v}'
+                                    # v8: the determinism points are the centre and 3 OUTER corners,
+                                    # chosen by box, not only by point_id (section 11 item 4)
+                                    if pid in det_ids and box in ('centre', 'outer'):
+                                        keep_logs[(pid, mu, v)] = (g, box, row, log_digest(log))
+                                        save_log_csv(sealed_logs, name, log)      # S03 3.4: log.csv
+                                    data = npz_bytes(log)    # S3E-1: compressed for every run, same work
+                                    if box == 'centre' or row['completed'] != 'true':
+                                        save_log(sealed_logs, name, log, data)
+                    n_mark, rr_mark, t_mark = len(all_runs), len(rerun_notes), time.time()
+                    run_points(todo)
+                    # L41 (Liam 06/11, 'Chot B'): the inner box always runs, so the run time does not
+                    # tell whether the rule of S03 3.2 is on; it enters the analysis only when the
+                    # rule is on
+                    run_points([(p, 'inner', c) for p, c in inner])
+                    pha_notes.append(dict(pha='tam_va_hai_hop', controller=ctrl,
+                                          n_luot_ke_hoach=257 * len(mu_levels) * len(SPEEDS),
+                                          n_luot_thuc=len(all_runs) - n_mark,
+                                          n_chay_lai_chan_doan=len(rerun_notes) - rr_mark,
+                                          giay_may=time.time() - t_mark, so_tien_trinh=1))
+                    # v8 (L67): axial points always run too, 3 mu x 3 speeds, sealed; S03 does not
+                    # analyse them (section 5 and the rule of 3.2 use the outer / inner / centre runs)
+                    n_mark, rr_mark, t_mark = len(all_runs), len(rerun_notes), time.time()
+                    run_points([(p, 'axial', c) for p, c in axial])
+                    pha_notes.append(dict(pha='truc', controller=ctrl,
+                                          n_luot_ke_hoach=14 * len(mu_levels) * len(SPEEDS),
+                                          n_luot_thuc=len(all_runs) - n_mark,
+                                          n_chay_lai_chan_doan=len(rerun_notes) - rr_mark,
+                                          giay_may=time.time() - t_mark, so_tien_trinh=1))
+                    corner_ids = [p for p, _ in outer]
+                    need_inner = [v for v in SPEEDS
+                                  if sum(runs[(i, mu_mid, v)]['completed'] == 'false'
+                                         for i in corner_ids) > 64]
+                    inner_rule[ctrl] = need_inner
+                    notes = {('outer', v): 'most corners not completed at the middle mu (S03 3.2): '
+                             'reported with this warning; see the inner box' for v in need_inner}
+                    no_concl[ctrl] = [v for v in need_inner
+                                      if sum(runs[(p, mu_mid, v)]['completed'] == 'false'
+                                             for p, _ in inner) > 64]
 
-                # 5 analysis: both boxes at every speed always (S3E-1: the same work whether the rule
-                # of 3.2 is on or not); kept: the inner box only when the rule is on, no effects /
-                # curvature / Y2 versions at a speed where the inner box is also mostly not completed
-                nc = no_concl[ctrl]
-                for box, pts in (('outer', outer), ('inner', inner)):
-                    e, c, vr, f = analyse(ctrl, box, pts, runs, mu_levels, SPEEDS, y3_ref, notes)
-                    if box == 'inner' and not need_inner:
-                        continue
-                    eff_rows += [r for r in e if r['v'] not in nc]
-                    curv_rows += [r for r in c if r['v'] not in nc]
-                    ver_rows += [r for r in vr if r['v'] not in nc]
-                    fail_rows += f
-        except S03Stop as exc:
-            stop_sealed = str(exc)
-            print('[STOP] S03 stopped in the main design; the reason is in sealed/stop.json (L56)', flush=True)
+                    # 3.4 determinism in a new process (job files under sealed/, S3C-2)
+                    n_mark, rr_mark, t_mark = len(all_runs), len(rerun_notes), time.time()
+                    jobs = sorted(keep_logs)
+                    det_res = run_in_new_process(
+                        a.dll, [(ctrl, keep_logs[j][0], j[2], j[1]) for j in jobs], work_sealed)
+                    for j, r in zip(jobs, det_res):
+                        g, box, row0, dig0 = keep_logs[j]
+                        ids = (ctrl, j[0], box, j[1], j[2])
+                        det_rows.append(dict(controller=ctrl, point_id=j[0], mu=j[1], v=j[2],
+                                             log_arrays_equal=r['digest'] == dig0,
+                                             runs_fields_equal=row_text(r['row'], ids)
+                                             == row_text(row0, ids),
+                                             n_arrays=len(dig0)))
+                    pha_notes.append(dict(pha='kiem_tat_dinh_3_4', controller=ctrl,
+                                          n_luot_ke_hoach=4 * len(mu_levels) * len(SPEEDS),
+                                          n_luot_thuc=len(det_res),
+                                          n_chay_lai_chan_doan=len(rerun_notes) - rr_mark,
+                                          giay_may=time.time() - t_mark, so_tien_trinh=1))
+                    if not all(d['log_arrays_equal'] and d['runs_fields_equal'] for d in det_rows):
+                        raise S03Stop('determinism check failed (S03 3.4): stop, tell CODE and THESIS')
+
+                    # 5 analysis: both boxes at every speed always (S3E-1: the same work whether
+                    # the rule of 3.2 is on or not); kept: the inner box only when the rule is on,
+                    # no effects / curvature / Y2 versions at a speed where the inner box is also
+                    # mostly not completed
+                    nc = no_concl[ctrl]
+                    for box, pts in (('outer', outer), ('inner', inner)):
+                        e, c, vr, f = analyse(ctrl, box, pts, runs, mu_levels, SPEEDS, y3_ref, notes)
+                        if box == 'inner' and not need_inner:
+                            continue
+                        eff_rows += [r for r in e if r['v'] not in nc]
+                        curv_rows += [r for r in c if r['v'] not in nc]
+                        ver_rows += [r for r in vr if r['v'] not in nc]
+                        fail_rows += f
+            except S03Stop as exc:
+                stop_sealed = dict(pha=pha_name, ly_do=str(exc))
+            except Exception as exc:            # noqa: BLE001 (item 13: any failure stays sealed)
+                stop_sealed = dict(pha=pha_name, ly_do=f'{type(exc).__name__}: {exc}')
+                traceback.print_exc(file=diag)
 
     t_end = time.time()
-    # S3V8-1: the empty work folders of the sweep and of the main design are removed BEFORE sealed/
-    # is written and closed; after the manifest only sealed_test/ changes
-    for d in (work_pub, work_sealed):
+    # S3V8-1: the empty work folders of the sweep, of the main design and of the screening worker
+    # pools are removed BEFORE sealed/ is written and closed; after the manifest only sealed_test/
+    # changes
+    for d in (work_pub, work_sealed, os.path.join(sealed, 'sangloc', '_work'),
+              os.path.join(sealed, 'sangloc_thu', '_work')):
         if os.path.isdir(d) and not os.listdir(d):
             os.rmdir(d)
     # sealed outputs, with their own manifest (no hash of a sealed file outside sealed/, S3C-1)
@@ -1569,8 +1955,21 @@ def main():
         p = os.path.join(sealed, name)
         write_csv(p, rows, cols)
         sealed_files[name] = sha256_file(p)
+    for name in ('levels_sangloc.csv', 'design.csv'):          # written inside the window, step 4c/4d
+        p = os.path.join(sealed, name)
+        if os.path.isfile(p):
+            sealed_files[name] = sha256_file(p)
+    quet_entry = dict(pha='quet', controller='all', n_luot_ke_hoach=sweep_planned,
+                      n_luot_thuc=len(sweep_rows),
+                      n_chay_lai_chan_doan=sum(1 for n in rerun_notes if n['point'] is None),
+                      giay_may=(t_sweep_end or t_end) - t0, so_tien_trinh=1)
+    kep_note = ('PID: fwsim.kep_indicator on the O1 window up to the t_end of the run (ticks at '
+                'the PID integral clamp over ticks with the motor on); empty for ADRC, run_error '
+                'rows and a DLL without the channel' if bool(getattr(fw, 'kep_cols', 0))
+                else 'empty: the DLL has no kep channel')
     with open(os.path.join(sealed, 'notes.json'), 'w', encoding='utf-8') as f:
-        json.dump(dict(inner_rule_speeds=inner_rule, no_conclusion_speeds=no_concl, stop=stop_sealed,
+        json.dump(dict(inner_rule_speeds=inner_rule, no_conclusion_speeds=no_concl,
+                       stop=stop_sealed['ly_do'] if stop_sealed else None,
                        run_error_reruns=[n for n in rerun_notes if n['point'] is not None],
                        ngoai_tam_giac_points=({c: sum(1 for r in design_rows
                                                      if r['controller'] == c
@@ -1578,25 +1977,40 @@ def main():
                                                      and r[TRIANGLE_COL])
                                               for c in a.controllers} if design_rows else {}),
                        elapsed_s_total=round(t_end - t0),
-                       elapsed_s_main_design=round(t_end - t_sweep_end) if t_sweep_end else None),
+                       elapsed_s_main_design=round(t_end - t_sweep_end) if t_sweep_end else None,
+                       pha=[quet_entry] + pha_notes,          # S03 v8.5 section 7: one entry per phase
+                       kep_frac=kep_note),
                   f, indent=1, default=str)
     sealed_files['notes.json'] = sha256_file(os.path.join(sealed, 'notes.json'))
+    # sealed/diag.txt (item 13): every print, warning and traceback of the sealed phases; empty
+    # when nothing was captured
+    diag_text = diag.getvalue() + ''.join(f'warning: {w_.category.__name__}: {w_.message} '
+                                          f'({w_.filename}:{w_.lineno})\n' for w_ in caught)
+    with open(os.path.join(sealed, 'diag.txt'), 'w', encoding='utf-8') as f:
+        f.write(diag_text)
+    sealed_files['diag.txt'] = sha256_file(os.path.join(sealed, 'diag.txt'))
     if stop_sealed:
         with open(os.path.join(sealed, 'stop.json'), 'w', encoding='utf-8') as f:
-            json.dump(dict(stop=stop_sealed), f, indent=1)
+            json.dump(dict(stop=stop_sealed['ly_do'], pha=stop_sealed['pha']), f, indent=1)
+        sealed_files['stop.json'] = sha256_file(os.path.join(sealed, 'stop.json'))
+    for sub in ('sangloc', 'sangloc_thu'):          # every file the screening step wrote
+        root_dir = os.path.join(sealed, sub)
+        if os.path.isdir(root_dir):
+            for root, _dirs, fnames in os.walk(root_dir):
+                for fn in sorted(fnames):
+                    p = os.path.join(root, fn)
+                    sealed_files[os.path.relpath(p, sealed).replace(os.sep, '/')] = sha256_file(p)
     with open(os.path.join(sealed, 'manifest.json'), 'w', encoding='utf-8') as f:
         json.dump(dict(files=sealed_files), f, indent=1)
     # sealed/ is closed here: nothing below writes in it (S03 v8 section 7)
 
     # v8 (L67, S38-8): the test set of both controllers runs only now, after sealed/ is written,
     # so sealed/ does not depend on it; everything about it stays in sealed_test/
-    stop_test, test_rows, test_notes, test_s = None, [], [], None
     sealed_test = os.path.join(a.out, 'sealed_test')
     work_test = os.path.join(sealed_test, '_work')
-    if stop_public is None and stop_sealed is None:
+    if stop_before is None and stop_public is None and stop_sealed is None:
         test_logs = os.path.join(sealed_test, 'logs')
         t_test0 = time.time()
-        print('[test set] running the test points (results sealed in sealed_test/, S03 v8 section 7)', flush=True)
         # S3V8-2, R2-1: the whole phase (folder, runs, cleaning, every output of sealed_test/) is in
         # one guard; warnings, prints and tracebacks go to sealed_test/diag.txt, any exception is a
         # stop recorded in sealed_test/stop.json (written first); if even that cannot be written,
@@ -1617,7 +2031,8 @@ def main():
                             row, log = checked(ctrl, g, v, mu_mid, ids=(pid, 'test'), sink=test_rows,
                                                work=work_test, notes_to=test_notes)
                             test_rows.append(dict(controller=ctrl, point_id=pid, box='test', mu=mu_mid, v=v,
-                                                  ngoai_tam_giac=outside_triangle(ctrl, g), **row))
+                                                  ngoai_tam_giac=outside_triangle(ctrl, g), **row,
+                                                  **kep_frac_fields(ctrl, row, log)))
                             data = npz_bytes(log)             # same work for every run (S3E-1)
                             if row['completed'] != 'true':    # logs kept by the rule of section 7
                                 save_log(test_logs, f'{ctrl}_p{pid}_mu{mu_mid}_v{v}', log, data)
@@ -1669,126 +2084,12 @@ def main():
                             f_.write(text())
                     except Exception:         # noqa: BLE001,S110
                         pass
-        if stop_test:
-            print('[STOP] S03 stopped in the test set; the reason is in sealed_test/stop.json', flush=True)
-    # public outputs: sweep only (S03 3.1 is a source of campaign A's domain) and the design points
-    files = {}
-    for name, rows in (('sweep.csv', sweep_rows), ('sweep_counts.csv', sweep_counts(sweep_rows)),
-                       ('levels.csv', level_rows), ('kiem_ngoai_mien.csv', kiem_rows), ('design.csv', design_rows)):
-        p = os.path.join(a.out, name)
-        cols = (LEVEL_COLS if name == 'levels.csv' else      # S83-1: the header even when S03 stops early
-                KIEM_COLS if name == 'kiem_ngoai_mien.csv' else   # S03 v8.4: fixed header too
-                design_cols(rows) if name == 'design.csv' else None)  # v8.6: ngoai_tam_giac last
-        if name == 'sweep.csv':     # S3G-2, S3G2-3: one fixed header (identifiers, run columns), other keys after
-            cols = list(dict.fromkeys(list(SWEEP_ID_COLS) + RUN_COLS[5:] + [k for r in rows for k in r]))
-        write_csv(p, rows, cols)
-        files[name] = sha256_file(p)
-    # S3C-3 (b): no count in public; a failed check stops S03 (3.4), so 'passed' iff it ran to the end
-    det_public = ('not run' if stop_public else 'see sealed/ (S03 stopped in the main design)' if stop_sealed
-                  else 'passed (detail in sealed/determinism_check.csv)')
-    b = fw.build_info
-    dll_sha = sha256_file(a.dll)
-    sweep_s = round((t_sweep_end or t_end) - t0)
-    status = ('stopped in the sweep: ' + stop_public if stop_public else
-              'stopped in the main design (reason sealed)' if stop_sealed else
-              'stopped in the test set (reason in sealed_test/)' if stop_test else 'ran to the end')
-    # S3G-1: the sources the runs were made with are those taken at the start; the end must give the same
-    # (S3G2-1: and the evaluator files are those hashed at import; S3G2-2: untracked files do not count)
-    src_end = source_snapshot(os.path.join(HERE, '..'))
-    src_changed = (src_end['key'] != src_start['key'] or src_start['key']['evaluator'] != EVAL_SHA_AT_IMPORT)
-    source_check = (dict(result='CHANGED during the run: not usable as a main result', start=src_start['key'],
-                         end=src_end['key'], evaluator_at_import=EVAL_SHA_AT_IMPORT) if src_changed
-                    else 'same at import, start and end of the run')
-    if src_changed:
-        status += '; the script or evaluator sources changed during the run (S3G-1)'
-        print('WARNING: the script commit or the evaluator files changed during the run; see meta.yaml '
-              'source_check (not usable as a main result)', flush=True)
-    # S3V8-3: what was read before the main design, not a second read of the file now
-    tp_meta = tp_info if tp_info is not None else dict(file=_rel_here(a.test_points),
-                                                         read='no (S03 stopped before the test file was read)')
-    with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
-        f.write(f"""spec: S03 v8.4 (06_SPECS/2026-11-05_Spec_S03_DOE_chon_gain.md)
-date: {time.strftime('%Y-%m-%d')}
-setup: sim                     # fwsim: ESP32 firmware C code (DLL) + rpi5/plant_step.py, NOT hardware
-operator: Claude (phiên CODE)
-trial: {str(a.trial).lower()}     # true: tool check with mu 0.5 (S03 2.2, 11.3), never main numbers
-sealed: "L56 / S03 section 1: everything derived from the main-design responses is in sealed/ (with its own manifest.json) and is not looked at before campaign A ends"
-status: {json.dumps(status)}
-script: {json.dumps(src_start['script'])}   # taken before the first run (S3G-1)
-source_check: {json.dumps(source_check)}   # script and evaluator again at the end (S3G-1)
-firmware:
-  esp32: {json.dumps(b.get('esp32'))}
-  hil_framework_at_build: {json.dumps(b.get('hil_framework'))}
-  compiler: "{b.get('compiler')}"
-  dll_sha256: {dll_sha}
-  h7: null
-  rpi5: null
-plant: {fwsim.plant_meta(fwsim.plant_params(argparse.Namespace(ground='traction', mu=mu_mid)))}
-plant_check: chua_X3
-mu_levels: {json.dumps(mu_levels)}
-mu_source: "{a.mu_source or ('trial: fwsim assumption 0.5 (params.py), no MU_FLOOR measurement yet' if a.trial else '')}"
-imu: {json.dumps(IMU)}
-seed: {SEED}                       # plant has no random input; IMU noise replay seed (imu.noise_seed)
-determinism_seed: {DET_SEED}       # draws the 3 corners of the determinism check (S03 3.4)
-determinism: "{det_public}"
-speeds: {json.dumps(list(SPEEDS))}
-gate_speeds: {json.dumps(gate)}
-controllers: {json.dumps(a.controllers)}
-factors: {json.dumps(FACTORS)}
-temporary_bounds_for_the_grid: {json.dumps({m: tune_ga.BOUNDS[m] for m in a.controllers})}   # tune_ga.BOUNDS (S03 3.1)
-thresholds: {json.dumps(THRESH)}   # S03 v8.6 section 5.2: tv_duty 0.4 s^-1 absolute, every speed and mu, worst and range (y3_reference below is reported beside it, not a base)
-y3_reference: {json.dumps({f'{c} v={v}': y for (c, v), y in y3_ref.items()})}
-o1: {json.dumps(dict(A=o1.A, a_r=o1.A_R, D=o1.D, D_d=o1.D, t_d=o1.T_D, t_late=o1.T_LATE, delta=o1.DELTA, v_d=o1.V_D, c_cens=o1.C_CENS))}
-grid: {json.dumps({f'{c} {n}': {k: v_ for k, v_ in i.items() if k != 'noi'} for (c, n), i in grid_info.items()})}   # S03 v8.3 section 3.1: a, b, r, K, b_n, points per gain; from v8.6 the grid is cut at the gain-table ceiling T: T, n_bo (points dropped), noi / n_noi / n_points after the cut, b_n = the largest point after the cut (T when cut, else the extension end; for omega_o, which has no extension, the end b of its grid)
-kiem_ngoai_mien: {json.dumps(kiem_sum, ensure_ascii=False)}   # S03 v8.4 section 3.1: total per controller (đã kiểm đủ / kiểm dở / không kiểm), counts, flagged (co), inconclusive (chua_ket_luan) and bao_rieng points; detail in kiem_ngoai_mien.csv
-gate: {json.dumps(gate_meta())}   # S03 v8.2 section 7: G1-G5 per run (o1_gate.gate), U = 0 on fwsim
-evaluator_sha256: {json.dumps(EVAL_SHA_AT_IMPORT)}   # S03 v8.2 section 8 condition 8: S03 and S04 on the same evaluator; the files as hashed when the script was imported (S3G-1, S3G2-1)
-sweep_run_error_reruns: {json.dumps([n for n in rerun_notes if n['point'] is None], default=str)}
-planned_runs_per_controller: {json.dumps(PLANNED_RUNS)}   # S03 v8 3.2, 7 (rows actually run: sealed/, sealed_test/)
-test_points: {json.dumps(tp_meta)}   # S03 v8 3.2, 7, 8.7 (S3V8-3): read once before the main design; sha256 of the bytes read, sha256_lf after CRLF -> LF, matches_head_blob_lf, generation from <name>.gen.json beside the file
-test_set: {json.dumps('not run (S03 stopped before it)' if (stop_public or stop_sealed) else 'sealed in sealed_test/ (not looked at before the RSM coefficients are saved, S03 v8 section 7)')}
-interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THESIS correct if wrong
-  - "completion: conditions 1, 5 at the instant, conditions 2 and 3 together as the trailing unbroken t_d window (condition 2 over the window: L63 (2), Liam 07/11), condition 4 strictly before the deadline; after a tracking error that came before the progress, the window runs to the deadline (o1_feasibility.evaluate_v7)"
-  - "sweep level rule: a point is 'completing' only with y1 'true' at every gate speed (inconclusive breaks the run)"
-  - "inner box trigger: corners with y1 'false' only (inconclusive not counted)"
-  - "a stop of the spec (3.1 (i), (ii), 3.4, run_error) ends S03 for both controllers; the default gains of every controller are checked first"
-  - "logs: log.csv (%.17g) of the four determinism points and npz (exact bits) of the centre and every main-design run not completed, all in sealed/logs/; npz of every sweep run not completed in logs_sweep/ (public, as the sweep)"
-  - "the inner box (codes +-0.5) always runs for every controller (L41, Liam 06/11 'Chot B'), so the number of runs does not depend on the results; both boxes are always analysed (the same work), and the inner box is kept (effects, Y2 versions, fail counts; curvature is for the outer box only; at every speed, as before L41) only when the rule of S03 3.2 is on at one speed or more (> 64/128 corners 'false' at the middle mu); otherwise its runs are only rows of sealed/runs.csv"
-  - "elapsed_s here is the sweep only; the total and the main-design time are in sealed/notes.json (L56, Codex S3E-1; S03 section 7 asks elapsed_s in meta.yaml)"
-  - "public channels left (L56, S3C-3, S3E-1; Liam 06/11 'Chot B', 'Duyet khuyen nghi'): status, exit code and console say that S03 stopped in the main design (S03 3.4 asks to report the stop; the reason is in sealed/stop.json); the wall-clock time still varies a little with the results (scoring a run that does not complete is a little longer, evaluate_v7 closes the window early on completion; v8.2: the G4 scoring of o1_gate_eval works on the scored frames and their projection solutions, so it may add to this, S3G-7; writing the npz of the runs not completed; machine noise): accepted, not measured"
-  - "the upper-end tracking flag uses the 400 001-point path grid (about 15 um); at s = S the window is cut by the end of the path, not flagged (Codex S3C-5, deferred)"
-  - "v8: run order per controller centre, outer, inner, axial (3 mu x 3 speeds each), then determinism and analysis; sealed/ is written and closed after every controller; then the test set of every controller (middle mu x 3 speeds); a stop before the test set means the test set does not run"
-  - "v8: test-set logs follow the rule of section 7 (npz of every run not completed; there is no centre point in the test set); the compressed npz is made for every run (same work)"
-  - "v8: the test-points file is read once before the main design (S3V8-3); 'committed' (section 8.7) = tracked, unmodified for git status AND the bytes read match the blob in HEAD after CRLF -> LF of both; its generation record is <name>.gen.json beside the file read, with the sha256 of the bytes read or of their LF or CRLF form (R2-2: the committed record holds the SHA-256 of the CRLF file; a clean LF checkout is the same content); a stop at this check keeps what was read in test_points (R2-4); with --trial a failed check is allowed and recorded in test_points.problems"
-  - "v8 (S3V8-2): warnings, prints and tracebacks of the test phase go to sealed_test/diag.txt and any exception of the phase, writing its outputs included, is a stop recorded in sealed_test/stop.json (written first; R2-1); the warning policy in force is kept, a warning made an error stays an error (R2-3); the same channel in the main design (warnings to the console) is left as before (deferred, Codex S3V8-2)"
-  - "v8: n_upper_frames, n_back_frames count the frames evaluate_v7 kept for scoring (t_k <= t_end), as section 4 defines them; they are diagnostics, never responses"
-  - "v8.2: every run (sweep, main design, axial, test set, determinism reruns) is scored by o1_gate_eval.evaluate_fig8, which calls evaluate_v7 unchanged (the S03 v8 columns keep their values), then o1_gate.gate with u_t = 0 (fwsim knows the command start; the 50 Hz hold is a property of the command path, not added to U, o1_gate docstring), U_p = U_psi = 0 (true plant pose) and every condition deciding (DECIDE_ALL)"
-  - "v8.2: G1-G5 columns use the names of tools/rq3_log.py GATE_COLS (B81-3); gate_json_sha256 is not written; gate_outcome is the O1 3.5 outcome over G1-G5; with U = 0, lo = hi = q"
-  - "v8.2: a failure of the gate scoring (e.g. the rebuilt nearest distance of G4 not the row e_perp) is a run_error, so S03 stops (B8b-20) as for a DLL error"
-  - "B81-3 (15/11, Liam CODE_FEAS 'code di'): the G1 fields of O1 3.5 last block and the common domain are written (G1_RUN_COLS after gate_outcome): t_done = t_end when completed 'true', t1 = first tracking-error frame, prog_before_t1 = progress strictly before t1, cond25_before_deadline = cond2_5_ever (o1_gate_eval.g1_fields_v7, from the evaluate_v7 summary, which is unchanged); G1 recomputed from them must agree with the state from completed (o1_gate.gate raises, so a run_error); one way of using the frames: g1_ways 1, g1_t_done_2 and g1_cat_t1 empty, _chung the same as the union; gate_version stays gate_v3.2 (tools/rq3_log.py accepts only that version)"
-  - "v8.3: the sweep grid is the v8 grid (sweep_grid, unchanged; C12 keeps it for its box [a, b]) plus b r^k, k = 1..K, r = (b/a)^(1/10), K the smallest integer with r^K >= 10 (1 - 1e-9), found by a loop on r**k; omega_o is not extended (cap 48); v8.4: the extension still runs with the sweep, only for the out-of-range check; the level rule runs on the original grid (11 log points, the default, 0)"
-  - "v8.3 (agreed with CODE_C13 15/11): luoi of the default value is mac_dinh even when it is on a log point, the (default check) and (default) rows are mac_dinh; L_nguon 'hết lưới dưới' when L is the lowest grid point and L > 0; v8.4: H_nguon 'hết lưới' when H = b, 'trần ω_o' instead for omega_o when b = 48; levels.csv b_n: see v8.6"
-  - "v8.4 out-of-range check: a run is comparable when it exists, completed 'true', status 'ok' and its e_perp_max and tv_duty are finite; a point below L is put against the run at L, above H against H; the Y2 threshold is 0.01 m and the Y3 threshold is the absolute 0.4 s^-1 of section 5.2 (v8.6; before: 20 % of the default-gain run), compared exactly as a decimal; the bounds are inclusive and compared exactly, with no tolerance, on the decimal of each number as written in the CSV (repr of the float) (S84-1, S84V2-1, S84V3-1: 0.03 - 0.02 is 0.01, not the binary64 0.009999999999999998; two identical responses never count as lower by a positive threshold; a point a few ULP past a bound is past it; the column nguong_tv holds the threshold as a float); bao_rieng = not flagged and, at one gate speed where both are comparable, e_perp_max lower by >= 0.01 m; buoc is the step of section 3.1 that matched"
-  - "v8.4 out-of-range check totals: 'không kiểm' for every controller when S03 stopped at 3.1 (i) or (ii); 'đã kiểm đủ' when every factor of the controller has levels; else 'kiểm dở' (the sweep stopped part way): factors with levels are checked, every grid point (original and extension) of a factor without levels counts in n_chua_kiem, n_gain_chua_kiem counts those factors; every grid is computed before the first sweep run. v8.5 (K6): a flagged or inconclusive point does not stop S03, it is written in kiem_ngoai_mien.csv, printed and kept in meta.yaml kiem_ngoai_mien"
-  - "v8.6 section 3.1: the sweep grid is sweep_grid_n cut at the ceiling T of the gain in tools/gain_table.py (table {gain_table.TABLE_VERSION}; the factor names are the table's names): points above T are dropped; when a point was dropped, a remaining point within the relative error 1e-9 of T becomes T, else T is added, to the original grid when T < b and to the extension when T > b; sweep.csv tran is true at value == T; an added T has luoi log (original grid) or noi (extension); a, b, r, K keep their definitions; b_n is the largest point after the cut (omega_o has no extension: its b_n is the end b of its grid); H_nguon 'trần bảng chặn' when H = T is the end of the cut original grid (first over 'hết lưới'); a firmware default above its ceiling stops S03; a default the cut made T (within 1e-9 below T) is run at the grid point T when both are the same float32: that point stands for the default run (is_default true, luoi mac_dinh, tran true, the level rule starts from it; levels.csv default keeps the firmware value); another float32 stops S03"
-  - "v8.6 section 5.2: tv_duty threshold 0.4 s^-1 absolute for every speed, mu, worst and range; y3_reference is only reported"
-  - "v8.6 sections 3.1b item 4, 3.2: before the main design the float32 of every gain of every design point is also compared with the gain table (0 accepted where the lower bound is 0), a failure stops S03; a design point with omega_c + 2 omega_o >= 200 on an axis (binary64 sum of the float32 values) runs like any point and has ngoai_tam_giac true in design.csv, runs.csv, runs_test.csv (PID always false); the number of such points per controller is in sealed/notes.json (centre, outer, inner, axial) and sealed_test/notes.json (test points)"
-  - "not in this script yet: S03 v8.5 section 3.1b (screening, sealed/levels_sangloc.csv, sealed/design.csv): the spec line above stays v8.4, design.csv is still at the root and the levels of the main design are the sweep levels; w_nodes and check_candidate are ready for that step"
-  - "v8.2: the public sweep carries the G columns too (Liam 14/11 CODE_FEAS 'Co, mot cach cham'); G3-G5 are not responses of section 5"
-elapsed_s: {sweep_s}
-file_sha256: {json.dumps(files)}
-files:
-  - sweep.csv: "one line per sweep run (section 3.1) and default gains at the other mu levels; v8.3: luoi = log | mac_dinh | 0 | noi (the extension); v8.6: tran = true at the point of value T, the gain-table ceiling"
-  - sweep_counts.csv: "section 5.3 for the sweep: runs not completed, inconclusive, saturated per factor, speed, mu"
-  - levels.csv: "L, H, centre, scale per factor (v8.4: on the original grid); v8.3: a, b (ends of the 11 log points), b_n (v8.6: the largest point of the grid after the cut at the gain-table ceiling, T when the grid is cut, else the end of the extension; for omega_o, which has no extension, the end b of its grid; from v8.5 the upper end of campaign A's domain and of the reference box W), L_nguon, H_nguon (source of each level, S03 v8.4 section 3.1; v8.6: 'trần bảng chặn' when H = T ends the cut original grid)"
-  - kiem_ngoai_mien.csv: "S03 v8.4 section 3.1: one row (dong diem) per original or extension point outside [L, H]: luoi, level compared (can L or H, can_value), ket_qua (không cờ / chưa kết luận / cờ), buoc, bao_rieng, per speed: in the gate, y1, status, e_perp_max, tv_duty of the point and of the level, Y3 threshold; one total row (dong tong) per controller: đã kiểm đủ / kiểm dở / không kiểm and counts"
-  - design.csv: "371 rows per controller: centre, outer box, inner box, axial points, test points (all run, L41, L67); v8.6: ngoai_tam_giac (outside the LADRC triangle, runs anyway)"
-  - logs_sweep/: "npz of the sweep runs not completed"
-  - sealed/: "SEALED (L56): runs.csv (section 4 responses; centre, outer, inner, axial), effects.csv (every term, per box, response, speed, mu / worst / range; outer and inner only), curvature.csv (5.4), y2_versions.csv (5.1), fail_counts.csv (5.3), determinism_check.csv (3.4), notes.json (v8.6: ngoai_tam_giac_points per controller), stop.json, manifest.json, logs/"
-  - sealed_test/: "SEALED separately (S03 v8 section 7): runs_test.csv, logs/, notes.json (v8.6: ngoai_tam_giac_points per controller, test points), stop.json, diag.txt (warnings, prints, traceback of the test phase), manifest.json; opened only after the RSM coefficients at the middle mu are saved and committed"
-""")
-    print(f'S03 finished -> {a.out}; status: {status}')
-    return 0 if not (stop_public or stop_sealed or stop_test or src_changed) else 2
+        # the test-set stop is not printed: after the sweep the console prints one line when
+        # S03 ends (v8.5 3.1b item 13); the status string carries the phase
+    write_meta(final=True)                       # the real status, source check, counts
+    print(f'S03 finished -> {a.out}; status: {meta_state["status"]}')
+    return 0 if not (stop_before or stop_public or stop_sealed or stop_test
+                     or meta_state['src_changed']) else 2
 
 
 # S3G2-1: the evaluator files on disk, read at the end of this module's import, a few milliseconds after
@@ -1800,10 +2101,14 @@ EVAL_SHA_AT_IMPORT = evaluator_sha256()
 
 
 if __name__ == '__main__':
+    # run through the canonical module: the S03Stop raised by s04_ga / s03_sangloc (which
+    # 'import s03_doe') is then the class main() catches, in both 'python fwsim/s03_doe.py' and
+    # 'python -m fwsim.s03_doe'
+    import s03_doe as _m
     if '--child' in sys.argv:
-        child_main(sys.argv[sys.argv.index('--child') + 1])
+        _m.child_main(sys.argv[sys.argv.index('--child') + 1])
         sys.exit(0)
     if '--make-test-points' in sys.argv:          # S03 v8 section 7: once, then commit the file
-        print(json.dumps(make_test_points(), indent=1))
+        print(json.dumps(_m.make_test_points(), indent=1))
         sys.exit(0)
-    sys.exit(main())
+    sys.exit(_m.main())

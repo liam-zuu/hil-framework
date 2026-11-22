@@ -1,10 +1,12 @@
 """Tests of fwsim/s03_doe.py (spec S03 v6) and o1_feasibility.evaluate_v7 (O1 v7 section 5.9,
 S03 v6 section 4). Synthetic logs and responses with a known answer; the last tests need
 fwsim/build/fwsim.dll (firmware with pos_ctrl.c). Run: python -m pytest fwsim/tests -q"""
+import itertools
 import math
 import struct
 import os
 import sys
+import warnings
 
 import numpy as np
 import pytest
@@ -14,6 +16,9 @@ sys.path.insert(0, os.path.join(HERE, '..'))
 import fwsim  # noqa: E402
 import o1_feasibility as o1  # noqa: E402
 import s03_doe as s3  # noqa: E402
+import s03_sangloc as sl  # noqa: E402
+import s04_ga as s4  # noqa: E402
+import make_s03_screen_u as mk  # noqa: E402
 
 _DLL = os.path.join(fwsim.HERE, 'build', 'fwsim.dll')
 
@@ -693,11 +698,15 @@ def _fake_gate_fields(ctrl, g, v):
     return f
 
 
-def _fake(design_fail=False, default_fails=False, error_in_design=False, error_in_sweep=None, row_over=None):
+def _fake(design_fail=False, default_fails=False, error_in_design=False, error_in_sweep=None, row_over=None,
+          kep=False, design_warn=False):
     """Instant stand-in for safe_run: sweep runs (one factor off its default) complete; design
     runs (several factors off) fail when X1 or X2 is above its default (96/128 corners).
     error_in_sweep (S3G-2): 'default' -> run_error at the first default check; 'factor' -> at every
-    sweep run with one factor off. row_over (S03 v8.4): f(ctrl, g, v) -> dict of row fields to replace, or None."""
+    sweep run with one factor off. row_over (S03 v8.4): f(ctrl, g, v) -> dict of row fields to replace, or None.
+    kep (S03 v8.6 2.1): the log carries an 'en' channel (motor on 2 of 3 ticks) and a 'kep' channel
+    (KEP_COLS, vx flagged on the two motor-on ticks). design_warn: a RuntimeWarning in every
+    main-design run (the sealed diag.txt channel of section 3.1b item 13)."""
     calls, works = _Calls(), []
 
     def fake_safe_run(fw, path, ctrl, g, v, mu):
@@ -706,6 +715,8 @@ def _fake(design_fail=False, default_fails=False, error_in_design=False, error_i
         off = [n for n in f if not math.isclose(g[n], dflt[n])]
         calls.append(len(off))
         design = len(off) >= 2
+        if design_warn and design:
+            warnings.warn('FakeDesignWarning', RuntimeWarning)
         if error_in_design and design:
             return dict(status='run_error', completed='', error='FakeError: boom'), None
         if (error_in_sweep == 'default' and not off) or (error_in_sweep == 'factor' and len(off) == 1):
@@ -714,6 +725,10 @@ def _fake(design_fail=False, default_fails=False, error_in_design=False, error_i
                (default_fails and not off and v == 0.8)
         x = np.array([g[n] for n in f])
         log = dict(t=np.arange(3.0) * 0.01, duty=np.zeros((3, 4)) + x.sum())
+        if kep:
+            k = np.zeros((3, len(fwsim.KEP_COLS)))
+            k[0, 0] = k[1, 0] = 1.0                       # kep_vx flagged on the two motor-on ticks
+            log.update(en=np.array([1.0, 1.0, 0.0]), kep=k)
         # S3V8-7: the two diagnostic counts carry known values (factors off the default; v = 0.8)
         row = dict(status='ok', completed='false' if fail else 'true', e_perp_max=0.01 + 1e-3 * float(x[0]),
                    e_perp_max_cens=0.01, e_perp_global_max=0.01, tv_duty=np.float64(1.0 + float(x[1])),
@@ -763,10 +778,11 @@ def _tree(d):
 
 
 def _test_gains(out):
-    """{controller: set of gain tuples} of the 'test' rows of design.csv: the test-set runs are
-    known from the input, not from the phase the script is in (S3V8-6)."""
+    """{controller: set of gain tuples} of the 'test' rows of sealed/design.csv: the test-set runs are
+    known from the input, not from the phase the script is in (S3V8-6; v8.5 section 7: the design is
+    sealed now)."""
     import csv as _csv
-    f = out / 'design.csv'
+    f = out / 'sealed' / 'design.csv'
     if not f.is_file() or not f.read_text().strip():
         return None
     res = {}
@@ -776,23 +792,70 @@ def _test_gains(out):
     return res
 
 
-def _run_main(tmp_path, monkeypatch, capsys, error_in_test=False, argv=None, **kw):
+def _fake_load_screen_u(path=None, trial=False):
+    """Stand-in for sl.load_screen_u (S03 v8.5 8.9; independent of the git state of the worktree):
+    the sets and the info dict the meta.yaml 'sang_loc' plan line records."""
+    screen = {s: np.zeros((sl.SET_ROWS[s], 7)) for s in sl.SETS}
+    info = dict(file='fake_screen_u.csv', sha256='0' * 64, sha256_lf='1' * 64, sha256_crlf='2' * 64,
+                git=dict(tracked=True, clean=True, commit='f4k3'), head_blob_sha256='0' * 64,
+                matches_head_blob_lf=True, problems=[])
+    return screen, info
+
+
+def _fake_run_step(sealed, dll, controllers, gate, mu_levels, W, quet, screen, n_proc,
+                   tool_check=None):
+    """Default fake of sl.run_step (S03 3.1b): every controller falls back, nhanh
+    'du_phong_kiem'; a minimal sealed/sangloc/ket_qua.json is written; returns the run_step dict
+    shape (mien / nhanh / ly_do / N_da_dung / pha)."""
+    sl_dir = os.path.join(sealed, 'sangloc')
+    os.makedirs(sl_dir, exist_ok=True)
+    doc = dict(N=None, N_da_dung=0, m_min=sl.M_MIN)
+    for c in controllers:
+        doc[c] = dict(nhanh='du_phong_kiem', trang_thai='hoan_tat',
+                      ly_do=['fake run_step: no accepted box'], nguon_mien='du_phong',
+                      nguong={m: None for m in sl.MODES},
+                      hop={b: None for b in ('B_giua', 'B_ba_mu', 'B1', 'B2')}, mien=None,
+                      che_do={m: dict(kiem_duoc_nhan_o_lan=None, can=None, tap={})
+                              for m in sl.MODES},
+                      n_ngoai_bang={s: 0 for s in sl.SCREEN_SETS},
+                      ti_le_kha_thi_trong_mien={m: None for m in sl.MODES},
+                      n_cap_trung_float32=0, kiem_tat_dinh=None)
+    sl.write_json(os.path.join(sl_dir, 'ket_qua.json'), doc)
+    return dict(mien={c: None for c in controllers},
+                nhanh={c: 'du_phong_kiem' for c in controllers},
+                ly_do={c: ['fake run_step: no accepted box'] for c in controllers},
+                N_da_dung=0, pha=[])
+
+
+def _run_main(tmp_path, monkeypatch, capsys, error_in_test=False, argv=None, run_step=None,
+              load_screen=None, patch_screen=True, **kw):
     """error_in_test: True -> run_error row; 'warn' -> a warning and a print in every test run;
-    'raise' -> an OSError (not S03Stop) in the first test run."""
+    'raise' -> an OSError (not S03Stop) in the first test run.
+    Non-trial runs (S03 3.1b wired in): s03_sangloc.load_screen_u and run_step are faked so the
+    pipeline does not depend on the git state of s03_screen_u.csv (run_step / load_screen give
+    other fakes; patch_screen=False keeps the real functions, e.g. the --sangloc-thu check)."""
     fsr, fnp, calls, works = _fake(**kw)
+    argv = argv or ['--mu', '0.5', '--trial']
+    if '--trial' not in argv and patch_screen:
+        monkeypatch.setattr(sl, 'load_screen_u', load_screen or _fake_load_screen_u)
+        monkeypatch.setattr(sl, 'run_step', run_step or _fake_run_step)
     out = tmp_path / 'run'
     seen = dict(design_before_first_main_run=None, analyse=[], after_sealed=0, other_after_test=0,
-                manifest_at_first_test=None, sealed_before_test=None, sealed_after=None)
+                manifest_at_first_test=None, sealed_before_test=None, sealed_after=None,
+                meta_at_first_run=None)
     tg = {}
 
     def fsr_watch(fw, path, ctrl, g, v, mu):
         dflt = FAKE_DEFAULTS[ctrl]
+        if seen['meta_at_first_run'] is None:
+            m = out / 'meta.yaml'                        # S03 8.9: the plan meta at the first run
+            seen['meta_at_first_run'] = m.read_text(encoding='utf-8') if m.is_file() else None
         if not tg.get('loaded'):
             got = _test_gains(out)
             if got is not None:
                 tg.update(got, loaded=True)
         is_test = tg.get('loaded') and tuple(g[n] for n in s3.FACTORS[ctrl]) in tg.get(ctrl, ())
-        if is_test:                                    # S3V8-6: a test-set run, known from design.csv
+        if is_test:                                    # S3V8-6: a test-set run, known from sealed/design.csv
             if seen['after_sealed'] == 0:
                 seen['manifest_at_first_test'] = (out / 'sealed' / 'manifest.json').is_file()
                 seen['sealed_before_test'] = _tree(out / 'sealed')
@@ -810,7 +873,7 @@ def _run_main(tmp_path, monkeypatch, capsys, error_in_test=False, argv=None, **k
             seen['other_after_test'] += 1
         if seen['design_before_first_main_run'] is None and \
                 sum(not math.isclose(g[n], dflt[n]) for n in s3.FACTORS[ctrl]) >= 2:
-            f = out / 'design.csv'
+            f = out / 'sealed' / 'design.csv'          # v8.5 section 7: the design is sealed
             seen['design_before_first_main_run'] = f.read_text() if f.is_file() else ''
         return fsr(fw, path, ctrl, g, v, mu)
     real_analyse = getattr(s3.analyse, 'real', s3.analyse)        # not a watcher of an earlier call
@@ -838,10 +901,15 @@ def test_main_pipeline_clean(tmp_path, monkeypatch, capsys):
     import csv as _csv
     code, out, console, calls, works = _run_main(tmp_path, monkeypatch, capsys)
     assert code == 0
-    for f in ('sweep.csv', 'sweep_counts.csv', 'levels.csv', 'design.csv', 'meta.yaml', 'sealed/runs.csv',
+    for f in ('sweep.csv', 'sweep_counts.csv', 'levels.csv', 'meta.yaml', 'sealed/runs.csv',
               'sealed/effects.csv', 'sealed/fail_counts.csv', 'sealed/notes.json', 'sealed/manifest.json',
-              'sealed/determinism_check.csv', 'sealed_test/diag.txt'):
+              'sealed/determinism_check.csv', 'sealed_test/diag.txt',
+              # v8.5 section 7 [v8.5]: the design and the screening levels are sealed, with the
+              # screening outputs and the sealed diagnostics
+              'sealed/design.csv', 'sealed/levels_sangloc.csv', 'sealed/diag.txt',
+              'sealed/sangloc/ket_qua.json'):
         assert (out / f).is_file(), f
+    assert not (out / 'design.csv').exists()                 # v8.5 section 7: no public design.csv
     assert not (out / 'determinism_check.csv').exists() and not (out / '_work').exists()
     assert works and all(os.path.relpath(w, out).split(os.sep)[0] == 'sealed' for w in works)   # S3C-2
     assert not (out / 'sealed_test' / '_work').exists()
@@ -856,15 +924,18 @@ def test_main_pipeline_clean(tmp_path, monkeypatch, capsys):
     assert len(runs) == 2 * (129 + 128 + 14) * 3                   # L41: the inner box always runs; v8 axial
     assert sum(r['box'] == 'inner' for r in runs) == 2 * 128 * 3
     assert sum(r['box'] == 'axial' for r in runs) == 2 * 14 * 3 and not any(r['box'] == 'test' for r in runs)
-    design = list(_csv.DictReader(open(out / 'design.csv')))
+    design = list(_csv.DictReader(open(out / 'sealed' / 'design.csv')))      # v8.5 7: sealed
     assert len(design) == 2 * 371 and {r['box'] for r in design} == {'centre', 'outer', 'inner', 'axial', 'test'}
     test = list(_csv.DictReader(open(out / 'sealed_test' / 'runs_test.csv')))      # v8: separate seal
     assert len(test) == 2 * 100 * 3 and {r['box'] for r in test} == {'test'} and {r['mu'] for r in test} == {'0.5'}
     for f in ('notes.json', 'manifest.json'):
         assert (out / 'sealed_test' / f).is_file()
     sealed_txt = ''.join(open(os.path.join(r_, f_), encoding='utf-8', errors='replace').read()
-                         for r_, _, fs in os.walk(out / 'sealed') for f_ in fs if not f_.endswith('.npz'))
-    assert 'test' not in sealed_txt.replace('determinism', '')          # sealed/ says nothing of the test set
+                         for r_, _, fs in os.walk(out / 'sealed') for f_ in fs
+                         if not f_.endswith('.npz') and f_ != 'design.csv')
+    # sealed/ says nothing of the test set; design.csv is excluded: it lists the 100 test
+    # points (an input of the phase, S03 section 7)
+    assert 'test' not in sealed_txt.replace('determinism', '')
     # S3V8-7: the values of the two diagnostic counts reach the three CSV files (fake: n_upper =
     # factors off the default, n_back = 1 at v = 0.8)
     off = {(d['controller'], d['point_id']): sum(not math.isclose(float(d[f'{n}_value']), FAKE_DEFAULTS[d['controller']][n])
@@ -937,7 +1008,8 @@ def test_main_stops_everything_when_a_default_fails(tmp_path, monkeypatch, capsy
     code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys, default_fails=True)
     assert code == 2 and '3.1 (i)' in console
     assert len(calls) == 3                                   # PID defaults at the 3 speeds, then stop
-    assert (out / 'design.csv').read_text().strip() == ''
+    # v8.5 section 7: design.csv is sealed and is never made after a sweep stop
+    assert not (out / 'design.csv').exists() and not (out / 'sealed' / 'design.csv').exists()
     sweep = list(_csv.DictReader(open(out / 'sweep.csv')))   # S3D-4: the default check is recorded
     assert [(r['factor'], r['v'], r['completed']) for r in sweep] == [
         ('(default check)', '0.2', 'true'), ('(default check)', '0.5', 'true'), ('(default check)', '0.8', 'false')]
@@ -948,17 +1020,17 @@ def test_main_stops_everything_when_a_default_fails(tmp_path, monkeypatch, capsy
 @needs_dll
 def test_main_run_error_in_the_design_is_recorded_and_sealed(tmp_path, monkeypatch, capsys):
     """S3C-12, S3C-3: the run_error row is in sealed/runs.csv; the console and meta.yaml only say
-    that S03 stopped in the main design."""
+    that S03 stopped after the sweep (v8.5 3.1b item 13: the reason is in sealed/stop.json)."""
     import csv as _csv
     code, out, console, _, _ = _run_main(tmp_path, monkeypatch, capsys, error_in_design=True)
     assert code == 2
     assert 'FakeError' not in console and 'sealed/stop.json' in console
     meta = (out / 'meta.yaml').read_text(encoding='utf-8')
-    assert 'FakeError' not in meta and 'stopped in the main design' in meta
+    assert 'FakeError' not in meta and 'stopped after the sweep' in meta
     rows = list(_csv.DictReader(open(out / 'sealed' / 'runs.csv')))
     assert rows[-1]['status'] == 'run_error' and 'FakeError' in rows[-1]['error']
     assert 'FakeError' in (out / 'sealed' / 'stop.json').read_text()
-    design = list(_csv.DictReader(open(out / 'design.csv')))         # S3C-3 (c): written before the run
+    design = list(_csv.DictReader(open(out / 'sealed' / 'design.csv')))   # v8.5 7: sealed, before the run
     assert {r['controller'] for r in design} == {'PID', 'ADRC'} and len(design) == 2 * 371
     assert not (out / 'sealed_test').exists()                       # v8: no test set after a sealed stop
 
@@ -1402,14 +1474,16 @@ def test_v8_unwritable_sealed_test_still_says_only_stop(tmp_path, monkeypatch, c
 @needs_dll
 def test_v8_stop_at_the_test_file_keeps_what_was_read(tmp_path, monkeypatch, capsys):
     """R2-4: a main run stops because the test file is not committed: meta.yaml still records the
-    SHA-256 and the problems of the bytes read (not 'not read')."""
+    SHA-256 and the problems of the bytes read (not 'not read'). v8.5 section 7: the file is read
+    once at the start, so the stop is now BEFORE the sweep and no run is made at all."""
     import hashlib
     p = tmp_path / 'tp.csv'
     raw = open(s3.TEST_POINTS, 'rb').read()
     p.write_bytes(raw)
-    code, out, console, _, _ = _run_main(tmp_path, monkeypatch, capsys,
-                                         argv=['--mu', '0.4', '0.5', '0.6', '--test-points', str(p)])
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys,
+                                             argv=['--mu', '0.4', '0.5', '0.6', '--test-points', str(p)])
     assert code == 2 and 'not committed' in console
+    assert not calls                                            # the stop is before any run
     meta = (out / 'meta.yaml').read_text(encoding='utf-8')
     line = next(l for l in meta.splitlines() if l.startswith('test_points:'))
     assert hashlib.sha256(raw).hexdigest() in line and 'not committed' in line and '"read": "no' not in line
@@ -1417,13 +1491,15 @@ def test_v8_stop_at_the_test_file_keeps_what_was_read(tmp_path, monkeypatch, cap
 
 @needs_dll
 def test_v8_uncommitted_test_points_stop_a_main_run(tmp_path, monkeypatch, capsys):
-    """Section 8.7: without --trial the test file must be tracked and unmodified in git."""
+    """Section 8.7: without --trial the test file must be tracked and unmodified in git; v8.5
+    section 7: read at the start, so a failed check is a public stop before the sweep."""
     p = tmp_path / 'tp.csv'
     p.write_bytes(open(s3.TEST_POINTS, 'rb').read())
-    code, out, console, _, _ = _run_main(tmp_path, monkeypatch, capsys,
-                                         argv=['--mu', '0.4', '0.5', '0.6', '--test-points', str(p)])
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys,
+                                             argv=['--mu', '0.4', '0.5', '0.6', '--test-points', str(p)])
     assert code == 2 and 'not committed' in console
-    assert (out / 'design.csv').read_text().strip() == '' and not (out / 'sealed_test').exists()
+    assert not calls                                            # the stop is before any run
+    assert not (out / 'design.csv').exists() and not (out / 'sealed_test').exists()
 
 
 # ── S03 v8.2: e_bao_max and G1-G5 (design 03_CODE/docs/2026-11-14_Thiet_ke_S03_G1G5_v1.md) ──────────
@@ -1573,16 +1649,19 @@ def test_v82_main_writes_the_gate_columns_and_meta(tmp_path, monkeypatch, capsys
     code, out, _, _, _ = _run_main(tmp_path, monkeypatch, capsys)
     assert code == 0
     for f in ('sealed/runs.csv', 'sealed_test/runs_test.csv'):
-        # S03 v8.6: ngoai_tam_giac is the last column of the two sealed run files only
-        assert next(_csv.reader(open(out / f))) == V8_COLS + V82_COLS + G1C_COLS + ['ngoai_tam_giac'], f
+        # S03 v8.6: ngoai_tam_giac then the three kep_frac columns end the two sealed run files
+        # only (2.1 last item, section 7, 11 item 6 (c))
+        assert next(_csv.reader(open(out / f))) == \
+            V8_COLS + V82_COLS + G1C_COLS + ['ngoai_tam_giac'] + s3.KEP_FRAC_COLS, f
     assert next(_csv.reader(open(out / 'sweep.csv'))) == list(s3.SWEEP_ID_COLS) + s3.RUN_COLS[5:]   # S3G2-3
-    assert 'ngoai_tam_giac' not in next(_csv.reader(open(out / 'sweep.csv')))
+    sweep_head = next(_csv.reader(open(out / 'sweep.csv')))
+    assert 'ngoai_tam_giac' not in sweep_head and not set(s3.KEP_FRAC_COLS) & set(sweep_head)
     for f in ('sealed/runs.csv', 'sealed_test/runs_test.csv'):
         # S03 v8.6: the standard fake defaults never break the LADRC triangle
         assert {r['ngoai_tam_giac'] for r in _csv.DictReader(open(out / f))} == {'false'}
     # S3G-3: the VALUES reach the three files (fake gate fields differ per gains and speed)
     gains = {(d['controller'], d['point_id']): {n: float(d[f'{n}_value']) for n in s3.FACTORS[d['controller']]}
-             for d in _csv.DictReader(open(out / 'design.csv'))}
+             for d in _csv.DictReader(open(out / 'sealed' / 'design.csv'))}        # v8.5 7: sealed
     n = 0
     for f in ('sealed/runs.csv', 'sealed_test/runs_test.csv'):
         for r in _csv.DictReader(open(out / f)):
@@ -1603,7 +1682,7 @@ def test_v82_main_writes_the_gate_columns_and_meta(tmp_path, monkeypatch, capsys
     assert n > 2 * (271 * 3 + 300)
     meta = (out / 'meta.yaml').read_text(encoding='utf-8')
     assert 'source_check: "same at import, start and end of the run"' in meta   # S3G-1, S3G2-1
-    assert meta.startswith('spec: S03 v8.4 ')                                # v8.4 (keeps the v8.2 gate)
+    assert meta.startswith('spec: S03 v8.6 ')                                # v8.6 (keeps the v8.2 gate)
     lines = meta.splitlines()
     gate = _json.loads(next(x for x in lines if x.startswith('gate: ')).split('   #')[0][len('gate: '):])
     assert gate['version'] == G.GATE_VERSION and gate['eval_version'] == E.EVAL_VERSION and gate['u_t'] == 0.0
@@ -2153,9 +2232,10 @@ def test_v83_main_writes_levels_sources_luoi_and_grid_meta(tmp_path, monkeypatch
                 assert x['tran'] == ('true' if float(x['value']) == info['T'] else 'false')
     assert {x['luoi'] for x in sweep if x['factor'].startswith('(')} == {'mac_dinh'}
     assert {x['tran'] for x in sweep if x['factor'].startswith('(')} == {'false'}
-    # S83-5: every design value (centre, outer, inner, axial, test) is the decoding of its code with the levels
-    # read back from levels.csv
-    design = list(_csv.DictReader(open(out / 'design.csv', encoding='utf-8')))
+    # S83-5: every design value (centre, outer, inner, axial, test) is the decoding of its code with the
+    # levels; v8.5 section 7: the design is sealed/design.csv and decodes from levels_sangloc.csv,
+    # which in a --trial run holds the same (fallback) levels as the public levels.csv
+    design = list(_csv.DictReader(open(out / 'sealed' / 'design.csv', encoding='utf-8')))
     assert {r['box'] for r in design} == {'centre', 'outer', 'inner', 'axial', 'test'}
     for r in design:
         c = r['controller']
@@ -2169,7 +2249,7 @@ def test_v83_main_writes_levels_sources_luoi_and_grid_meta(tmp_path, monkeypatch
     assert {r['H_nguon'] for r in lv.values()} == {'hết lưới', 'trần ω_o', 'trần bảng chặn'}
     assert {r['L_nguon'] for r in lv.values()} == {'0', 'hết lưới dưới'}
     meta = (out / 'meta.yaml').read_text(encoding='utf-8')
-    assert meta.startswith('spec: S03 v8.4 ')
+    assert meta.startswith('spec: S03 v8.6 ')
     assert 'reference only' not in meta                                     # S03 v8.6: b_n is used
     grid_meta = _json.loads(next(x for x in meta.splitlines() if x.startswith('grid: ')).split('   #')[0][6:])
     assert set(grid_meta) == {f'{c} {n}' for c in s3.CONTROLLERS for n in s3.FACTORS[c]}
@@ -2226,7 +2306,7 @@ def test_v85_main_flag_is_reported_and_s03_goes_on(tmp_path, monkeypatch, capsys
     assert code == 0
     assert max(calls) == 7                                          # the main design ran
     assert len(list(_csv.DictReader(open(out / 'sealed' / 'runs.csv')))) == 2 * 271 * 3
-    assert len(list(_csv.DictReader(open(out / 'design.csv')))) == 2 * 371
+    assert len(list(_csv.DictReader(open(out / 'sealed' / 'design.csv')))) == 2 * 371   # v8.5 7: sealed
     kiem = list(_csv.DictReader(open(out / 'kiem_ngoai_mien.csv', encoding='utf-8')))
     co = [r for r in kiem if r['ket_qua'] == 'cờ']
     assert co and {(r['controller'], r['factor'], r['can']) for r in co} == {('ADRC', 'k_psi', 'H')}
@@ -2600,28 +2680,72 @@ def test_v86_bounds_check_gain_table():
 
 
 def test_v86_candidate_check_and_outside_triangle():
-    """check_candidate is gain_table.classify; outside_triangle is 'not trong_tam_giac' (PID always
-    False); the sum is binary64 on the float32 values, strictly below 200."""
+    """S03 v8.6 section 3.1b item 4 (Codex C3-2): check_candidate(ctrl, g, w) checks, in order,
+    (1) finite binary64 and a_i <= x <= w_i of the reference box W (exact, no tolerance),
+    (2) the float32 of every omega_o* <= 48, (3) the float32 of every gain inside the gain table,
+    (4) the LADRC triangle. A failure of 1-3 raises S03Stop naming the step; a broken triangle is
+    the only classifiable failure ('ngoai_bang'), else 'ok'. outside_triangle is
+    'not trong_tam_giac' (PID always False); the sum is binary64 on the float32 values, strictly
+    below 200."""
     base = dict(omega_c_xy=8.0, omega_o_xy=30.0, omega_c_wz=8.0, omega_o_wz=30.0, pos_kp=6.0,
                 pos_ki=3.0, k_psi=1.0)
-    v = s3.check_candidate('ADRC', base)
-    assert (v.trong_bang, v.trong_tam_giac) == (True, True) and s3.outside_triangle('ADRC', base) is False
-    v = s3.check_candidate('ADRC', dict(base, omega_c_xy=150.0, omega_o_xy=48.0))
-    assert (v.trong_bang, v.trong_tam_giac) == (True, False)
-    assert s3.outside_triangle('ADRC', dict(base, omega_c_xy=150.0, omega_o_xy=48.0)) is True
-    v = s3.check_candidate('ADRC', dict(base, omega_c_wz=104.0, omega_o_wz=48.0))   # sum exactly 200
-    assert (v.trong_bang, v.trong_tam_giac) == (True, False)
-    v = s3.check_candidate('ADRC', dict(base, omega_c_wz=103.99999, omega_o_wz=48.0))
-    assert (v.trong_bang, v.trong_tam_giac) == (True, True)
-    v = s3.check_candidate('ADRC', dict(base, omega_c_xy=103.9999999, omega_o_xy=48.0))  # f32 = 104.0
-    assert (v.trong_bang, v.trong_tam_giac) == (True, False)
-    g = dict(FAKE_DEFAULTS['PID'])
-    v = s3.check_candidate('PID', g)
-    assert (v.trong_bang, v.trong_tam_giac) == (True, True) and s3.outside_triangle('PID', g) is False
-    v = s3.check_candidate('PID', dict(g, kp_xy=41.1))
-    assert (v.trong_bang, v.trong_tam_giac) == (False, True)
+
+    def w_adrc(**kw):
+        w = {n: (0.5, 200.0) for n in s3.FACTORS['ADRC']}
+        w.update(omega_o_xy=(5.0, 50.0), omega_o_wz=(5.0, 50.0), pos_kp=(1.0, 6.0))
+        w.update(kw)
+        return w
+
+    W = w_adrc()
+    assert s3.check_candidate('ADRC', base, W) == 'ok' and s3.outside_triangle('ADRC', base) is False
+    # Codex C3-2: omega_o 49 inside a W ending at 50 passes the table (49 <= 100) and the
+    # triangle (8 + 2*49 < 200) but is above the omega_o ceiling 48 -> step 2
+    with pytest.raises(s3.S03Stop, match='step 2'):
+        s3.check_candidate('ADRC', dict(base, omega_o_xy=49.0), W)
+    # step 1: outside the W box
+    with pytest.raises(s3.S03Stop, match='step 1'):
+        s3.check_candidate('ADRC', dict(base, pos_kp=7.0), W)
+    # a set failing steps 1 and 2 reports step 1
+    with pytest.raises(s3.S03Stop, match='step 1'):
+        s3.check_candidate('ADRC', dict(base, omega_o_xy=51.0), W)
+    # the two ends of W are inside (exact comparison)
+    assert s3.check_candidate('ADRC', dict(base, pos_kp=1.0), W) == 'ok'
+    assert s3.check_candidate('ADRC', dict(base, pos_kp=6.0), W) == 'ok'
+    # not finite -> step 1
+    for bad in (float('nan'), float('inf'), -float('inf')):
+        with pytest.raises(s3.S03Stop, match='step 1'):
+            s3.check_candidate('ADRC', dict(base, pos_kp=bad), W)
+    # step 2 is on the float32: float32(48.0000001) is 48.0 and passes; float32(48.00001) > 48
+    assert s3.check_candidate('ADRC', dict(base, omega_o_xy=48.0000001), W) == 'ok'
+    with pytest.raises(s3.S03Stop, match='step 2'):
+        s3.check_candidate('ADRC', dict(base, omega_o_xy=48.00001), W)
+    # step 3: the float32 must be inside the gain table (0 accepted where the lower bound is 0)
+    with pytest.raises(s3.S03Stop, match='step 3'):
+        s3.check_candidate('ADRC', dict(base, omega_c_xy=0.4), w_adrc(omega_c_xy=(0.3, 200.0)))
+    # step 4: a broken triangle is the only classifiable failure, on either axis
+    g = dict(base, omega_c_xy=104.0, omega_o_xy=48.0)            # sum exactly 200
+    assert s3.check_candidate('ADRC', g, W) == 'ngoai_bang' and s3.outside_triangle('ADRC', g) is True
+    g = dict(base, omega_c_wz=104.0, omega_o_wz=48.0)
+    assert s3.check_candidate('ADRC', g, W) == 'ngoai_bang' and s3.outside_triangle('ADRC', g) is True
+    g = dict(base, omega_c_xy=103.9999999, omega_o_xy=48.0)      # float32 is 104.0 -> outside
+    assert s3.check_candidate('ADRC', g, W) == 'ngoai_bang' and s3.outside_triangle('ADRC', g) is True
+    g = dict(base, omega_c_xy=103.99999, omega_o_xy=48.0)        # float32 stays below 104.0
+    assert s3.check_candidate('ADRC', g, W) == 'ok' and s3.outside_triangle('ADRC', g) is False
+    # PID: inside -> 'ok' (never 'ngoai_bang'); a float32 above the table bound -> step 3
+    gp = dict(FAKE_DEFAULTS['PID'])
+    Wp = {n: (0.0, 10.0) for n in s3.FACTORS['PID']}
+    Wp['kp_wz'] = (0.0, 5.0)
+    assert s3.check_candidate('PID', gp, Wp) == 'ok' and s3.outside_triangle('PID', gp) is False
+    assert s3.check_candidate('PID', dict(gp, kp_wz=4.6), Wp) == 'ok'         # 4.6 is the table bound
+    with pytest.raises(s3.S03Stop, match='step 3'):
+        s3.check_candidate('PID', dict(gp, kp_wz=4.6000002), Wp)  # float32 is 4.6000004 > 4.6
+    with pytest.raises(s3.S03Stop, match='step 3'):
+        s3.check_candidate('PID', dict(gp, kp_xy=41.1), dict(Wp, kp_xy=(0.0, 50.0)))  # 41.1 > 41.0
+    # malformed input: a wrong key set of g or w -> ValueError
     with pytest.raises(ValueError):
-        s3.check_candidate('PID', {k: x for k, x in g.items() if k != 'k_psi'})
+        s3.check_candidate('PID', {k: x for k, x in gp.items() if k != 'k_psi'}, Wp)
+    with pytest.raises(ValueError):
+        s3.check_candidate('ADRC', base, {k: v for k, v in W.items() if k != 'k_psi'})
 
 
 @needs_dll
@@ -2634,13 +2758,14 @@ def test_v86_main_ngoai_tam_giac_columns_and_count(tmp_path, monkeypatch, capsys
     monkeypatch.setitem(FAKE_DEFAULTS['ADRC'], 'omega_c_xy', 12.0)
     code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys)
     assert code == 0
-    header = next(_csv.reader(open(out / 'design.csv', encoding='utf-8')))
+    # v8.5 section 7: design.csv is sealed/design.csv (not public)
+    header = next(_csv.reader(open(out / 'sealed' / 'design.csv', encoding='utf-8')))
     assert header[-1] == 'ngoai_tam_giac'
     # S03 v8.6: the value columns are the factor names, shared names deduplicated (pos_*, k_psi)
     assert header[:-1] == (['controller', 'point_id', 'box'] + [f'X{k}' for k in range(1, 8)]
                            + [f'{n}_value' for n in s3.FACTORS['PID']]
                            + [f'{n}_value' for n in s3.FACTORS['ADRC'] if n not in s3.FACTORS['PID']])
-    design = list(_csv.DictReader(open(out / 'design.csv', encoding='utf-8')))
+    design = list(_csv.DictReader(open(out / 'sealed' / 'design.csv', encoding='utf-8')))
 
     def want_flag(r):
         if r['controller'] == 'PID':
@@ -2682,17 +2807,30 @@ def test_v86_main_ngoai_tam_giac_columns_and_count(tmp_path, monkeypatch, capsys
 
 @needs_dll
 def test_v86_main_gain_table_failure_stops_before_the_main_design(tmp_path, monkeypatch, capsys):
-    """S03 v8.6 section 3.1b item 4: an ADRC omega_c_xy design corner below the (raised) table
-    lower bound stops S03 before the main design: no main-design run, no sealed run row."""
+    """S03 v8.6 section 3.1b item 4 (C3-1 stop channel): an ADRC omega_c_xy design corner below the
+    (raised) table lower bound stops S03 inside the sealed window, phase 'thiet_ke': the console
+    and meta.yaml say only 'stopped after the sweep', the reason and the phase are in
+    sealed/stop.json, no main-design run, no design.csv anywhere, stop.json in the manifest."""
     import csv as _csv
+    import json as _json
     monkeypatch.setitem(s3.gain_table.LO, 'ADRC', (1.0, 1.0, 0.5, 1.0, 0.0, 0.0, 0.0))
     code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys)
-    assert code == 2
-    assert '[STOP] before the main design' in console and 'gain table' in console
+    assert code == 2 and 'sealed/stop.json' in console
+    # the stop is sealed (3.1b item 13): the reason never reaches the console
+    assert 'gain table' not in console and '[STOP]' not in console
     assert max(calls) <= 1                                          # no run with two factors off
-    # as before v8.6: the public design.csv holds the rows made before the stop, here the PID rows
-    rows = list(_csv.DictReader(open(out / 'design.csv', encoding='utf-8')))
-    assert rows and {r['controller'] for r in rows} == {'PID'}
+    stop = _json.load(open(out / 'sealed' / 'stop.json', encoding='utf-8'))
+    assert stop['pha'] == 'thiet_ke' and 'outside the gain table' in stop['stop']
+    meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    assert 'stopped after the sweep (the reason is in sealed/stop.json)' in meta
+    # no gain value of the reason escapes into a public file
+    assert stop['stop'] not in meta and 'outside the gain table' not in meta
+    # the design is sealed (v8.5 section 7): nothing of it is public, and the stop hit during its
+    # construction, before the file was written
+    assert not (out / 'design.csv').exists() and not (out / 'sealed' / 'design.csv').exists()
+    man = _json.load(open(out / 'sealed' / 'manifest.json', encoding='utf-8'))
+    assert 'stop.json' in man['files'] and 'design.csv' not in man['files']
+    assert not (out / 'sealed_test').exists()
     runs = out / 'sealed' / 'runs.csv'
     assert not runs.exists() or len(list(_csv.DictReader(open(runs)))) == 0
 
@@ -2852,3 +2990,456 @@ def test_c3_4_main_runs_the_default_at_the_ceiling(tmp_path, monkeypatch, capsys
     assert (r['L'], r['H'], r['H_nguon'], r['b_n'], r['default']) == ('0.0', '41.0', 'trần bảng chặn', '41.0', repr(d))
     assert float(r['b']) == 10.0 * d
     assert max(calls) == 7                                          # the main design ran
+
+
+# ── S03 v8.5/v8.6: the screening step wired into main() (C3-1, section 7, kep_frac) ─────────────
+
+MU3 = ['--mu', '0.4', '0.5', '0.6']                       # three mu levels -> the step runs
+
+
+@needs_dll
+def test_v86_main_no_public_design_or_sealed_hash(tmp_path, monkeypatch, capsys):
+    """C3-1: after a clean run the root has no design.csv, no public file has a point_id
+    column, meta.yaml file_sha256 has no design entry, and the SHA-256 of sealed/design.csv and
+    sealed/levels_sangloc.csv appears in no public file and not on the console."""
+    import csv as _csv
+    import json as _json
+    code, out, console, _, _ = _run_main(tmp_path, monkeypatch, capsys)
+    assert code == 0
+    assert not (out / 'design.csv').exists()
+    for name in ('sweep.csv', 'sweep_counts.csv', 'levels.csv', 'kiem_ngoai_mien.csv'):
+        assert 'point_id' not in next(_csv.reader(open(out / name, encoding='utf-8')))
+    meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    sha = _json.loads(next(x for x in meta.splitlines() if x.startswith('file_sha256: '))
+                      [len('file_sha256: '):])
+    assert not any('design' in k for k in sha)
+    pub = _public_text(out)
+    for s_ in ('design.csv', 'levels_sangloc.csv'):
+        h = s3.sha256_file(str(out / 'sealed' / s_))
+        assert not any(h in t for t in pub.values()) and h not in console
+    header = next(_csv.reader(open(out / 'sealed' / 'design.csv', encoding='utf-8')))
+    assert header[-1] == 'ngoai_tam_giac'
+    assert len(list(_csv.DictReader(open(out / 'sealed' / 'design.csv', encoding='utf-8')))) == 2 * 371
+
+
+@needs_dll
+def test_v86_main_sealed_manifest_lists_the_screening_files(tmp_path, monkeypatch, capsys):
+    """v8.5 section 7: sealed/manifest.json lists levels_sangloc.csv, design.csv, diag.txt and
+    every file under sangloc/ (stop.json only when stopped, see the C3-1 stop-channel test);
+    every hash is the file's."""
+    import json as _json
+    code, out, _, _, _ = _run_main(tmp_path, monkeypatch, capsys)
+    assert code == 0
+    man = _json.load(open(out / 'sealed' / 'manifest.json', encoding='utf-8'))
+    for name in ('runs.csv', 'effects.csv', 'levels_sangloc.csv', 'design.csv', 'diag.txt',
+                 'notes.json', 'sangloc/ket_qua.json'):
+        assert name in man['files'], name
+    for name, sha in man['files'].items():
+        assert s3.sha256_file(str(out / 'sealed' / name)) == sha
+    assert 'stop.json' not in man['files']
+
+
+@needs_dll
+def test_v86_main_trial_levels_sangloc_is_the_fallback(tmp_path, monkeypatch, capsys):
+    """--trial (one mu level): the step cannot run (it needs three mu levels, S03 2.2):
+    sealed/levels_sangloc.csv holds the public levels rows plus nguon_mien 'du_phong' and the
+    reason (columns LEVEL_SL_COLS), sangloc/ket_qua.json says khong_chay_sang_loc, and the
+    design decodes from the sealed file read back (S03 3.2 Nguon muc)."""
+    import csv as _csv
+    import json as _json
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys)
+    assert code == 0
+    assert next(_csv.reader(open(out / 'sealed' / 'levels_sangloc.csv', encoding='utf-8'))) == \
+        sl.LEVEL_SL_COLS
+    pub = {(r['controller'], r['factor']): r
+           for r in _csv.DictReader(open(out / 'levels.csv', encoding='utf-8'))}
+    slv = list(_csv.DictReader(open(out / 'sealed' / 'levels_sangloc.csv', encoding='utf-8')))
+    assert len(slv) == 14
+    for r in slv:
+        p = pub[(r['controller'], r['factor'])]
+        assert all(r[k] == p[k] for k in s3.LEVEL_COLS)
+        assert r['nguon_mien'] == 'du_phong' and 'three mu levels' in r['ly_do']
+    doc = _json.load(open(out / 'sealed' / 'sangloc' / 'ket_qua.json', encoding='utf-8'))
+    for c in s3.CONTROLLERS:
+        assert doc[c]['nhanh'] == 'khong_chay_sang_loc' and doc[c]['nguon_mien'] == 'du_phong'
+        assert 'three mu levels' in doc[c]['ly_do'][0]
+    design = list(_csv.DictReader(open(out / 'sealed' / 'design.csv', encoding='utf-8')))
+    for c in s3.CONTROLLERS:
+        lv = sl.read_levels(str(out / 'sealed' / 'levels_sangloc.csv'), c)
+        for r in [r for r in design if r['controller'] == c]:
+            for k, n in enumerate(s3.FACTORS[c]):
+                assert r[f'{n}_value'] == repr(s3.decode(float(r[f'X{k + 1}']), *lv[n]))
+
+
+@needs_dll
+def test_v86_main_accepted_box_feeds_the_design(tmp_path, monkeypatch, capsys):
+    """A screening box strictly inside W (S03 3.1b): the PID rows of sealed/levels_sangloc.csv
+    are 'sang_loc' with L, H = the box and its labels; every PID design value is
+    decode(code, L, H, scale) of THAT file and differs from the public-levels decode; ADRC falls
+    back; public levels.csv is unchanged; meta.yaml and the console carry no result word or box
+    value of the step (spec 11.5 (e))."""
+    import csv as _csv
+    lo_b, hi_b = _tg.BOUNDS['PID']
+    nodes = {n: s3.w_nodes('PID', n, FAKE_DEFAULTS['PID'][n], lo_b[j], hi_b[j])
+             for j, n in enumerate(s3.FACTORS['PID'])}
+    box = {n: (ns[1], ns[2]) for n, ns in nodes.items()}          # strictly inside W
+
+    def step(sealed, dll, controllers, gate, mu_levels, W, quet, screen, n_proc, tool_check=None):
+        res = _fake_run_step(sealed, dll, controllers, gate, mu_levels, W, quet, screen, n_proc)
+        res['mien'] = dict(res['mien'], PID=box)
+        res['nhanh'] = dict(res['nhanh'], PID='nhan')
+        res['ly_do'] = dict(res['ly_do'], PID=[])
+        return res
+
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys, run_step=step,
+                                             argv=MU3)
+    assert code == 0
+    slv = list(_csv.DictReader(open(out / 'sealed' / 'levels_sangloc.csv', encoding='utf-8')))
+    pid = {r['factor']: r for r in slv if r['controller'] == 'PID'}
+    for n, r in pid.items():
+        assert r['nguon_mien'] == 'sang_loc'
+        assert float(r['L']) == box[n][0] and float(r['H']) == box[n][1]
+    assert {r['nguon_mien'] for r in slv if r['controller'] == 'ADRC'} == {'du_phong'}
+    pub = {r['factor']: r for r in _csv.DictReader(open(out / 'levels.csv', encoding='utf-8'))
+           if r['controller'] == 'PID'}
+    design = [r for r in _csv.DictReader(open(out / 'sealed' / 'design.csv', encoding='utf-8'))
+              if r['controller'] == 'PID']
+    differ = False
+    for r in design:
+        for k, n in enumerate(s3.FACTORS['PID']):
+            want = s3.decode(float(r[f'X{k + 1}']), box[n][0], box[n][1], pid[n]['scale'])
+            assert r[f'{n}_value'] == repr(want)
+            differ |= want != s3.decode(float(r[f'X{k + 1}']), float(pub[n]['L']),
+                                        float(pub[n]['H']), pub[n]['scale'])
+    assert differ                                                 # the box changed the domain
+    assert all(pub[n]['L'] != repr(box[n][0]) or pub[n]['H'] != repr(box[n][1]) for n in pid)
+    meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    # the 'interpretations' block legitimately explains du_phong/khong_chay_sang_loc; the RESULT
+    # words and the box values must not appear anywhere else (spec 11.5 (e))
+    meta_res = '\n'.join(l for l in meta.splitlines() if not l.startswith('  - '))
+    assert 'du_phong' not in meta_res and 'nguon_mien' not in meta_res
+    assert 'sang_loc' not in console and 'du_phong' not in console
+    for n in box:
+        assert repr(box[n][0]) not in meta and repr(box[n][1]) not in meta
+
+
+@needs_dll
+def test_v86_main_run_order_and_plan_meta(tmp_path, monkeypatch, capsys):
+    """Section 7 run order and 8.9: at the FIRST firmware run (the default check) the public
+    meta.yaml already says 'running: started; the sweep is not finished' and holds the
+    'sang_loc' plan line (m_min 86, T_max_gio 24.0, the label, the numbers-file SHA-256); when
+    the step is called the status is 'running: the sweep is done ...', the four public sweep
+    files exist, sealed/levels_sangloc.csv and sealed/design.csv do not, and the sweep of BOTH
+    controllers is complete (items 10, 13)."""
+    import csv as _csv
+    seen = {}
+
+    def step(sealed, dll, controllers, gate, mu_levels, W, quet, screen, n_proc, tool_check=None):
+        root = os.path.dirname(sealed)
+        meta = open(os.path.join(root, 'meta.yaml'), encoding='utf-8').read()
+        seen['meta_running'] = 'status: "running: the sweep is done' in meta
+        seen['plan'] = next((l for l in meta.splitlines() if l.startswith('sang_loc: ')), '')
+        seen['public'] = {n: os.path.isfile(os.path.join(root, n))
+                          for n in ('sweep.csv', 'sweep_counts.csv', 'levels.csv',
+                                    'kiem_ngoai_mien.csv')}
+        seen['not_yet'] = not os.path.isfile(os.path.join(sealed, 'levels_sangloc.csv')) \
+            and not os.path.isfile(os.path.join(sealed, 'design.csv'))
+        seen['sweep_done'] = {r['controller'] for r in _csv.DictReader(
+            open(os.path.join(root, 'sweep.csv'), encoding='utf-8'))} == set(s3.CONTROLLERS)
+        return _fake_run_step(sealed, dll, controllers, gate, mu_levels, W, quet, screen, n_proc)
+
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys, run_step=step,
+                                             argv=MU3)
+    assert code == 0 and seen['meta_running'] and seen['sweep_done'] and seen['not_yet']
+    assert all(seen['public'].values())
+    for frag in ('"m_min": 86', '"T_max_gio": 24.0', sl.T_MAX_LABEL, '0' * 64):
+        assert frag in seen['plan']
+    # S03 8 condition 9: already at the first firmware run (the default check) the public
+    # meta.yaml holds the numbers-file SHA-256 and the plan of section 3.1b
+    first = calls.seen['meta_at_first_run']
+    assert 'status: "running: started; the sweep is not finished"' in first
+    plan0 = next(l for l in first.splitlines() if l.startswith('sang_loc: '))
+    for frag in ('"m_min": 86', '"T_max_gio": 24.0', sl.T_MAX_LABEL, '0' * 64):
+        assert frag in plan0
+    # sealed/design.csv existed before the first main-design run (_run_main records its content)
+    assert calls.seen['design_before_first_main_run'].count('\n') == 1 + 2 * 371
+    assert calls.seen['manifest_at_first_test'] is True          # sealed/ closed before the test set
+
+
+@needs_dll
+@pytest.mark.parametrize('kind', ['stop', 'runtime'])
+def test_v86_main_screening_stop_stays_sealed(tmp_path, monkeypatch, capsys, kind):
+    """3.1b item 13: a failure inside the screening step is a sealed stop: 'SECRET 12.345' is
+    on neither the console nor any public file, sealed/stop.json holds the reason and
+    pha 'sang_loc', status 'stopped after the sweep', no main-design run, no sealed_test/; a
+    non-S03Stop also leaves its traceback in sealed/diag.txt, never on stderr."""
+    import json as _json
+
+    def step(*a, **k):
+        if kind == 'stop':
+            raise s3.S03Stop('SECRET 12.345')
+        raise RuntimeError('SECRET 12.345')
+
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys, run_step=step,
+                                             argv=MU3)
+    assert code == 2
+    for t in [console, calls.seen['stderr']] + list(_public_text(out).values()):
+        assert 'SECRET' not in t and '12.345' not in t and 'Traceback' not in t
+    stop = _json.load(open(out / 'sealed' / 'stop.json', encoding='utf-8'))
+    assert stop['pha'] == 'sang_loc' and 'SECRET 12.345' in stop['stop']
+    meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    assert 'stopped after the sweep (the reason is in sealed/stop.json)' in meta
+    assert max(calls) <= 1 and not (out / 'sealed_test').exists()
+    diag = (out / 'sealed' / 'diag.txt').read_text(encoding='utf-8')
+    if kind == 'runtime':
+        assert 'RuntimeError: SECRET 12.345' in diag and 'Traceback' in diag
+
+
+@needs_dll
+def test_v86_main_sealed_phase_output_goes_to_diag(tmp_path, monkeypatch, capsys):
+    """3.1b item 13: prints and warnings raised inside the sealed phases (here in the fake
+    step and in a main-design run) land in sealed/diag.txt, not on the console or stderr."""
+    def step(sealed, dll, controllers, gate, mu_levels, W, quet, screen, n_proc, tool_check=None):
+        print('SANG_PRINT')
+        warnings.warn('SANG_WARN', RuntimeWarning)
+        return _fake_run_step(sealed, dll, controllers, gate, mu_levels, W, quet, screen, n_proc)
+
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys, run_step=step,
+                                             design_warn=True, argv=MU3)
+    assert code == 0
+    for word in ('SANG_PRINT', 'SANG_WARN', 'FakeDesignWarning'):
+        assert word not in console and word not in calls.seen['stderr']
+    diag = (out / 'sealed' / 'diag.txt').read_text(encoding='utf-8')
+    assert 'SANG_PRINT' in diag and 'warning: RuntimeWarning: SANG_WARN' in diag
+    assert 'warning: RuntimeWarning: FakeDesignWarning' in diag
+
+
+@needs_dll
+def test_v86_main_tool_check_public_invariance(tmp_path, monkeypatch, capsys):
+    """spec 11.5 (e) and 8.11: --sangloc-thu end to end with the REAL sl.run_step (fake
+    safe_run_gate, _firmware and an in-process run_jobs): two runs with different fake scorings
+    (every set feasible / none feasible) produce identical console text and identical public
+    files except the meta.yaml date / elapsed_s / script lines; trial: true; the sealed
+    screening files exist, ket_qua says hoan_tat, and the two runs differ inside sealed/."""
+    import json as _json
+    ufile = str(tmp_path / 'u_thu.csv')
+    mk.write(ufile, base=sl.TRIAL_SEED_BASE)                        # the tool-check file (8.11)
+
+    def gate_all(fw, path, ctrl, g, v, mu):                         # every set feasible
+        return dict(status='ok', completed='true', e_perp_max=0.05, tv_duty=0.4, sat_frac=0.0,
+                    t_end=1.0, e_theta_lane_max_deg=0.5, e_theta_cmd_max_deg=0.5, ds_absmax=1.0,
+                    e_trk_max=0.05, e_bao_max=0.02), {'t': np.arange(3.0)}
+
+    def gate_none(fw, path, ctrl, g, v, mu):                        # no set feasible
+        row, log = gate_all(fw, path, ctrl, g, v, mu)
+        return dict(row, e_perp_max=99.0), log
+
+    def jobs(jobs_, work, n, lp):                                   # the worker pool in-process
+        return [sl.do_job(j) for j in jobs_]
+
+    outs = []
+    for gate in (gate_all, gate_none):
+        monkeypatch.setattr(s4, 'safe_run_gate', gate)
+        monkeypatch.setattr(sl, '_firmware', lambda dll: object())
+        monkeypatch.setattr(sl, 'run_jobs', jobs)
+        monkeypatch.setattr(sl, '_clock', itertools.count(1).__next__)
+        code, out, console, _, _ = _run_main(
+            tmp_path / ('a' if gate is gate_all else 'b'), monkeypatch, capsys,
+            patch_screen=False,
+            argv=['--mu', '0.4', '0.5', '0.6', '--sangloc-thu', '--screen-u', ufile,
+                  '--sangloc-thu-n0', '20', '--sangloc-thu-n', '30'])
+        outs.append((code, out, console))
+    (code_a, out_a, con_a), (code_b, out_b, con_b) = outs
+    assert code_a == code_b == 0
+    assert con_a.replace(str(out_a), '') == con_b.replace(str(out_b), '')
+    pub_a, pub_b = _public_text(out_a), _public_text(out_b)
+    assert set(pub_a) == set(pub_b)
+    for name in pub_a:
+        if name.endswith('meta.yaml'):
+            keep = [l for l in pub_a[name].splitlines()             # volatile meta fields only
+                    if not l.startswith(('date', 'elapsed_s', 'script'))]
+            want = [l for l in pub_b[name].splitlines()
+                    if not l.startswith(('date', 'elapsed_s', 'script'))]
+            assert keep == want
+        else:
+            assert pub_a[name] == pub_b[name], name
+    for out in (out_a, out_b):
+        assert 'trial: true' in (out / 'meta.yaml').read_text(encoding='utf-8')
+        assert (out / 'sealed' / 'sangloc_thu' / 'so_dem.json').is_file()
+        doc = _json.load(open(out / 'sealed' / 'sangloc' / 'ket_qua.json', encoding='utf-8'))
+        for c in s3.CONTROLLERS:
+            assert doc[c]['trang_thai'] == 'hoan_tat'
+    assert _tree(out_a / 'sealed') != _tree(out_b / 'sealed')       # they differ inside sealed/
+
+
+def test_v86_flag_validation(tmp_path, monkeypatch):
+    """8.11 and the flag rules: --sangloc-thu not with --trial, needs a --screen-u whose
+    basename is not the reference name, n0 in 1..SET_ROWS['S0'], n in 1..SET_ROWS['S1'],
+    --screen-r 0; the -n0/-n flags are refused without it; --screen-r >= 0; a --screen-r >= 1
+    rerun (item 3: a NEW numbers file) needs --screen-u under another name; --jobs >= 1;
+    --trial refuses --screen-u and --screen-r != 0."""
+    base = ['s03_doe.py', '--out', str(tmp_path / 'x'), '--mu', '0.4', '0.5', '0.6']
+    bad = [['s03_doe.py', '--out', str(tmp_path / 'x'), '--mu', '0.5', '--trial', '--sangloc-thu'],
+           base + ['--sangloc-thu'],
+           base + ['--sangloc-thu', '--screen-u', sl.SCREEN_U],
+           base + ['--sangloc-thu', '--screen-u', str(tmp_path / 'u.csv'),
+                   '--sangloc-thu-n0', '0', '--sangloc-thu-n', '30'],
+           base + ['--sangloc-thu', '--screen-u', str(tmp_path / 'u.csv'),
+                   '--sangloc-thu-n0', '20', '--sangloc-thu-n', str(sl.SET_ROWS['S1'] + 1)],
+           base + ['--sangloc-thu', '--screen-u', str(tmp_path / 'u.csv'),
+                   '--sangloc-thu-n0', '20', '--sangloc-thu-n', '30', '--screen-r', '1'],
+           base + ['--sangloc-thu-n0', '20'],
+           base + ['--screen-r', '-1'],
+           base + ['--screen-r', '1'],                    # a rerun needs its own numbers file
+           base + ['--screen-r', '1', '--screen-u', str(tmp_path / 's03_screen_u.csv')],
+           base + ['--jobs', '0'],
+           ['s03_doe.py', '--out', str(tmp_path / 'y'), '--mu', '0.5', '--trial',
+            '--screen-u', 'x'],
+           ['s03_doe.py', '--out', str(tmp_path / 'y'), '--mu', '0.5', '--trial',
+            '--screen-r', '1']]
+    for av in bad:
+        monkeypatch.setattr(sys, 'argv', av)
+        with pytest.raises(SystemExit):
+            s3.main()
+
+
+@needs_dll
+def test_v86_main_tool_check_same_content_stops_before_the_sweep(tmp_path, monkeypatch, capsys):
+    """8.11: the tool-check numbers file must also differ in CONTENT from the committed
+    reference — a byte copy of fwsim/s03_screen_u.csv is a public stop 'before the sweep'
+    whose console line names the same-content rule (exit 2), no run is made and no sealed
+    screening folder appears. Runs the real load_screen_u path (patch_screen=False)."""
+    u = tmp_path / 'u_thu.csv'
+    u.write_bytes(open(sl.SCREEN_U, 'rb').read())
+    code, out, console, calls, _ = _run_main(
+        tmp_path, monkeypatch, capsys, patch_screen=False,
+        argv=['--mu', '0.4', '0.5', '0.6', '--sangloc-thu', '--screen-u', str(u),
+              '--sangloc-thu-n0', '20', '--sangloc-thu-n', '30'])
+    assert code == 2 and 'before the sweep' in console and 'same content' in console
+    assert not calls
+    for sub in ('sangloc', 'sangloc_thu'):
+        d = out / 'sealed' / sub
+        assert not d.is_dir() or not list(d.iterdir())
+
+
+@needs_dll
+def test_v86_main_screen_file_failure_stops_before_the_sweep(tmp_path, monkeypatch, capsys):
+    """8.9 and item 13 first item: a numbers-file failure is a public stop BEFORE the sweep
+    (no run at all); the 'sang_loc' plan line of meta.yaml still holds the file info read
+    (.screen_info); exit code 2."""
+    def bad_load(path=None, trial=False):
+        exc = s3.S03Stop('screen numbers: fake_screen_u.csv: broken (S03 v8.5 8.9)')
+        exc.screen_info = dict(file='fake_screen_u.csv', sha256='a' * 64,
+                               problems=['broken on purpose'])
+        raise exc
+
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys,
+                                             load_screen=bad_load, argv=MU3)
+    assert code == 2 and 'before the sweep' in console and 'broken' in console
+    assert not calls
+    meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    plan = next(l for l in meta.splitlines() if l.startswith('sang_loc: '))
+    assert 'fake_screen_u.csv' in plan and 'broken on purpose' in plan
+    assert 'stopped before the sweep' in meta
+
+
+@needs_dll
+def test_v86_main_notes_pha(tmp_path, monkeypatch, capsys):
+    """Section 7 [v8.5]: sealed/notes.json 'pha' holds the 'quet' entry (actual = the rows of
+    sweep.csv, planned = what the grids imply, one process), the entries the step returned, and
+    per controller 'tam_va_hai_hop', 'truc', 'kiem_tat_dinh_3_4' whose actual counts equal the
+    runs.csv rows and the determinism rows; the old keys are still there."""
+    import csv as _csv
+    import json as _json
+    pha_in = [dict(pha='S0', controller='all', n_bo_gain={'PID': 5}, n_luot_ke_hoach=None,
+                   n_luot_thuc=5, n_luot_thuc_theo_controller=None, n_chay_lai_chan_doan=0,
+                   giay_may=1.0, so_tien_trinh=2)]
+
+    def step(sealed, dll, controllers, gate, mu_levels, W, quet, screen, n_proc, tool_check=None):
+        res = _fake_run_step(sealed, dll, controllers, gate, mu_levels, W, quet, screen, n_proc)
+        res['pha'] = pha_in
+        return res
+
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys, run_step=step,
+                                             argv=MU3)
+    assert code == 0
+    notes = _json.load(open(out / 'sealed' / 'notes.json', encoding='utf-8'))
+    pha = notes['pha']
+    n_sweep = len(list(_csv.DictReader(open(out / 'sweep.csv', encoding='utf-8'))))
+    q = next(p for p in pha if p['pha'] == 'quet')
+    planned = sum(3 + 3 * sum(len(s3.sweep_grid_cut(c, n, FAKE_DEFAULTS[c][n], lo, hi)[0])
+                              for n, lo, hi in zip(s3.FACTORS[c], *_tg.BOUNDS[c]))
+                  + 3 * (3 - 1) for c in s3.CONTROLLERS)
+    assert (q['controller'], q['n_luot_thuc'], q['n_luot_ke_hoach'], q['so_tien_trinh']) == \
+        ('all', n_sweep, planned, 1)
+    assert any(p.get('n_bo_gain') == {'PID': 5} for p in pha if p['pha'] == 'S0')
+    runs = list(_csv.DictReader(open(out / 'sealed' / 'runs.csv', encoding='utf-8')))
+    det = list(_csv.DictReader(open(out / 'sealed' / 'determinism_check.csv', encoding='utf-8')))
+    for c in s3.CONTROLLERS:
+        th = next(p for p in pha if p['pha'] == 'tam_va_hai_hop' and p['controller'] == c)
+        tr = next(p for p in pha if p['pha'] == 'truc' and p['controller'] == c)
+        kt = next(p for p in pha if p['pha'] == 'kiem_tat_dinh_3_4' and p['controller'] == c)
+        assert th['n_luot_thuc'] + tr['n_luot_thuc'] == sum(r['controller'] == c for r in runs)
+        assert tr['n_luot_thuc'] == sum(r['controller'] == c and r['box'] == 'axial'
+                                      for r in runs)
+        assert kt['n_luot_thuc'] == sum(r['controller'] == c for r in det)
+    for k in ('inner_rule_speeds', 'no_conclusion_speeds', 'ngoai_tam_giac_points',
+              'elapsed_s_total', 'elapsed_s_main_design', 'kep_frac', 'run_error_reruns',
+              'stop'):
+        assert k in notes
+
+
+def test_v86_kep_frac_fields():
+    """S03 v8.6 2.1 last item: PID with a 'kep' log channel -> the fwsim.kep_indicator
+    fractions; ADRC, a run_error row (log None) and a DLL without the channel -> the three
+    columns empty; a kep_lech flag -> S03Stop."""
+    t = np.arange(5) * 0.01
+    en = np.array([1.0, 1.0, 1.0, 0.0, 1.0])
+    kep = np.zeros((5, len(fwsim.KEP_COLS)))
+    kep[0, 0] = kep[1, 0] = kep[4, 0] = 1.0            # vx flagged on 3 of the 4 motor-on ticks
+    kep[2, 1] = 1.0                                  # vy on 1
+    log = dict(t=t, en=en, kep=kep)
+    row = dict(t_end=0.05)
+    want = fwsim.kep_indicator(log, row['t_end'])
+    got = s3.kep_frac_fields('PID', row, log)
+    assert got == {k: want[k] for k in s3.KEP_FRAC_COLS}
+    assert (got['kep_frac_vx'], got['kep_frac_vy'], got['kep_frac_wz']) == (0.75, 0.25, 0.0)
+    empty = {k: '' for k in s3.KEP_FRAC_COLS}
+    assert s3.kep_frac_fields('ADRC', row, log) == empty
+    assert s3.kep_frac_fields('PID', row, None) == empty
+    assert s3.kep_frac_fields('PID', row, dict(t=t, en=en)) == empty
+    bad = dict(t=t, en=en, kep=np.array(kep, copy=True))
+    bad['kep'][0, fwsim.KEP_COLS.index('kep_lech')] = 1.0
+    with pytest.raises(s3.S03Stop):
+        s3.kep_frac_fields('PID', row, bad)
+
+
+@needs_dll
+def test_v86_main_kep_frac_columns(tmp_path, monkeypatch, capsys):
+    """Through main(): a fake log with a kep channel -> the PID rows of runs.csv and
+    runs_test.csv hold the kep_indicator fractions (vx 1.0 here, vy/wz 0.0), the ADRC rows are
+    empty, sweep.csv has no kep column, and meta.yaml records kep_channel."""
+    import csv as _csv
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys, kep=True)
+    assert code == 0
+    for f in ('sealed/runs.csv', 'sealed_test/runs_test.csv'):
+        rows = list(_csv.DictReader(open(out / f)))
+        assert {r['kep_frac_vx'] for r in rows if r['controller'] == 'PID'} == {'1.0'}
+        assert {r['kep_frac_vy'] for r in rows if r['controller'] == 'PID'} == {'0.0'}
+        assert {r['kep_frac_vx'] for r in rows if r['controller'] == 'ADRC'} == {''}
+    assert not set(s3.KEP_FRAC_COLS) & set(next(_csv.reader(open(out / 'sweep.csv'))))
+    assert 'kep_channel: ' in (out / 'meta.yaml').read_text(encoding='utf-8')
+
+
+@needs_dll
+def test_v86_kep_frac_real_run(path):
+    """kep_frac_fields on a real PID run equals fwsim.kep_indicator of the log at the row's
+    t_end (skipped when the DLL has no kep channel)."""
+    fw = fwsim.FirmwareSim(_DLL)
+    if not fw.kep_cols:
+        pytest.skip('the DLL has no kep channel')
+    row, log = s3.run_one(fw, path, 'PID', s3.defaults(fw, 'PID'), 0.8, 0.5)
+    got = s3.kep_frac_fields('PID', row, log)
+    want = fwsim.kep_indicator(log, row['t_end'])
+    assert got == {k: want[k] for k in s3.KEP_FRAC_COLS}
+
