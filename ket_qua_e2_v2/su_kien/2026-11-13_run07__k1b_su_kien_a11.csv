@@ -1,7 +1,0 @@
-loai,wheel,target,log_seq,pwm_prev,t_esp_us,t_pi_us,moc_t0,bat_dinh_ms,k_first,duty_first,k_vao_dai,t_vao_dai_ms,vao_dai,n_lien_vao_dai,n_khong_bc,cat,cens_ms,cmd_level_ms
-lenh,fl,0,1834,-27,39724841,39257506200.707,udp_envelope,2.048034,7031,-0.213996,,,False,0,0,doi_lenh,11.330757,11.330757
-lenh,fl,0,1950,-16,40886367,39258667804.303,udp_envelope,2.048034,8193,0.067995,8220,27.537501,True,2874,0,,,
-lenh,fr,0,1950,-24,40886367,39258667804.303,udp_envelope,2.048034,8193,0.023988,8241,48.537845,True,2853,0,,,
-lenh,rl,0,1950,-24,40886367,39258667804.303,udp_envelope,2.048034,8193,0.023988,8241,48.537845,True,2853,0,,,
-lenh,rr,0,1834,-27,39724841,39257506200.707,udp_envelope,2.048034,7031,-0.213996,,,False,0,0,doi_lenh,11.330757,11.330757
-lenh,rr,0,1950,-16,40886367,39258667804.303,udp_envelope,2.048034,8193,0.067965,8220,27.537501,True,2874,0,,,
