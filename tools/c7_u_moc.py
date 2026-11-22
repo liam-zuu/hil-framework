@@ -31,7 +31,27 @@ Step 'khung' (this file, the heavy part; one run, every valid frame in [tu_s, de
   A frame is blocked (loi) when the base refit does not reproduce frames.csv (tag_x, tag_y, tag_psi to 1e-5), a refit
   is not ok (refit_pose_checked flags) or a number is not finite: the run has no U (design: 'chan, khong xuat so').
 
-Step 'manifest' (u_moc_manifest_v1 per scoring): later, needs the score files of C8B / NHACTAM (mien_phai_phu, W).
+Step 'manifest' (u_moc_manifest_v1, one per scoring = one luoi.json of c8b_luoi, H0 or H1; gate_c8 GC6-6, v6_C8
+sections 10, 23, 24; CAM v4 section 5):
+  scored nodes = the nodes of luoi.json nguon_nut kept by the grid (nodes_ok true, hong_nut false), in node order, as
+  gate_c8._node_scores reads them; mien_da_tinh = their khung_tuong_doi_v1.mien_phai_phu, exactly (gate: equal).
+  Domain of the bound = union of their id_khung, widened on each side by the largest grid step (camera time; every
+  valid frame with the car seen in it), plus the reference window W (tham_chieu_v1 ids). Adjacent scored nodes whose
+  domains start or end more than one grid step + one frame apart: ok false (domain not stable, v4 section 5).
+  Every frame of the domain must be in the khung file without loi; any (2a) flip of its worst refits: ok false.
+  q of the run: the chain of the scoring (c7_chuoi_khung.chuoi_khung with the very sources of the node score:
+  frames, A6, xoay, lan_lap, truc_xe, cho, u_psi_w_rad of tham_chieu_v1), recovered from its rows
+  q = R(-psi') (t - p); no q: ok false. The A6 of the khung file vs the A6 of the scoring: dpsi_a6 of the chain
+  equals dpsi_a6 of the khung file on EVERY frame of the khung file (1e-12 rad), else ok false.
+  Per frame: U_xy = max(S_t + 2|q| S_sin, C_t + 2|q| sin(C_psi / 2)), U_psi = max(S_psi, C_psi).
+  U_moc_dong_* = max over the domain; U_moc_tham_xy_m = mean of U_xy over W; U_moc_tham_psi_rad: z = mean e^{i psi'}
+  over W, R = |z|, S = mean 2 sin(min(U_psi, pi) / 2), asin(S / R) when S < R, else ok false; U_moc_hieu_xy_m =
+  dong + tham. Dependence (TC3-12): the scoring run again by c8b_luoi on the frames moved to the worst refit of each
+  frame (c7_score --khung-nhieu, once 'xy', once 'psi'); for every scored node: the reference window state (tap,
+  tham_chieu_trang_thai, hong_cua_so_tc), t1 and t_done (each way, within one frame) the same, else ok false; not
+  given: ok false (chua_kiem_phu_thuoc).
+
+Step 'nhieu' (used by c7_score --khung-nhieu): frames.csv rows moved to the worst refit of the khung file.
 
 Units: m and rad in the files.
 """
@@ -277,6 +297,354 @@ def run_khung(a):
     return 0 if not loi else 3
 
 
+# ---------------------------------------------------------------- khung file, step 'nhieu'
+FORMAT_MANIFEST = 'u_moc_manifest_v1'
+NHIEU_LOAI = {'xy': 'xau_xy', 'psi': 'xau_psi'}
+TOL_A6 = 1e-12                            # rad: dpsi_a6 of the khung A6 vs the scoring A6, same inputs
+TOL_Q = 1e-9                              # m: q recovered from every chain row agrees
+U_KEYS = ('U_moc_dong_xy_m', 'U_moc_tham_xy_m', 'U_moc_dong_psi_rad', 'U_moc_tham_psi_rad')
+
+
+def doc_khung(path):
+    """(header, {idx: record}) of a u_moc_khung_v1 file."""
+    with open(path, encoding='utf-8') as f:
+        lines = [json.loads(x) for x in f if x.strip()]
+    if not lines or lines[0].get('format') != FORMAT_KHUNG:
+        raise ValueError(f'{path}: not a {FORMAT_KHUNG} file')
+    recs = {}
+    for r in lines[1:]:
+        i = int(r['idx'])
+        if i in recs:
+            raise ValueError(f'{path}: frame idx {i} twice')
+        recs[i] = r
+    return lines[0], recs
+
+
+def khung_nhieu(rows, khung_path, loai, frames_sha):
+    """(rows, info): frames.csv rows (c7_measure.read_frames) with every frame of the khung file (no loi) moved to its
+    worst refit for xy ('xy': xau_xy) or psi ('psi': xau_psi): x, tag_x += dx; y, tag_y += dy; psi, tag_psi +=
+    dpsi_p (finite cells only). For the dependence check of 'manifest' (c7_score --khung-nhieu); never a scoring."""
+    if loai not in NHIEU_LOAI:
+        raise ValueError(f'--khung-nhieu-loai {loai!r}: one of {sorted(NHIEU_LOAI)}')
+    head, recs = doc_khung(khung_path)
+    if head['nguon']['frames']['sha256'] != frames_sha:
+        raise ValueError('the khung file was made from another frames.csv (sha256)')
+    out, n = [], 0
+    for r in rows:
+        rec = recs.get(int(r['idx']))
+        if rec is None or rec.get('loi'):
+            out.append(r)
+            continue
+        p = rec[NHIEU_LOAI[loai]]
+        r2 = dict(r)
+        for cols, v in ((('x', 'tag_x'), p['dx']), (('y', 'tag_y'), p['dy']), (('psi', 'tag_psi'), p['dpsi_p'])):
+            for c in cols:
+                if c in r2 and math.isfinite(ck._f(r2[c])):
+                    r2[c] = ck._f(r2[c]) + float(v)
+        out.append(r2)
+        n += 1
+    return out, dict(duong_dan=os.path.abspath(khung_path), sha256=sha256(khung_path), loai=loai, n_khung_doi=n,
+                     gioi_han='vx, vy, wz, speed of frames.csv not moved; the raw heading moved by dpsi_p (the change '
+                              'of psi\' after A6), the A6 change between the two poses neglected')
+
+
+# ---------------------------------------------------------------- step 'manifest'
+def _ref(path):
+    return dict(duong_dan=os.path.abspath(path), sha256=sha256(path))
+
+
+def _path(p, goc):
+    return p if os.path.isabs(p) else os.path.join(goc, p)
+
+
+def _doc_ref(ref, goc, what):
+    """Path of a {duong_dan, sha256} reference, hashed again."""
+    p = _path(ref['duong_dan'], goc)
+    if sha256(p) != ref['sha256']:
+        raise ValueError(f'{what}: {p} has another sha256 than the one named')
+    return p
+
+
+def _json(p):
+    with open(p, encoding='utf-8') as f:
+        return json.load(f)
+
+
+def nut_cham(luoi, goc):
+    """[(k, node score, its reference)] of the nodes the scoring relies on, in node order (gate_c8._node_scores: a
+    node score named by nguon_nut, nodes_ok true, hong_nut false)."""
+    nn, nd, hn, ok = (luoi.get(k) for k in ('nguon_nut', 'nodes_s', 'hong_nut', 'nodes_ok'))
+    if not (isinstance(nn, list) and isinstance(nd, list) and isinstance(hn, list) and isinstance(ok, list)
+            and nn and len(nd) == len(hn) == len(ok)):
+        raise ValueError('luoi.json: nguon_nut, nodes_s, hong_nut, nodes_ok (one per node) needed')
+    by = {}
+    for e in nn:
+        k = e.get('nut')
+        if type(k) is not int or not 0 <= k < len(nd) or k in by:
+            raise ValueError(f'luoi.json nguon_nut: node {k!r} not a node index, or twice')
+        by[k] = e
+    out = []
+    for k in range(len(nd)):
+        if k not in by or hn[k] or not ok[k]:
+            continue
+        p = _doc_ref(by[k], goc, f'node {k}')
+        out.append((k, _json(p), dict(nut=k, duong_dan=os.path.abspath(p), sha256=by[k]['sha256'])))
+    return out
+
+
+def _mpp(sc, k):
+    import c7_tuong_doi as ctd
+    m = (sc.get('khung_tuong_doi_v1') or {}).get('mien_phai_phu')
+    if not isinstance(m, dict) or m.get('nut') != k or not m.get('id_khung') \
+            or ctd.ids_sha(m['id_khung']) != m.get('id_khung_sha256'):
+        raise ValueError(f'node {k}: no mien_phai_phu {{nut, D_s, id_khung, id_khung_sha256}} (c7_score >= 0857f02)')
+    return m
+
+
+def _same_sources(kept):
+    """khung_tuong_doi_v1.nguon of the scored nodes: one set of sources for the scoring."""
+    srcs = [json.dumps((sc.get('khung_tuong_doi_v1') or {}).get('nguon'), sort_keys=True) for _, sc, _ in kept]
+    if len(set(srcs)) != 1:
+        raise ValueError('the scored nodes name different sources (khung_tuong_doi_v1.nguon)')
+    return kept[0][1]['khung_tuong_doi_v1']['nguon']
+
+
+def q_of_chain(chain):
+    """(q [x, y] or None, ly_do): q = R(-psi') (t - p) on every row with q_ok, all within TOL_Q."""
+    qs = []
+    for r in chain:
+        if not r['q_ok']:
+            continue
+        c, s = math.cos(r['psi_ma_p']), math.sin(r['psi_ma_p'])
+        dx, dy = r['tag_x'] - r['p_x'], r['tag_y'] - r['p_y']
+        qs.append((c * dx + s * dy, -s * dx + c * dy))
+    if not qs:
+        why = sorted({r['ly_do'] for r in chain if r['ly_do']})
+        return None, 'thieu_q: ' + '; '.join(why[:3])
+    Q = np.array(qs)
+    if np.max(np.abs(Q - Q[0])) > TOL_Q:
+        return None, 'q_khong_mot_gia_tri'
+    return [float(Q[0, 0]), float(Q[0, 1])], ''
+
+
+def u_khung(rec, aq):
+    """(U_xy, U_psi) of one frame record, arm |q| = aq."""
+    uxy = max(rec['S_t_m'] + 2.0 * aq * rec['S_sin'], rec['C_t_m'] + 2.0 * aq * math.sin(rec['C_psi_rad'] / 2.0))
+    return uxy, max(rec['S_psi_rad'], rec['C_psi_rad'])
+
+
+def u_tham_psi(psi_p, upsi):
+    """asin(S / R) (v4 section 5) or None when S >= R."""
+    z = np.mean(np.exp(1j * np.asarray(psi_p, float)))
+    R = float(abs(z))
+    S = float(np.mean(2.0 * np.sin(np.minimum(np.asarray(upsi, float), math.pi) / 2.0)))
+    return (math.asin(S / R) if S < R else None), R, S
+
+
+def _t_eq(a, b, tol):
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(float(a) - float(b)) <= tol
+
+
+def phu_thuoc(kept, luoi, nhieu, khung_sha, dt, goc):
+    """(record, reasons) of the dependence check (module docstring): the scoring again on the moved frames."""
+    rec, bad = {}, []
+    for loai in sorted(NHIEU_LOAI):
+        if loai not in nhieu:
+            bad.append(f'chua_kiem_phu_thuoc_{loai}')
+            continue
+        p = nhieu[loai]
+        L = _json(p)
+        if L.get('gio_sha256') != luoi.get('gio_sha256') or L.get('nodes_s') != luoi.get('nodes_s'):
+            bad.append(f'{loai}: luoi nhieu of another grid (gio_sha256, nodes_s)')
+            continue
+        by = {e['nut']: e for e in L.get('nguon_nut') or []}
+        n_doi = []
+        for k, sc, _ in kept:
+            if k not in by:
+                n_doi.append(f'nut {k}: khong co diem nhieu')
+                continue
+            s2 = _json(_doc_ref(by[k], goc, f'{loai} node {k}'))
+            kn = s2.get('khung_nhieu') or {}
+            if kn.get('sha256') != khung_sha or kn.get('loai') != loai or s2.get('frames_sha256') != sc.get('frames_sha256'):
+                n_doi.append(f'nut {k}: diem nhieu khong cua file khung nay ({loai}) hay frames khac')
+                continue
+            k1, k2 = sc.get('khung_tuong_doi_v1') or {}, s2.get('khung_tuong_doi_v1') or {}
+            for f in ('tap', 'tham_chieu_trang_thai'):
+                if k1.get(f) != k2.get(f):
+                    n_doi.append(f'nut {k}: {f} {k1.get(f)!r} -> {k2.get(f)!r}')
+            if bool(sc.get('hong_cua_so_tc')) != bool(s2.get('hong_cua_so_tc')):
+                n_doi.append(f'nut {k}: hong_cua_so_tc doi')
+            g1, h1 = (sc.get('gate_v3') or {}).get('g1') or {}, (s2.get('gate_v3') or {}).get('g1') or {}
+            td1, td2 = list(g1.get('t_done') or [None, None]), list(h1.get('t_done') or [None, None])
+            for w in range(2):
+                a_, b_ = (td1 + [None, None])[w], (td2 + [None, None])[w]
+                if not _t_eq(a_, b_, dt + 1e-9):
+                    n_doi.append(f'nut {k}: t_done cach {w + 1} {a_!r} -> {b_!r}')
+            if not _t_eq(g1.get('t1'), h1.get('t1'), dt + 1e-9):
+                n_doi.append(f'nut {k}: t1 {g1.get("t1")!r} -> {h1.get("t1")!r}')
+        rec[loai] = dict(luoi=_ref(p), n_nut=len(kept), doi=n_doi)
+        bad += [f'{loai}: {x}' for x in n_doi]
+    return rec, bad
+
+
+def run_manifest(a):
+    import c7_tuong_doi as ctd
+    t_start = time.time()
+    goc = a.goc or os.path.dirname(os.path.abspath(a.luoi))
+    head, recs = doc_khung(a.khung)
+    khung_sha = sha256(a.khung)
+    ng = head['nguon']
+    fpath = _doc_ref(ng['frames'], goc, 'khung nguon.frames')
+    for k in ('session', 'u_so', 'lich', 'hang_so'):
+        _doc_ref(ng[k], goc, f'khung nguon.{k}')
+    luoi = _json(a.luoi)
+    kept = nut_cham(luoi, goc)
+    if not kept:
+        raise ValueError('luoi.json: no node the scoring relies on (no manifest for a scoring without one)')
+    bad = []
+    mien = [_mpp(sc, k) for k, sc, _ in kept]
+    for k, sc, _ in kept:
+        if sc.get('frames_sha256') != ng['frames']['sha256']:
+            raise ValueError(f'node {k} scored another frames.csv than the khung file')
+    src = _same_sources(kept)
+    task = kept[0][1].get('task')
+    rows = cm.read_frames(fpath)
+    t_of = {int(r['idx']): float(r['t_s']) for r in rows}
+    dt = float(np.median(np.diff(sorted(t_of.values()))))
+    nodes_s = sorted(float(x) for x in luoi['nodes_s'])
+    step = float(np.max(np.diff(nodes_s))) if len(nodes_s) > 1 else 0.0
+    # domain: union of the node domains, widened by the largest grid step, plus W
+    spans = []
+    for m in mien:
+        miss = [i for i in m['id_khung'] if int(i) not in t_of]
+        if miss:
+            raise ValueError(f'node {m["nut"]}: frame ids not in frames.csv ({miss[:3]})')
+        ts = [t_of[int(i)] for i in m['id_khung']]
+        spans.append((min(ts), max(ts)))
+    for (s0, e0), (s1, e1), m0, m1 in zip(spans, spans[1:], mien, mien[1:]):
+        if abs(s1 - s0) > step + dt + 1e-9 or abs(e1 - e0) > step + dt + 1e-9:
+            bad.append(f'mien_chua_on_dinh: nut {m0["nut"]} -> {m1["nut"]} ({s0:.3f}-{e0:.3f} -> {s1:.3f}-{e1:.3f} s)')
+    lo, hi = min(s for s, _ in spans) - step, max(e for _, e in spans) + step
+    dom = {int(i) for m in mien for i in m['id_khung']}
+    dom |= {int(r['idx']) for r in rows if r['valid'] and r['car_seen'] and lo - 1e-9 <= float(r['t_s']) <= hi + 1e-9}
+    tc_path = _doc_ref(src['tham_chieu_v1'], goc, 'tham_chieu_v1')
+    tc = _json(tc_path)
+    W = [int(i) for i in tc.get('ids') or []]
+    if not W or ctd.ids_sha(W) != tc.get('ids_sha256'):
+        raise ValueError('tham_chieu_v1: no reference ids, or ids_sha256 not of its ids')
+    # every frame of the domain and W in the khung file, without loi, no (2a) flip of its worst refits
+    need = sorted(dom | set(W))
+    thieu = [i for i in need if i not in recs]
+    loi = [i for i in need if i in recs and recs[i].get('loi')]
+    flip = [i for i in need if i in recs and not recs[i].get('loi') and recs[i].get('doi_cong_cuc_dai')]
+    if thieu:
+        bad.append(f'thieu_khung: {len(thieu)} khung cua mien khong co trong file khung (dau {thieu[:5]})')
+    if loi:
+        bad.append(f'khung_loi: {len(loi)} khung (dau {loi[:5]})')
+    if flip:
+        bad.append(f'doi_cong_2a: {len(flip)} khung (dau {flip[:5]})')
+    # the chain of the scoring: q, and the A6 of the khung file vs the A6 of the scoring
+    a6c_p = _doc_ref(src['c8b_a6_v2'], goc, 'c8b_a6_v2 of the scoring')
+    a6c = ck.doc_a6(a6c_p)
+    if ng.get('a6') is None:
+        raise ValueError('the khung file has no A6 (A6 = 0 is a test run)')
+    a6k_p = _doc_ref(ng['a6'], goc, 'khung nguon.a6')
+    xo_p = _doc_ref(src['xoay_v1'], goc, 'xoay_v1') if src.get('xoay_v1') else None
+    ll_p = _doc_ref(src['lan_lap_v1'], goc, 'lan_lap_v1') if src.get('lan_lap_v1') else None
+    tr_p = _doc_ref(src['truc_xe_v1'], goc, 'truc_xe_v1') if src.get('truc_xe_v1') else None
+    cs_p = _doc_ref(src['cua_so_v1'], goc, 'cua_so_v1')
+    pres = [r for r in ctd.read_jsonl(cs_p) if r.get('loai') == 'pre' and r.get('luot_id') == head.get('luot_id')]
+    if len(pres) != 1 or pres[0].get('frames_sha256') != ng['frames']['sha256']:
+        raise ValueError(f'cua_so_v1: not one pre row of {head.get("luot_id")!r} with the frames of the khung file')
+    ll = ck.doc_lan_lap(ll_p, head.get('luot_id')) if ll_p else None
+    tj = os.path.join(os.path.dirname(fpath), 'track.json')
+    track = _json(tj) if os.path.isfile(tj) else None
+    chain = ck.chuoi_khung(fpath, a6c, xo_p, ll, track=track, cho=ctd.cho_of(task),
+                           truc_xe=_json(tr_p) if tr_p else None, u_psi_w_rad=tc.get('u_psi_w_rad'))
+    q, why_q = q_of_chain(chain)
+    if q is None:
+        bad.append(why_q)
+    kiem_a6 = dict(a6_khung=_ref(a6k_p), a6_cham=_ref(a6c_p), n_khung=0, n_khac=0, max_lech_rad=0.0)
+    if sha256(a6k_p) != sha256(a6c_p):
+        a6k = ck.doc_a6(a6k_p)
+        by_id = {int(r['idx']): r for r in rows}
+        ids = sorted(i for i in recs if not recs[i].get('loi'))
+        src_h = ck._tag_heading_source(rows, fpath, track)
+        xy = np.array([[ck._f(by_id[i]['tag_x']), ck._f(by_id[i]['tag_y'])] for i in ids], float)
+        ps = np.array([ck._f(by_id[i][src_h]) for i in ids], float)
+        dk, okk, _ = a6k['mod'].delta_psi_a6(a6k['obj'], xy, ps, ck.PLUMB_16_11, ck.ZC_16_11)
+        dc, okc, _ = a6c['mod'].delta_psi_a6(a6c['obj'], xy, ps, ck.PLUMB_16_11, ck.ZC_16_11)
+        dk, dc = np.asarray(dk, float), np.asarray(dc, float)
+        same = (np.asarray(okk, bool) == np.asarray(okc, bool)) & (np.abs(dk - dc) <= TOL_A6)
+        lech = np.abs(dk - dc)
+        kiem_a6.update(n_khung=len(ids), n_khac=int((~same).sum()),
+                       max_lech_rad=float(np.nanmax(lech)) if np.isfinite(lech).any() else None)
+        if (~same).any():
+            bad.append(f'a6_khung_khac_a6_cham: {int((~same).sum())} khung')
+    else:
+        kiem_a6.update(n_khung=sum(1 for i in recs if not recs[i].get('loi')), cung_file=True)
+    # the bound
+    U = dict.fromkeys(U_KEYS)
+    U['U_moc_hieu_xy_m'] = None
+    if q is not None and not thieu and not loi:
+        aq = math.hypot(q[0], q[1])
+        ud = [u_khung(recs[i], aq) for i in sorted(dom)]
+        uw = [u_khung(recs[i], aq) for i in W]
+        U['U_moc_dong_xy_m'] = max(x for x, _ in ud)
+        U['U_moc_dong_psi_rad'] = max(p for _, p in ud)
+        U['U_moc_tham_xy_m'] = float(np.mean([x for x, _ in uw]))
+        ut, R, S = u_tham_psi([recs[i]['psi_p'] for i in W], [p for _, p in uw])
+        U['U_moc_tham_psi_rad'] = ut
+        if ut is None:
+            bad.append(f'tham_psi_S_khong_nho_hon_R: S {S} R {R}')
+        U['U_moc_hieu_xy_m'] = U['U_moc_dong_xy_m'] + U['U_moc_tham_xy_m']
+    if not all(isinstance(U[k], float) and math.isfinite(U[k]) and U[k] >= 0.0 for k in U_KEYS) and not bad:
+        bad.append('U_khong_huu_han')
+    nhieu = dict(x.split('=', 1) for x in (a.nhieu or []))
+    pt, bad_pt = phu_thuoc(kept, luoi, nhieu, khung_sha, dt, goc)
+    bad += bad_pt
+    ses = _json(_path(ng['session']['duong_dan'], goc))
+    if not isinstance(ses.get('tag_h_m'), (int, float)):
+        raise ValueError('session.json: no tag_h_m (car_pose h_m)')
+    cp = head['car_pose']
+    lich_p = _path(ng['lich']['duong_dan'], goc)
+    lich = _json(lich_p)
+    if lich.get('version') != 'c7_lich_v3' or lich.get('hoi_tu') is not True or not lich.get('tap_moc_file_sha256'):
+        raise ValueError('lich.json: not a converged c7_lich_v3 with tap_moc_file_sha256')
+    gh = []
+    if ll is not None and ll.get('cung_lan_lap') is not True:
+        gh.append('q qua delta_c_B tho (NHACTAM cach (i), Liam chot 23/11 o NHACTAM: gia dinh tam khong doi cao): vi tri '
+                  'lech them khoang dh*|P - F|/(H - h), 0,2*dh o goc toi 0,6*dh o K1; khong cong vao U')
+    gh.append('can thuc nghiem (lon nhat quan sat duoc tren 8 huong va 200 to hop), khong phai can chung minh (v3 2)')
+    man = dict(format=FORMAT_MANIFEST, ok=not bad, ly_do=bad, file_cham_sha256=sha256(a.luoi), file_cham=_ref(a.luoi),
+               lan_cham=a.lan_cham, luot_id=head.get('luot_id'), task=task, mien_da_tinh=mien, **U,
+               nguon=dict(bo_lay_mau=head['bo_lay_mau'],
+                          car_pose=dict(tag_offset=[0.0, 0.0, 0.0], side_m=cp['side_m'], h_m=float(ses['tag_h_m']),
+                                        kappa=cp['kappa'], phien_ban=cp['phien_ban']),
+                          tap_moc=lich['tap_moc_file_sha256'], lich=_ref(lich_p)),
+               a6_sha256=sha256(a6c_p), kiem_a6=kiem_a6,
+               q=dict(q_m=q, abs_q_m=None if q is None else math.hypot(*q), nguon='c7_chuoi_khung (q_luot) cua lan cham'),
+               mien=dict(n_khung=len(dom), n_W=len(W), buoc_luoi_s=step, dt_khung_s=dt, tu_s=lo, den_s=hi,
+                         n_nut=len(kept)),
+               phu_thuoc=pt, gioi_han=gh,
+               dau_vao=dict(khung=_ref(a.khung), nut=[r for _, _, r in kept], tham_chieu_v1=_ref(tc_path),
+                            cua_so_v1=_ref(cs_p), xoay_v1=xo_p and _ref(xo_p), lan_lap_v1=ll_p and _ref(ll_p),
+                            truc_xe_v1=tr_p and _ref(tr_p), **{k: ng[k] for k in ('frames', 'dets', 'session', 'u_so',
+                                                                                    'hang_so')}),
+               script=cm.script_state(('tools/c7_u_moc.py', 'tools/c7_chuoi_khung.py', 'tools/c7_tuong_doi.py',
+                                       'tools/c7_measure.py', 'tools/c8b_a6.py')),
+               giay=round(time.time() - t_start, 1))
+    text = json.dumps(cm._json(man), ensure_ascii=False, indent=1, allow_nan=False)
+    with open(a.out, 'x', encoding='utf-8') as f:
+        f.write(text + '\n')
+    print(f"{head.get('luot_id')} {a.lan_cham}: ok {man['ok']}, U dong/tham xy {U['U_moc_dong_xy_m']} / "
+          f"{U['U_moc_tham_xy_m']} m, psi {U['U_moc_dong_psi_rad']} / {U['U_moc_tham_psi_rad']} rad"
+          + ('' if not bad else '; ' + '; '.join(bad[:4])))
+    return 0 if man['ok'] else 3
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[1])
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -294,8 +662,19 @@ def main(argv=None):
     k.add_argument('--den-s', dest='den_s', type=float, default=math.inf)
     k.add_argument('--jobs', type=int, default=1)
     k.add_argument('--out', required=True)
+    m = sub.add_parser('manifest', help='u_moc_manifest_v1 of one scoring (module docstring)')
+    m.add_argument('--khung', required=True, help='u_moc_khung.jsonl of the run (step khung)')
+    m.add_argument('--luoi', required=True, help='luoi.json of the scoring (c8b_luoi; H0 or H1)')
+    m.add_argument('--lan-cham', dest='lan_cham', required=True, help='H0, H1_so_bo or H1 (recorded)')
+    m.add_argument('--nhieu', action='append', metavar='LOAI=LUOI',
+                   help='luoi.json of the scoring again with c7_score --khung-nhieu (xy=..., psi=...)')
+    m.add_argument('--goc', default=None, help='folder the relative paths of the score files are relative to '
+                                               '(default: the folder of --luoi)')
+    m.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
+        if a.cmd == 'manifest':
+            return run_manifest(a)
         return run_khung(a)
     except (OSError, ValueError, KeyError) as e:
         print(f'c7_u_moc: {e}', file=sys.stderr)
