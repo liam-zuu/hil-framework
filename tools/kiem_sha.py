@@ -5,6 +5,21 @@ doi dau xuong dong. Moi file co toi da 3 dang sha: tho (nguyen byte), lf, crlf.
 File nhi phan (theo duoi mo rong hoac chua byte NUL) chi co 'tho'.
 
 Ma thoat: 0 dat, 1 khong_khop/thieu_file, 2 loi tham so, 3 chua xac minh.
+Ma 0 khong phu hash khong kem duong dan (khong_co_duong_dan chi la thong
+tin).
+
+Truong bat buoc = hash gan voi duong dan (khoa manifest/ban do la duong dan,
+hoac truong duong dan cung khoi); null o truong bat buoc ->
+sha_rong_bat_buoc (ma 3). Null o hash khong kem duong dan -> so_rong
+(thong tin).
+
+Phan giai duong tuong doi: ten tran -> chi thu muc chua JSON; duong co thu
+muc (ke ca './a.csv', 'F2\\a.jsonl') -> chi goc luot: --goc-luot neu khai
+bao, khong thi thu muc to tien gan nhat cua thu muc JSON (ke ca chinh no)
+co ten khop YYYY-MM-DD_runNN; khong co goc luot -> khong_co_goc_luot
+(ma 3); dich khong ton tai -> thieu_file, khong thu goc repo. Duong tuyet
+doi giu luat cu. File co st_nlink > 1 (JSON hay file tham chieu) khong mo:
+hard_link (ma 3).
 """
 import argparse
 import csv
@@ -32,7 +47,8 @@ _TEN_LUOT = re.compile(r'\d{4}-\d{2}-\d{2}_run\d+')
 _CHUA_XAC_MINH = frozenset({
     'json_loi', 'sha_khong_hop_le', 'manifest_khoa_khong_phai_file',
     'danh_sach_khong_ghep', 'nhieu_duong_dan', 'kieu_khong_ho_tro',
-    'mo_ho_phan_giai',
+    'mo_ho_phan_giai', 'sha_rong_bat_buoc', 'khong_co_goc_luot',
+    'hard_link',
 })
 _BO_NHO = {}
 
@@ -81,6 +97,8 @@ def kiem(path, sha_ghi):
     p = Path(path)
     if not p.is_file():
         return 'thieu_file'
+    if p.stat().st_nlink > 1:
+        return 'hard_link'
     dang = sha_cac_dang(p)
     s = sha_ghi.strip().lower()
     for k in ('tho', 'lf', 'crlf'):
@@ -107,6 +125,22 @@ def _la_manifest(d):
     return all(la_duong_dan(k) and _hex64(v) for k, v in d.items())
 
 
+def _la_ban_do_hash(d):
+    if not d:
+        return False
+    co_str = False
+    for k, v in d.items():
+        if not (isinstance(k, str) and 'sha256' not in k.lower()
+                and la_duong_dan(k)):
+            return False
+        if v is None:
+            continue
+        if not isinstance(v, str) or la_duong_dan(v):
+            return False
+        co_str = True
+    return co_str
+
+
 def _chon_duong_dan(cands, khoa, sha, cap, kh):
     # cands: [(gia_tri, dang)] da loc la_duong_dan
     rieng = []
@@ -124,54 +158,70 @@ def _chon_duong_dan(cands, khoa, sha, cap, kh):
                    'ly_do': 'nhieu_duong_dan'})
 
 
+def _tim_duong_dan(k, D):
+    # cands: [(gia_tri, dang)] da loc la_duong_dan; rieng=True khi khoa
+    # 'sha256' co sha256_file/sha256_duong_dan/sha256_path di kem
+    cands = []
+    rieng = False
+    if k.lower() == 'sha256':
+        thuong = {kk.lower() for kk in D if isinstance(kk, str)}
+        if any(kk in thuong for kk in
+               ('sha256_file', 'sha256_duong_dan', 'sha256_path')):
+            rieng = True
+        else:
+            for kk, dang in (('duong_dan', 'khoi_duong_dan'),
+                             ('path', 'khoi_path'),
+                             ('file', 'khoi_file')):
+                if kk in D and la_duong_dan(D[kk]):
+                    cands.append((D[kk], dang))
+    else:
+        m = _DUOI_SHA.match(k)
+        if m:
+            b = m.group(1)
+            thuong = {kk.lower() for kk in D if isinstance(kk, str)}
+            if b in D and la_duong_dan(D[b]):
+                cands.append((D[b], 'ten_sha256'))
+            bf = b + '_file'
+            if (bf in D and (b + '_file_sha256').lower() not in thuong
+                    and la_duong_dan(D[bf])):
+                cands.append((D[bf], 'ten_file'))
+            bp = b + '_path'
+            if (bp in D and (b + '_path_sha256').lower() not in thuong
+                    and la_duong_dan(D[bp])):
+                cands.append((D[bp], 'ten_path'))
+        else:
+            m2 = _DAU_SHA.match(k)
+            if m2:
+                x = m2.group(1)
+                if (x.lower() in ('file', 'duong_dan', 'path')
+                        and x in D and la_duong_dan(D[x])):
+                    cands.append((D[x], 'sha256_hau_to'))
+                for kk in ('file_' + x, 'duong_dan_' + x, 'path_' + x):
+                    if kk in D and la_duong_dan(D[kk]):
+                        cands.append((D[kk], 'sha256_hau_to'))
+    return cands, rieng
+
+
 def _xu_sha(k, v, D, path, cap, kh, st):
     khoa = _con(path, k)
     if v is None:
-        st[0] += 1
+        cands, rieng = _tim_duong_dan(k, D)
+        if rieng or not cands:
+            st[0] += 1
+        else:
+            kh.append({'khoa': khoa, 'gia_tri': 'null',
+                       'ly_do': 'sha_rong_bat_buoc'})
         return
     if isinstance(v, str):
         if not _hex64(v):
             kh.append({'khoa': khoa, 'gia_tri': v[:200],
                        'ly_do': 'sha_khong_hop_le'})
             return
-        cands = []
-        if k.lower() == 'sha256':
-            thuong = {kk.lower() for kk in D if isinstance(kk, str)}
-            if any(kk in thuong for kk in
-                   ('sha256_file', 'sha256_duong_dan', 'sha256_path')):
-                kh.append({'khoa': khoa, 'gia_tri': v[:200],
-                           'ly_do': 'co_sha256_file_rieng'})
-                return
-            for kk, dang in (('duong_dan', 'khoi_duong_dan'),
-                             ('path', 'khoi_path'),
-                             ('file', 'khoi_file')):
-                if kk in D and la_duong_dan(D[kk]):
-                    cands.append((D[kk], dang))
-        else:
-            m = _DUOI_SHA.match(k)
-            if m:
-                b = m.group(1)
-                thuong = {kk.lower() for kk in D if isinstance(kk, str)}
-                if b in D and la_duong_dan(D[b]):
-                    cands.append((D[b], 'ten_sha256'))
-                bf = b + '_file'
-                if (bf in D and (b + '_file_sha256').lower() not in thuong
-                        and la_duong_dan(D[bf])):
-                    cands.append((D[bf], 'ten_file'))
-                bp = b + '_path'
-                if (bp in D and (b + '_path_sha256').lower() not in thuong
-                        and la_duong_dan(D[bp])):
-                    cands.append((D[bp], 'ten_path'))
-            else:
-                m2 = _DAU_SHA.match(k)
-                if m2:
-                    x = m2.group(1)
-                    if (x.lower() in ('file', 'duong_dan', 'path')
-                            and x in D and la_duong_dan(D[x])):
-                        cands.append((D[x], 'sha256_hau_to'))
-                    for kk in ('file_' + x, 'duong_dan_' + x, 'path_' + x):
-                        if kk in D and la_duong_dan(D[kk]):
-                            cands.append((D[kk], 'sha256_hau_to'))
+        cands, rieng = _tim_duong_dan(k, D)
+        if rieng:
+            kh.append({'khoa': khoa, 'gia_tri': v[:200],
+                       'ly_do': 'co_sha256_file_rieng'})
+            return
         _chon_duong_dan(cands, khoa, v, cap, kh)
         return
     if isinstance(v, list):
@@ -201,7 +251,11 @@ def _xu_sha(k, v, D, path, cap, kh, st):
                     kh.append({'khoa': sub, 'gia_tri': str(k2)[:200],
                                'ly_do': 'manifest_khoa_khong_phai_file'})
             elif v2 is None:
-                st[0] += 1
+                if la_duong_dan(k2):
+                    kh.append({'khoa': sub, 'gia_tri': 'null',
+                               'ly_do': 'sha_rong_bat_buoc'})
+                else:
+                    st[0] += 1
             elif isinstance(v2, str):
                 kh.append({'khoa': sub, 'gia_tri': v2[:200],
                            'ly_do': 'sha_khong_hop_le'})
@@ -222,6 +276,21 @@ def _duyet(v, path, cap, kh, st):
                 cap.append({'khoa': _manifest_con(path, k2),
                             'duong_dan': k2, 'sha': v2, 'dang': 'manifest'})
             return
+        if _la_ban_do_hash(v):
+            for k2, v2 in v.items():
+                if _hex64(v2):
+                    cap.append({'khoa': _manifest_con(path, k2),
+                                'duong_dan': k2, 'sha': v2,
+                                'dang': 'manifest'})
+                elif v2 is None:
+                    kh.append({'khoa': _manifest_con(path, k2),
+                               'gia_tri': 'null',
+                               'ly_do': 'sha_rong_bat_buoc'})
+                else:
+                    kh.append({'khoa': _manifest_con(path, k2),
+                               'gia_tri': v2[:200],
+                               'ly_do': 'sha_khong_hop_le'})
+            return
         if any(isinstance(k, str) and 'sha256' not in k.lower()
                and la_duong_dan(k) and _hex64(v2)
                for k, v2 in v.items()):
@@ -236,6 +305,11 @@ def _duyet(v, path, cap, kh, st):
                     kh.append({'khoa': _manifest_con(path, k),
                                'gia_tri': v2[:200],
                                'ly_do': 'sha_khong_hop_le'})
+                elif (isinstance(k, str) and 'sha256' not in k.lower()
+                      and la_duong_dan(k) and v2 is None):
+                    kh.append({'khoa': _manifest_con(path, k),
+                               'gia_tri': 'null',
+                               'ly_do': 'sha_rong_bat_buoc'})
                 elif isinstance(k, str) and 'sha256' in k.lower():
                     _xu_sha(k, v2, v, path, cap, kh, st)
                 else:
@@ -259,7 +333,7 @@ def tim_cap(obj):
     return cap, kh, st[0]
 
 
-def ung_vien(duong_dan, thu_muc_json, goc_repo):
+def ung_vien(duong_dan, thu_muc_json, goc_repo, goc_luot=None):
     s = str(duong_dan)
     out = []
     if _TUYET_DOI.match(s) or s.startswith('/') or s.startswith('\\'):
@@ -276,16 +350,16 @@ def ung_vien(duong_dan, thu_muc_json, goc_repo):
                             Path(goc_repo, *tach[cuoi + 1:])))
     else:
         rel = s.replace('\\', '/')
-        out.append(('thu_muc_json', Path(thu_muc_json) / rel))
         if '/' not in rel:
-            return out
-        if goc_repo is not None:
-            out.append(('goc_repo', Path(goc_repo) / rel))
-        tmj = Path(thu_muc_json)
-        for d in (tmj, *tmj.parents):
-            if _TEN_LUOT.fullmatch(d.name):
-                out.append(('thu_muc_luot', d / rel))
-                break
+            out.append(('thu_muc_json', Path(thu_muc_json) / rel))
+        elif goc_luot is not None:
+            out.append(('goc_luot', Path(goc_luot) / rel))
+        else:
+            tmj = Path(thu_muc_json)
+            for d in (tmj, *tmj.parents):
+                if _TEN_LUOT.fullmatch(d.name):
+                    out.append(('thu_muc_luot', d / rel))
+                    break
     return out
 
 
@@ -297,9 +371,17 @@ def _la_sealed(p):
     return any(x.lower() in _SEALED for x in parts)
 
 
-def kiem_cap(duong_dan, sha, thu_muc_json, goc_repo):
-    ds = ung_vien(duong_dan, thu_muc_json, goc_repo)
+def kiem_cap(duong_dan, sha, thu_muc_json, goc_repo, goc_luot=None):
+    s = str(duong_dan)
+    tuong_doi = not (_TUYET_DOI.match(s) or s.startswith('/')
+                     or s.startswith('\\'))
+    if tuong_doi and any(x.lower() in _SEALED
+                         for x in re.split(r'[\\/]', s)):
+        return 'bo_qua_sealed', '', ''
+    ds = ung_vien(s, thu_muc_json, goc_repo, goc_luot)
     if not ds:
+        if tuong_doi and '/' in s.replace('\\', '/'):
+            return 'khong_co_goc_luot', '', ''
         return 'thieu_file', '', ''
     c0, p0 = ds[0]
     if _la_sealed(p0):
@@ -334,7 +416,7 @@ def tim_goc_repo(start):
     return None
 
 
-def quet(goc, goc_repo):
+def quet(goc, goc_repo, goc_luot=None):
     goc = Path(goc)
     ds_json = []
     for dirpath, dirnames, filenames in os.walk(goc):
@@ -355,6 +437,10 @@ def quet(goc, goc_repo):
                             'gia_tri': '',
                             'ly_do': 'json_trong_sealed_khong_doc'})
             continue
+        if pj.stat().st_nlink > 1:
+            kh_rows.append({'file_ghi': file_ghi, 'khoa': '',
+                            'gia_tri': '', 'ly_do': 'hard_link'})
+            continue
         try:
             obj = json.loads(pj.read_text(encoding='utf-8-sig'))
         except Exception:
@@ -368,16 +454,16 @@ def quet(goc, goc_repo):
                             'gia_tri': e['gia_tri'], 'ly_do': e['ly_do']})
         for c in cap:
             kq, cach, thuc = kiem_cap(c['duong_dan'], c['sha'],
-                                      pj.parent, goc_repo)
+                                      pj.parent, goc_repo, goc_luot)
             if kq == 'bo_qua_sealed':
                 kh_rows.append({'file_ghi': file_ghi, 'khoa': c['khoa'],
                                 'gia_tri': c['duong_dan'],
                                 'ly_do': 'tro_vao_sealed_khong_doc'})
                 continue
-            if kq == 'mo_ho_phan_giai':
+            if kq in ('mo_ho_phan_giai', 'hard_link', 'khong_co_goc_luot'):
                 kh_rows.append({'file_ghi': file_ghi, 'khoa': c['khoa'],
                                 'gia_tri': c['duong_dan'],
-                                'ly_do': 'mo_ho_phan_giai'})
+                                'ly_do': kq})
                 continue
             dd = str(c['duong_dan'])
             ghi_chu = ('ten_tran' if ('/' not in dd and '\\' not in dd)
@@ -413,7 +499,8 @@ def main(argv=None):
         description='Kiem sha256 trong JSON, chiu sai khac CRLF/LF.')
     ap.add_argument('--goc', required=True)
     ap.add_argument('--goc-repo', default=None)
-    ap.add_argument('--ra', default=None)
+    ap.add_argument('--goc-luot', default=None)
+    ap.add_argument('--ra', '--out', dest='ra', default=None)
     a = ap.parse_args(argv)
     goc = Path(a.goc)
     if not goc.is_dir():
@@ -425,6 +512,16 @@ def main(argv=None):
         return 2
     goc_repo = (Path(a.goc_repo).resolve() if a.goc_repo
                 else tim_goc_repo(goc))
+    goc_luot = None
+    if a.goc_luot:
+        goc_luot = Path(a.goc_luot)
+        if not goc_luot.is_dir():
+            _in('loi: --goc-luot khong phai thu muc')
+            return 2
+        goc_luot = goc_luot.resolve()
+        if _la_sealed(goc_luot):
+            _in('loi: --goc-luot nam trong sealed/sealed_test')
+            return 2
     if a.ra:
         ra = Path(a.ra).resolve()
     else:
@@ -432,7 +529,7 @@ def main(argv=None):
     if _trong(ra, goc) or (goc_repo is not None and _trong(ra, goc_repo)):
         _in('loi: --ra nam trong --goc hoac goc_repo')
         return 2
-    rows, kh_rows, tom_tat = quet(goc, goc_repo)
+    rows, kh_rows, tom_tat = quet(goc, goc_repo, goc_luot)
     if any(r['ket_qua'] in ('khong_khop', 'thieu_file') for r in rows):
         ma = 1
     elif tom_tat['so_chua_xac_minh'] > 0:
@@ -457,6 +554,7 @@ def main(argv=None):
     tt['ma'] = ma
     tt['goc'] = str(goc)
     tt['goc_repo'] = str(goc_repo) if goc_repo is not None else None
+    tt['goc_luot'] = str(goc_luot) if goc_luot is not None else None
     with open(ra / 'tom_tat.json', 'w', encoding='utf-8') as f:
         json.dump(tt, f, ensure_ascii=True, indent=2)
     for kq in ('tho', 'lf', 'crlf', 'khong_khop', 'thieu_file'):
