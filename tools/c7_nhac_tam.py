@@ -1795,6 +1795,22 @@ GIOI_HAN_V4 = [
 
 
 # ---------------------------------------------------------------- F2 checks (LLC1-7)
+def lap_E_hop_le(rows, i, j):
+    """CODE 22/11 (hop dong C8 muc 3): window j may repeat window i (same clip, identical frame list, so equal first
+    PTS) ONLY when i is the LAST dung_12b of its 12b run in the clip and j is E_dau (HIEUCHUAN v2, v3: E_dau is the last
+    dung_12b when the E turn follows the 12b at once). Every other repeat / equal first PTS stays an error."""
+    a, b = rows[i], rows[j]
+    if a[TEN['loai']] != 'dung_12b' or b[TEN['loai']] != 'E_dau' or a[TEN['clip_sha']] != b[TEN['clip_sha']]:
+        return False
+    fa = khung_cua(a)
+    if not fa or fa != khung_cua(b):
+        return False
+    t_a = min(p for _, p in fa)
+    return not any(k != i and w[TEN['loai']] == 'dung_12b' and w[TEN['luot']] == a[TEN['luot']]
+                   and w[TEN['clip_sha']] == a[TEN['clip_sha']] and khung_cua(w)
+                   and min(p for _, p in khung_cua(w)) > t_a for k, w in enumerate(rows))
+
+
 def kiem_f2(rows):
     """Structure of the window file before any measurement: unique IDs and finite increasing PTS in a window, one pre
     and one post per run, no window given twice, no frame shared by the fit and held-out roles."""
@@ -1812,7 +1828,7 @@ def kiem_f2(rows):
             if w.get(kk) is not None and w[kk] != sha_ids(lst):
                 raise ValueError(f'window {i}: {kk} is not sha_ids of its frame list')
         key = (w[TEN['clip_sha']], tuple(ids))
-        if ids and key in seen:                        # an empty window (CT4-3) is a failed window, not a duplicate
+        if ids and key in seen and not lap_E_hop_le(rows, seen[key], i):   # CT4-3: empty = failed window, not a duplicate
             raise ValueError(f'window {i}: the same frames as window {seen[key]}')
         seen[key] = i
         role = 'khop' if w[TEN['loai']] in LOAI_KHOP else 'giu'
@@ -2834,7 +2850,8 @@ def phan_doan(rows, luot, hw, fitw, so, ctx, g_b, nguong_cho, cmap=None):
         if pts:
             t0[i] = min(pts)
             by_clip.setdefault(w[TEN['clip_sha']], []).append((i, t0[i]))
-    sai = any(any(b[1] <= a[1] for a, b in zip(v, v[1:])) for v in by_clip.values())
+    sai = any(any(b[1] < a[1] or (b[1] == a[1] and not lap_E_hop_le(rows, a[0], b[0])) for a, b in zip(v, v[1:]))
+              for v in by_clip.values())          # CODE 22/11: equal only for (last dung_12b, E_dau), same frames
     sai = sai or any(d.get('pre') in t0 and d.get('post') in t0 and t0[d['post']] <= t0[d['pre']]       # same clip only
                      and rows[d['pre']][TEN['clip_sha']] == rows[d['post']][TEN['clip_sha']] for d in luot.values())
     if sai:

@@ -1685,3 +1685,61 @@ def test_round5_f15_case_names_not_strings(files):
         f.write_text(json.dumps(_f15_hash(o)), encoding='utf-8')
         b = _again(files, rows, recs, 'h5', f)['beta_cam_replay']['goc']
         assert b['trang_thai'] == 'chua_ket_luan' and f'{kh}:ten_ca_sai' in b['ly_do'], (kh, b['ly_do'])
+
+
+# ---------------------------------------------------------------- CODE 22/11: E_dau = the last dung_12b (HIEUCHUAN v2, v3)
+def _e_lap(rows, recs, cho='goc', which=-1, drop_last=False):
+    """E_dau of `cho` made a copy of a dung_12b of the same place (which=-1: the last), same clip."""
+    d12 = [i for i, w in enumerate(rows) if w['loai'] == 'dung_12b' and w['cho'] == cho]
+    e = next(i for i, w in enumerate(rows) if w['loai'] == 'E_dau' and w['cho'] == cho)
+    src = d12[which]
+    r = [dict(x) for x in recs[src]]
+    if drop_last:
+        r = r[:-1]
+    recs[e] = r
+    rows[e]['khung'] = [{'id': x['id'], 'pts_s': x['t']} for x in r]
+    rows[e]['khung_ma_hop_le'] = [x['id'] for x in r]
+    return e, src
+
+
+def test_code_22_11_E_dau_repeats_last_dung_12b(files):
+    """E_dau identical to the last dung_12b of its 12b run, same clip: accepted (no thu_tu_mau_thuan), placements as
+    without the repeat; an E_dau with the same first frame but another list -> thu_tu_mau_thuan for every run."""
+    rows, recs = T_build()
+    _, _, _, L0 = run(files, rows, recs, tag='e0')
+    rows, recs = T_build()
+    _e_lap(rows, recs)
+    nt.kiem_f2(rows)
+    _, _, _, L1 = run(files, rows, recs, tag='e1')
+    assert all(x['lan_lap_id_ly_do'] != 'thu_tu_mau_thuan' for x in L1.values() if 'lan_lap_id_ly_do' in x)
+    assert {k: v['lan_lap_id'] for k, v in L1.items()} == {k: v['lan_lap_id'] for k, v in L0.items()}
+    assert any(v['lan_lap_id'] is not None for v in L1.values())
+    rows, recs = T_build()
+    _e_lap(rows, recs, drop_last=True)                       # equal first PTS, not the same frames
+    _, _, _, L2 = run(files, rows, recs, tag='e2')
+    assert all(v['lan_lap_id'] is None and v['lan_lap_id_ly_do'] == 'thu_tu_mau_thuan' for v in L2.values())
+
+
+def test_code_22_11_other_repeats_refused():
+    """A repeat of a dung_12b that is not the last of its run, of the ref_12b, or of the last dung_12b by E_cuoi (not
+    E_dau), stays an error (kiem_f2)."""
+    rows, recs = T_build()
+    d_last = [i for i, w in enumerate(rows) if w['loai'] == 'dung_12b' and w['cho'] == 'goc'][-1]
+    ec = next(i for i, w in enumerate(rows) if w['loai'] == 'E_cuoi' and w['cho'] == 'goc')
+    rows[ec]['khung'] = [dict(k) for k in rows[d_last]['khung']]
+    with pytest.raises(ValueError, match='the same frames'):
+        nt.kiem_f2(rows)
+    for which in (0, -2):
+        rows, recs = T_build()
+        if which == 0:
+            e = next(i for i, w in enumerate(rows) if w['loai'] == 'E_dau' and w['cho'] == 'goc')
+            ref = next(i for i, w in enumerate(rows) if w['loai'] == 'ref_12b' and w['cho'] == 'goc')
+            rows[e]['khung'] = [dict(k) for k in rows[ref]['khung']]
+        else:
+            _e_lap(rows, recs, which=-2)
+        with pytest.raises(ValueError, match='the same frames'):
+            nt.kiem_f2(rows)
+
+
+def T_build():
+    return build()
