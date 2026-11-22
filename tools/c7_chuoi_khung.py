@@ -129,6 +129,40 @@ def doc_xoay(src, cho=None):
     return out
 
 
+def doc_xoay_cung_lan_lap(src, cho, cho_q=None, ll_id=None, ll_id_q=None):
+    """doc_xoay of the place cho; a place WITHOUT its own block in a per-place xoay_v1 (K2: no E turn there) takes,
+    CODE 22/11 option (A) (contract C8 section 3, "F4 cho K2"), the block of the place cho_q WITH E on the SAME
+    mounting of the plate: q is the tag centre seen from the turning centre, fixed while the plate is not taken off.
+    The mounting is verified by ll_id (lan_lap_id of the F5 of cho) = ll_id_q (lan_lap_id of the F5 of cho_q), both
+    from F8 run 1, non-empty strings. Another mounting, an id missing (not verified) or no cho_q: no q (ok False,
+    ly_do says why), so u_q is missing and the place is chua_ket_luan. A place WITH its own block always uses it
+    (cho_q ignored). Returns the doc_xoay dict plus nguon_q {cho, lan_lap_id, cach} when a q is taken; cho_q = cho:
+    ValueError."""
+    xo = doc_xoay(src, cho)
+    raw = xo.get('raw')
+    per_place = isinstance(raw, dict) and isinstance(raw.get('cho'), dict)
+    if xo['q'] is not None or not per_place or isinstance(raw['cho'].get(cho), dict):
+        if xo['q'] is not None:
+            xo['nguon_q'] = dict(cho=cho, lan_lap_id=ll_id, cach='khoi F4 cua chinh cho')
+        return xo
+    if cho_q is None:
+        return xo                                              # xoay_thieu_cho_<cho>, as before
+    if cho_q == cho:
+        raise ValueError(f'cho_q {cho_q!r} is the place itself')
+    if not (isinstance(ll_id, str) and ll_id and isinstance(ll_id_q, str) and ll_id_q):
+        xo['ly_do'] = f'chua_xac_minh_cung_lan_lap_{cho_q} (lan_lap_id {cho} {ll_id!r}, {cho_q} {ll_id_q!r})'
+        return xo
+    if ll_id != ll_id_q:
+        xo['ly_do'] = f'khac_lan_lap_{cho_q} (lan_lap_id {cho} {ll_id!r}, {cho_q} {ll_id_q!r})'
+        return xo
+    xq = doc_xoay(src, cho_q)
+    if xq['q'] is None or not xq['ok']:
+        xo['ly_do'] = f'cho_{cho_q}_cung_lan_lap:{xq["ly_do"]}'
+        return xo
+    xq['nguon_q'] = dict(cho=cho_q, lan_lap_id=ll_id, cach='khoi F4 cua cho co E cung lan lap tam (CODE 22/11 A)')
+    return xq
+
+
 LAN_LAP_FILE_KEYS = ('cua_so_v1_sha256', 'session_sha256', 'tam_id', 'hieu_chuan', 'a6')
 
 
@@ -262,15 +296,16 @@ def tam_cua_luot(lan_lap, tam_id=None):
 
 
 def chuoi_khung(frames_csv, a6, xoay, lan_lap=None, plumb=PLUMB_16_11, zc=ZC_16_11, track=None, cho=None,
-                truc_xe=None, u_psi_w_rad=None, tam_id=None):
+                truc_xe=None, u_psi_w_rad=None, tam_id=None, cho_q=None, ll_id=None, ll_id_q=None):
     """Rows (dicts with ROW_KEYS) of every frame of frames.csv (module docstring). a6: doc_a6(...) or None; xoay: path,
     dict or doc_xoay(...) result; lan_lap: path, dict or doc_lan_lap(...) result, or None (calibration clips of the
     session of E: same mounting); cho: place k of the run (goc, K1, K2) for the C8B q composition of another
     mounting; truc_xe (truc_xe_v1 dict) and u_psi_w_rad: passed to the C8B q composition of another mounting; tam_id:
-    the plate on the car, used for the A6 plate check when lan_lap is None or has no tam_id (tam_cua_luot). Angles
-    in rad, positions in m."""
+    the plate on the car, used for the A6 plate check when lan_lap is None or has no tam_id (tam_cua_luot); cho_q,
+    ll_id, ll_id_q: a place without its own F4 block (K2) takes the block of cho_q on the same mounting
+    (doc_xoay_cung_lan_lap, CODE 22/11 option A). Angles in rad, positions in m."""
     rows, fpath = _frames(frames_csv)
-    xo = xoay if (isinstance(xoay, dict) and 'ok' in xoay and 'q' in xoay) else doc_xoay(xoay, cho)
+    xo = xoay if (isinstance(xoay, dict) and 'ok' in xoay and 'q' in xoay) else         doc_xoay_cung_lan_lap(xoay, cho, cho_q, ll_id, ll_id_q)     # cho_q None: doc_xoay(xoay, cho) as before
     ll = lan_lap if (lan_lap is None or '_sha256' in lan_lap) else doc_lan_lap(lan_lap)
     src = _tag_heading_source(rows, fpath, track)
     n = len(rows)
