@@ -166,7 +166,7 @@ def _straddle(level='O1-F05', u_t=0.02):
 def test_rt3_1_refinement_tells_the_half_threshold():
     hang = _straddle()
     uh = GC.uhat_level('O1-F05', _blk('O1-F05', hang=hang), 0.02)['g3']
-    assert uh['trang_thai'] in ('quyet', 'chi_bao_cao') and uh['delta_cuoi_s'] < GC.DELTA0_S
+    assert uh['trang_thai'] in ('quyet', 'so_do') and uh['delta_cuoi_s'] < GC.DELTA0_S
     assert uh['uhat_duoi'] <= uh['uhat']
     assert (uh['uhat'] <= 0.05) if uh['trang_thai'] == 'quyet' else (uh['uhat_duoi'] > 0.05)
 
@@ -178,11 +178,11 @@ def test_rt3_1_budget_spent_is_bien_nguong_and_needs_liam():
     uh = GC.uhat_level('O1-F05', blk, 0.02, budget=n0 + 1)
     assert uh['g3']['trang_thai'] == 'bien_nguong'
     with pytest.raises(GC.GateFileError, match='CAN LIAM QUYET'):
-        GC.report_only_of('O1-F05', uh)
-    q = dict(g3=dict(chon='chi_bao_cao', ngay='2026-11-20', phien='local_x', nguyen_van='FAKE'))
-    assert GC.report_only_of('O1-F05', uh, q) == (('g3',), {'g3': ['quyet_liam']})
+        GC.so_do_of('O1-F05', uh)
+    q = dict(g3=dict(chon='so_do', ngay='2026-11-20', phien='local_x', nguyen_van='FAKE'))
+    assert GC.so_do_of('O1-F05', uh, q) == (('g3',), {'g3': ['quyet_liam']})
     q['g3']['chon'] = 'quyet'
-    assert GC.report_only_of('O1-F05', uh, q) == ((), {})
+    assert GC.so_do_of('O1-F05', uh, q) == ((), {})
 
 
 def test_regression_constant_terms():
@@ -198,7 +198,7 @@ def test_half_threshold_equal_still_decides():
     uh = GC.uhat_level('O1-F05', _blk('O1-F05', hang=0.05), 0.01)
     assert uh['g2']['uhat'] > 0.05 > uh['g2']['uhat_duoi'] and uh['g2']['trang_thai'] == 'bien_nguong'
     uh = GC.uhat_level('O1-F05', _blk('O1-F05', hang=0.05 + 1e-12), 0.01)
-    assert uh['g2']['trang_thai'] == 'chi_bao_cao'
+    assert uh['g2']['trang_thai'] == 'so_do'
 
 
 def test_gc6_10_round3_bound_rounded_out():
@@ -213,18 +213,18 @@ def test_missing_closed_term_is_thieu():
     blk['u_p']['he_so_r'] = None
     uh = GC.uhat_level('O1-F05', blk, 0.01)
     assert uh['g2']['trang_thai'] == uh['g3']['trang_thai'] == 'thieu' and uh['g5']['trang_thai'] == 'quyet'
-    assert GC.report_only_of('O1-F05', uh)[0] == ('g2', 'g3')
+    assert GC.so_do_of('O1-F05', uh)[0] == ('g2', 'g3')
 
 
 # ── mask (design section 5) ──────────────────────────────────────────────────────────────────────────────────
 
-def test_g5_f08_always_report_only():
+def test_g5_f08_always_so_do():
     d = GC.fake_gate(('O1-F08',), u_psi_deg=0.1, u_t_s=0.001)
     e = d['dieu_2b']['per_level']['O1-F08']
-    assert e['uhat']['g5']['trang_thai'] == 'quyet' and e['report_only'] == ['g5']
-    assert e['ly_do_report_only'] == {'g5': ['liam_g5_f08']}
-    e['report_only'] = []
-    with pytest.raises(GC.GateFileError, match='report_only'):
+    assert e['uhat']['g5']['trang_thai'] == 'quyet' and e['so_do'] == ['g5']
+    assert e['ly_do_so_do'] == {'g5': ['liam_g5_f08']}
+    e['so_do'] = []
+    with pytest.raises(GC.GateFileError, match='so_do'):
         GC.check(d)
 
 
@@ -483,22 +483,22 @@ def test_integer_beyond_float():
 
 
 @pytest.mark.parametrize('level, platform, stage, campaign, want', [
-    ('O1-F08', 'SIM', 'script', 'B-chung', o1_gate.CONDS),
-    ('O1-F08', 'HW', 'screen', 'A-PID', ('g1', 'g2', 'g3', 'g4')),
-    ('O1-F05', 'HW', 'confirm', 'A-PID', o1_gate.CONDS),
-    ('O1-K1', 'HW', 'final', 'A-PID', o1_gate.CONDS),
-    ('O1-F08', 'HIL', 'hil_check', 'B-PID', ('g1', 'g2', 'g3', 'g4')),
-    ('O1-F08', 'HIL', 'final_hil', 'RQ2', o1_gate.CONDS),
+    ('O1-F08', 'SIM', 'script', 'B-chung', ()),
+    ('O1-F08', 'HW', 'screen', 'A-PID', ('g5',)),
+    ('O1-F05', 'HW', 'confirm', 'A-PID', ()),
+    ('O1-K1', 'HW', 'final', 'A-PID', ()),
+    ('O1-F08', 'HIL', 'hil_check', 'B-PID', ('g5',)),
+    ('O1-F08', 'HIL', 'final_hil', 'RQ2', ()),
 ])
-def test_required_by_run(tmp_path, level, platform, stage, campaign, want):
+def test_so_do_by_run(tmp_path, level, platform, stage, campaign, want):
     gf = GC.read_gate_c8(_write(tmp_path, _good()))
-    assert gf.required(level, platform, stage, campaign) == tuple(want)
+    assert gf.run_so_do(level, platform, stage, campaign) == tuple(want)
 
 
 def test_unknown_platform_refused(tmp_path):
     gf = GC.read_gate_c8(_write(tmp_path, _good()))
     with pytest.raises(GC.GateFileError, match='platform'):
-        gf.required('O1-F08', 'CAR', 'final', 'A-PID')
+        gf.run_so_do('O1-F08', 'CAR', 'final', 'A-PID')
 
 
 # ── check_nguon on a C8 folder with real source files (design sections 3, 6-10) ──────────────────────────────
@@ -545,7 +545,8 @@ def _gio(rid, cell, h_s, tt_ref=None, ops=(), **kw):
              dem_truot_kiem_gio=False, h_s=h_s, sha256=dict(esp32=esp, frames=_h('frames ' + rid)),
              nguon=[dict(file='frames.csv', sha256=_h('frames ' + rid)), dict(file=rid.split('#')[0] + '.csv', sha256=esp)],
              thao_tac_nguon=None if tt_ref is None else dict(file='score_tt.json', sha256=tt_ref['sha256']),
-             nodes_s=[0.0, 0.001], cua_so_ghep_log_s=[1.0, 4.0])
+             nodes_s=[0.0, 0.001], cua_so_ghep_log_s=[1.0, 4.0],
+             script=dict(commit='5' * 40, dirty=False, luc_chay=LUC_CHAM))      # CODE 23/11: c8b_gio of commit_hil
     g.update(kw)
     return g
 
@@ -562,6 +563,7 @@ def _nodes(goc, rid, cell, base=0, fg_obj=None, gio_sha=None, lost=False, ops=()
         if not lost:
             sc['khung_tuong_doi_v1'] = dict(mien_phai_phu=m, gio_sha256=gio_sha)
             sc.update(U_t_s=u_t, gate_v3={c: dict(state='dat') for c in o1_gate.CONDS}, session_sha256=session)
+            sc['gate_v3']['g5'].update(q=5.0, chung=dict(q=5.0))          # the middle node q of a so_do G5 (CODE 23/11)
         r = _jw(goc, f'luot/{rid}/nut_{k:03d}.json', sc)
         nn.append(dict(nut=k, **r))
         mpp.append(m)
@@ -583,11 +585,14 @@ def _luoi(goc, rid, cell, fg, u_max, outcome='dat', clip=None, fg_obj=None, ops=
     x = dict(trang_thai_luot='hong_he_do' if lost else 'cham', outcome=outcome, task=cell['muc'],
              gio_sha256=None if fg is None else fg['sha256'], u_max_s=u_max, nodes_s=[0.0, 0.001], nguon_nut=nn,
              hong_nut=[lost, lost], clip=dict(ten=clip, clip_sha256=_h('clip ' + clip)),
-             script=dict(commit='c' * 40, dirty=False, luc_chay=LUC_CHAM), nodes_ok=[not lost, not lost],
+             script=dict(commit='5' * 40, dirty=False, luc_chay=LUC_CHAM), nodes_ok=[not lost, not lost],
              scorer=None if lost else dict(commit='5' * 40, dirty=False,
                                            nut=[dict(commit='5' * 40, dirty=False, luc_chay=LUC_CHAM)] * 2),
-             u_t_nodes=[None, None] if lost else [u_max, u_max], report_only=['g5'] if cell['muc'] == 'O1-F08' else [],
-             nums=dict(g4=dict(hi=0.01, n_undef=0)), states={c: 'dat' for c in o1_gate.CONDS},
+             u_t_nodes=[None, None] if lost else [u_max, u_max], so_do=['g5'] if cell['muc'] == 'O1-F08' else [],
+             states_ba_nhanh={'g5': 'dat'} if cell['muc'] == 'O1-F08' else {},
+             q_so_do={'g5': dict(nut=0, q=5.0, q_chung=5.0)} if cell['muc'] == 'O1-F08' else {},
+             nums=dict(g4=dict(hi=0.01, n_undef=0), g5=dict(q=5.0, n_undef=0, chung=dict(q=5.0))),
+             states={c: 'dat' for c in o1_gate.CONDS},
              file_so_h=None, file_cham_h1=None, file_gio_h1=None,
              loai_hong=(['thao_tac'] if ops else ['he_do']) if lost else [])
     x.update(kw)
@@ -724,11 +729,13 @@ def build_c8(tmp_path, levels=LEVELS, u_t=0.014, two=False, sub=''):
     d['bo_cham']['phien_ban'] = 'tools/c8b_khoa_v5.py@' + 'c' * 40
     kv5 = _jw(goc, 'c8b_khoa_v5.json', dict(
         version=GC.KHOA_FORMAT, trang_thai='khoa', nhanh_tick=d['u_t_branch'], bang_man_trap=d['bo_cham']['bang_man_trap'],
+        commit_hil='5' * 40,                                          # CODE 23/11: the scoring commit (bo_tick)
         muc_kha_thi=list(levels), mien_car_pose=d['camera']['c8b']['mien_car_pose'], eps_H=d['camera']['c8b']['eps_H'],
         khoa_truoc=dict(nguon=[dict(vai='ke_hoach_c8', file='ke_hoach_c8.json', sha256=kh['sha256']),
                                dict(vai='a6', file='a6.json', sha256=a6['sha256'])],
-                        script=dict(file='tools/c8b_khoa_v5.py', commit='c' * 40, dirty=False), luc=LUC_KHOA_C8B),
-        muc={lv: dict(chi_bao_cao=['g5'] if lv == 'O1-F08' else [],
+                        script=dict(file='tools/c8b_khoa_v5.py', commit='c' * 40, dirty=False), luc=LUC_KHOA_C8B,
+                        commit_hil='5' * 40),
+        muc={lv: dict(so_do=['g5'] if lv == 'O1-F08' else [],
                       hang_dong=dict(a_m=pl[lv]['a_m'], hang_m=pl[lv]['u_p']['hang_m'],
                                      he_so_r=pl[lv]['u_p']['he_so_r'], u_phi_rad=pl[lv]['u_p']['u_phi_rad'],
                                      hang_rad=pl[lv]['u_psi']['hang_rad']),
@@ -1211,7 +1218,7 @@ def test_gc6_5_the_c8b_lock(tmp_path):
             ('f2', lambda k: k['khoa_truoc'].update(nguon=[dict(vai='3b O1-F05', file='x.json', sha256='a' * 64)]),
              'anchored'),
             ('f3', lambda k: k['khoa_truoc']['nguon'][0].update(vai='3b O1-F05'), 'anchored'),   # the plan SHA, other role
-            ('g', lambda k: k['muc']['O1-F08'].update(chi_bao_cao=[]), 'F08')]:
+            ('g', lambda k: k['muc']['O1-F08'].update(so_do=[]), 'F08')]:
         d, goc = build_c8(tmp_path / name)
         _rewrite_khoa(goc, d, edit)
         with pytest.raises(GC.GateFileError, match=msg):
@@ -1489,15 +1496,15 @@ def test_gc6_11_budget_covers_the_first_grid():
 def test_gc6_7_g5_f08_needs_no_liam_choice_and_holds_off_the_gate_levels(tmp_path):
     uh = {c: dict(trang_thai='quyet') for c in GC.MASKABLE}
     uh['g5'] = dict(trang_thai='bien_nguong')
-    assert GC.report_only_of('O1-F08', uh) == (('g5',), {'g5': ['liam_g5_f08']})
+    assert GC.so_do_of('O1-F08', uh) == (('g5',), {'g5': ['liam_g5_f08']})
     with pytest.raises(GC.GateFileError, match='CAN LIAM QUYET'):          # elsewhere bien_nguong needs Liam
-        GC.report_only_of('O1-F05', uh)
+        GC.so_do_of('O1-F05', uh)
     with pytest.raises(GC.GateFileError, match='not needed'):
-        GC.report_only_of('O1-F08', uh, {'g5': dict(chon='quyet')})
+        GC.so_do_of('O1-F08', uh, {'g5': dict(chon='quyet')})
     gf = GC.read_gate_c8(_write(tmp_path, GC.fake_gate(('O1-F05',))))      # F08 not a gate level
-    assert gf.required('O1-F08', 'HW', 'final', 'A-PID') == ('g1', 'g2', 'g3', 'g4')
-    assert gf.required('O1-F08', 'SIM', 'script', 'B-chung') == o1_gate.CONDS
-    assert gf.required('O1-K1', 'HW', 'final', 'A-PID') == o1_gate.CONDS
+    assert gf.run_so_do('O1-F08', 'HW', 'final', 'A-PID') == ('g5',)
+    assert gf.run_so_do('O1-F08', 'SIM', 'script', 'B-chung') == ()
+    assert gf.run_so_do('O1-K1', 'HW', 'final', 'A-PID') == ()
 
 
 def test_ct2_6_ids_sha_is_the_comma_join():
@@ -1522,8 +1529,8 @@ def test_gc6_15_types_before_the_tolerance():
 
 def test_gc6_16_reasons_of_the_mask_recomputed():
     d = _good()
-    d['dieu_2b']['per_level']['O1-F08']['ly_do_report_only'] = {'g5': ['vuot_nua_nguong']}
-    with pytest.raises(GC.GateFileError, match='ly_do_report_only'):
+    d['dieu_2b']['per_level']['O1-F08']['ly_do_so_do'] = {'g5': ['vuot_nua_nguong']}
+    with pytest.raises(GC.GateFileError, match='ly_do_so_do'):
         GC.check(d)
 
 
@@ -1554,14 +1561,14 @@ def test_gc6_16_write_gate_on_a_boundary_case(tmp_path, monkeypatch):
     runs = d['runs_c8'][lv]
     with pytest.raises(GC.GateFileError, match='CAN LIAM QUYET'):
         GC.level_block(lv, t['a_m'], t['u_p'], t['u_psi'], runs)
-    q = {'g3': dict(chon='chi_bao_cao', ngay='2026-11-20', phien='local_x', nguyen_van='FAKE')}
+    q = {'g3': dict(chon='so_do', ngay='2026-11-20', phien='local_x', nguyen_van='FAKE')}
     d['dieu_2b']['per_level'][lv] = GC.level_block(lv, t['a_m'], t['u_p'], t['u_psi'], runs, q)
     with pytest.raises(GC.GateFileError, match='CAN LIAM QUYET'):
         GC.write_gate(str(tmp_path / 'a.json'), d)
     assert not os.path.exists(str(tmp_path / 'a.json'))
     d['quyet_liam'] = {lv: q}
     GC.write_gate(str(tmp_path / 'b.json'), d)
-    assert 'g3' in GC.read_gate_c8(str(tmp_path / 'b.json')).report_only(lv)
+    assert 'g3' in GC.read_gate_c8(str(tmp_path / 'b.json')).so_do(lv)
 
 
 # ── Codex round 2 of code v6_C8 (GC6-1..6, 10, GC7-1, 2, 5; Liam at CODE "Sửa + vòng 3 ngay trên TK4") ──────────
@@ -1574,8 +1581,8 @@ def test_gc7_1_lower_bound_above_half_keeps_the_mask():
                                             dict(u_lo=1.1686358585973085, u_hi=5.0, gia_tri=None)])
     uh = GC.uhat_level('O1-F08', b, 0.027)
     for c in ('g2', 'g3'):
-        assert uh[c]['trang_thai'] == 'chi_bao_cao' and uh[c]['uhat'] is None and uh[c]['uhat_duoi'] > 0.05
-    ro, why = GC.report_only_of('O1-F08', uh)
+        assert uh[c]['trang_thai'] == 'so_do' and uh[c]['uhat'] is None and uh[c]['uhat_duoi'] > 0.05
+    ro, why = GC.so_do_of('O1-F08', uh)
     assert ro == ('g2', 'g3', 'g5') and why['g2'] == ['vuot_nua_nguong', 'thieu_chua_phan_giai']
 
 
@@ -2038,7 +2045,8 @@ def test_round4_chain_starts_with_the_run_itself(tmp_path):
 
 
 def test_round4_grid_outcome_from_its_states(tmp_path):
-    """GC9-5 (Codex): five states dat but outcome khong_dat is refused; report_only conditions do not decide."""
+    """GC9-5 (Codex): five states dat but outcome khong_dat is refused; a so_do condition decides too (CODE 23/11);
+    a report_only list (before 23/11) is refused."""
     d, goc = build_c8(tmp_path / 'a')
     x = d['o_c8'][0]['chuoi'][0]
     old = x['file_cham']['sha256']
@@ -2046,11 +2054,13 @@ def test_round4_grid_outcome_from_its_states(tmp_path):
     _relink(goc, d, x, old)
     with pytest.raises(GC.GateFileError, match='GC9-5'):
         GC.check_nguon(d, goc)
-    fc = dict(trang_thai_luot='cham', outcome='dat', report_only=['g5'],
+    fc = dict(trang_thai_luot='cham', outcome='khong_dat', so_do=['g5'],
               states=dict(g1='dat', g2='dat', g3='dat', g4='dat', g5='khong_dat'))
     GC._grid_outcome(fc, [], 'x')
     with pytest.raises(GC.GateFileError, match='GC9-5'):
-        GC._grid_outcome(dict(fc, report_only=[]), [], 'x')
+        GC._grid_outcome(dict(fc, outcome='dat'), [], 'x')
+    with pytest.raises(GC.GateFileError, match='report only is no rule'):
+        GC._grid_outcome(dict(fc, report_only=['g5']), [], 'x')
 
 
 def test_round4_lost_node_offset_and_nodes_ok(tmp_path):
@@ -2175,11 +2185,11 @@ def test_round5_grid_nodes_of_its_time_file(tmp_path):
         GC.check_nguon(d, goc)
 
 
-def test_round5_grid_report_only_and_states_from_nodes(tmp_path):
-    """GC9-5: report_only of a C8 grid is that of J (Codex: F05 with report_only g2 and outcome dat); a grid state dat
-    needs every node dat; G1 by g1_rule."""
+def test_round5_grid_so_do_and_states_from_nodes(tmp_path):
+    """GC9-5: so_do of a C8 grid is that of J (Codex: F05 with a mask g2 and outcome dat); a grid state dat needs
+    every node dat; G1 by g1_rule."""
     for name, edit, msg in [
-            ('a', lambda y: (y.update(report_only=['g2'], outcome='dat'), y['states'].update(g2='khong_dat')), 'report_only'),
+            ('a', lambda y: (y.update(so_do=['g2'], outcome='khong_dat'), y['states'].update(g2='khong_dat')), 'so_do'),
             ('b', lambda y: (y['states'].update(g1='khong_dat'), y.update(outcome='khong_dat')), 'node states')]:
         d, goc = build_c8(tmp_path / name)
         x = next(c for c in d['o_c8'] if c['muc'] == 'O1-F05')['chuoi'][0]
@@ -2301,7 +2311,7 @@ def _add_k(goc, d, run_id='C8-P-K1-1', luc=LUC_CHAM):
     cell = dict(muc='O1-' + run_id.split('-')[2], controller='PID')
     rid = run_id.replace('-', '_')
     fk, _ = _luoi(goc, 'K_' + rid, cell, None, 0.005, clip='IMG_' + rid,
-                  script=dict(commit='c' * 40, dirty=False, luc_chay=luc))
+                  script=dict(commit='5' * 40, dirty=False, luc_chay=luc))
     d['luot_k'].append(dict(run_id=run_id, clip='IMG_' + rid, file_cham=fk, file_cham_h1=None))
     _write_csv(goc, d)
     runs = [x['run_id'] for c in d['o_c8'] for x in c['chuoi']] + [x['run_id'] for x in d['luot_k']]
@@ -2484,7 +2494,7 @@ def test_gc6_16_write_gate_on_a_boundary_case_with_its_sources(tmp_path, monkeyp
     hang = _straddle(lv)
     t = dict(a_m=0.1445, u_p=dict(hang_m=hang, he_so_r=0.0, u_phi_rad=0.0, hang_theo_u=[]),
              u_psi=dict(hang_rad=math.radians(0.1), hang_theo_u=[]))
-    q = {'g3': dict(chon='chi_bao_cao', ngay='2026-11-20', phien='local_x', nguyen_van='FAKE')}
+    q = {'g3': dict(chon='so_do', ngay='2026-11-20', phien='local_x', nguyen_van='FAKE')}
     d['dieu_2b']['per_level'][lv] = GC.level_block(lv, t['a_m'], t['u_p'], t['u_psi'], d['runs_c8'][lv], q)
     _rewrite_khoa(goc, d, lambda k: k['muc'][lv]['hang_dong'].update(hang_m=hang, hang_rad=math.radians(0.1)))
     with pytest.raises(GC.GateFileError, match='CAN LIAM QUYET'):
@@ -2492,7 +2502,7 @@ def test_gc6_16_write_gate_on_a_boundary_case_with_its_sources(tmp_path, monkeyp
     assert not os.path.exists(str(tmp_path / 'a.json'))
     d['quyet_liam'] = {lv: q}
     GC.write_gate(str(tmp_path / 'b.json'), d, goc)
-    assert 'g3' in GC.read_gate_c8(str(tmp_path / 'b.json')).report_only(lv)
+    assert 'g3' in GC.read_gate_c8(str(tmp_path / 'b.json')).so_do(lv)
 
 
 # ── campaign side with a v2 gate (CODE's choice (a), 19/11) ───────────────────────────────────────────────────
@@ -2822,3 +2832,150 @@ def test_code_23_11_one_a6_for_the_lock_and_the_f_files(tmp_path):
         _rewrite_khoa(goc, d, lambda k: k['khoa_truoc'].update(nguon=nguon_edit(k['khoa_truoc']['nguon'])))
         with pytest.raises(GC.GateFileError, match='A6 file'):
             GC.check_nguon(d, goc)
+
+
+# ── CODE 23/11 (chot T12 section 3, O1 Q4): bo_tick needs the scoring commit in the lock, every grid made by it ─────
+
+def test_code_23_11_bo_tick_needs_the_scoring_commit_of_the_lock(tmp_path):
+    d, goc = build_c8(tmp_path / 'a')                                  # bo_tick, commit_hil = the scorer: accepted
+    assert d['u_t_branch'] == 'bo_tick'
+    cases = ((lambda k: k.pop('commit_hil'), 'with commit_hil None'),
+             (lambda k: k.update(commit_hil='5' * 39), 'with commit_hil'),
+             (lambda k: k.update(commit_hil='6' * 40) or k['khoa_truoc'].update(commit_hil='6' * 40),
+              'is not commit_hil 666666'),
+             (lambda k: k['khoa_truoc'].update(commit_hil='6' * 40), 'khoa_truoc.commit_hil'))
+    for i, (edit, msg) in enumerate(cases):
+        d, goc = build_c8(tmp_path / f'b{i}')
+        _rewrite_khoa(goc, d, edit)
+        with pytest.raises(GC.GateFileError, match=msg):
+            GC.check_nguon(d, goc)
+    # the c8b_luoi and the final c8b_gio script of every scoring (CODE 23/11), clean
+    x0 = None
+    for key, edit, msg in (('file_cham', lambda y: y['script'].update(commit='6' * 40), 'luoi.json script'),
+                           ('file_cham', lambda y: y['script'].update(dirty=True), 'luoi.json script'),
+                           ('file_gio', lambda y: y['script'].update(commit='6' * 40), 'time file script'),
+                           ('file_gio', lambda y: y.pop('script'), 'time file script')):
+        d, goc = build_c8(tmp_path / f'e{len(os.listdir(tmp_path))}')
+        x0 = d['o_c8'][0]['chuoi'][0]
+        prev = x0['file_cham']['sha256']
+        _rewrite(goc, x0[key], edit)
+        _relink(goc, d, x0, old=prev)
+        with pytest.raises(GC.GateFileError, match=msg):
+            GC.check_nguon(d, goc)
+    # a K run: its final time file found by the sha256 its luoi.json names, its script checked too
+    d, goc = build_c8(tmp_path / 'k')
+    _add_k(goc, d)
+    GC.check_nguon(d, goc)
+    raw = open(os.path.join(goc, d['luot_k'][0]['file_cham']['duong_dan']), 'rb').read()
+    sha = d['luot_k'][0]['file_cham']['sha256']
+    _rewrite(goc, d['luot_k'][0]['file_cham'], lambda y: y['script'].update(commit='6' * 40))
+    with pytest.raises(GC.GateFileError, match='K run C8-P-K1-1: file_cham: luoi.json script'):
+        GC.check_nguon(d, goc)
+    with open(os.path.join(goc, d['luot_k'][0]['file_cham']['duong_dan']), 'wb') as f:
+        f.write(raw)
+    d['luot_k'][0]['file_cham']['sha256'] = sha
+    kcell = dict(muc='O1-K1', controller='PID')
+    for commit, msg in (('6' * 40, 'K run time file'), ('5' * 40, None)):
+        gk = _jw(goc, f'luot/K/gio_{commit[0]}.json', _gio('K_x', kcell, 0.005, script=dict(commit=commit, dirty=False)))
+        _rewrite(goc, d['luot_k'][0]['file_cham'], lambda y: y.update(gio_sha256=gk['sha256']))
+        if msg:
+            with pytest.raises(GC.GateFileError, match=msg):
+                GC.check_nguon(d, goc)
+        else:
+            GC.check_nguon(d, goc)
+    os.remove(os.path.join(goc, gk['duong_dan']))
+    with pytest.raises(GC.GateFileError, match='in no C8 session folder'):
+        GC.check_nguon(d, goc)
+    # giu_tick: the tick part kept, no commit asked
+    d, goc = build_c8(tmp_path / 'c')
+    _rewrite_khoa(goc, d, lambda k: k.update(nhanh_tick='giu_tick', commit_hil=None))
+    d['u_t_branch'] = 'giu_tick'
+    GC._check_commit_hil(d, goc, json.load(open(os.path.join(goc, d['khoa_c8b']['duong_dan']), encoding='utf-8')),
+                         {'7' * 40})
+
+
+# ── CODE 23/11 (03_CODE/docs/2026-11-23_Chot_luat_mat_na_quyet_bang_so_do_v1.md; Liam at CODE: "duyệt bảng luật mới"):
+# a condition of the mask decides by its measured value q (branch so_do), no longer report only ──
+
+def _gate_v32(theta=9.0, n=20, u_t=0.0015):
+    frames = {'e_perp': [0.02] * n, 'e_trk': [0.03] * n, 'e_bao': [0.04] * n, 'e_theta_cmd_deg': [theta] * n}
+    return rl.floor_gate(rl._plain(o1_gate.gate(frames, 'true', v_cmd_max=0.729, wz_cmd_max=1.634, u_t=u_t)))
+
+
+def test_code_23_11_so_do_state_by_q():
+    thr = 7.5
+    assert GC.so_do_state(7.5, 7.5, 0, thr) == 'dat'                   # q at the threshold does not block
+    assert GC.so_do_state(7.6, 7.6, 0, thr) == 'khong_dat'             # q above it blocks
+    assert GC.so_do_state(7.0, 7.6, 0, thr) == 'chua_ket_luan'         # above it only in the union: not certain
+    assert GC.so_do_state(7.0, 7.0, 1, thr) == 'chua_ket_luan'         # an undefined frame may lie above it
+    assert GC.so_do_state(7.6, 7.6, 3, thr) == 'khong_dat'             # a measured value above it blocks anyway
+    assert GC.so_do_state(float('nan'), float('nan'), 0, thr) == 'chua_ket_luan'
+    assert GC.so_do_state(None, 7.0, 0, thr) == 'dat'                  # no common domain number: the union decides
+    assert GC.so_do_state(7.0, 7.0, True, thr) == 'chua_ket_luan'      # a bool is no count
+
+
+def test_code_23_11_apply_so_do_three_branch_kept_and_outcome_by_q():
+    sha = 'a' * 64
+    # theta 7.4 deg with U_t 15 ms: hi above 7.5 (three branches chua_ket_luan), q below it (so_do dat)
+    g = _gate_v32(theta=7.4, u_t=0.015)
+    assert g['g5']['state'] == 'chua_ket_luan' and g['outcome'] == 'chua_ket_luan'
+    a = GC.apply_so_do(g, ['g5'], 'O1-F08', sha)
+    assert a['version'] == GC.GATE_VERSION_SO_DO and a['so_do'] == ['g5'] and a['gate_file_sha256'] == sha
+    assert a['g5']['state'] == 'dat' and a['g5']['state_ba_nhanh'] == 'chua_ket_luan' and a['g5']['nhanh'] == 'so_do'
+    assert a['outcome'] == a['outcome_decide'] == 'dat' and a['complete'] is True and a['decide'] == list(o1_gate.CONDS)
+    assert 'report_only' not in a and 'required' not in a and g['version'] == o1_gate.GATE_VERSION   # copy
+    assert 'nhanh' not in a['g2'] and a['g2']['state'] == g['g2']['state']
+    # 15 deg at F08 (Liam's example): khong_dat, it blocks the run
+    b = GC.apply_so_do(_gate_v32(theta=15.0), ['g5'], 'O1-F08', sha)
+    assert b['g5']['state'] == 'khong_dat' and b['outcome_decide'] == 'khong_dat' and b['any_certain_fail'] is True
+    e = GC.apply_so_do(_gate_v32(theta=15.0), [], 'O1-F05', sha)                 # no so_do: three branches
+    assert e['g5']['state'] == 'khong_dat' and e['so_do'] == [] and 'nhanh' not in e['g5']
+    rl.validate_gate(a, 'HW', ('g5',))
+    rl.validate_gate(b, 'HW', ('g5',))
+    for bad, msg in [(dict(a, g5=dict(a['g5'], state='chua_ket_luan')), 'so_do'),
+                     (dict(a, g5=dict(a['g5'], state_ba_nhanh='dat')), 'state_ba_nhanh'),
+                     (dict(a, g5={k: v for k, v in a['g5'].items() if k != 'nhanh'}), 'nhanh'),
+                     (dict(a, so_do=[]), 'gate file gives|nhanh'),
+                     (dict(a, report_only=['g5']), 'report_only'),
+                     (dict(a, gate_file_sha256=None), 'gate_file_sha256')]:
+        with pytest.raises(rl.LogError, match=msg):
+            rl.validate_gate(bad, 'HW', ('g5',))
+    with pytest.raises(rl.LogError, match='gate file gives'):
+        rl.validate_gate(a, 'HW', None)                                         # no gate file: no so_do
+    with pytest.raises(rl.LogError, match='gate file gives'):
+        rl.validate_gate(_gate_v32(), 'HW', ('g5',))                            # a three-branch gate where so_do is due
+
+
+def test_code_23_11_apply_so_do_refuses():
+    g = _gate_v32()
+    for args, msg in [((g, ['g4'], 'O1-F08', 'a' * 64), 'so_do'), ((g, ['g5', 'g5'], 'O1-F08', 'a' * 64), 'so_do'),
+                      ((g, ['g5'], '', 'a' * 64), 'level'), ((g, ['g5'], 'O1-F08', 'A' * 64), 'gate_file_sha256'),
+                      ((dict(g, report_only=['g5']), ['g5'], 'O1-F08', 'a' * 64), 'report only is no rule'),
+                      ((dict(g, version='gate_v3.4'), ['g5'], 'O1-F08', 'a' * 64), 'gate version')]:
+        with pytest.raises(GC.GateFileError, match=msg):
+            GC.apply_so_do(*args)
+
+
+def test_code_23_11_grid_so_do_state_from_its_numbers(tmp_path):
+    """A C8 grid at F08: G5 so_do, its state from nums (chung.q, q, n_undef), its three-branch state in
+    states_ba_nhanh, the outcome over all five."""
+    d, goc = build_c8(tmp_path / 'a')
+    GC.check_nguon(d, goc)
+    cell = next(c for c in d['o_c8'] if c['muc'] == 'O1-F08')
+    for name, edit, msg in [
+            ('b', lambda y: y['q_so_do']['g5'].update(q=8.0, q_chung=8.0), 'not the q, chung.q of node 0'),
+            ('f', lambda y: y['q_so_do']['g5'].update(nut=1), 'the node is 0'),
+            ('g', lambda y: (y['states'].update(g5='chua_ket_luan'), y.update(outcome='chua_ket_luan')),
+             'so_do from the middle node'),
+            ('h', lambda y: y['nums']['g5'].update(n_undef=1), 'so_do from the middle node'),
+            ('c', lambda y: y.pop('states_ba_nhanh'), 'states_ba_nhanh'),
+            ('d', lambda y: y.update(so_do=[]), 'J says'),
+            ('e', lambda y: y.update(report_only=['g5']), 'report only is no rule')]:
+        d, goc = build_c8(tmp_path / name)
+        x = next(c for c in d['o_c8'] if c['muc'] == 'O1-F08')['chuoi'][0]
+        old = x['file_cham']['sha256']
+        _rewrite(goc, x['file_cham'], edit)
+        _relink(goc, d, x, old)
+        with pytest.raises(GC.GateFileError, match=msg):
+            GC.check_nguon(d, goc)
+    assert cell['muc'] == 'O1-F08'

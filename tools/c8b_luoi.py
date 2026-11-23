@@ -109,7 +109,11 @@ def node_from_files(score_path, rows_path):
         b = gate.get(c)
         if not isinstance(b, dict) or b.get('state') not in STATES:
             return dict(out, ok=False, kind='loi', why=f'gate {c}: no state')
-        st[c] = b['state']
+        # so_do (CODE 23/11): the node gate of a so_do condition keeps its three-branch state as state_ba_nhanh; the
+        # grid combines the three-branch states, the so_do state is taken at the middle node (combine)
+        st[c] = b.get('state_ba_nhanh', b['state'])
+        if st[c] not in STATES:
+            return dict(out, ok=False, kind='loi', why=f'gate {c}: state_ba_nhanh {st[c]!r}')
         if c != 'g1':
             ch = b.get('chung') or {}
             nums[c] = dict(q=_f(b.get('q')), lo=_f(b.get('lo')), hi=_f(b.get('hi')), n_undef=b.get('n_undef'),
@@ -123,7 +127,8 @@ def node_from_files(score_path, rows_path):
         bien = domain_key(sc, gate)
     except LuoiError as exc:
         return dict(out, ok=False, kind='loi', why=str(exc))
-    out.update(states=st, nums=nums, gate=gate, bien=bien)
+    out.update(states=st, nums=nums, gate=gate, bien=bien, so_do=list(sc.get('so_do') or []),
+               so_do_sha=gate.get('gate_file_sha256') if gate.get('version') == 'gate_v3.4' else None)
     try:
         with open(rows_path, newline='', encoding='utf-8') as f:
             rr = list(csv.DictReader(f))
@@ -187,20 +192,6 @@ def cell_violation(a, b, c):
     return best
 
 
-def _cat_check(x, report_only):
-    """C8BS-7 (O1 3.5 OG2-3): the exception 'violation before t1' counts only for a DECIDING condition. A node whose
-    exception rests only on report-only conditions is a node where the run is lost (t1 without a deciding certain
-    violation before it)."""
-    if not (x['ok'] and x.get('cat')) or not report_only:
-        return x
-    dec = [c for c in MEASURED if c not in report_only]
-    hit = any(r['mien_chung'] and math.isfinite(r[c]) and r[c] > THRESHOLDS[c] for r in x['rows'].values() for c in dec)
-    if hit:
-        return x
-    return dict(x, ok=False, kind='hong', cat=False,
-                why='violation before t1 only in report-only conditions: run lost at this node (OG2-3)')
-
-
 def g1_rule(node_st):
     """G1 over the grid (C8B4R5-1, R5-2; luoi_v1 of CODE_GATE v2 section 2)."""
     if len(node_st) == 1:
@@ -212,12 +203,30 @@ def g1_rule(node_st):
     return 'chua_ket_luan'
 
 
-def combine(nodes, report_only=frozenset()):
-    """Grid states of G1-G5, the run outcome and the gate numbers from the node results (list, in node order)."""
+def nut_giua(nodes_s, ok):
+    """CODE 23/11 (2): the node of a so_do condition, the scored node nearest the middle of the time grid
+    ((first + last node offset) / 2; the lower index on a tie); None when no node is scored."""
+    scored = [i for i in range(len(ok)) if ok[i]]
+    if not scored:
+        return None
+    if not nodes_s:
+        c = len(ok) // 2
+        return min(scored, key=lambda i: (abs(i - c), i))
+    mid = 0.5 * (float(nodes_s[0]) + float(nodes_s[-1]))
+    return min(scored, key=lambda i: (abs(float(nodes_s[i]) - mid), i))
+
+
+def combine(nodes, so_do=frozenset(), nodes_s=None):
+    """Grid states of G1-G5, the run outcome and the gate numbers from the node results (list, in node order).
+    so_do (rule 2b by the measured value, CODE 23/11, Liam "duyệt bảng luật mới"): every condition decides; a so_do
+    condition takes so_do_state of q and q of the common domain at the middle node (nut_giua, CODE 23/11 (2): the
+    best estimate, U not added) with n_undef of the grid (a node not scored or a moving domain: chua_ket_luan unless
+    q is above the threshold, (4)); its three-branch grid state is kept in states_ba_nhanh. The scorer applied so_do
+    at every node (the exception before t1 on q_k, (3))."""
+    import gate_c8                                       # tools/gate_c8.py of CODE_GATE (so_do_state)
     if not nodes:
         raise LuoiError('no node')
     n = len(nodes)
-    nodes = [_cat_check(x, report_only) for x in nodes]
     ok = [x['ok'] for x in nodes]
     hong = [x.get('kind') == 'hong' for x in nodes]
     # C8BS-6: a frame-dependent domain end that changes between two adjacent scored nodes
@@ -267,7 +276,19 @@ def combine(nodes, report_only=frozenset()):
                        q=mx('q'), lo=mx('lo'), hi=mx('hi'), n_undef=mxn('n_undef'), threshold=THRESHOLDS[c])
         bieu[c] = _state_from_numbers(lo_c, nums[c]['lo'], nums[c]['hi'], nums[c]['n_undef'],
                                       THRESHOLDS[c]) == states[c]
-    decide = [c for c in CONDS if c not in report_only]
+    so_do = [c for c in MEASURED if c in set(so_do)]
+    m = nut_giua(nodes_s, ok)
+    states_ba, q_so_do = {}, {}
+    for c in so_do:
+        states_ba[c] = states[c]
+        if m is None:
+            q_so_do[c] = dict(nut=None, q=math.nan, q_chung=math.nan)
+            states[c] = 'chua_ket_luan'
+            continue
+        nm = nodes[m]['nums'][c]
+        q_so_do[c] = dict(nut=m, q=nm['q'], q_chung=nm['q_chung'])
+        states[c] = gate_c8.so_do_state(nm['q_chung'], nm['q'], nums[c]['n_undef'], THRESHOLDS[c])
+    decide = list(CONDS)
     ds = [states[c] for c in decide]
     fail_cause = ''
     if all(hong):
@@ -286,7 +307,8 @@ def combine(nodes, report_only=frozenset()):
     scored = [i for i in range(n) if ok[i]]
     nut_tam = min(scored, key=lambda i: (abs(i - centre), i)) if scored else None
     return dict(states=states, outcome=outcome, fail_cause=fail_cause, decide=decide,
-                report_only=sorted(report_only), nums=nums, lo_cells={c: v for c, v in lo_cells.items()},
+                so_do=so_do, states_ba_nhanh=states_ba, q_so_do=q_so_do, nut_so_do=m if so_do else None,
+                nums=nums, lo_cells={c: v for c, v in lo_cells.items()},
                 bieu_dien=bieu, nodes_ok=ok, n_nodes=n, nut_tam=nut_tam, bien_doi=bien_doi,
                 nhanh_tick=sorted({str(x.get('nhanh_tick')) for x in nodes if x['ok']}),
                 g1_nut=node_st['g1'], hong_nut=hong, cat_nut=cat,
@@ -311,11 +333,16 @@ def luoi_block(res, gio, gio_sha):
 
 def gate_block(nodes, res, gio, gio_sha, task='', gate_sha=None):
     """The combined gate block of the run: the gate_v3 block of the node nut_tam (G1 fields, constants) with G2-G5
-    replaced by the combined numbers and states, G1 state = the combined one, u_t = the largest node U_t, and the
-    luoi block. None when no node is scored."""
+    replaced by the combined numbers and three-branch states, G1 state = the combined one, u_t = the largest node
+    U_t, and the luoi block; then, with the source of so_do (gate_sha: the C8 gate file, or J v6 for G5 of F08),
+    gate_c8.apply_so_do with the q of the middle node (a gate_v3.4 block). None when no node is scored."""
+    import gate_c8
     if res['nut_tam'] is None:
         return None
     g = json.loads(json.dumps(nodes[res['nut_tam']]['gate']))
+    for k in ('so_do', 'level', 'gate_file_sha256', 'report_only', 'required'):
+        g.pop(k, None)
+    g['version'] = 'gate_v3.2'                       # the three-branch block (o1_gate.GATE_VERSION) before so_do
     g['g1'] = dict(g.get('g1') or {}, state=res['states']['g1'],
                    q={'dat': 'true', 'khong_dat': 'false'}.get(res['states']['g1'], 'inconclusive'))
     for c in MEASURED:
@@ -324,21 +351,28 @@ def gate_block(nodes, res, gio, gio_sha, task='', gate_sha=None):
         g[c] = dict(q=nm['q'], lo=nm['lo'], hi=hi, n_undef=nm['n_undef'],
                     n_frames=max((x['nums'][c].get('n_frames') or 0) for x in nodes if x['ok']),
                     ratio=hi / nm['threshold'] if math.isfinite(hi) else math.nan, threshold=nm['threshold'],
-                    state=res['states'][c], chung=nm['chung'])
+                    state=res['states_ba_nhanh'].get(c, res['states'][c]), chung=nm['chung'])
     ut = [x for x in res['u_t_nodes'] if isinstance(x, (int, float)) and math.isfinite(x)]
     g['u_t'] = max(ut) if ut else math.nan
-    # C8BS-8: the deciding set and the outcome fields of the COMBINED block (gate_v3.3 fields when a mask applies;
-    # CODE_GATE v1 section 4: complete = decide is the required set)
+    # C8BS-8: the outcome fields of the COMBINED block (every condition decides since 23/11)
     dec = list(res['decide'])
     g['decide'] = dec
-    if res['report_only']:
-        g.update(report_only=list(res['report_only']), required=dec, level=task, gate_file_sha256=gate_sha)
-    g.update(outcome=_order(res['states'][c] for c in CONDS), outcome_decide=_order(res['states'][c] for c in dec),
-             complete=True, any_certain_fail=any(res['states'][c] == 'khong_dat' for c in dec))
+    st3 = dict(res['states'], **res['states_ba_nhanh'])
+    g.update(outcome=_order(st3[c] for c in CONDS), outcome_decide=_order(st3[c] for c in dec),
+             complete=True, any_certain_fail=any(st3[c] == 'khong_dat' for c in dec))
     r = [g[c]['ratio'] for c in MEASURED if math.isfinite(g[c]['ratio'])]
     g['max_ratio'] = max(r) if r else math.nan
     g['luoi'] = luoi_block(res, gio, gio_sha)
     g['note'] = (g.get('note') or '') + f'; c8b_luoi: {len(nodes)} nodes, node {res["nut_tam"]} for G1 fields'
+    if gate_sha:
+        g = gate_c8.apply_so_do(g, res['so_do'], task, gate_sha, q_nut=res['q_so_do'])
+        if any(g[c]['state'] != res['states'][c] for c in CONDS):
+            raise LuoiError(f'the so_do gate block disagrees with the grid states {res["states"]} (a bug)')
+        if g['outcome_decide'] != res['outcome'] and res['fail_cause'] != 'vi_pham_truoc_loi_he_do' \
+                and res['outcome'] != 'hong_he_do':
+            raise LuoiError(f'the so_do gate block outcome {g["outcome_decide"]!r}, the grid {res["outcome"]!r} (a bug)')
+    elif res['so_do']:
+        raise LuoiError(f'so_do {res["so_do"]} without its source (C8 gate file SHA or J v6)')
     return g
 
 
@@ -359,7 +393,7 @@ def not_bounded(gio):
     lost = gio.get('ket_luan') == 'hong_he_do'
     st = {c: 'chua_ket_luan' for c in CONDS}
     return dict(states=st, outcome='hong_he_do' if lost else 'chua_ket_luan', fail_cause='he_do' if lost else '',
-                gate_v3=None, decide=list(CONDS), report_only=[],
+                gate_v3=None, decide=list(CONDS), so_do=[], states_ba_nhanh={}, q_so_do={}, nut_so_do=None,
                 nums=None, lo_cells={}, bieu_dien={c: False for c in CONDS}, nodes_ok=[], n_nodes=0,
                 node_states=[], node_errors=[], u_t_nodes=[], ly_do=gio.get('ly_do', []))
 
@@ -372,6 +406,8 @@ def scorer_cmd(gio_path, k, a, score, rows, task):
            '--out', score, '--rows', rows]
     if a.sender:
         cmd += ['--sender', a.sender]
+    if getattr(a, 'so_do_run', None):                    # CODE 23/11: the so_do of the run and the SHA of its source
+        cmd += ['--so-do', ','.join(sorted(a.so_do_run)), '--so-do-sha', a.so_do_sha_run]
     for x in a.scorer_arg or []:
         cmd.append(x)
     return cmd
@@ -476,7 +512,7 @@ def gio_loai_hong(gio):
     return out
 
 
-J_REPORT_ONLY = {'O1-F08': frozenset({'g5'})}   # J v6 section 6, L130 (Liam 19/11 "chi bao cao, khong lam bu")
+J_SO_DO = {'O1-F08': frozenset({'g5'})}   # J v6 section 6, L130 (Liam 19/11 "khong lam bu"); by q since 23/11 (CODE)
 
 
 def _file_ref(path):
@@ -510,15 +546,20 @@ def chain_files(a):
                 file_gio_h1=_file_ref(a.file_gio_h1))
 
 
-def report_only_of(gate_file, task):
-    """Conditions that only report at this level: those of the J source (G5 of the figure 8 at F08, always, Codex CAM
-    CT4-4: an empty or missing gate mask must not decide it again from the grid) plus the gate file's 2b mask."""
-    j = J_REPORT_ONLY.get(task, frozenset())
+def so_do_of(gate_file, task):
+    """(so_do conditions at this level, the SHA of their source): those of the J source (G5 of the figure 8 at F08,
+    always, Codex CAM CT4-4: an empty or missing gate mask must not drop it) plus the gate file's 2b mask (the floor:
+    gate_c8 run_so_do 'HW'); the source is the C8 gate file, or J v6 (c7_score.J_V6_SHA256) without one (CODE 23/11:
+    decided by q, report only before)."""
+    import gate_c8                                       # tools/gate_c8.py of CODE_GATE
+    j = J_SO_DO.get(task, frozenset())
     if not gate_file:
-        return j, None
-    import gate_c8                                       # tools/gate_c8.py of CODE_GATE (feat/gate-v1133)
+        return j, (J_V6_SHA256 if j else None)
     g = gate_c8.read_gate_c8(gate_file)
-    return j | frozenset(g.report_only(task) if task in g.levels else ()), g.sha256
+    return j | frozenset(g.so_do(task) if task in g.levels else ()), g.sha256
+
+
+J_V6_SHA256 = '98767aa41ac176363795ca87d37f8a7efb4944e6d8d2925d4da293ceafd29d00'   # = c7_score.J_V6_SHA256 (tested)
 
 
 def main(argv=None):
@@ -553,7 +594,8 @@ def main(argv=None):
         task = a.task or gio['task']
         if task != gio['task']:
             raise LuoiError(f'--task {task} but the clock file is for {gio["task"]}')
-        ro, gsha = report_only_of(a.gate_file, task)
+        ro, gsha = so_do_of(a.gate_file, task)
+        a.so_do_run, a.so_do_sha_run = ro, gsha          # the C8 gate file, or J v6 for G5 of F08 without one
         prov_scorer = None
         if not gio.get('ok'):
             res = not_bounded(gio)
@@ -573,7 +615,12 @@ def main(argv=None):
                                dirty=not (len({x.get('commit') for x in prov}) == 1
                                           and all(x.get('dirty') is False for x in prov)),
                                nut=prov)
-            res = combine(nodes, ro)
+            for k, x in enumerate(nodes):
+                # CODE 23/11: every node scored with the so_do of the run and its source (also with --gop-only)
+                if x['ok'] and (sorted(x.get('so_do') or []) != sorted(ro) or (ro and x.get('so_do_sha') != gsha)):
+                    raise LuoiError(f'node {k}: scored with so_do {x.get("so_do")} ({x.get("so_do_sha")}), the run '
+                                    f'needs {sorted(ro)} ({gsha}): score the nodes again')
+            res = combine(nodes, ro, gio.get('nodes_s'))
             n_cham = sum(1 for x in res['nodes_ok'] if x)
             res['n_nut_cham'] = n_cham
             if n_cham == 0:

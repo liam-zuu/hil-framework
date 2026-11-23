@@ -315,24 +315,27 @@ def score(path, task, allow_final_set=False, esp_log=None, allow_pre_b81_15=Fals
         v_max, wz_max = o1_gate.fig8_cmd_max(Schedule(FIG8[task]))
     else:
         v_max, wz_max = o1_gate.k_cmd_max(o1_lanes.KSchedule(task))
-    # O1 v11.33 (CODE_GATE design sections 3, 4): per-frame G3, G5 bounds when U_t is known; the report-only
-    # conditions of the C8 gate file at this level when --gate-file is given (they apply to the HIL candidate check
-    # of procedure B only, gate_c8.mask_applies; recorded with the file's SHA either way)
+    # O1 v11.33 (CODE_GATE design sections 3, 4): per-frame G3, G5 bounds when U_t is known. With --gate-file, the
+    # so_do conditions of the C8 gate file at this level (the HIL candidate check of procedure B only,
+    # gate_c8.mask_applies; none otherwise) decide by q (CODE 23/11, Liam "duyệt bảng luật mới"; report only before):
+    # a gate_v3.4 block with the file's SHA either way
     extra = {}
     if u_t is not None:
         t_cmd, f_cmd = o1_tasks.task(task, allow_final_set=True)
         extra['v_k'], extra['w_k'] = o1_gate.cmd_rate_frames(f_cmd, t_cmd, frames['t'], u_t, turn=task in FIG8,
                                                              v_cap=v_max, wz_cap=wz_max)
+    gf = None
     if gate_file:
         gf = gate_c8.read_gate_c8(gate_file)
         if (gf.fake or gf.fake_sign) and not (gf.fake and gate_file_fake):      # GC6-14 (round 4): as rq3_log reads it
             raise ValueError(f'--gate-file {gate_file!r}: a FAKE content or FAKE marks (tests, demo), not a C8 gate')
-        extra.update(report_only=gf.run_report_only(task, 'HIL', stage, campaign), level=task,
-                     gate_file_sha256=gf.sha256)
         out['gate_file'] = os.path.basename(gate_file)
     out['gate_v3'] = o1_gate.gate(frames, out['completed'], v_cmd_max=v_max, wz_cmd_max=wz_max, u_t=u_t,
                                   decide=decide, status=out.get('status', ''), note=note, **extra)
     add_b81_3(out['gate_v3'], out, period)                               # B81-3 (module docstring)
+    if gf is not None:
+        out['gate_v3'] = gate_c8.apply_so_do(out['gate_v3'], gf.run_so_do(task, 'HIL', stage, campaign), task,
+                                             gf.sha256)
     mc = manifest.get('miso_check') or {}
     out.update(frame_log=os.path.basename(path), k0=k0, k_run=k_run, t0_step=a, t0_src=t0_src,
                frames_scored=int(len(state) - k0), edge_map=em,
