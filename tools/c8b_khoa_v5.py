@@ -94,6 +94,17 @@ L136 = ('L136, Liam 20/11 phien CODE local_c29a2de2: "Ap L132 cho F08 (Recommend
 
 BRANCHES = ('bo_tick', 'giu_tick')
 HANG_DONG = ('a_m', 'hang_m', 'he_so_r', 'u_phi_rad', 'hang_rad')
+CHO_MUC = 'goc'             # CODE 23/11 muc 5: the 12 level cells of the plan are figure 8 at goc (gate 888, 1955)
+U_THANG_THUOC = 1.0e-3      # CODE 23/11 muc 5: tape class III max error (0.6 + 0.4 L) mm at L = 1 m (OIML R 35-1)
+DQ_LECH_TAM_M = 0.00057     # CODE 23/11 Chot_F8_rong_buoi2_v1 muc 1: plate shift bound of session 1 (P3), F8 null
+CHO_THIEU = dict(           # sources not delivered yet (CODE 23/11 muc 5): the term stays null with this reason
+    P6_rieng_i='P6 rieng dau (i) lan lap: theo lua chon cua Liam o muc 4 (cach A: 0; cach B: thieu)',
+    P6_rieng_ii='P6 rieng dau (ii) dong: C8B chua tinh (thiet ke v7 muc 3, track cac luot C8)',
+    neo='neo P_neo, A_neo: KIEMCHEO chua xuat (hop dong F15)',
+    U_moc='U_moc_hieu_xy_m, U_moc_hieu_psi_rad: CAM chua xuat (hop dong muc G (6))',
+    W='W (dao dong W, W-canh): CAM T11 tham_chieu_v1 chua chay',
+    u_theta='u_theta cua delta_q: u_a_k_deg cua F7 (HIEUCHUAN tinh) chua co',
+    u_phi='u_phi_hat (F7 truc_xe_v1 goc) va u_beta, u_beta_cam (muc 4, cho Liam) chua co')
 
 
 class KhoaError(Exception):
@@ -108,6 +119,110 @@ def u_3b(level, a_m):
     import o1_gate
     v, wz = o1_gate.fig8_cmd_max(Schedule(FIG8[level]))
     return float(v) + float(wz) * a_m / math.sqrt(2.0)
+
+
+def hang_dong_tinh(src, side):
+    """CODE 23/11 (03_CODE/docs/2026-11-23_Chot_T12_khoa_C8B_v1.md muc 5; design v7 sections 1, 3, 10): the closed
+    terms BEFORE the margin, the largest over the camera segments of the C8 runs (one kiem_cheo.json each) at the
+    level place goc. src: dict(kiem_cheo=[...], a6=..., xoay=..., u_h=..., cam=[...]) parsed files (None = absent).
+      hang_rad = 2 A3 + 2 A6du + A5 (+ A_neo + U_moc_hieu_psi + W)
+      hang_m   = P1 + L (2 A3 + 2 A6du + A5) + 2 thi_sai + P7 + 2 dq (+ P6 rieng (i), (ii) + P_neo + U_moc_hieu_xy + W)
+      he_so_r  = U_thang + u_h_chung / (H - h_max) + h_max dzc / ((H - h_max)(H - dzc))
+      u_phi_rad (not here: F7 and muc 4)
+    A3 = A3_tuong_doi.A3_xp_deg[goc] per end, P1 = P1_tuong_doi.theo_vung.goc.max_m (flags ngoai_suy, mot_phuong,
+    cap_hong false), P7 = P7.lech_max_m, A5 = A5.lech_max_deg (KIEMCHEO luot3_g4); A6du = c8b_a6.a6du_rad at the
+    largest valid centre rho (rho_max - side / sqrt 2); L = |q_hat| + dq, dq = u_q_m (xoay_v1 goc) + DQ_LECH_TAM_M
+    (+ L u_theta, F7); thi_sai = sum_i |r_i| (u_h_goc_i - u_h_chung) / (4 (H - h)) per end (the common height part
+    cancels in sum r_i dh_i); U_thang = U_THANG_THUOC + thang_chung.lech_max; h_max = max(h_goc + u_h_goc).
+    Returns (values {hang_m, he_so_r, hang_rad, u_phi_rad}, reasons {key: [..]}, parts {name: value}, L or None)."""
+    why = {k: [] for k in ('hang_m', 'he_so_r', 'hang_rad', 'u_phi_rad')}
+    part = {}
+    kcs = [k for k in (src.get('kiem_cheo') or []) if isinstance(k, dict)]
+    a6, xo, uh = src.get('a6'), src.get('xoay'), src.get('u_h')
+    if not kcs:
+        for k in ('hang_m', 'hang_rad', 'he_so_r'):
+            why[k].append('khong co kiem_cheo.json (KIEMCHEO luot3_g4, --kiem-cheo)')
+    else:
+        a3, p1, p7, a5, th = [], [], [], [], []
+        for k in kcs:
+            at, pt = k.get('A3_tuong_doi') or {}, (((k.get('P1_tuong_doi') or {}).get('theo_vung') or {})
+                                                     .get(CHO_MUC) or {})
+            bad = [f for f in ('ngoai_suy', 'mot_phuong', 'cap_hong')
+                   if (at.get(f) or {}).get(CHO_MUC) is not False or pt.get(f) is not False]
+            if bad:
+                why['hang_m'].append(f'A3/P1 {CHO_MUC} co {bad} (thiet ke v7 muc 1: cap do thieu)')
+                why['hang_rad'].append(f'A3 {CHO_MUC} co {bad}')
+            a3.append(_num((at.get('A3_xp_deg') or {}).get(CHO_MUC)))
+            p1.append(_num(pt.get('max_m')))
+            p7.append(_num((k.get('P7') or {}).get('lech_max_m')))
+            a5.append(_num((k.get('A5') or {}).get('lech_max_deg')))
+            th.append(_num((k.get('thang_chung') or {}).get('lech_max')))
+        for name, vals, keys in (('A3_rad', a3, ('hang_m', 'hang_rad')), ('P1_m', p1, ('hang_m',)),
+                                 ('P7_m', p7, ('hang_m',)), ('A5_rad', a5, ('hang_m', 'hang_rad')),
+                                 ('thang_lech', th, ('he_so_r',))):
+            if any(v is None for v in vals):
+                for kk in keys:
+                    why[kk].append(f'kiem_cheo thieu {name}')
+            else:
+                part[name] = max(vals) if not name.endswith('_rad') else math.radians(max(vals))
+    if not isinstance(a6, dict):
+        for k in ('hang_m', 'hang_rad', 'he_so_r'):
+            why[k].append('khong co A6 (--a6)')
+    else:
+        import c8b_a6 as a6m
+        rho_in = float((a6.get('mien') or {}).get('rho_max_m', a6m.RHO_MAX_M)) - float(side) / math.sqrt(2.0)
+        try:
+            du = a6m.a6du_rad(a6, rho_in)
+        except (KeyError, TypeError, ValueError):
+            du = None
+        if du is None:
+            why['hang_m'].append('A6du khong tinh duoc (A6 khong dat hay ngoai mien)')
+            why['hang_rad'].append('A6du khong tinh duoc')
+        else:
+            part['A6du_rad'], part['rho_A6du_m'] = du, rho_in
+        hg, uhg, H = a6.get('h_goc_m'), a6.get('u_h_goc_m'), _num(a6.get('H_m'))
+        uc = _num((uh or {}).get('u_h_chung_m')) if isinstance(uh, dict) and uh.get('trang_thai') == 'dat' else None
+        if uc is None or not isinstance(hg, list) or not isinstance(uhg, list) or len(hg) != 4 or len(uhg) != 4 \
+                or H is None:
+            why['hang_m'].append('thi sai goc: thieu h_goc_m / u_h_goc_m (A6) hay u_h_chung dat (--u-h-chung)')
+            why['he_so_r'].append('P6 chung, P5: thieu u_h_chung dat hay h_goc (A6)')
+        else:
+            hb = _num(a6.get('h_m'))
+            r = float(side) / math.sqrt(2.0)
+            part['thi_sai_m'] = sum(r * max(0.0, float(u) - uc) for u in uhg) / (4.0 * (H - hb))
+            h_max = max(float(h) + float(u) for h, u in zip(hg, uhg))
+            part['P6_chung_he_so'] = uc / (H - h_max)
+            dz = [_num(((c or {}).get('day_doi') or {}).get('dzc_m')) for c in (src.get('cam') or [])]
+            if not dz or any(x is None for x in dz):
+                why['he_so_r'].append('P5: thieu day_doi.dzc_m (--camera)')
+            else:
+                dzc = max(dz)
+                part['P5_he_so'] = h_max * dzc / ((H - h_max) * (H - dzc))
+    if isinstance(xo, dict) and isinstance((xo.get('cho') or {}).get(CHO_MUC), dict):
+        x = xo['cho'][CHO_MUC]
+        q, uq = x.get('q_tag_m'), _num(x.get('u_q_m'))
+        if x.get('trang_thai') != 'dat' or uq is None or not isinstance(q, list) or len(q) != 2:
+            why['hang_m'].append(f'xoay_v1 {CHO_MUC} khong dat')
+        else:
+            part['q_hat_m'] = math.hypot(float(q[0]), float(q[1]))
+            part['dq_khong_u_theta_m'] = uq + DQ_LECH_TAM_M
+    else:
+        why['hang_m'].append(f'khong co xoay_v1 {CHO_MUC} (--xoay)')
+    why['hang_m'].append(CHO_THIEU['u_theta'])
+    for k in ('P6_rieng_i', 'P6_rieng_ii', 'neo', 'U_moc', 'W'):
+        why['hang_m'].append(CHO_THIEU[k])
+    for k in ('neo', 'U_moc', 'W'):
+        why['hang_rad'].append(CHO_THIEU[k])
+    why['u_phi_rad'].append(CHO_THIEU['u_phi'])
+    if 'thang_lech' in part:
+        part['U_thang'] = U_THANG_THUOC + part['thang_lech']
+    val = dict(hang_m=None, he_so_r=None, hang_rad=None, u_phi_rad=None)
+    if not why['he_so_r'] and all(k in part for k in ('U_thang', 'P6_chung_he_so', 'P5_he_so')):
+        val['he_so_r'] = part['U_thang'] + part['P6_chung_he_so'] + part['P5_he_so']
+    if not why['hang_rad'] and all(k in part for k in ('A3_rad', 'A6du_rad', 'A5_rad')):
+        val['hang_rad'] = 2 * part['A3_rad'] + 2 * part['A6du_rad'] + part['A5_rad']
+    # hang_m and the lever L wait for u_theta (F7) and the sources above: never a partial sum (design 0.2)
+    return val, {k: v for k, v in why.items() if v}, part, None
 
 
 def hang_theo_u(cq, level, a_m):
@@ -322,8 +437,14 @@ def u_beta_cam(lan_lap):
 
 
 def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None, muc_kha_thi=LEVELS, nguong=None,
-          a6=None, ses=None, cam=None, commit_hil=None):
+          a6=None, ses=None, cam=None, commit_hil=None, kiem_cheo=None, xoay=None, u_h=None):
     muc = {}
+    side = a_m
+    hd, hd_why, hd_part, _lever = (hang_dong_tinh(dict(kiem_cheo=kiem_cheo, a6=a6, xoay=xoay, u_h=u_h,
+                                                       cam=cam if isinstance(cam, list) else [cam] if cam else []),
+                                                  side)
+                                   if side is not None else (dict(hang_m=None, he_so_r=None, hang_rad=None,
+                                                                  u_phi_rad=None), {}, {}, None))
     for lv in LEVELS:
         tb = tbs.get(lv)
         cq = can_quay(tb, lv)
@@ -331,14 +452,15 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
         muc[lv] = dict(can_quay=cq, man_trap=man_trap(tb),
                        chi_bao_cao=['g5'] if lv == 'O1-F08' else [],
                        hang_theo_u=bands, hang_theo_u_ly_do=bwhy,
-                       hang_dong=dict(a_m=a_m, hang_m=None, he_so_r=None, u_phi_rad=None, hang_rad=None),
+                       hang_dong=dict(a_m=a_m, **{k: (None if hd[k] is None else LE * hd[k])
+                                                  for k in ('hang_m', 'he_so_r', 'u_phi_rad', 'hang_rad')}),
+                       hang_dong_truoc_le=dict(hd), hang_dong_thanh_phan=dict(hd_part),
+                       P4_tay_don=dict(gia_tri_m=None, ly_do='(|q_hat| + dq) A4(u) them vao P4_m khi co dq day du '
+                                       '(u_theta F7); CODE 23/11 muc 5, GATE RT4-3'),
                        hang_dong_ly_do=dict(
                            a_m=None if a_m is not None else 'thieu --canh-ma-m',
-                           hang_m='chua co nguon: P1/A3, P5, P6, P7, A6 vi tri, W-canh, U_p_tc_san, neo (thiet ke v7 '
-                                  'muc 1, 10; KIEMCHEO, NHACTAM, HIEUCHUAN, CAM, M4 A6)',
-                           he_so_r='chua co nguon: delta_q, U_thang (C8BX-03), tay don q (thiet ke v7 muc 10)',
-                           u_phi_rad='chua co nguon: u_phi (HIEUCHUAN u_phi_hat, NHACTAM u_beta, C8B u_beta_cam)',
-                           hang_rad='chua co nguon: A1, A2, A3, A5, A6, A7, neo (thiet ke v7 muc 1)'),
+                           **{k: ('; '.join(hd_why[k]) if k in hd_why else None)
+                              for k in ('hang_m', 'he_so_r', 'u_phi_rad', 'hang_rad')}),
                        khac={k: dict(gia_tri=None, trang_thai='thieu', ly_do='chua co nguon') for k in KHAC})
     ub, ust, uwhy = u_beta_cam(lan_lap)
     # F17 bo_cham.bang_man_trap: each level and K one branch; alpha needs the 3b source; K (0.5 m/s, F05 speeds)
@@ -402,6 +524,10 @@ def main(argv=None):
                          'camera session of the C8 session (da session (A)): they must agree, else mien thieu')
     ap.add_argument('--camera', action='append', default=None,
                     help='camera file c8_cam_u_vao (day_doi.dzc_m); repeatable, the largest dzc is used')
+    ap.add_argument('--kiem-cheo', action='append', default=None,
+                    help='KIEMCHEO kiem_cheo.json (luot3_g4) of a camera segment with C8 runs; repeat (largest used)')
+    ap.add_argument('--xoay', default=None, help='F4 xoay_v1 (q_tag_m, u_q_m of goc) for dq and the lever')
+    ap.add_argument('--u-h-chung', default=None, help='c8b_u_h_chung_v1 (P6 common, thi sai goc)')
     ap.add_argument('--commit-hil', default=None,
                     help='40-hex hil commit that will score the runs; required with bo_tick (O1 v11.34 Q4)')
     ap.add_argument('--out', required=True)
@@ -452,11 +578,12 @@ def main(argv=None):
             raise KhoaError(f'--canh-ma-m {a.canh_ma_m}: the tag side in metres')
         extra = {}
         for key, path, vai in (('nguong', a.nguong, 'nguong'), ('a6', a.a6, 'a6'), ('ses', a.session, 'session'),
-                               ('cam', a.camera, 'camera')):
+                               ('cam', a.camera, 'camera'), ('kiem_cheo', a.kiem_cheo, 'kiem_cheo'),
+                               ('xoay', a.xoay, 'xoay'), ('u_h', a.u_h_chung, 'u_h_chung')):
             for pth in (path if isinstance(path, list) else [path] if path else []):   # da session (A): repeatable
                 with open(pth, encoding='utf-8') as f:
                     d = json.load(f)
-                if key in ('ses', 'cam'):
+                if key in ('ses', 'cam', 'kiem_cheo'):
                     extra.setdefault(key, []).append(d)
                 else:
                     extra[key] = d

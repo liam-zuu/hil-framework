@@ -274,3 +274,67 @@ def test_cli_refuses_bad_commit_hil(tmp_path, capsys):
     tb.write_text(json.dumps(_tb('O1-F05')), encoding='utf-8')
     rc = K.main(['--tb', f'O1-F05={tb}', '--commit-hil', 'xyz', '--out', str(tmp_path / 'o.json')])
     assert rc == 2 and not (tmp_path / 'o.json').exists()
+
+
+def _kc(a3=0.2, p1=0.004, p7=1e-4, a5=0.13, th=2e-5, flag=False):
+    return dict(A3_tuong_doi=dict(A3_xp_deg=dict(goc=a3), ngoai_suy=dict(goc=flag), mot_phuong=dict(goc=False),
+                                  cap_hong=dict(goc=False)),
+                P1_tuong_doi=dict(theo_vung=dict(goc=dict(max_m=p1, ngoai_suy=False, mot_phuong=False,
+                                                          cap_hong=False))),
+                P7=dict(lech_max_m=p7), A5=dict(lech_max_deg=a5), thang_chung=dict(lech_max=th))
+
+
+def _src(**kw):
+    a6 = dict(h_goc_m=[0.123, 0.122, 0.125, 0.126], u_h_goc_m=[0.013] * 4, H_m=2.632, h_m=0.124175,
+              mien=dict(rho_max_m=1.615))
+    d = dict(kiem_cheo=[_kc(), _kc(a3=0.25, p1=0.003, th=3e-6)], a6=a6,
+             xoay=dict(cho=dict(goc=dict(trang_thai='dat', q_tag_m=[0.0003, 0.0004], u_q_m=0.0013))),
+             u_h=dict(trang_thai='dat', u_h_chung_m=0.008), cam=[dict(day_doi=dict(dzc_m=0.017))])
+    d.update(kw)
+    return d
+
+
+def test_hang_dong_from_the_sources(monkeypatch):
+    """CODE 23/11 (Chot_T12_khoa_C8B_v1 muc 5): he_so_r from U_thang, P6 common, P5; hang_rad and hang_m stay null
+    while a source is missing (never a partial sum); the parts read are the largest over the segments."""
+    import c8b_a6 as a6m
+    monkeypatch.setattr(a6m, 'a6du_rad', lambda a6, rho: 0.0078 if abs(rho - (1.615 - 0.1445 / math.sqrt(2))) < 1e-12
+                        else None)
+    v, why, part, _ = K.hang_dong_tinh(_src(), 0.1445)
+    H, hmax = 2.632, 0.126 + 0.013
+    assert part['A3_rad'] == pytest.approx(math.radians(0.25)) and part['P1_m'] == 0.004
+    assert part['U_thang'] == pytest.approx(K.U_THANG_THUOC + 2e-5)
+    want = K.U_THANG_THUOC + 2e-5 + 0.008 / (H - hmax) + hmax * 0.017 / ((H - hmax) * (H - 0.017))
+    assert v['he_so_r'] == pytest.approx(want, rel=1e-12) and 'he_so_r' not in why
+    assert part['thi_sai_m'] == pytest.approx(4 * 0.1445 / math.sqrt(2) * 0.005 / (4 * (H - 0.124175)))
+    assert part['dq_khong_u_theta_m'] == pytest.approx(0.0013 + K.DQ_LECH_TAM_M) and part['q_hat_m'] == pytest.approx(5e-4)
+    assert part['A6du_rad'] == 0.0078
+    assert v['hang_rad'] is None and any('neo' in w for w in why['hang_rad'])
+    assert v['hang_m'] is None and any('u_theta' in w for w in why['hang_m']) and v['u_phi_rad'] is None
+    k = K.build({'O1-F05': _tb('O1-F05')}, a_m=0.1445, **{kk: vv for kk, vv in _src().items() if kk != 'a6'},
+                a6=None)
+    assert k['muc']['O1-F05']['hang_dong']['he_so_r'] is None                   # no A6: no P6 / P5 term
+
+
+def test_hang_dong_refuses_flags_and_missing(monkeypatch):
+    import c8b_a6 as a6m
+    monkeypatch.setattr(a6m, 'a6du_rad', lambda a6, rho: 0.0078)
+    v, why, _, _ = K.hang_dong_tinh(_src(kiem_cheo=[_kc(flag=True)]), 0.1445)
+    assert any('ngoai_suy' in w for w in why['hang_rad'])
+    v, why, _, _ = K.hang_dong_tinh(_src(cam=[]), 0.1445)
+    assert v['he_so_r'] is None and any('dzc' in w for w in why['he_so_r'])
+    v, why, _, _ = K.hang_dong_tinh(_src(u_h=dict(trang_thai='thieu', u_h_chung_m=0.008)), 0.1445)
+    assert v['he_so_r'] is None
+    v, why, _, _ = K.hang_dong_tinh(_src(kiem_cheo=[]), 0.1445)
+    assert v['he_so_r'] is None and any('kiem_cheo' in w for w in why['he_so_r'])
+
+
+def test_build_puts_the_margin_once(monkeypatch):
+    import c8b_a6 as a6m
+    monkeypatch.setattr(a6m, 'a6du_rad', lambda a6, rho: 0.0078)
+    s = _src()
+    k = K.build({'O1-F05': _tb('O1-F05')}, a_m=0.1445, kiem_cheo=s['kiem_cheo'], a6=s['a6'], xoay=s['xoay'],
+                u_h=s['u_h'], cam=s['cam'])
+    m = k['muc']['O1-F05']
+    assert m['hang_dong']['he_so_r'] == pytest.approx(K.LE * m['hang_dong_truoc_le']['he_so_r'])
+    assert m['hang_dong']['hang_m'] is None and 'u_theta' in m['hang_dong_ly_do']['hang_m']
