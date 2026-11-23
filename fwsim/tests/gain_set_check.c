@@ -50,6 +50,28 @@ static void expect_err(const char *name, const char *pkt, int want) {
     check(r == want, name, d);
 }
 
+/* Range table of the campaign binary (L142, Liam 21/11). Expected numbers written here from the spec, not
+ * read from gain_set.c: ceilings S03 v8.6 2.1 (Liam 22/11); lower bounds rows 1a-1e of
+ * 03_CODE/docs/review/2026-11-21_Fable_API_can_cu_nhom1/vong3/ket_luan_da_kiem.md, 0 only for the integral
+ * gains (ki_xy, ki_wz, pos_ki). The LADRC triangle omega_c + 2*omega_o < 200 is the scripts' check. */
+static const struct { const char *ctrl; int mode; const char *names[GAIN_N]; float lo[GAIN_N], hi[GAIN_N], mid[GAIN_N]; } TBL[2] = {
+    { "PID",  CTRL_PID,  { "kp_xy", "ki_xy", "kp_wz", "ki_wz", "pos_kp", "pos_ki", "k_psi" },
+      { 0.001f, 0.0f, 0.001f, 0.0f, 0.0004f, 0.0f, 0.0027f },
+      { 41.0f, 1500.0f, 4.6f, 230.0f, 200.0f, 5500.0f, 50.0f },
+      { 1.5f, 0.05f, 1.0f, 0.05f, 6.0f, 3.0f, 1.0f } },
+    { "ADRC", CTRL_ADRC, { "omega_c_xy", "omega_o_xy", "omega_c_wz", "omega_o_wz", "pos_kp", "pos_ki", "k_psi" },
+      { 0.00585f, 0.03f, 0.0103f, 0.03f, 0.0004f, 0.0f, 0.0027f },
+      { 200.0f, 100.0f, 200.0f, 100.0f, 200.0f, 40000.0f, 50.0f },
+      { 8.0f, 30.0f, 8.0f, 30.0f, 6.0f, 3.0f, 1.0f } },
+};
+
+/* "#gain_set,v=1,tx=5,id=7,ctrl=<c>,<name>=<%.9g>..." for controller c of TBL */
+static void tbl_packet(char *pkt, size_t n, int c, const float v[GAIN_N]) {
+    int k = snprintf(pkt, n, "#gain_set,v=1,tx=5,id=7,ctrl=%s", TBL[c].ctrl);
+    for (int j = 0; j < GAIN_N; j++)
+        k += snprintf(pkt + k, n - (size_t)k, ",%s=%.9g", TBL[c].names[j], (double)v[j]);
+}
+
 int main(void) {
     gain_set_t g;
     char d[256];
@@ -98,49 +120,34 @@ int main(void) {
     expect_err("err_inf_word",      "#gain_set,v=1,tx=5,id=7,ctrl=PID,kp_xy=inf,ki_xy=0,kp_wz=1,ki_wz=0,pos_kp=1,pos_ki=0,k_psi=1", GAIN_ERR_FORMAT);
     expect_err("range_overflow",    "#gain_set,v=1,tx=5,id=7,ctrl=PID,kp_xy=1e40,ki_xy=0,kp_wz=1,ki_wz=0,pos_kp=1,pos_ki=0,k_psi=1", GAIN_ERR_RANGE);
     expect_err("range_negative",    "#gain_set,v=1,tx=5,id=7,ctrl=PID,kp_xy=1,ki_xy=-0.1,kp_wz=1,ki_wz=0,pos_kp=1,pos_ki=0,k_psi=1", GAIN_ERR_RANGE);
-    /* Range table of the campaign binary (L142, Liam 21/11). Expected numbers written here from the spec,
-     * not from gain_set.c: ceilings S03 v8.6 2.1 (Liam 22/11); lower bounds 1a-1e of
-     * 03_CODE/docs/review/2026-11-21_Fable_API_can_cu_nhom1/vong3/ket_luan_da_kiem.md, 0 only for the
-     * integral gains (ki_xy, ki_wz, pos_ki). Each gain at LO and HI passes; the next float32 outside fails;
-     * 0 passes only where LO is 0. The LADRC triangle is the scripts' check, not the table's. */
-    {
-        static const struct { const char *ctrl; const char *names[7]; float lo[7], hi[7], mid[7]; } T[2] = {
-            { "PID",  { "kp_xy", "ki_xy", "kp_wz", "ki_wz", "pos_kp", "pos_ki", "k_psi" },
-              { 0.001f, 0.0f, 0.001f, 0.0f, 0.0004f, 0.0f, 0.0027f },
-              { 41.0f, 1500.0f, 4.6f, 230.0f, 200.0f, 5500.0f, 50.0f },
-              { 1.5f, 0.05f, 1.0f, 0.05f, 6.0f, 3.0f, 1.0f } },
-            { "ADRC", { "omega_c_xy", "omega_o_xy", "omega_c_wz", "omega_o_wz", "pos_kp", "pos_ki", "k_psi" },
-              { 0.00585f, 0.03f, 0.0103f, 0.03f, 0.0004f, 0.0f, 0.0027f },
-              { 200.0f, 100.0f, 200.0f, 100.0f, 200.0f, 40000.0f, 50.0f },
-              { 8.0f, 30.0f, 8.0f, 30.0f, 6.0f, 3.0f, 1.0f } },
-        };
-        for (int c = 0; c < 2; c++) {
-            for (int i = 0; i < 7; i++) {
-                const float lo = T[c].lo[i], hi = T[c].hi[i];
-                const struct { const char *what; float v; int want; } K[5] = {
-                    { "at_lo",    lo,                       GAIN_OK },
-                    { "at_hi",    hi,                       GAIN_OK },
-                    { "above_hi", nextafterf(hi, INFINITY), GAIN_ERR_RANGE },
-                    { "below_lo", lo > 0.0f ? nextafterf(lo, 0.0f) : -1e-6f, GAIN_ERR_RANGE },
-                    { "zero",     0.0f,                     lo == 0.0f ? GAIN_OK : GAIN_ERR_RANGE },
-                };
-                for (int k = 0; k < 5; k++) {
-                    char pkt[300], name[64];
-                    int n = snprintf(pkt, sizeof pkt, "#gain_set,v=1,tx=5,id=7,ctrl=%s", T[c].ctrl);
-                    for (int j = 0; j < 7; j++)
-                        n += snprintf(pkt + n, sizeof pkt - (size_t)n, ",%s=%.9g", T[c].names[j],
-                                      (double)(j == i ? K[k].v : T[c].mid[j]));
-                    snprintf(name, sizeof name, "table_%s_%s_%s", T[c].ctrl, T[c].names[i], K[k].what);
-                    expect_err(name, pkt, K[k].want);
-                }
+    /* Range table of the campaign binary (L142): table TBL (file scope). Every gain at LO and HI passes; the
+     * next float32 outside on each side fails (below 0 is -FLT_TRUE_MIN, Codex L142-3); 0 passes only where LO
+     * is 0. Each case also checks that the packet parses to exactly the intended float32 bits. */
+    for (int c = 0; c < 2; c++) {
+        for (int i = 0; i < 7; i++) {
+            const float lo = TBL[c].lo[i], hi = TBL[c].hi[i];
+            const struct { const char *what; float v; int want; } K[5] = {
+                { "at_lo",    lo,                        GAIN_OK },
+                { "at_hi",    hi,                        GAIN_OK },
+                { "above_hi", nextafterf(hi, INFINITY),  GAIN_ERR_RANGE },
+                { "below_lo", nextafterf(lo, -INFINITY), GAIN_ERR_RANGE },
+                { "zero",     0.0f,                      lo == 0.0f ? GAIN_OK : GAIN_ERR_RANGE },
+            };
+            for (int k = 0; k < 5; k++) {
+                float v[GAIN_N];
+                memcpy(v, TBL[c].mid, sizeof v);
+                v[i] = K[k].v;
+                char pkt[300], name[64], d[96];
+                tbl_packet(pkt, sizeof pkt, c, v);
+                snprintf(name, sizeof name, "table_%s_%s_%s", TBL[c].ctrl, TBL[c].names[i], K[k].what);
+                gain_set_t g;
+                int r = parse(pkt, &g);
+                int bits = r == GAIN_OK && memcmp(&g.v[i], &K[k].v, sizeof(float)) == 0;
+                if (r == GAIN_OK) r = gain_set_check_range(&g);
+                snprintf(d, sizeof d, "got %s, want %s, parsed bits %s", gain_err_str(r), gain_err_str(K[k].want),
+                         bits ? "same" : "DIFFERENT");
+                check(bits && r == K[k].want, name, d);
             }
-            /* every gain at its ceiling at once (the table alone; the LADRC triangle is not checked here) */
-            char pkt[300], name[64];
-            int n = snprintf(pkt, sizeof pkt, "#gain_set,v=1,tx=5,id=7,ctrl=%s", T[c].ctrl);
-            for (int j = 0; j < 7; j++)
-                n += snprintf(pkt + n, sizeof pkt - (size_t)n, ",%s=%.9g", T[c].names[j], (double)T[c].hi[j]);
-            snprintf(name, sizeof name, "table_%s_all_at_hi", T[c].ctrl);
-            expect_err(name, pkt, GAIN_OK);
         }
     }
 
@@ -252,6 +259,21 @@ int main(void) {
     r = parse(pkt, &back);
     check(r == GAIN_OK && memcmp(back.v, g.v, sizeof g.v) == 0, "roundtrip_odd_values", pkt);
 
+    /* a value the formatter writes with an exponent (Codex L142-4): parse, apply, format, parse, same bits */
+    {
+        const char *expo = "#gain_set,v=1,tx=5,id=8,ctrl=PID,kp_xy=1.5,ki_xy=1.00000015e-07,kp_wz=1,ki_wz=0.05,"
+                           "pos_kp=6,pos_ki=3,k_psi=1";
+        int r1 = parse(expo, &g);
+        int r2 = r1 == GAIN_OK ? gain_set_apply(&g) : r1;
+        gain_set_current(&cur);
+        int k = gain_set_format(line, sizeof line, &cur, 0);
+        int has_e = k > 0 && strstr(line, "ki_xy=1.00000015e-07") != NULL;
+        snprintf(pkt, sizeof pkt, "#gain_set,v=1,tx=5,id=8%s", k > 0 ? strstr(line, ",ctrl=") : "");
+        int r3 = parse(pkt, &back);
+        check(r1 == GAIN_OK && r2 == GAIN_OK && has_e && r3 == GAIN_OK && memcmp(back.v, g.v, sizeof g.v) == 0,
+              "roundtrip_exponent", line);
+    }
+
     /* ── a rejected request changes nothing ── */
     gain_set_t before;
     gain_set_current(&before);
@@ -333,6 +355,39 @@ int main(void) {
                    xa[i]->eso.beta2 == xb[i]->eso.beta2 && xa[i]->eso.b0 == xb[i]->eso.b0 &&
                    xa[i]->output_limit == xb[i]->output_limit;
         check(same, "parity_fwsim_adrc", "gain_set_apply and the fwsim path give different LADRC / outer fields");
+    }
+
+    /* ── table corners through the whole path (Codex L142-5): for each controller, every gain at LO and every
+     * gain at HI at once: apply OK, read-back same bits, fixed clamps / b0 / out_limit unchanged, %.9g line
+     * parses back to the same bits. Table only: the LADRC all-HI set is outside the scripts' triangle. ── */
+    for (int c = 0; c < 2; c++) {
+        for (int corner = 0; corner < 2; corner++) {
+            char name[64], d[400], pkt2[400], line2[400];
+            const float *v = corner ? TBL[c].hi : TBL[c].lo;
+            snprintf(name, sizeof name, "corner_%s_all_at_%s", TBL[c].ctrl, corner ? "hi" : "lo");
+            vel_ctrl_init(); vel_ctrl_set_mode(TBL[c].mode);
+            pid_controller_t p0 = *vel_ctrl_pid();
+            adrc_controller_t a0 = *vel_ctrl_adrc();
+            gain_set_t gc = { .id = 21, .ctrl = TBL[c].mode }, now, bk;
+            memcpy(gc.v, v, sizeof gc.v);
+            int r1 = gain_set_apply(&gc);
+            gain_set_current(&now);
+            int same = r1 == GAIN_OK && memcmp(now.v, v, sizeof now.v) == 0;
+            const pid_controller_t *p1 = vel_ctrl_pid();
+            const adrc_controller_t *a1 = vel_ctrl_adrc();
+            const pid_t *qa[3] = { &p0.vx, &p0.vy, &p0.wz }, *qb[3] = { &p1->vx, &p1->vy, &p1->wz };
+            const adrc_axis_t *ya[3] = { &a0.vx, &a0.vy, &a0.wz }, *yb[3] = { &a1->vx, &a1->vy, &a1->wz };
+            for (int i = 0; i < 3; i++)
+                same = same && qa[i]->kd == qb[i]->kd && qa[i]->integral_limit == qb[i]->integral_limit &&
+                       qa[i]->output_limit == qb[i]->output_limit &&
+                       ya[i]->eso.b0 == yb[i]->eso.b0 && ya[i]->output_limit == yb[i]->output_limit;
+            int k = gain_set_format(line2, sizeof line2, &now, gain_set_applied_n());
+            snprintf(pkt2, sizeof pkt2, "#gain_set,v=1,tx=5,id=21%s", k > 0 ? strstr(line2, ",ctrl=") : "");
+            int r2 = parse(pkt2, &bk);
+            same = same && k > 0 && r2 == GAIN_OK && memcmp(bk.v, v, sizeof bk.v) == 0;
+            snprintf(d, sizeof d, "apply %s, parse %s, line %s", gain_err_str(r1), gain_err_str(r2), line2);
+            check(same, name, d);
+        }
     }
 
     printf("%d FAIL\n", n_fail);
