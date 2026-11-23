@@ -98,12 +98,51 @@ int main(void) {
     expect_err("err_inf_word",      "#gain_set,v=1,tx=5,id=7,ctrl=PID,kp_xy=inf,ki_xy=0,kp_wz=1,ki_wz=0,pos_kp=1,pos_ki=0,k_psi=1", GAIN_ERR_FORMAT);
     expect_err("range_overflow",    "#gain_set,v=1,tx=5,id=7,ctrl=PID,kp_xy=1e40,ki_xy=0,kp_wz=1,ki_wz=0,pos_kp=1,pos_ki=0,k_psi=1", GAIN_ERR_RANGE);
     expect_err("range_negative",    "#gain_set,v=1,tx=5,id=7,ctrl=PID,kp_xy=1,ki_xy=-0.1,kp_wz=1,ki_wz=0,pos_kp=1,pos_ki=0,k_psi=1", GAIN_ERR_RANGE);
-    expect_err("range_pid_kp_max",  "#gain_set,v=1,tx=5,id=7,ctrl=PID,kp_xy=20.5,ki_xy=0,kp_wz=1,ki_wz=0,pos_kp=1,pos_ki=0,k_psi=1", GAIN_ERR_RANGE);
-    expect_err("range_pid_at_max",  "#gain_set,v=1,tx=5,id=7,ctrl=PID,kp_xy=20,ki_xy=50,kp_wz=20,ki_wz=50,pos_kp=30,pos_ki=30,k_psi=10", GAIN_OK);
-    expect_err("range_k_psi_max",   "#gain_set,v=1,tx=5,id=7,ctrl=PID,kp_xy=1,ki_xy=0,kp_wz=1,ki_wz=0,pos_kp=1,pos_ki=0,k_psi=10.5", GAIN_ERR_RANGE);
-    expect_err("range_adrc_wo_49",  "#gain_set,v=1,tx=5,id=9,ctrl=ADRC,omega_c_xy=10,omega_o_xy=49,omega_c_wz=12,omega_o_wz=40,pos_kp=5,pos_ki=2,k_psi=1", GAIN_OK);
-    expect_err("range_adrc_wo_50",  "#gain_set,v=1,tx=5,id=9,ctrl=ADRC,omega_c_xy=10,omega_o_xy=49.5,omega_c_wz=12,omega_o_wz=40,pos_kp=5,pos_ki=2,k_psi=1", GAIN_ERR_RANGE);
-    expect_err("range_adrc_wc_low", "#gain_set,v=1,tx=5,id=9,ctrl=ADRC,omega_c_xy=0.4,omega_o_xy=35,omega_c_wz=12,omega_o_wz=40,pos_kp=5,pos_ki=2,k_psi=1", GAIN_ERR_RANGE);
+    /* Range table of the campaign binary (L142, Liam 21/11). Expected numbers written here from the spec,
+     * not from gain_set.c: ceilings S03 v8.6 2.1 (Liam 22/11); lower bounds 1a-1e of
+     * 03_CODE/docs/review/2026-11-21_Fable_API_can_cu_nhom1/vong3/ket_luan_da_kiem.md, 0 only for the
+     * integral gains (ki_xy, ki_wz, pos_ki). Each gain at LO and HI passes; the next float32 outside fails;
+     * 0 passes only where LO is 0. The LADRC triangle is the scripts' check, not the table's. */
+    {
+        static const struct { const char *ctrl; const char *names[7]; float lo[7], hi[7], mid[7]; } T[2] = {
+            { "PID",  { "kp_xy", "ki_xy", "kp_wz", "ki_wz", "pos_kp", "pos_ki", "k_psi" },
+              { 0.001f, 0.0f, 0.001f, 0.0f, 0.0004f, 0.0f, 0.0027f },
+              { 41.0f, 1500.0f, 4.6f, 230.0f, 200.0f, 5500.0f, 50.0f },
+              { 1.5f, 0.05f, 1.0f, 0.05f, 6.0f, 3.0f, 1.0f } },
+            { "ADRC", { "omega_c_xy", "omega_o_xy", "omega_c_wz", "omega_o_wz", "pos_kp", "pos_ki", "k_psi" },
+              { 0.00585f, 0.03f, 0.0103f, 0.03f, 0.0004f, 0.0f, 0.0027f },
+              { 200.0f, 100.0f, 200.0f, 100.0f, 200.0f, 40000.0f, 50.0f },
+              { 8.0f, 30.0f, 8.0f, 30.0f, 6.0f, 3.0f, 1.0f } },
+        };
+        for (int c = 0; c < 2; c++) {
+            for (int i = 0; i < 7; i++) {
+                const float lo = T[c].lo[i], hi = T[c].hi[i];
+                const struct { const char *what; float v; int want; } K[5] = {
+                    { "at_lo",    lo,                       GAIN_OK },
+                    { "at_hi",    hi,                       GAIN_OK },
+                    { "above_hi", nextafterf(hi, INFINITY), GAIN_ERR_RANGE },
+                    { "below_lo", lo > 0.0f ? nextafterf(lo, 0.0f) : -1e-6f, GAIN_ERR_RANGE },
+                    { "zero",     0.0f,                     lo == 0.0f ? GAIN_OK : GAIN_ERR_RANGE },
+                };
+                for (int k = 0; k < 5; k++) {
+                    char pkt[300], name[64];
+                    int n = snprintf(pkt, sizeof pkt, "#gain_set,v=1,tx=5,id=7,ctrl=%s", T[c].ctrl);
+                    for (int j = 0; j < 7; j++)
+                        n += snprintf(pkt + n, sizeof pkt - (size_t)n, ",%s=%.9g", T[c].names[j],
+                                      (double)(j == i ? K[k].v : T[c].mid[j]));
+                    snprintf(name, sizeof name, "table_%s_%s_%s", T[c].ctrl, T[c].names[i], K[k].what);
+                    expect_err(name, pkt, K[k].want);
+                }
+            }
+            /* every gain at its ceiling at once (the table alone; the LADRC triangle is not checked here) */
+            char pkt[300], name[64];
+            int n = snprintf(pkt, sizeof pkt, "#gain_set,v=1,tx=5,id=7,ctrl=%s", T[c].ctrl);
+            for (int j = 0; j < 7; j++)
+                n += snprintf(pkt + n, sizeof pkt - (size_t)n, ",%s=%.9g", T[c].names[j], (double)T[c].hi[j]);
+            snprintf(name, sizeof name, "table_%s_all_at_hi", T[c].ctrl);
+            expect_err(name, pkt, GAIN_OK);
+        }
+    }
 
     char longpkt[400];
     memset(longpkt, '0', sizeof longpkt - 1);
@@ -203,7 +242,7 @@ int main(void) {
     check(r == GAIN_OK && memcmp(back.v, cur.v, sizeof cur.v) == 0, "roundtrip_9g", pkt);
 
     /* awkward float values round trip too */
-    const char *odd = "#gain_set,v=1,tx=5,id=8,ctrl=PID,kp_xy=0.1,ki_xy=3.33333325,kp_wz=1e-07,ki_wz=19.9999981,"
+    const char *odd = "#gain_set,v=1,tx=5,id=8,ctrl=PID,kp_xy=0.1,ki_xy=3.33333325,kp_wz=0.00123456791,ki_wz=19.9999981,"
                       "pos_kp=0.300000012,pos_ki=7.1,k_psi=2.71828175";
     parse(odd, &g);
     gain_set_apply(&g);
