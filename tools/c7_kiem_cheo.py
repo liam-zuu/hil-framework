@@ -2859,7 +2859,8 @@ def iii_leg(fp_, rows, dets, ids_a, ids_b, side, kappa, plumb, to):
             tx, ty = rows[f].get('tag_x'), rows[f].get('tag_y')
             if tx not in ('', None) and ty not in ('', None):
                 dev = max(dev, abs(pS['tag_x'] - float(tx)), abs(pS['tag_y'] - float(ty)))
-            e[f] = np.array([pS['x'] - pR['x'], pS['y'] - pR['y'], float(cm.cp_wrap(pS['psi'] - pR['psi']))])
+            e[f] = np.array([pS['tag_x'] - pR['tag_x'], pS['tag_y'] - pR['tag_y'],          # KCP4V2-10: the tag
+                             float(cm.cp_wrap(pS['tag_psi'] - pR['tag_psi']))])
     except KCError as ex:
         return None, None, str(ex)[:200], None
     if not dev <= TOL_REPLAY_M:
@@ -2895,9 +2896,13 @@ def e_hieu(a):
         raise KCError('kiem_cheo result without P1_tuong_doi for this place')
     part_i = tv.get('trong_vung_max_m')
     # KCP4-7 (S7-13 KS7B-1): (i) is not usable when the start region is extrapolated / one-direction / a pair failed
-    why_i = [f'(i) {k}' for k in ('ngoai_suy', 'mot_phuong', 'cap_hong') if tv.get(k) is not False]
-    if not _fin_ge0(part_i) or not tv.get('trong_vung_n_cap'):
-        why_i.append('(i) khong co cap trong vung')
+    # cap_hong of the region also counts pairs outside the (i) maximum (out of the disc, longer than L_MAX_M, A3), so
+    # it is not a reason here (KCP4V2-7; the in-region pairs are counted by trong_vung_n_cap); NaN never enters a max
+    why_i = [f'(i) {k}' for k in ('ngoai_suy', 'mot_phuong') if tv.get(k) is not False]
+    n_i = tv.get('trong_vung_n_cap')
+    if not _fin_ge0(part_i) or not (isinstance(n_i, int) and not isinstance(n_i, bool) and n_i > 0):
+        why_i.append('(i) khong co cap trong vung (hay so khong huu han)')
+        part_i = None
     if d.get('trang_thai') not in ('khoa', 'chan_doan'):          # KCP4-6: the root states c8_hc_a writes
         raise KCError(f'{a.doan}: trang_thai {d.get("trang_thai")!r} is not khoa / chan_doan')
     cfg = d.get('car_pose_cfg') or {}
@@ -3010,10 +3015,10 @@ def e_hieu(a):
                                                    list(cb.get('khung_id') or []), float(s['car_side_m']), *set_iii)
             if w3:
                 why.append(f'(iii) {w3}')
-        vals = [v for v in (part_i, ii_m, iii_m) if v is not None]
+        vals = [v for v in (part_i, ii_m, iii_m) if v is not None and math.isfinite(v)]       # KCP4V2-7
         if not vals:
             raise KCError('e_hieu_m: a leg with neither (i) nor (ii) (start region without in-region pairs)')
-        psis = [v for v in (ii_psi, iii_psi) if v is not None]
+        psis = [v for v in (ii_psi, iii_psi) if v is not None and math.isfinite(v)]
         rec = dict(i=g.get('i'), e_hieu_psi_rad=max(psis) if psis else None, phan_i_m=part_i, phan_ii_m=ii_m,
                    phan_iii_m=iii_m, phan_iii_psi_rad=iii_psi, phan_iii=iii_info)
         # KCJ1-7: a diagnostic number is NOT written under e_hieu_m (the key the reader turns into a usable value);
@@ -3047,13 +3052,21 @@ def e_hieu(a):
 
 NEO_LUOT_SCHEMA = 'c7_neo_luot_v1'            # P_neo / A_neo (S7-13 KS7B-3, S7-14.5; CODE 23/11 T12 chot section 5)
 GATE_KEYS = ('min_marks', 'rms_extra_px', 'car_res_sim_m', 'scale_rel', 'scale_win_s', 'scale_min')
-W_MIN_FRAC = 0.5          # [DE XUAT] KCP4-1: a reference set R_t is usable when >= half of the W frames pass the gates on it
+RATIO_WHY = ('ti_le', 'ti_le_it_lan_can')      # (2b) verdicts of c7_measure.apply_gates: a frame failing only these is
+                                               # still a neighbour of the scale gate (KCP4V2-1)
+W_PRE_SPAN_S = 1.0                             # c7_tuong_doi.mot_phia: the one-sided reference spans w_s + 1 s
 
 
 def circ_mean(a):
-    """Mean of angles [rad] unwrapped around the first one ('trung_binh_go_vong', KCP4-11): a0 + mean(wrap(a - a0))."""
-    a = np.asarray(a, float)
-    return float(a[0] + np.mean([cm.cp_wrap(x - a[0]) for x in a])) if len(a) else float('nan')
+    """Mean of angles [rad] as c7_chuoi_khung.trung_binh_go_vong (each unwrapped around the circular mean, contract
+    'trung_binh_go_vong'; KCP4-11, KCP4V2-8); NaN when the circular mean is undefined (resultant below 1e-9: no branch
+    can be chosen) or no finite angle."""
+    g = np.asarray(a, float).ravel()
+    g = g[np.isfinite(g)]
+    if not len(g) or math.hypot(float(np.mean(np.sin(g))), float(np.mean(np.cos(g)))) < 1e-9:
+        return float('nan')
+    c = math.atan2(float(np.mean(np.sin(g))), float(np.mean(np.cos(g))))
+    return float(c + np.mean([cm.cp_wrap(x - c) for x in g]))
 
 
 def _gate_row(f, t, pose, n, rms):
@@ -3061,22 +3074,49 @@ def _gate_row(f, t, pose, n, rms):
                 scale=pose['scale'], x=pose['x'], y=pose['y'], psi=pose['psi'])
 
 
-def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms_h):
-    """P_neo / A_neo of one C8 run (S7-14.5; CODE 23/11: the bound of hang_m covers EVERY frame t of the run). The
-    reference window W = pre. For every valid frame t of the run (frames.csv valid with a tag pose, from the first W
-    frame to the last post frame), the reference anchor set R_t = (anchors common to every W frame) & S_t; the replay
-    deviation of a frame f on R_t is e_f = pose on its own anchors S_f - pose on R_t (scoring chain, as iii_leg);
-    value_t = |e_t - mean over W of e_f| (position; heading by the unwrapped mean, KCP4-11).
-    KCP4-1 (S7-14.5 'replay changing valid -> frame not valid'): the reference chain is gated as the track (gates of
-    track.json: min_marks on R_t, rms of the refit, tag shape (2a), scale against the neighbours (2b), apply_gates on
-    the replayed rows); a frame t failing, and the W frames failing on R_t, are left out and counted with the reason;
-    R_t with fewer than W_MIN_FRAC of W passing is not usable. KCP4-2: the run needs at least one valid replayed frame
-    AFTER the last W frame; otherwise (None, reason). Returns (dict, reason)."""
+def _fail_row(f, t, n):
+    """A replayed frame whose refit failed: gate (1) / khop fails it and it is no neighbour of (2b)."""
+    return dict(idx=f, t_s=t, n_marks=n, rms_px=float('inf'), khop_ok=False, car_seen=True, res_sim_m=float('inf'),
+                scale=float('nan'), x=float('nan'), y=float('nan'), psi=float('nan'))
+
+
+def _gate12(r, gates, rms_h):
+    """The (1) and (2a) verdicts of c7_measure.apply_gates for one replayed row (its why list without (2b))."""
+    why = []
+    if r['n_marks'] < gates['min_marks']:
+        why.append('moc_it')
+    elif not (r['rms_px'] <= rms_h + gates['rms_extra_px']):
+        why.append('moc_du_thua')
+    if r.get('khop_ok') is False:
+        why.append('khop')
+    if not (r['res_sim_m'] <= gates['car_res_sim_m']):
+        why.append('xe_meo')
+    return why
+
+
+def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms_h, t_ref=None, kt=None):
+    """P_neo / A_neo of one C8 run (S7-14.5; CODE 23/11: the bound of hang_m covers EVERY frame t of the run). W = pre.
+    For every valid frame t of the run (frames.csv valid with a tag pose, from the first W frame to the last post
+    frame), R_t = (anchors common to every W frame) & S_t; the replay deviation of a frame f on R_t is e_f = TAG pose
+    (tag_x, tag_y, tag_psi; KCP4V2-10) on its own anchors S_f - tag pose on R_t (scoring chain, as iii_leg);
+    value_t = |e_t - mean over W of e_f| (heading by trung_binh_go_vong, KCP4V2-8).
+    Gates of the reference chain (S7-14.5 'replay changing valid -> frame not valid'; KCP4-1, KCP4V2-1): every frame
+    the TRACK let into its scale neighbours (car seen, tag in dets, frames.csv why only (2b) or none) within
+    scale_win_s of the run is replayed on its R_t, times from dets.npz (checked increasing), and the chain goes through
+    c7_measure.apply_gates with the gates of the track; a run frame failing is left out and counted with the reason.
+    W on R_t (KCP4V2-2): the frames of [t_ref - w_s - 1 s, t_ref) the track let in are replayed on R_t, failures per
+    frame, and gated by the ONE-SIDED scale gate of CAM (c7_tuong_doi.mot_phia, as F2 'pre'); the W frames passing
+    must meet n_min and frac_min of the F2 thresholds kt over [t_ref - w_s, t_ref) (c7_tuong_doi._samples rules
+    without the hole rule), else R_t is not usable. KCP4-2: at least one valid replayed frame AFTER the last W frame.
+    Returns (dict, reason)."""
+    import c7_tuong_doi as td                      # CAM: one-sided gate of the reference window
     if not ids_w or not ids_post:
         return None, 'cua so khong co khung'
     for f in list(ids_w) + list(ids_post):
         if f not in rows:
             return None, f'khung {f} cua cua so khong co trong frames.csv'
+    if t_ref is None or kt is None or not all(k in kt for k in ('w_s', 'n_min', 'frac_min')):
+        raise KCError('neo: the F2 pre window without t_canh_s / nguong (w_s, n_min, frac_min)')
     S = {}
 
     def anchors(f):
@@ -3088,6 +3128,15 @@ def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms
         if f not in dets or cm.CAR_ID not in dets[f][1]:
             return None, f'khung W {f} khong co trong dets.npz (hay khong thay ma noc)'
     W = set.intersection(*[set(anchors(f)) for f in ids_w])
+    t_of = {f: float(dets[f][0]) for f in dets}
+    order = sorted(t_of)
+    if any(t_of[b] <= t_of[a_] for a_, b in zip(order, order[1:])):
+        raise KCError('neo: dets.npz times not increasing with the frame ids')
+
+    def eligible(f):                               # a neighbour of the TRACK's scale gate
+        r = rows.get(f)
+        return (r is not None and f in dets and cm.CAR_ID in dets[f][1]
+                and all(w in RATIO_WHY for w in (r.get('why') or '').split('|') if w))   # c7_measure writes '|'
 
     def replay(f, ref):
         d = dets[f][1]
@@ -3096,61 +3145,79 @@ def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms
         pR = cm.car_pose(camR, d[cm.CAR_ID], side, kappa, plumb, to)
         return pS, pR, rmsR
 
-    def dev(pS, pR):
-        return np.array([pS['x'] - pR['x'], pS['y'] - pR['y'], float(cm.cp_wrap(pS['psi'] - pR['psi']))])
+    def dev(pS, pR):                               # KCP4V2-10: the tag centre and tag heading (not the wheel centre)
+        return np.array([pS['tag_x'] - pR['tag_x'], pS['tag_y'] - pR['tag_y'],
+                         float(cm.cp_wrap(pS['tag_psi'] - pR['tag_psi']))])
 
     lo, hi, wmax = min(ids_w), max(ids_post), max(ids_w)
     run = [f for f in sorted(rows) if lo <= f <= hi and _true(rows[f].get('valid'))
            and rows[f].get('tag_x') not in ('', None)]
+    t_lo, t_hi = t_of.get(lo, -math.inf), t_of.get(hi, math.inf)
+    ctx = [f for f in order if t_lo - gates['scale_win_s'] - 1e-9 <= t_of[f] <= t_hi + gates['scale_win_s'] + 1e-9
+           and eligible(f)]
+    run_set = set(run)
     cache, bad, rep_dev = {}, {}, 0.0
     ref_rows, e_t = [], {}
-    for t in run:                                   # pass 1: replay every frame on its R_t (rows of the reference chain)
-        if t not in dets or cm.CAR_ID not in dets[t][1]:
-            bad[t] = 'khong co dets / ma noc'
-            continue
+    for t in ctx:                                   # pass 1: the reference chain over the run and its scale neighbours
         ref = tuple(sorted(W & set(anchors(t))))
-        if len(ref) < max(MIN_TRAIN, int(gates['min_marks'])):
-            bad[t] = f'moc_it: tap tham chieu {len(ref)} moc (< {gates["min_marks"]})'
+        if len(ref) < MIN_TRAIN:
+            ref_rows.append(_fail_row(t, t_of[t], len(ref)))
+            if t in run_set:
+                bad[t] = f'moc_it: tap tham chieu {len(ref)} moc (< {gates["min_marks"]})'
             continue
         try:
             pS, pR, rmsR = replay(t, list(ref))
         except KCError as ex:
-            bad[t] = f'khop: {str(ex)[:150]}'
+            ref_rows.append(_fail_row(t, t_of[t], len(ref)))
+            if t in run_set:
+                bad[t] = f'khop: {str(ex)[:150]}'
             continue
-        rep_dev = max(rep_dev, abs(pS['tag_x'] - float(rows[t]['tag_x'])), abs(pS['tag_y'] - float(rows[t]['tag_y'])))
-        if not all(math.isfinite(v) for v in (pS['psi'], pR['psi'], pS['x'], pR['x'], pS['y'], pR['y'])):
-            bad[t] = 'khong huu han'
-            continue
-        e_t[t] = (ref, dev(pS, pR))
-        ref_rows.append(_gate_row(t, float(rows[t]['t_s']), pR, len(ref), rmsR))
+        if t in run_set:
+            rep_dev = max(rep_dev, abs(pS['tag_x'] - float(rows[t]['tag_x'])),
+                          abs(pS['tag_y'] - float(rows[t]['tag_y'])))
+            e_t[t] = (ref, dev(pS, pR))
+        ref_rows.append(_gate_row(t, t_of[t], pR, len(ref), rmsR))
     if not rep_dev <= TOL_REPLAY_M:
         raise KCError(f'neo: the replayed scoring pose differs from frames.csv by {rep_dev:.3g} m (another session, '
                       'detections or anchors)')
-    cm.apply_gates(ref_rows, rms_h, gates)          # KCP4-1: the reference chain through the gates of the track
+    for t in run:
+        if t not in bad and t not in e_t:
+            bad[t] = 'khong co dets / ma noc hay frames.csv khong cho lam lan can'
+    cm.apply_gates(ref_rows, rms_h, gates)          # KCP4-1, KCP4V2-1: the chain with the track's neighbours
     for r in ref_rows:
-        if not r['valid']:
+        if not r['valid'] and r['idx'] in e_t:
             bad[r['idx']] = 'cong: ' + ','.join(r['why'])
             e_t.pop(r['idx'], None)
+    a_w = t_ref - kt['w_s']
+    w_ctx = [f for f in order if a_w - W_PRE_SPAN_S - 1e-12 <= t_of[f] < t_ref and eligible(f)]
+    dt = float(np.median(np.diff([t_of[f] for f in order]))) if len(order) > 1 else float('nan')
     best_p, best_a, f_p, f_a, n_ok, n_sau = 0.0, 0.0, None, None, 0, 0
     for t in sorted(e_t):
         ref, et = e_t[t]
-        if ref not in cache:                        # mean over W of e_f on R_t, W frames gated on R_t
-            try:
-                wr, wd = [], {}
-                for f in ids_w:
+        if ref not in cache:                        # W on R_t: per-frame failures, the one-sided gate of CAM
+            fr_, ch_, wd, why_w = [], [], {}, {}
+            for f in w_ctx:
+                try:
                     pS, pR, rmsR = replay(f, list(ref))
+                    gr = _gate_row(f, t_of[f], pR, len(ref), rmsR)
+                    fr_.append(dict(t_s=t_of[f], scale=pR['scale'], car_seen=True, why=_gate12(gr, gates, rms_h)))
+                    ch_.append(dict(tag_x=pR['tag_x'], tag_y=pR['tag_y'], tag_psi=pR['tag_psi']))
                     wd[f] = dev(pS, pR)
-                    wr.append(_gate_row(f, float(rows[f]['t_s']), pR, len(ref), rmsR))
-                cm.apply_gates(wr, rms_h, gates)
-                ok = [r['idx'] for r in wr if r['valid']]
-                if len(ok) < W_MIN_FRAC * len(ids_w):
-                    cache[ref] = f'W tren tap chung: {len(ok)}/{len(ids_w)} khung qua cong'
-                else:
-                    m = np.array([np.mean([wd[f][0] for f in ok]), np.mean([wd[f][1] for f in ok]),
-                                  circ_mean([wd[f][2] for f in ok])])
-                    cache[ref] = (m, len(ok))
-            except KCError as ex:
-                cache[ref] = f'W tren tap chung: {str(ex)[:150]}'
+                except KCError as ex:
+                    why_w[f] = str(ex)[:120]
+                    fr_.append(dict(t_s=t_of[f], scale=float('nan'), car_seen=True, why=['khop']))
+                    ch_.append(dict(tag_x=float('nan'), tag_y=float('nan'), tag_psi=float('nan')))
+            okm = td.mot_phia(fr_, ch_, gates, t_ref) if fr_ else np.zeros(0, bool)
+            ok = [f for f, o in zip(w_ctx, okm) if o and f in set(ids_w) and t_of[f] + dt < t_ref]
+            nominal = kt['w_s'] / dt if dt > 0 else float('inf')
+            if len(ok) < kt['n_min'] or len(ok) < kt['frac_min'] * nominal:
+                cache[ref] = (f'W tren tap chung: {len(ok)}/{len(ids_w)} khung qua cong mot phia '
+                              f'(n_min {kt["n_min"]}, frac_min {kt["frac_min"]})')
+            else:
+                m = np.array([np.mean([wd[f][0] for f in ok]), np.mean([wd[f][1] for f in ok]),
+                              circ_mean([wd[f][2] for f in ok])])
+                cache[ref] = 'W: goc khong xac dinh nhanh (trung_binh_go_vong)' if not np.all(np.isfinite(m)) \
+                    else (m, len(ok), sorted(why_w))
         m = cache[ref]
         if isinstance(m, str):
             bad[t] = m
@@ -3164,9 +3231,10 @@ def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms
         if f_a is None or ang > best_a:
             best_a, f_a = ang, t
     info = dict(n_khung=len(run), n_khung_hop_le=n_ok, n_khung_sau_W=n_sau, n_khung_khong_hop_le=len(bad),
-                khong_hop_le=[dict(khung=k, ly_do=v) for k, v in sorted(bad.items())],
+                khong_hop_le=[dict(khung=k, ly_do=v) for k, v in sorted(bad.items())], n_khung_lan_can=len(ctx),
                 n_tap_chung=len(cache), tap_W=sorted(W), lech_phat_lai_max_m=rep_dev,
-                W_qua_cong={','.join(map(str, k)): (v if isinstance(v, str) else v[1]) for k, v in cache.items()},
+                W_qua_cong={','.join(map(str, k)): (v if isinstance(v, str) else dict(n=v[1], loi_khung=v[2]))
+                            for k, v in cache.items()},
                 doi_tap=any(set(anchors(t)) != W for t in e_t))
     if not n_sau:                                   # KCP4-2: nothing replayed after the reference window
         return dict(info=info), f'khong khung nao sau W phat lai duoc ({len(bad)} khung khong hop le)'
@@ -3300,7 +3368,8 @@ def neo_luot(a):
                         raise KCError(f'{lid}: track.json without the gates {GATE_KEYS}')
                     gates = cm.check_gates({k: g_tr[k] for k in GATE_KEYS})
                     fp_ = FramePoses(s, pc)
-                    res, w3 = neo_run(fp_, rows, dets, ids['pre'], ids['post'], *cfg, gates, float(s['rms_px_H']))
+                    res, w3 = neo_run(fp_, rows, dets, ids['pre'], ids['post'], *cfg, gates, float(s['rms_px_H']),
+                                      t_ref=pre.get('t_canh_s'), kt=pre.get('nguong'))
                     if w3:
                         why.append(w3)
                         rec['info'] = (res or {}).get('info')
@@ -3343,16 +3412,18 @@ def neo_luot(a):
                           cua_so_nguon=dict(duong_dan=os.path.abspath(mp), sha256=man_sha)),
                loai='chi so thuc nghiem truoc le (S7-13 KS7B-3, S7-14.5): max tren moi khung hop le cua luot '
                     '|lech phat lai khung t - trung binh lech phat lai tren W (pre)|',
-               W_MIN_FRAC=W_MIN_FRAC,
                gioi_han=['phat lai tap neo that tung khung (frames.csv moc_dung) tren khung that (dets.npz) qua chuoi '
                          'cham, so voi tap tham chieu R_t = (neo chung moi khung W) giao S_t (doi chung dinh nghia o '
                          'neo_run); chi thay phan do doi tap neo, khong thay sai chung cua ca tap',
                          'khung luot: hop le trong frames.csv, co tu the ma, tu khung W dau toi khung post cuoi; chuoi '
-                         'doi chung qua cung cong cua track (min_marks, rms, hinh ma, ti le lan can; apply_gates); khung '
-                         'truot cong hay phat lai khong duoc thi khong hop le, ghi ID va ly do; R_t dung duoc khi >= '
-                         'W_MIN_FRAC khung W qua cong tren no [DE XUAT]',
-                         'P_neo la hieu tam ma tho, chua qua A6 / q; phan quay q do C8B cong ((|q|+dq)*A_neo vao '
-                         'hang_m, CODE 23/11, KCP4-5)',
+                         'doi chung gom ca lan can cong ti le cua track (khung chi truot (2b), +- scale_win_s), gio tu '
+                         'dets.npz, qua cung cong cua track (apply_gates); khung truot cong hay phat lai khong duoc thi '
+                         'khong hop le, ghi ID va ly do (KCP4V2-1)',
+                         'W tren R_t: cong ti le MOT PHIA cua CAM (c7_tuong_doi.mot_phia, nhu F2 pre), loi theo khung; '
+                         'du n_min va frac_min cua nguong F2; quy tac ho t_trong va dung yen cua tham_chieu khong ap lai '
+                         '(KCP4V2-2)',
+                         'P_neo la hieu tam ma tho (tag_x, tag_y; tag_psi), chua qua A6 / q; phan quay q do C8B cong '
+                         '((|q|+dq)*A_neo vao hang_m, CODE 23/11, KCP4-5, KCP4V2-10)',
                          'dem trung mot phan voi P7 / A5 (lech khung theo thoi gian): phia than trong (CODE 23/11)',
                          'info.hai_dau: so hai dau post - pre nhu e_hieu (iii), chi de doi chieu'],
                commit_hil=commit_hil())
