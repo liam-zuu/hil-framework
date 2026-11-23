@@ -1010,8 +1010,11 @@ def p1_rel_clip(clip, pc, marks, regions, tag, kappa, plumb, l_max=L_MAX_M, phis
                     continue
                 # KCP4V3-1: whether the pair belongs to the (i) maximum (both marks of the region, L <= l_max) is
                 # known from the tape before any fit, so a failing pair of (i) is recorded as such
-                L0 = float(np.linalg.norm(np.array(marks[j][:2]) - np.array(marks[s][:2])))
-                tv0 = j in reg['moc'] and L0 <= l_max
+                if s in marks and j in marks:           # KCP4V4-6: a clip without the mark keeps the pair as broken
+                    L0 = float(np.linalg.norm(np.array(marks[j][:2]) - np.array(marks[s][:2])))
+                    tv0 = j in reg['moc'] and L0 <= l_max
+                else:
+                    L0, tv0 = None, j in reg['moc']      # length unknown: counted in the region (conservative)
                 try:                                        # KS7-7, KCJ1-13: the WHOLE pair, listed when it fails
                     cam = pc((s, j))
                     xs, xj = np.array(marks[s][:2]), np.array(marks[j][:2])
@@ -2918,8 +2921,8 @@ def e_hieu(a):
     # KCP4V3-1: a failing pair of the (i) maximum: (i) is an observed maximum over a partial set, not dat. Results
     # written before trong_vung_hong existed: any failing P1 pair of the region with both marks in it counts
     # (its length is not recorded there, so the pair may lie outside L_MAX_M: conservative)
-    if 'trong_vung_hong' in tv:
-        hong_i = list(tv.get('trong_vung_hong') or [])
+    if isinstance(tv.get('trong_vung_hong'), list):                    # KCP4V4-5: null / not a list -> the
+        hong_i = list(tv['trong_vung_hong'])                             # conservative path from cap_hong
     else:
         mv = set(tv.get('moc_vung') or [])
         hong_i = [h for h in ((kc.get('P1_tuong_doi') or {}).get('cap_hong') or [])
@@ -3127,11 +3130,12 @@ def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms
     the TRACK let into its scale neighbours (car seen, tag in dets, frames.csv why only (2b) or none) within
     scale_win_s of the run is replayed on its R_t, times from dets.npz (checked increasing), and the chain goes through
     c7_measure.apply_gates with the gates of the track; a run frame failing is left out and counted with the reason.
-    W on R_t (KCP4V2-2): the frames of [t_ref - w_s - 1 s, t_ref) the track let in are replayed on R_t, failures per
-    frame, and gated by the ONE-SIDED scale gate of CAM (c7_tuong_doi.mot_phia, as F2 'pre'); the W frames passing
-    must meet n_min and frac_min of the F2 thresholds kt over [t_ref - w_s, t_ref) (c7_tuong_doi._samples rules
-    without the hole rule), else R_t is not usable. KCP4-2: at least one valid replayed frame AFTER the last W frame.
-    Returns (dict, reason)."""
+    W on R_t (KCP4V2-2, KCP4V3-2, KCP4V3-3, KCP4V4-3): the frames of [t_ref - W_S - 1 s, t_ref) (frames.csv times,
+    those of F2) the track let in are replayed on R_t, failures per frame, gated by the ONE-SIDED scale gate of CAM
+    (c7_tuong_doi.mot_phia); R_t is usable only when EVERY W id of F2 replays, passes and the replayed W is still
+    (c7_tuong_doi._stillness, F2 thresholds). The caller requires the F2 pre conclusion du_mau and dat (KCP4V4-1).
+    A valid frame whose R_t is not usable makes the run not concluded (KCP4V4-2, diagnostic max kept). KCP4-2: at
+    least one valid replayed frame AFTER the last W frame. Returns (dict, reason)."""
     import c7_tuong_doi as td                      # CAM: one-sided gate of the reference window
     if not ids_w or not ids_post:
         return None, 'cua so khong co khung'
@@ -3140,8 +3144,12 @@ def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms
             return None, f'khung {f} cua cua so khong co trong frames.csv'
     if not (isinstance(t_ref, (int, float)) and not isinstance(t_ref, bool) and math.isfinite(t_ref)):
         raise KCError(f'neo: F2 pre t_canh_s {t_ref!r} is not a finite number')
+    if not isinstance(kt, dict):                                         # KCP4V4-4
+        raise KCError(f'neo: F2 pre nguong {kt!r} is not an object')
+    if kt.get('w_s') != td.W_S:                                          # KCP4V4-4: check_khung_tc of CAM: w_s = W_S
+        raise KCError(f'neo: F2 pre nguong.w_s {kt.get("w_s")!r} is not the reference window {td.W_S} s')
     for k in ('w_s', 'p_dung_m', 'psi_dung_deg', 'dau_cuoi_s'):          # KCP4V3-5: the ranges of CAM
-        v, (lo_, hi_) = (kt or {}).get(k), td.KTC_RANGES[k]
+        v, (lo_, hi_) = kt.get(k), td.KTC_RANGES[k]
         if not (isinstance(v, (int, float)) and not isinstance(v, bool) and lo_ <= v <= hi_):
             raise KCError(f'neo: F2 pre nguong.{k} {v!r} outside {td.KTC_RANGES[k]}')
     S = {}
@@ -3215,10 +3223,22 @@ def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms
         if not r['valid'] and r['idx'] in e_t:
             bad[r['idx']] = 'cong: ' + ','.join(r['why'])
             e_t.pop(r['idx'], None)
-    a_w = t_ref - kt['w_s']
-    w_ctx = [f for f in order if a_w - W_PRE_SPAN_S - 1e-12 <= t_of[f] < t_ref and eligible(f)]
+    # KCP4V4-3: the one-sided span and the stillness of W in the TIMES OF F2 (frames.csv t_s, the times c7_tuong_doi
+    # used to choose W); the dets times stay for the two-sided (2b) chain of the track
+    t_csv = {}
+    for f in order:
+        try:
+            t_csv[f] = float(rows[f]['t_s']) if f in rows else float('nan')
+        except (TypeError, ValueError, KeyError):
+            t_csv[f] = float('nan')
+    a_w = t_ref - td.W_S
+    w_ctx = [f for f in order if math.isfinite(t_csv[f]) and a_w - W_PRE_SPAN_S - 1e-12 <= t_csv[f] < t_ref
+             and eligible(f)]
+    if any(not math.isfinite(t_csv.get(f, float('nan'))) for f in ids_w):
+        raise KCError('neo: a W frame without a finite frames.csv t_s (KCP4V4-3)')
     W_ids = set(ids_w)
     best_p, best_a, f_p, f_a, n_ok, n_sau = 0.0, 0.0, None, None, 0, 0
+    mat_w = []                                      # KCP4V4-2: frames that passed the chain gates but lost W on R_t
     for t in sorted(e_t):
         ref, et = e_t[t]
         if ref not in cache:
@@ -3232,12 +3252,12 @@ def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms
                 try:
                     pS, pR, rmsR = replay(f, list(ref))
                     gr = _gate_row(f, t_of[f], pR, len(ref), rmsR)
-                    fr_.append(dict(t_s=t_of[f], scale=pR['scale'], car_seen=True, why=_gate12(gr, gates, rms_h)))
+                    fr_.append(dict(t_s=t_csv[f], scale=pR['scale'], car_seen=True, why=_gate12(gr, gates, rms_h)))
                     ch_.append(dict(tag_x=pR['tag_x'], tag_y=pR['tag_y'], tag_psi=pR['tag_psi']))
                     wd[f] = dev(pS, pR)
                 except KCError as ex:
                     loi.append(dict(khung=f, ly_do=str(ex)[:120]))
-                    fr_.append(dict(t_s=t_of[f], scale=float('nan'), car_seen=True, why=['khop']))
+                    fr_.append(dict(t_s=t_csv[f], scale=float('nan'), car_seen=True, why=['khop']))
                     ch_.append(dict(tag_x=float('nan'), tag_y=float('nan'), tag_psi=float('nan')))
             okm = td.mot_phia(fr_, ch_, gates, t_ref) if fr_ else np.zeros(0, bool)
             passed = {f for f, o in zip(w_ctx, okm) if o}
@@ -3248,7 +3268,7 @@ def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms
                               f'cong mot phia (dau {miss[:5]})', rec_w)
             else:
                 ok = sorted(W_ids)
-                still, num = td._stillness(np.array([t_of[f] for f in ok]),
+                still, num = td._stillness(np.array([t_csv[f] for f in ok]),
                                            np.array([ch_[w_ctx.index(f)]['tag_x'] for f in ok]),
                                            np.array([ch_[w_ctx.index(f)]['tag_y'] for f in ok]),
                                            np.array([ch_[w_ctx.index(f)]['tag_psi'] for f in ok]), kt)
@@ -3264,6 +3284,7 @@ def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms
         m, _rec = cache[ref]
         if isinstance(m, str):
             bad[t] = m
+            mat_w.append(t)
             continue
         dd = et - m
         p, ang = float(math.hypot(dd[0], dd[1])), abs(float(cm.cp_wrap(dd[2])))
@@ -3279,6 +3300,11 @@ def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms
                 W_qua_cong={','.join(map(str, k)): dict(v[1], ly_do=v[0] if isinstance(v[0], str) else None)
                             for k, v in cache.items()},
                 doi_tap=any(set(anchors(t)) != W for t in e_t))
+    if mat_w:                                       # KCP4V4-2: a valid frame without its W reference: the maximum may
+        info.update(P_neo_m_chan_doan=best_p if f_p is not None else None,       # be among them (diagnostic only)
+                    A_neo_rad_chan_doan=best_a if f_a is not None else None, khung_mat_W=mat_w[:50])
+        return dict(info=info), (f'{len(mat_w)} khung qua cong chuoi doi chung mat doi chung W tren R_t '
+                                 f'(dau {mat_w[:5]}): cuc dai khong bao het khung hop le')
     if not n_sau:                                   # KCP4-2: nothing replayed after the reference window
         return dict(info=info), f'khong khung nao sau W phat lai duoc ({len(bad)} khung khong hop le)'
     info.update(khung_max_P=f_p, khung_max_A=f_a)
@@ -3385,6 +3411,11 @@ def neo_luot(a):
                 why.append(f'cua so khong co khung ma hop le: {[k for k, v in ids.items() if v is None]}')
             elif not max(ids['pre']) < min(ids['post']):
                 why.append('pre khong ket thuc truoc post')
+            elif not (isinstance(pre.get('ket_luan'), dict) and pre['ket_luan'].get('du_mau') is True
+                      and pre['ket_luan'].get('dat') is True):                   # KCP4V4-1: W of F2 usable
+                kl = pre.get('ket_luan') if isinstance(pre.get('ket_luan'), dict) else {}
+                why.append(f"F2 pre khong dat (du_mau {kl.get('du_mau')!r}, dat {kl.get('dat')!r}): "
+                           f"{kl.get('ly_do')}")
             elif fs not in tracks:
                 why.append('khong co --track co frames.csv cua cua so')
             elif pre.get('session_sha256') not in sessions:

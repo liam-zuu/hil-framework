@@ -2678,7 +2678,8 @@ def _neo_files(tmp_path, scene, drop_b=(), tape_off=None, windows=('pre', 'post'
     lines = [json.dumps(dict(schema='cua_so_v1', luot_id=lid, cho='goc', loai=w, clip_sha256='b' * 64,
                              session_sha256=src['session']['sha256'], frames_sha256=src['frames']['sha256'],
                              khung=[dict(id=k, pts_s=k / 60) for k in ids[w]],
-                             khung_ma_hop_le=list(ids[w]), t_canh_s=t_canh, nguong=NEO_KT))
+                             khung_ma_hop_le=list(ids[w]), t_canh_s=t_canh, nguong=NEO_KT,
+                             ket_luan=dict(du_mau=True, dat=True, ly_do=[])))
              for w in windows]                         # ints, as c7_score writes; the F2 edge time and thresholds
     csp = tmp_path / 'cua_so_v1.jsonl'
     csp.write_text('\n'.join(lines) + '\n', encoding='utf-8')
@@ -2928,14 +2929,15 @@ def test_neo_luot_w_not_still_on_r_t_is_not_usable(tmp_path, scene, monkeypatch)
 
 def test_neo_luot_refuses_bad_f2_thresholds(tmp_path, scene):
     """KCP4V3-5: t_canh_s not a finite number, or w_s outside the CAM ranges: code 2."""
-    for key, val in (('t_canh_s', '26'), ('nguong', dict(NEO_KT, w_s=0.1))):
+    for key, val in (('t_canh_s', '26'), ('nguong', dict(NEO_KT, w_s=0.1)), ('nguong', dict(NEO_KT, w_s=2.0)),
+                     ('nguong', [3])):                                   # KCP4V4-4: w_s = W_S, an object
         csp, sp, *_ = _neo_files(tmp_path, scene)
         _neo_rewrite(csp, lambda x, k=key, v=val: dict(x, **{k: v}))
         rc, o = _neo_run(tmp_path, csp, sp)
         assert rc == 2 and o is None
 
 
-@pytest.mark.parametrize('case', ['moi', 'cu_trong', 'cu_ngoai'])
+@pytest.mark.parametrize('case', ['moi', 'cu_trong', 'cu_ngoai', 'null_trong'])
 def test_e_hieu_failing_pair_of_i_is_not_dat(tmp_path, scene, case):
     """KCP4V3-1: a failing pair of the (i) maximum (trong_vung_hong, or for results written before it a failing P1
     pair of the region with both marks in it) makes the leg chan_doan; a failing pair with a mark outside the region
@@ -2946,6 +2948,9 @@ def test_e_hieu_failing_pair_of_i_is_not_dat(tmp_path, scene, case):
     tv['moc_vung'] = [25, 26, 27, 28]
     if case == 'moi':
         tv['trong_vung_hong'] = [dict(clip='H_a', s=25, j=26)]
+    elif case == 'null_trong':                    # KCP4V4-5: null is not an empty list: the cap_hong path decides
+        tv['trong_vung_hong'] = None
+        k['P1_tuong_doi']['cap_hong'] = [dict(clip='H_a', vung='goc', s=25, j=26, trong_vung=True, ly_do='x')]
     else:
         k['P1_tuong_doi']['cap_hong'] = [dict(clip='H_a', vung='goc', s=25, j=26 if case == 'cu_trong' else 9,
                                               ly_do='x')]
@@ -2965,6 +2970,47 @@ def test_circ_mean_branch_at_pi_is_the_cam_one():
     a = [0.0, 0.0, math.pi]
     assert kc.circ_mean(a) == pytest.approx(ck.trung_binh_go_vong(a), abs=1e-12)
     assert kc.circ_mean(a) == pytest.approx(math.radians(60.0), abs=1e-9)
+
+
+def test_neo_luot_f2_pre_not_concluded_is_not_used(tmp_path, scene):
+    """KCP4V4-1: F2 says its pre window lacks samples (ket_luan du_mau false): the run is not concluded even though
+    every W id replays."""
+    csp, sp, *_ = _neo_files(tmp_path, scene)
+    _neo_rewrite(csp, lambda x: dict(x, ket_luan=dict(du_mau=False, dat=False, ly_do=['90 khung < n_min 120'])))
+    rc, o = _neo_run(tmp_path, csp, sp)
+    r = o['luot']['C8-P-F02-1']
+    assert rc == 0 and r['trang_thai'] == 'chua_ket_luan' and r['ly_do'][0].startswith('F2 pre khong dat')
+
+
+def test_neo_luot_lost_w_of_the_peak_frame_is_not_concluded(tmp_path, scene, monkeypatch):
+    """KCP4V4-2: the peak frame 5 (R_5 = W without 25) loses its W reference (W frame 2 fails on that R_t only); the
+    other frames (R = W) still give 0 after W: the run must not be dat at 0, it is not concluded with the
+    diagnostic maximum kept."""
+    csp, sp, *_ = _neo_files(tmp_path, scene, tape_off=(25, 0.003), tag_more={5: (0.05, 0.02)}, drop_more={5: (25,)})
+    real = kc.FramePoses.full_rms
+
+    def fake(self, anchors, d, what=''):
+        if what.startswith('khung 2 ') and 25 not in anchors:
+            raise kc.KCError('khung 2: thu loi khop tren R_5')
+        return real(self, anchors, d, what)
+    monkeypatch.setattr(kc.FramePoses, 'full_rms', fake)
+    rc, o = _neo_run(tmp_path, csp, sp)
+    r = o['luot']['C8-P-F02-1']
+    assert rc == 0 and r['trang_thai'] == 'chua_ket_luan' and 'mat doi chung W' in r['ly_do'][0]
+    assert r['info']['khung_mat_W'] == [5] and r['info']['P_neo_m_chan_doan'] == 0.0
+
+
+def test_p1_rel_clip_region_mark_missing_from_the_clip(scene):
+    """KCP4V4-6: a region mark absent from the clip marks (a trial clip H_b with fewer marks) gives broken pairs, no
+    KeyError; their in-region flag is conservative (length unknown)."""
+    marks, cam, img = scene
+    mk = {i: m for i, m in marks.items() if i != 25}
+    pc = kc.PairCams(img, marks, 'B1', W, H, ZC)
+    rows, pairs, hong = kc.p1_rel_clip('H_b', pc, mk, {'goc': dict(moc=[25, 26])}, (0.1445, 0.119), 0.04,
+                                       np.array(F15_C), l_max=1.05, phis=(0.0,))
+    h25 = [h for h in hong if 25 in (h['s'], h['j'])]
+    assert h25 and all(h['L_m'] is None or h['s'] != 25 for h in h25)
+    assert any(h['s'] == 25 and h['j'] == 26 and h['trong_vung'] is True for h in h25)
 
 
 def test_circ_mean_across_pi():
