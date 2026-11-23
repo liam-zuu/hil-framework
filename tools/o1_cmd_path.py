@@ -44,7 +44,8 @@ Anchors (O1 3.5): received data lines sorted by log_seq.
             after t_w1. run_active falls and rises again before the end anchor: no evidence.
   (3)       start anchor: last line with t + L <= t_w0 in the same motor-on stretch; end anchor:
             first line at or after t_w1; a line b is used as a LATER anchor only when the line
-            b+1 (next log_seq, motor on) exists: L = t_(b+1) - t_b.
+            b+1 (next log_seq, motor on) exists: L = t_(b+1) - t_b. A start anchor age >= TRAJ_TIMEOUT_MS
+            is the last packet of the run before, read as -1 (Liam 23/11 CODE_CAM local_f3c5357d).
   (2), (4): the value of a run is the largest of the deviation ON the anchor lines and of the pair
   bound below over the pairs that HIDE ticks (a lost line, or a tick difference other than 1):
   every control tick pushes one data line (tick + 1 on every consecutive pair, 1030/1030 on
@@ -671,7 +672,7 @@ def analyse(rows, task, events=(), has_age_col=True, sched=None, bao_s=None, sen
         else:
             chain = [start] + [r for r in mo_rows
                                if start['_seq'] < r['_seq'] <= fin['_seq'] and L_of(r) is not None]
-            worst, at, neg = -math.inf, None, 0
+            worst, at, neg, stale = -math.inf, None, 0, None
             for pa, pb in zip(chain[:-1], chain[1:]):
                 age = pa['_age']
                 if age is None:                 # empty cell: no evidence for this pair (CP1-2)
@@ -681,11 +682,20 @@ def analyse(rows, task, events=(), has_age_col=True, sched=None, bao_s=None, sen
                 if age < 0:                     # -1: no packet since boot; any later packet came after t_a
                     neg += 1
                     age = 0
+                elif pa is start and age >= TRAJ_TIMEOUT_MS:
+                    # Liam 23/11 CODE_CAM local_f3c5357d, box "Dieu (3)": "Sua (Recommended)". The start anchor is
+                    # before the window; an age from TRAJ_TIMEOUT_MS is the last packet of the RUN BEFORE (no
+                    # schedule packet runs that old: the firmware stops at 200 ms), not of this schedule ("from
+                    # the first packet", O1 3.5 (3)): as -1, any packet of the schedule came after t_a, so the pair
+                    # bound counts from t_a, before the first packet (an upper bound). C8 session 2: 8/17 runs.
+                    stale = age
+                    age = 0
                 b3 = age + 1.0 + (pb['_t'] - pa['_t']) / 1e3 + L_of(pb) / 1e3
                 if b3 > worst:
                     worst, at = b3, [pa['_seq'], pb['_seq']]
             res['cond3'] = dict(value_ms=worst if at else None, at_seq=at, start_anchor_seq=start['_seq'],
-                                end_anchor_seq=fin['_seq'], n_pairs=len(chain) - 1, age_minus1_as_0=neg)
+                                end_anchor_seq=fin['_seq'], n_pairs=len(chain) - 1, age_minus1_as_0=neg,
+                                start_age_run_before_ms=stale)
     res['decided'] = True
     return res
 

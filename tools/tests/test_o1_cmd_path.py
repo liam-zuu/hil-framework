@@ -437,6 +437,25 @@ def test_CP2_3_negative_age_on_a_run_active_line_is_a_flag(tmp_path):
     assert any(f.startswith('ra_age_negative') for f in res['flags'])
 
 
+def test_start_anchor_age_of_the_run_before_reads_as_no_packet(tmp_path):
+    """Liam 23/11 CODE_CAM local_f3c5357d ("Sua (Recommended)"; C8 session 2, 8/17 runs: e.g. C8-L-F05-2 log_seq 22886
+    traj_age_ms 94110 before the edge, 9 at the edge): a pre-edge age from TRAJ_TIMEOUT_MS on is the last packet of the
+    previous run, not of the schedule; (3) counts as with -1. A fresher start anchor age stays a number."""
+    rows = make_log()
+    for d in 'abc':
+        (tmp_path / d).mkdir()
+    base = run(tmp_path / 'a', rows)['cond3']
+    assert base['age_minus1_as_0'] == 1 and base['start_age_run_before_ms'] is None
+    old = [dict(r, traj_age_ms=94000 + i) if r['traj_age_ms'] == -1 else r for i, r in enumerate(rows)]
+    c3 = run(tmp_path / 'b', old)['cond3']
+    assert c3['value_ms'] == pytest.approx(base['value_ms']) and c3['value_ms'] < 100
+    assert c3['start_age_run_before_ms'] >= cp.TRAJ_TIMEOUT_MS and c3['age_minus1_as_0'] == 0
+    assert c3['at_seq'] == base['at_seq']
+    young = [dict(r, traj_age_ms=cp.TRAJ_TIMEOUT_MS - 1) if r['traj_age_ms'] == -1 else r for r in rows]
+    c3y = run(tmp_path / 'c', young)['cond3']
+    assert c3y['start_age_run_before_ms'] is None and c3y['value_ms'] > cp.TRAJ_TIMEOUT_MS - 1
+
+
 def test_CP2_4_empty_age_before_the_edge(tmp_path):
     rows = make_log()
     edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
