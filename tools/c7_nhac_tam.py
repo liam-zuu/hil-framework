@@ -885,6 +885,12 @@ LOAI_CHUAN, LOAI_DICH = 'ref_12b', 'pre'                       # standard window
 LOAI_12B = ('ref_12b', 'dung_12b')
 LL_DEFAULTS = dict(
     min_marks=8, rms_extra_px=0.5, corr_min=0.9, peak2_ratio=0.9, search_px=60,
+    neo_cach='mau',          # v4 3 / 12f (Liam 23/11): 'mau' template of the boxes, >= 3 anchors; 'tam_trang' centroid
+                             #   of the white tape on the dark body, anchors A and B only (no template look, any heading)
+    tam_r_px=30,             # tam_trang: half side of the search crop around the predicted centre
+    tam_lech_px=15,          # tam_trang: largest blob-centre distance from the prediction (prediction <= 2 px, 12f)
+    tam_dt_ti=(0.6, 1.6),    # tam_trang: blob area / area on the template frame [DE XUAT; camera distance over the
+                             #   floor 2.6-3.05 m gives 0.73-1.37]
     still_neo_m=0.0005,      # v4 3: 95th percentile of the anchor deviation in a window
     min_khung=120,           # v4 3: >= 120 frames (3 s) ...
     min_frac=0.6,            #       ... and >= 60 % of the window
@@ -1100,14 +1106,29 @@ def r_max_tu(bang, cfg):
     return r, math.degrees(r * k)
 
 
+def r_max_hai_neo(G, cfg):
+    """12f (Liam 23/11): two tapes A, B. With two points the pose takes the whole 2-D shift of a tape across A-B, so
+    the residual sees only the change of the A-B length (one tape moved d along A-B -> residual d / 2 at each anchor).
+    The tapes are fixed (paper tape under a clear tape layer, Liam 23/11), so no angle term eps_neo is carried; the
+    gate confirms it with the same locked budget: a move d with d / L_AB = tan(eps_tong_deg / 2) along A-B fails it,
+    r_max = L_AB tan(eps_tong_deg / 2) / 2."""
+    L = float(np.linalg.norm(np.asarray(G, float)[1] - np.asarray(G, float)[0]))
+    return L * math.tan(math.radians(cfg['eps_tong_deg'] / 2.0)) / 2.0
+
+
 def eps_goc(bang, r_max):
-    """eps_neo (deg) of one end with its own geometry and the locked r_max."""
+    """eps_neo (deg) of one end with its own geometry and the locked r_max (two fixed tapes, 12f: 0)."""
+    if len(bang) == 2:
+        return 0.0
     return math.degrees(r_max * k_goc(bang))
 
 
 def eps_vi_tri(bang, r_max, c_B):
     """LL5-4: largest error of R(-alpha)(t - o) for a tag point at c_B (body frame) from one anchor displaced with
-    residual <= r_max (origin and angle through the lever arm), one end, continuous over the direction (LLC1-11)."""
+    residual <= r_max (origin and angle through the lever arm), one end, continuous over the direction (LLC1-11).
+    Two fixed tapes (12f): 0."""
+    if len(bang) == 2:
+        return 0.0
     Jc = np.array([[0.0, 1.0], [-1.0, 0.0]]) @ np.asarray(c_B, float)    # d/dalpha of R(-alpha) x at alpha = 0
 
     def num(U, b):
@@ -1285,18 +1306,67 @@ def kiem_r_neo(neo, kiem_files, mau_clip, mau_idx):
     return {n: all(tuple(b) in passed for b in bs) for n, bs in neo.items()}, ev
 
 
+def tam_bang_dinh(gray, uc, vc, S0, cfg):
+    """v4 12f (Liam 23/11): centre of the white tape near the predicted (uc, vc): Otsu threshold of the crop of half
+    side tam_r_px, the bright connected blob nearest to the centre (<= tam_lech_px), not touching the crop border,
+    area within tam_dt_ti x S0 (S0 None: any area >= 30 px); centre weighted by the grey level over the blob (the tape
+    pattern is fixed on the tape, so the centre is the same physical point at any heading). Returns (u, v, area) or
+    (NaN, NaN, 0)."""
+    r = int(cfg['tam_r_px'])
+    u0, v0 = int(round(uc)) - r, int(round(vc)) - r
+    if not (math.isfinite(uc) and math.isfinite(vc)) or u0 < 0 or v0 < 0 or u0 + 2 * r > gray.shape[1] \
+            or v0 + 2 * r > gray.shape[0]:
+        return NAN, NAN, 0
+    c = gray[v0:v0 + 2 * r, u0:u0 + 2 * r]
+    if float(c.std()) < 2.0:
+        return NAN, NAN, 0
+    _, bw = cv2.threshold(c, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    n, lab, st, cen = cv2.connectedComponentsWithStats(bw)
+    lo, hi = (30, math.inf) if S0 is None else (cfg['tam_dt_ti'][0] * S0, cfg['tam_dt_ti'][1] * S0)
+    best = None
+    for i in range(1, n):
+        x, y, w, hh, S = st[i]
+        if x == 0 or y == 0 or x + w >= 2 * r or y + hh >= 2 * r or not lo <= S <= hi:
+            continue
+        d = math.hypot(cen[i][0] - (uc - u0), cen[i][1] - (vc - v0))
+        if d <= cfg['tam_lech_px'] and (best is None or d < best[0]):
+            best = (d, i)
+    if best is None:
+        return NAN, NAN, 0
+    # weight = grey level above the local body level, over the blob grown by 2 px: an edge pixel counts by the part of
+    # it the tape covers (no threshold cut at the edge); the body level is the median of the ring 3-5 px outside
+    blob = (lab == best[1]).astype(np.uint8)
+    k3 = np.ones((3, 3), np.uint8)
+    m2 = cv2.dilate(blob, k3, iterations=2).astype(bool)
+    ring = cv2.dilate(blob, k3, iterations=5).astype(bool) & ~cv2.dilate(blob, k3, iterations=3).astype(bool)
+    if not ring.any():
+        return NAN, NAN, 0
+    w = np.where(m2, np.clip(c.astype(np.float64) - float(np.median(c[ring])), 0.0, None), 0.0)
+    if w.sum() <= 0:
+        return NAN, NAN, 0
+    ys, xs = np.mgrid[0:2 * r, 0:2 * r]
+    return u0 + float((w * xs).sum() / w.sum()), v0 + float((w * ys).sum() / w.sum()), int(st[best[1], 4])
+
+
 class NeoMau:
     """Anchor templates on one frame (v4 3): per box, the lifted floor point in the TAG frame of that frame (to predict
-    where the box is in another window from the tag pose) and a patch wide enough to be turned."""
+    where the box is in another window from the tag pose) and a patch wide enough to be turned. neo_cach 'tam_trang'
+    (12f): the point is the white-tape centre found on the template frame inside the box, with its area S0."""
 
     def __init__(self, gray, cam, tag, neo, kappa_n, C, cfg):
         self.neo, self.kappa_n, self.C, self.cfg = neo, kappa_n, np.asarray(C, float), cfg
         self.t0, self.psi0 = np.array([tag['tag_x'], tag['tag_y']]), tag['tag_psi']
         self.img_ang0 = self._img_ang(cam, self.t0, self.psi0)
         self.items = []
+        tam = cfg.get('neo_cach', 'mau') == 'tam_trang'
         for name, boxes in neo.items():
             for (u, v, w, hh) in boxes:
                 uc, vc = u + (w - 1) / 2.0, v + (hh - 1) / 2.0
+                S0 = None
+                if tam:
+                    uc, vc, S0 = tam_bang_dinh(gray, uc, vc, None, cfg)
+                    if not math.isfinite(uc):
+                        raise ValueError(f'anchor box {(u, v, w, hh)}: no white tape on the template frame')
                 Ph = lift(cam.pix2floor(np.array([[uc, vc]]), 0.0)[0], kappa_n, self.C)
                 d = rot2(-self.psi0) @ (Ph - self.t0)
                 r = int(math.ceil(math.hypot(w, hh) / 2.0)) + 3
@@ -1305,7 +1375,7 @@ class NeoMau:
                     raise ValueError(f'anchor box {(u, v, w, hh)}: too close to the template frame edge')
                 patch = gray[v_lo:v_lo + 2 * r + 2, u_lo:u_lo + 2 * r + 2].astype(np.float32)
                 self.items.append(dict(name=name, box=(u, v, w, hh), d=d, patch=patch, pc=(uc - u_lo, vc - v_lo),
-                                       wh=(w, hh)))
+                                       wh=(w, hh), S0=S0))
         self._cache = {}
 
     def _img_ang(self, cam, t, psi):
@@ -1556,7 +1626,10 @@ def do_clip(clip, wins, ctx, mau):
         for i, p in fr:
             want.setdefault(i, []).append((key, p))
     p1, cam = {}, ctx.cam0
+    kmax = max(want) if want else -1                          # 12f: no decoding past the last window frame
     for k, t, g in cm.iter_frames(clip):
+        if k > kmax:
+            break
         if k in want:
             for key, p in want[k]:
                 if abs(t - p) > 1e-3:
@@ -1583,6 +1656,8 @@ def do_clip(clip, wins, ctx, mau):
         why.setdefault(key, []).append('du_doan_tu_cua_so_gan_nhat' if near else 'khong_du_doan_neo')
     out = {key: [] for key, _ in wins}
     for k, t, g in cm.iter_frames(clip):
+        if k > kmax:
+            break
         if k not in want:
             continue
         r1 = p1[k]
@@ -1596,10 +1671,15 @@ def do_clip(clip, wins, ctx, mau):
             if r1['cam_ok'] and pred[key] is not None:
                 uvp, rot = mau.du_doan(r1['cam'], *pred[key])
                 pts, ok = {}, True
+                tam = ctx.cfg.get('neo_cach', 'mau') == 'tam_trang'
                 for j, it in enumerate(mau.items):
-                    u, v, c, q = khop_mau(g, mau.tpl(j, rot), uvp[j, 0], uvp[j, 1], ctx.cfg['search_px'])
-                    if not (math.isfinite(u) and c >= ctx.cfg['corr_min'] and q < ctx.cfg['peak2_ratio']):
-                        ok = False
+                    if tam:                                     # 12f: tape centre, no template
+                        u, v, _ = tam_bang_dinh(g, uvp[j, 0], uvp[j, 1], it['S0'], ctx.cfg)
+                        ok = math.isfinite(u)
+                    else:
+                        u, v, c, q = khop_mau(g, mau.tpl(j, rot), uvp[j, 0], uvp[j, 1], ctx.cfg['search_px'])
+                        ok = bool(math.isfinite(u) and c >= ctx.cfg['corr_min'] and q < ctx.cfg['peak2_ratio'])
+                    if not ok:
                         break
                     P = lift(r1['cam'].pix2floor(np.array([[u, v]]), 0.0)[0], ctx.kappa_n, ctx.C)
                     pts.setdefault(it['name'], []).append(P)
@@ -1850,7 +1930,7 @@ def kiem_f2(rows):
 
 
 # ---------------------------------------------------------------- hieu_chuan (v4 1, 3, 9; F6)
-def _measure(cs_rows, keys, session_path, mau_args, ctx, neo, clip_dir):
+def _measure(cs_rows, keys, session_path, mau_args, ctx, neo, clip_dir, tien_trinh=1):
     """Records of the windows `keys` (indices into cs_rows), clip by clip; each clip with the camera of its session
     (v4 14: ctx a CtxMap; the windows of one clip must name one session)."""
     mau = _mau(mau_args, _mot_ctx(ctx), neo)
@@ -1881,10 +1961,32 @@ def _measure(cs_rows, keys, session_path, mau_args, ctx, neo, clip_dir):
         if len({cs_rows[i][TEN['session_sha']] for i, _ in wins}) != 1:      # v4 14: one clip, one camera session
             raise ValueError(f'{clip}: its windows name several sessions')
         wins.sort(key=lambda kw: min(p for _, p in kw[1]))
-        r, f = do_clip(path, wins, _cx(ctx, cs_rows[wins[0][0]]), mau)
+    jobs = [(clip if os.path.isabs(clip) or clip_dir is None else os.path.join(clip_dir, clip), wins,
+             cs_rows[wins[0][0]]) for clip, wins in by_clip.items()]
+    if tien_trinh > 1 and len(jobs) > 1 and isinstance(ctx, CtxMap):
+        # 12f (Liam 23/11): clips measured at the same time in worker processes; every clip is measured by the same
+        # do_clip on a context rebuilt from the same session file (sha256 checked), so the records are the ones of the
+        # one-process run; they are merged in the same clip order.
+        src = {s['sha256']: s['file'] for s in ctx.src}
+        args = [(path, wins, src[_ses_of(w0)], _cx(ctx, w0).h_n, _cx(ctx, w0).cfg, _ses_of(w0), mau)
+                for path, wins, w0 in jobs]
+        import concurrent.futures as cf
+        with cf.ProcessPoolExecutor(max_workers=min(int(tien_trinh), len(args))) as ex:
+            res = list(ex.map(_do_clip_tien_trinh, args))
+    else:
+        res = [do_clip(path, wins, _cx(ctx, w0), mau) for path, wins, w0 in jobs]
+    for r, f in res:
         recs.update(r)
         flags.update(f)
     return recs, flags, mau
+
+
+def _do_clip_tien_trinh(arg):
+    """Worker of _measure (12f): rebuild the session context from its file (sha256 must match) and run do_clip."""
+    path, wins, ses_file, h_n, cfg, ses_sha, mau = arg
+    if cm.sha256(ses_file) != ses_sha:
+        raise ValueError(f'{ses_file}: session sha256 changed during the run')
+    return do_clip(path, wins, LLCtx(doc_json(ses_file), h_n, cfg), mau)
 
 
 def _mau(mau_args, ctx, neo):
@@ -1967,8 +2069,11 @@ def khoa_hieu_chuan(wsum, ctx, cfg, a6):
     obs = [dict(Ph=s['neo']['Ph'], F=s['neo']['F'], H=s['neo']['H']) for _, s in use]
     fit = khop_hinh(obs, ctx.h_n, ctx.C, ctx.a_n)
     hg = hang(fit, cfg)
-    bangs = [eps_neo_bang(fit['G'], fit['h'], o['F'], o['H'], ctx.C, ctx.a_n) for o in obs]   # LLC1-11: every window
-    r_max, eps1 = r_max_tu(bangs, cfg)
+    if len(fit['G']) == 2:                                   # 12f: two fixed tapes A, B
+        r_max, eps1 = r_max_hai_neo(fit['G'], cfg), 0.0
+    else:
+        bangs = [eps_neo_bang(fit['G'], fit['h'], o['F'], o['H'], ctx.C, ctx.a_n) for o in obs]   # LLC1-11: every window
+        r_max, eps1 = r_max_tu(bangs, cfg)
     du = float(fit['res'].max())
     tt = 'dat'
     if du > r_max:
@@ -2030,14 +2135,19 @@ def khoa_hieu_chuan(wsum, ctx, cfg, a6):
 
 
 def run_hieu_chuan(cua_so_path, session_path, neo_spec, mau, out_dir, a6_path, tam_id, kiem_r=None, h_neo=None,
-                   clip_dir=None, cfg=None, a6_mod=None, _records=None):
+                   clip_dir=None, cfg=None, a6_mod=None, _records=None, tien_trinh=1):
     """v4 1, 3, 9: fit windows only -> hieu_chuan_neo.json, locked (time, sha256) before any held-out window is read.
     mau = (clip, session, idx) of the template frame of the anchor boxes. Returns the exit code (0 dat, 1 written with
     chua_ket_luan, 2 error)."""
     cfg = dict(LL_DEFAULTS, **(cfg or {}))
+    if cfg['neo_cach'] not in ('mau', 'tam_trang'):
+        raise ValueError(f'neo_cach {cfg["neo_cach"]!r}: mau or tam_trang')
     rows = doc_cua_so(cua_so_path)
     kiem_f2(rows)
     neo = parse_neo(neo_spec)
+    hai_neo = cfg['neo_cach'] == 'tam_trang'                 # 12f: exactly the two tapes A, B
+    if hai_neo and set(neo) != {'A', 'B'}:
+        raise ValueError('neo_cach tam_trang: give exactly the anchors A and B (the two tapes, 12f)')
     r_ok, r_ev = kiem_r_neo(neo, kiem_r, mau[0], mau[2])
     neo_dung = {k: v for k, v in neo.items() if r_ok[k]}
     cmap, ses_src = tao_ctx(session_path, lambda s: s['tag_h_m'] if h_neo is None else h_neo, cfg)   # v4 14
@@ -2066,11 +2176,11 @@ def run_hieu_chuan(cua_so_path, session_path, neo_spec, mau, out_dir, a6_path, t
                phep_gop='trung_binh_go_vong', vai_tro=dict(khop=list(LOAI_KHOP), giu_ngoai=list(LOAI_GIU),
                                                              chuan=LOAI_CHUAN, dich=LOAI_DICH),
                gioi_han=GIOI_HAN_V4, nguong=dict(cfg, trang_thai=LL_THRESH_STATUS))
-    if len(neo_dung) < 3 or 'A' not in neo_dung or 'B' not in neo_dung:
+    if len(neo_dung) < (2 if hai_neo else 3) or 'A' not in neo_dung or 'B' not in neo_dung:
         out.update(trang_thai='chua_ket_luan', ly_do=['thieu_neo'])
     else:
         if _records is None:
-            recs, flags, _ = _measure(rows, keys, session_path, mau, cmap, neo_dung, clip_dir)
+            recs, flags, _ = _measure(rows, keys, session_path, mau, cmap, neo_dung, clip_dir, tien_trinh)
         else:
             recs, flags = _records, {}
         wsum = [(rows[i], dict(tom_cua_so(rows[i], recs[i], a6, a6_ok, ctx, cfg), thu_tu=i)) for i in keys]
@@ -2289,7 +2399,7 @@ def beta_cam_replay(f15_path, hc, out_l, luot, hw, fitw, doan, G, h, ctx):
 
 def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, tam_id, truc_xe=None, xoay=None,
                 u_beta_cam_deg=None, clip_dir=None, mau_clip=None, cfg=None, a6_mod=None, _records=None, f15=None,
-                khung_giua_session=None):
+                khung_giua_session=None, tien_trinh=1):
     """v4 0, 3-9, 14: held-out windows -> lan_lap.json (lan_lap_v1). Exit code 0 written / 2 error. session_path: one
     path or a list (v4 14: every session of hieu_chuan_neo.json plus the sessions of the held-out windows)."""
     hc = doc_hieu_chuan(hc_path)
@@ -2389,7 +2499,7 @@ def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, tam_id, tr
         neo = {d['ten']: [tuple(b) for b in d['o_px']] for d in hc['neo'] if d['ten'] in hc['neo_ten']}
         m = hc['mau']
         recs, flags, _ = _measure(rows, keys, session_path, (mau_clip or m['clip'], m['session'], m['idx']), cmap, neo,
-                                  clip_dir)
+                                  clip_dir, tien_trinh)
     else:
         recs, flags = _records, {}
     hw = {}
@@ -2957,6 +3067,9 @@ def main(argv=None):
     a4.add_argument('--tam-id', required=True, help='plate id of the session (CAM) for ap_dung of c8b_a6_v2')
     a4.add_argument('--h-neo', type=float, help='nominal anchor height h_n (default tag_h_m of the session)')
     a4.add_argument('--thu-muc-clip')
+    a4.add_argument('--neo-cach', choices=('mau', 'tam_trang'), default='mau',
+                    help='12f: tam_trang = centre of the white tapes A, B (no template, two anchors)')
+    a4.add_argument('--tien-trinh', type=int, default=1, help='clips measured at the same time (12f)')
     a4.add_argument('--out', required=True)
     a5 = sub.add_parser('lan_lap', help='v4: pre / post of every run -> lan_lap.json (lan_lap_v1)')
     a5.add_argument('--hieu-chuan', required=True)
@@ -2974,18 +3087,20 @@ def main(argv=None):
                     help='c7_khung_giua_session_v1 files of CAM, one per session pair (v4 14)')
     a5.add_argument('--f15', help='c7_meo_dau_chan_bang_v1 of KIEMCHEO (F15 b) -> block beta_cam_replay (v4 13)')
     a5.add_argument('--thu-muc-clip')
+    a5.add_argument('--tien-trinh', type=int, default=1, help='clips measured at the same time (12f)')
     a5.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
         if a.cmd == 'hieu_chuan':
             code = run_hieu_chuan(a.cua_so, a.session, a.neo, (a.mau[0], a.mau[1], int(a.mau[2])), a.out, a.a6,
-                                  a.tam_id, a.kiem_r, a.h_neo, a.thu_muc_clip)
+                                  a.tam_id, a.kiem_r, a.h_neo, a.thu_muc_clip, cfg=dict(neo_cach=a.neo_cach),
+                                  tien_trinh=a.tien_trinh)
             o = doc_json(os.path.join(a.out, 'hieu_chuan_neo.json'))
             print(f'hieu_chuan: {o["trang_thai"]} {", ".join(o.get("ly_do", []))}')
         elif a.cmd == 'lan_lap':
             code = run_lan_lap(a.hieu_chuan, a.cua_so, a.session, a.out, a.a6, a.tam_id, a.truc_xe, a.xoay,
                                a.u_beta_cam_deg, a.thu_muc_clip, a.mau_clip, f15=a.f15,
-                               khung_giua_session=a.khung_giua_session)
+                               khung_giua_session=a.khung_giua_session, tien_trinh=a.tien_trinh)
             o = doc_json(os.path.join(a.out, 'lan_lap.json'))
             for x in o['luot']:
                 print(f'{x["luot_id"]}: beta {x["trang_thai"]["beta"]} {x["beta_deg"]}, delta_c_B '
