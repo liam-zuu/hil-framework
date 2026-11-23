@@ -1259,3 +1259,61 @@ def test_gap_with_a_gyro_gap_still_breaks_without_usable_counts(tmp_path):
         S = U.rv_samples(U.load_log(p), period_s=T0)
         assert math.isfinite(S['t_break']) and S['nhanh_ho'][0]['gay'] and S['nhanh_ho'][0]['nguon'] == src, kw
         assert np.isnan(U.interp_yaw(S, np.array([13.5]))[0])
+
+
+# ── 24/11: a report whose rows all carry a negative age is left out, not refused (CODE order, CODE_C8B) ──
+
+def _neg_age(p, col_n, col_age, count, age='-0.1'):
+    """Rewrite every row of report `count` of col_n with a negative age (the case of run03 C8-P-F08-1_lai1)."""
+    with open(p, newline='', encoding='utf-8') as f:
+        rows = list(csv.DictReader(f))
+    hit = [r for r in rows if r[col_n] == str(count)]
+    assert hit
+    for r in hit:
+        r[col_age] = age
+    with open(p, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=COLS)
+        w.writeheader()
+        w.writerows(rows)
+    return float(hit[0]['timestamp_us']) * 1e-6
+
+
+@pytest.mark.parametrize('col_n,col_age,kind', [('gyro_n', 'age_g_ms', 'gyro'), ('rv_n', 'age_r_ms', 'rv')])
+def test_skip_report_with_only_negative_age(tmp_path, col_n, col_age, kind):
+    p, a, b = _c8_log(tmp_path)
+    L0 = U.load_log(p)
+    S0 = U.rv_samples(L0, period_s=T0)
+    assert S0['bo_report'] == dict(rv=[], gyro=[])                     # clean log: nothing left out
+    t_row = _neg_age(p, col_n, col_age, 200)
+    L = U.load_log(p)
+    with pytest.raises(U.InputError):                                   # the strict call still refuses
+        U.report_rows(L[col_n], L[col_age])
+    S = U.rv_samples(L, period_s=T0)                                    # was refused before 24/11
+    assert S['bo_report'][kind] == [dict(n=200, t_row_s=t_row)]
+    other = 'rv' if kind == 'gyro' else 'gyro'
+    assert S['bo_report'][other] == []
+    if kind == 'gyro':
+        assert len(S['tg']) == len(S0['tg']) - 1 and np.array_equal(S['t_recv'], S0['t_recv'])
+    else:
+        assert S['n_samples'] == S0['n_samples'] - 1 and np.array_equal(S['tg'], S0['tg'])
+        tt = np.linspace(a, b, 400)                                     # one lost report: still bridged within h_lim
+        assert np.all(np.isfinite(U.interp_yaw(S, tt)))
+    c = U.bo_report_trong(S, t_row - 0.01, t_row + 0.01)
+    assert c[kind]['tong'] == 1 and c[kind]['trong_cua_so'] == 1 and c[kind]['t_trong_cua_so_s'] == [t_row]
+    assert U.bo_report_trong(S, t_row + 1.0, t_row + 2.0)[kind]['trong_cua_so'] == 0
+
+
+def test_skip_report_tong_level_records_it(tmp_path):
+    """tong's per-log numbers carry the left-out report (in the window); without one the numbers are unchanged."""
+    g = _globals()
+    p, a, b = _c8_log(tmp_path)
+    x0 = U._level_numbers(p, 'O1-F08', g['tre'], g['thang'], T0, U.J_LIM_S, U.H_LIM_S, 2.0, 1.0)
+    assert x0['bo_report']['rv']['tong'] == 0 and x0['bo_report']['gyro']['tong'] == 0
+    q = str(tmp_path / 'c8b.csv')
+    with open(p, encoding='utf-8') as f, open(q, 'w', encoding='utf-8', newline='') as g2:
+        g2.write(f.read())
+    t_row = _neg_age(q, 'gyro_n', 'age_g_ms', 120)
+    x = U._level_numbers(q, 'O1-F08', g['tre'], g['thang'], T0, U.J_LIM_S, U.H_LIM_S, 2.0, 1.0)
+    assert x['bo_report']['gyro']['tong'] == 1
+    assert x['bo_report']['gyro']['trong_cua_so'] == (1 if a - 2.0 <= t_row <= b + 1.0 else 0)
+    assert x['P'] == pytest.approx(x0['P']) and x['N'] == pytest.approx(x0['N'])

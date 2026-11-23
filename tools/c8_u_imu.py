@@ -410,7 +410,13 @@ def rv_samples(L, period_s=PERIOD_S, tau_hat=0.0, s_plus=0.0, s_minus=0.0, j_lim
         _finite(v, w)
     if not (-0.1 < s_plus < 0.1 and -0.1 < s_minus < 0.1):
         raise InputError('scale correction outside +-10 %')
-    idx = report_rows(L['rv_n'], L['age_r_ms'])
+    # 24/11 (CODE order, CODE_C8B local_23e1330a): a report whose only rows carry a negative age (-0.1 ms, row time
+    # taken just before the receive time; run03 C8-P-F08-1_lai1 gyro 6959) is LEFT OUT and listed in bo_report,
+    # not refused for the whole log; no age tolerance is added (no basis for one, L143). A left-out report is a
+    # missing sample: the grid index steps over it (turn_totals then takes the pair as suspect) and interp_yaw
+    # bridges it only within h_lim, as for any lost report.
+    rv_skip, g_skip = [], []
+    idx = report_rows(L['rv_n'], L['age_r_ms'], rv_skip)
     if idx.size < 2:
         raise InputError(f'{L.get("path")}: fewer than two rotation vector reports')
     r = L['timestamp_us'][idx] * 1e-6 - L['age_r_ms'][idx] * 1e-3
@@ -423,7 +429,7 @@ def rv_samples(L, period_s=PERIOD_S, tau_hat=0.0, s_plus=0.0, s_minus=0.0, j_lim
     valid = (L['r_valid'][idx] == 1) if 'r_valid' in L else np.ones(len(idx), dtype=bool)
     keep = keep & valid                                    # CU-4: firmware settle / age flag
     t_all = t_fit - tau_hat
-    tg, gz = gyro_samples(L) if np.any(L['gyro_n'] > 0) else (np.array([]), np.array([]))
+    tg, gz = gyro_samples(L, g_skip) if np.any(L['gyro_n'] > 0) else (np.array([]), np.array([]))
     d0 = (np.diff(y) + math.pi) % (2 * math.pi) - math.pi
     d = d0.copy()
     t_break = math.inf
@@ -451,7 +457,27 @@ def rv_samples(L, period_s=PERIOD_S, tau_hat=0.0, s_plus=0.0, s_minus=0.0, j_lim
     return dict(t=t_all[keep], psi=psi[keep], t_all=t_all, psi_all=psi, n_all=n, t_recv=r, j=j, keep=keep,
                 n_samples=int(idx.size), n_late=int((~keep & valid).sum()), n_invalid=int((~valid).sum()),
                 valid=valid, period_fit_s=float(b), rows=idx, h_lim=h_lim,
-                t_break=t_break, resets=resets, tg=tg, gz=gz, nhanh_ho=nhanh_ho)
+                t_break=t_break, resets=resets, tg=tg, gz=gz, nhanh_ho=nhanh_ho,
+                bo_report=dict(rv=_skip_rows(L, 'rv_n', rv_skip), gyro=_skip_rows(L, 'gyro_n', g_skip)))
+
+
+def _skip_rows(L, col, skip):
+    """[{n, t_row_s}] of the reports left out by report_rows (row time of the first row of that count)."""
+    out = []
+    for c in skip:
+        i = np.nonzero(L[col] == c)[0]
+        out.append(dict(n=int(c), t_row_s=float(L['timestamp_us'][i[0]] * 1e-6) if i.size else None))
+    return out
+
+
+def bo_report_trong(S, w0, w1):
+    """Counts of the left-out reports (rv, gyro): all, and inside [w0, w1] (row times, log clock) with those times."""
+    d = {}
+    for k in ('rv', 'gyro'):
+        xs = (S.get('bo_report') or {}).get(k, [])
+        inn = [x['t_row_s'] for x in xs if x['t_row_s'] is not None and w0 <= x['t_row_s'] <= w1]
+        d[k] = dict(tong=len(xs), trong_cua_so=len(inn), t_trong_cua_so_s=inn)
+    return d
 
 
 def interp_yaw(S, t, h_lim=None):
@@ -798,7 +824,7 @@ def _level_numbers(path, muc, tre, thang_d, period_s, j_lim, h_lim, pre_s, tail_
     if S['t_break'] < w1:
         raise InputError(f'{path}: a gap in the IMU reports could not be unwrapped inside the window (CU-3)')
     P, N = turn_totals(S, w0, w1)
-    tg, gz = gyro_samples(L) if np.any(L['gyro_n'] > 0) else (np.array([]), np.array([]))
+    tg, gz = gyro_samples(L, []) if np.any(L['gyro_n'] > 0) else (np.array([]), np.array([]))   # 24/11: skip as rv_samples
     if tg.size < 2 or tg[0] > w0 or tg[-1] < w1:
         raise InputError(f'{path}: gyro reports do not cover the window (CU-6)')
     i0, i1 = np.searchsorted(tg, w0, 'right') - 1, np.searchsorted(tg, w1, 'left')
@@ -815,7 +841,8 @@ def _level_numbers(path, muc, tre, thang_d, period_s, j_lim, h_lim, pre_s, tail_
                             np.nanmax(np.abs(L['pitch'][win] - np.nanmedian(L['pitch'][pre])))))
     return dict(P=P, N=N, E=thang_d['delta_plus'] * P + thang_d['delta_minus'] * N, T_win=float(w1 - w0),
                 omega=float(np.max(np.abs(gw))), alpha=alpha_max(tw, gw), eps_max_deg=eps,
-                n_late=S['n_late'], n_reports=S['n_samples'], file=os.path.basename(path), sha256=sha256(path))
+                n_late=S['n_late'], n_reports=S['n_samples'], file=os.path.basename(path), sha256=sha256(path),
+                bo_report=bo_report_trong(S, w0, w1))
 
 
 def tong(muc, logs, thang_d, troi_d, tre, u_g, le, out, period_s=PERIOD_S, j_lim=J_LIM_S, h_lim=H_LIM_S,
@@ -1087,6 +1114,7 @@ def kiem(frames, log, offset_s, u, muc, u_psi, u_ghep=0.0, n_min=30, wz_still=0.
                    closure_note=f'fewer than {n_min} still frames in the {END_STILL_S:.0f} s after the window')
     out['ok'] = bool(out['align_ok'] and out['compared_ok'] and out['n_over'] == 0 and out['closure_ok'] is True)
     out['yaw_tru_gz'] = yaw_minus_gz(L, t0 - u['pre_s'], te + END_STILL_S, u['period_s'], u['j_lim_s'], u['h_lim_s'])
+    out['bo_report'] = bo_report_trong(S, t0 - u['pre_s'], te + END_STILL_S)      # 24/11: left-out reports
     return out
 
 
@@ -1259,6 +1287,11 @@ def main(argv=None):
             print(f'{a.muc}: U_IMU,dong {m["U_IMU_dong_deg"]:.2f} deg; parts (deg) '
                   + ', '.join(f'{k} {math.degrees(v):.2f}' for k, v in m['phan'].items())
                   + (' [THU: not lockable]' if d['thu'] else ''))
+            for x in m['logs']:                                    # 24/11: reports left out (no row with age >= 0)
+                b = x.get('bo_report') or {}
+                if any(b.get(k, {}).get('tong') for k in ('rv', 'gyro')):
+                    print(f'  {x["file"]}: left out rv {b["rv"]["tong"]} ({b["rv"]["trong_cua_so"]} in the window), '
+                          f'gyro {b["gyro"]["tong"]} ({b["gyro"]["trong_cua_so"]} in the window)')
     except (InputError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         print('c8_u_imu:', exc, file=sys.stderr)
         print('#ket_qua,ma=2')
