@@ -54,7 +54,7 @@ Commands (the operator types them while working; every time stamp is the PC cloc
                                          (sha256 of F computed; gain set id prefixed by the campaign)
   summary [--gate-file F] [--out S05_summary.csv]   recompute the summary from the logs;
                                          F = the locked C8 gate file (gate_c8_v1 JSON, tools/gate_c8.py:
-                                         gate levels, report-only conditions per level); its sha256 is
+                                         gate levels, so_do conditions per level); its sha256 is
                                          reported; every gate row is checked against it (O1 v11.33)
   so-h   --run-uid UID --score-final F   S05 v3.37 4.3: outcome of a car run after the clip H comparison at the end
                                          of the session (F = c7_calib_drift.py gop output); appended to
@@ -136,7 +136,7 @@ if _FWSIM not in sys.path:
 import o1_gate                                                          # noqa: E402
 import gate_c8                                                          # noqa: E402  (C8 gate file, O1 v11.33)
 GATE_CONDS = o1_gate.CONDS
-GATE_VERSIONS = (o1_gate.GATE_VERSION, o1_gate.GATE_VERSION_V1133)
+GATE_VERSIONS = (o1_gate.GATE_VERSION, o1_gate.GATE_VERSION_V1133, gate_c8.GATE_VERSION_SO_DO)
 # 13/11 gate v3.2 (SC-1, SC3-1; Liam CODE local_7f7b0ef4 "Duyệt gộp luôn lo/hi"): per condition G2-G5 the
 # maxima over the frames of q, lo, hi (each field over its finite frames) and n_undef; G1 q is 'completed';
 # gate_u_t = the U_t used (empty = not known: HIL run without the run_active edge mapping, RS-4)
@@ -166,7 +166,13 @@ G1_COLS = ['g1_ways', 'g1_t_deadline', 'g1_t_done_1', 'g1_t_done_2', 'g1_t1', 'g
 # conditions of their level (O1 3.9 rule 2b, OG2-7). The required set is recomputed from the gate file
 # (tools/gate_c8.py, --gate-file of end / summary), never taken from the row: a row whose report-only list differs
 # from the file is an error. Empty in gate_v3.2 rows (all five required).
-GATE_V1133_COLS = ['gate_file_sha256', 'gate_report_only']
+# 23/11 (CODE, 03_CODE/docs/2026-11-23_Chot_luat_mat_na_quyet_bang_so_do_v1.md; Liam at CODE: "duyệt bảng luật mới"):
+# the masked conditions decide by their measured value q (gate_c8.so_do_state), no longer report only: a gate_v3.4
+# gate / row carries gate_so_do (the so_do list of the run, recomputed from the gate file) and every condition
+# decides; a gate_v3.3 gate / row carries no mask (its report_only, gate_report_only refused: the rule of before 23/11).
+GATE_V1133_COLS = ['gate_file_sha256', 'gate_so_do']
+# CODE 23/11 (2): on a C8b grid a so_do condition is decided at the middle node (gate block q_so_do {nut, q, q_chung})
+SO_DO_NUT_COLS = [f'{c}_so_do_{k}' for c in gate_c8.MASKABLE for k in ('nut', 'q', 'q_chung')]
 # C8b time grid (CODE_GATE design v2 section 2; Liam 17/11 at CODE_GATE "Duyệt, code luôn (Recommended)", the exception
 # before t1 "Khi mọi nút đều có (Recommended)"): a floor gate scored on the nodes of the C8b time grid carries a block
 # 'luoi' (format luoi_v1): G1 per node, lost / exception-before-t1 per node; G1 of the run is recomputed from it
@@ -179,7 +185,7 @@ _G1_LETTER = {'dat': 'd', 'khong_dat': 'k', 'chua_ket_luan': 'c'}
 GATE_COLS = (['gate_version', 'gate_decide', 'gate_json_sha256', 'gate_u_t', 'g1_q', 'g1_state']
              + [f'{g}_{x}' for g in o1_gate.MEASURED for x in GATE_FIELDS]
              + [f'{g}_{x}_chung' for g in o1_gate.MEASURED for x in DOMAIN_FIELDS] + G1_COLS + GATE_V1133_COLS
-             + LUOI_COLS)
+             + LUOI_COLS + SO_DO_NUT_COLS)
 TUNING_COLS = TUNING_OLD + TUNING_NEW + GATE_COLS
 EFFORT_OLD = ['ngay', 'bat_dau', 'ket_thuc', 'gio', 'buoc', 'giai_doan', 'mot_lan_hay_thich_nghi', 'dut',
               'ghi_chu', 'chien_dich', 'lap_lai']
@@ -563,7 +569,7 @@ def segment_totals(segments: List[dict]) -> dict:
     return {**{f't_{k}_s': v for k, v in tot.items()}, 't_operator_wait_s': wait}
 
 
-GATE_FILE_COLS = ('gate_file_sha256', 'gate_report_only')   # O1 v11.33: the C8 gate file the run was scored with
+GATE_FILE_COLS = ('gate_file_sha256', 'gate_so_do')   # O1 v11.33: the C8 gate file the run was scored with
 NOT_A_GATE = ('gate_json_sha256',) + GATE_FILE_COLS
 
 
@@ -867,20 +873,20 @@ def _common_block(gate: dict, c: str, union: tuple, one: bool, platform: Optiona
     return com
 
 
-def _recompute(gate: dict, platform: Optional[str] = None, required=None) -> dict:
+def _recompute(gate: dict, platform: Optional[str] = None, so_do=None) -> dict:
     """States and outcomes recomputed from q, lo, hi, n_undef with fwsim/o1_gate (thresholds, O1 3.5
     three states SC3-1, O1 3.5 order); shared by the JSON path (end) and the logged rows (summary).
     B81-3: G2-G5 on the common and the union frame domain (cond_state2), G1 from its fields (gate_g1_state)
     when the gate has them (always on the car). Returns the outcomes."""
     if gate.get('version') not in GATE_VERSIONS:
         raise LogError(f'gate version {gate.get("version")!r}: only {GATE_VERSIONS} are supported')
-    req = gate_required(gate, required)
-    decide = _check_decide(gate.get('decide'), platform, req)
+    sd = gate_so_do(gate, so_do)
+    decide = _check_decide(gate.get('decide'), platform)
     u_t = _qnum(gate.get('u_t'), 'u_t')
     if u_t < 0.0:
         raise LogError(f'gate u_t: {u_t!r} is negative (a bound is >= 0)')
-    # U_t known <=> G3, G5 may decide (RS-4): a HIL gate without the mapping cannot claim them. O1 v11.33: G4 is never
-    # report only, so 'G4 decides' tells a mapped run from a refused one also when the level has report-only ones
+    # U_t known <=> G3, G5 may decide (RS-4): a HIL gate without the mapping cannot claim them (every condition
+    # decides since 23/11, so_do ones by q)
     if ('g4' in decide) == math.isnan(u_t):
         raise LogError(f'gate decide {decide!r} with u_t {gate.get("u_t")!r}: G3, G4, G5 may decide exactly when '
                        'U_t is known (RS-4)')
@@ -890,9 +896,10 @@ def _recompute(gate: dict, platform: Optional[str] = None, required=None) -> dic
     f1 = gate_g1_fields(gate['g1'], platform)                                   # B81-3
     lb = None
     if gate.get('luoi') is not None:                                            # C8b time grid (design v2)
-        if (gate.get('version') != o1_gate.GATE_VERSION_V1133 or platform not in (None, 'HW') or f1 is None
+        if (gate.get('version') not in (o1_gate.GATE_VERSION_V1133, gate_c8.GATE_VERSION_SO_DO)
+                or platform not in (None, 'HW') or f1 is None
                 or f1['ways'] != 2):
-            raise LogError('gate luoi: only in a gate_v3.3 floor gate with its G1 fields (2 ways)')
+            raise LogError('gate luoi: only in a gate_v3.3 / v3.4 floor gate with its G1 fields (2 ways)')
         lb = check_luoi(gate['luoi'])
         if gate['g1']['state'] != lb['g1_state']:
             raise LogError(f'gate g1: state {gate["g1"]["state"]!r}, the grid gives {lb["g1_state"]!r} (luoi)')
@@ -934,13 +941,34 @@ def _recompute(gate: dict, platform: Optional[str] = None, required=None) -> dic
         union = _domain_nums(gate[c], c)
         com = _common_block(gate, c, union, one, platform)
         st = cond_state2(com[1], union[1], union[2], union[3], thr)
-        if st != gate[c].get('state'):
+        if c in sd:
+            # so_do (CODE 23/11, Liam): the three-branch state is kept (state_ba_nhanh, checked when the gate holds it:
+            # a logged row has no column for it), the state is decided by q of the common domain and of the union
+            if 'state_ba_nhanh' in gate[c] and gate[c]['state_ba_nhanh'] != st:
+                raise LogError(f'gate {c}: state_ba_nhanh {gate[c]["state_ba_nhanh"]!r}, recomputed from lo of the '
+                               f'common domain, hi and n_undef of the union: {st!r}')
+            qs = gate[c].get('q_so_do')
+            if qs is None:
+                st = gate_c8.so_do_state(com[0], union[0], union[3], thr)
+            else:
+                # CODE 23/11 (2): on a C8b grid the q of the middle node (not lost), with n_undef of the grid; that the
+                # node is the one nearest the middle of the grid needs the node offsets (gate_c8 checks it at C8)
+                if lb is None or not isinstance(qs, dict) or set(qs) != {'nut', 'q', 'q_chung'}                         or type(qs['nut']) is not int or not 0 <= qs['nut'] < lb['n_nut'] or lb['hong_nut'][qs['nut']]:
+                    raise LogError(f'gate {c} q_so_do {qs!r}: {{nut, q, q_chung}} of a scored node of the grid')
+                qn, qc = _qnum(qs['q'], f'{c} q_so_do.q'), _qnum(qs['q_chung'], f'{c} q_so_do.q_chung')
+                if (not math.isnan(qn) and not math.isnan(union[0]) and qn > union[0])                         or (not math.isnan(qc) and not math.isnan(com[0]) and qc > com[0]):
+                    raise LogError(f'gate {c} q_so_do {qs!r}: above the grid maxima q {union[0]!r}, chung.q {com[0]!r}')
+                st = gate_c8.so_do_state(qc, qn, union[3], thr)
+            if st != gate[c].get('state'):
+                raise LogError(f'gate {c}: state {gate[c].get("state")!r} (so_do), recomputed from q of the common '
+                               f'domain, q and n_undef of the union: {st!r} (CODE 23/11)')
+        elif st != gate[c].get('state'):
             raise LogError(f'gate {c}: state {gate[c].get("state")!r}, recomputed from lo of the common domain, '
                            f'hi and n_undef of the union: {st!r}')
         if f1 is not None and f1['ca_t_som'] and c in T_SOM_ZERO and st != 'chua_ket_luan':
             raise LogError(f'gate {c}: state {st!r} in the t_som case (g1.ca_t_som): G1-G4 have no position basis '
                            'and are chua_ket_luan (undefined frames, no finite lo above the threshold; J v6 section 5)')
-    return o1_gate.evaluate_outcomes(gate, decide, req)
+    return o1_gate.evaluate_outcomes(gate, decide, GATE_CONDS)
 
 
 def luoi_g1(states) -> str:
@@ -1000,41 +1028,54 @@ def check_luoi(lb) -> dict:
     return lb
 
 
-def gate_required(gate: dict, required=None) -> tuple:
-    """O1 v11.33 (OG2-7): the required set of a gate, checked against the one of the gate file (`required`, from
-    gate_c8.GateC8.required for the run; None = no gate file: all five). A gate_v3.2 gate has no report-only
-    conditions. A gate_v3.3 gate states its report_only, required and gate_file_sha256; they must agree with each
-    other and with `required` (a condition missing from the run is never taken as exempt)."""
-    want = tuple(GATE_CONDS) if required is None else tuple(c for c in GATE_CONDS if c in set(required))
-    if gate.get('version') == o1_gate.GATE_VERSION:
-        for k in ('report_only', 'required', 'gate_file_sha256'):
-            if gate.get(k) not in (None, [], ''):
-                raise LogError(f'gate {k} {gate.get(k)!r}: not a {o1_gate.GATE_VERSION} field')
-        ro = []
+def gate_so_do(gate: dict, so_do=None) -> tuple:
+    """The so_do conditions of a gate (CODE 23/11, Liam "duyệt bảng luật mới"), checked against those the C8 gate
+    file gives for the run (`so_do`, gate_c8.GateC8.run_so_do; None = no gate file: none). A gate_v3.2 gate and a
+    gate_v3.3 gate have none (a gate_v3.3 report_only list, the rule of before 23/11, is refused). A gate_v3.4 gate
+    states its so_do, level and gate_file_sha256 (OG2-7: never taken from the run record)."""
+    want = () if so_do is None else tuple(c for c in gate_c8.MASKABLE if c in set(so_do))
+    if gate.get('version') in (o1_gate.GATE_VERSION, o1_gate.GATE_VERSION_V1133):
+        for k in ('report_only', 'required', 'so_do'):
+            if gate.get(k) not in (None, []) and not (k == 'required' and gate.get(k) == list(GATE_CONDS)):
+                raise LogError(f'gate {k} {gate.get(k)!r}: not a {gate.get("version")} field since 23/11 (the masked '
+                               f'conditions decide by q: {gate_c8.GATE_VERSION_SO_DO}, CODE, Liam)')
+        if gate.get('version') == o1_gate.GATE_VERSION and gate.get('gate_file_sha256') not in (None, ''):
+            raise LogError(f'gate gate_file_sha256: not a {o1_gate.GATE_VERSION} field')
+        got = ()
     else:
-        ro, rq, sha = gate.get('report_only'), gate.get('required'), gate.get('gate_file_sha256')
-        if not isinstance(ro, list) or not isinstance(rq, list):
-            raise LogError(f'gate report_only {ro!r} / required {rq!r}: lists ({o1_gate.GATE_VERSION_V1133})')
+        sd, sha = gate.get('so_do'), gate.get('gate_file_sha256')
+        if 'report_only' in gate or 'required' in gate:
+            raise LogError(f'gate report_only / required: not {gate_c8.GATE_VERSION_SO_DO} fields')
+        if not isinstance(sd, list):
+            raise LogError(f'gate so_do {sd!r}: a list ({gate_c8.GATE_VERSION_SO_DO})')
         try:
-            if tuple(rq) != o1_gate.required_of(ro):
-                raise LogError(f'gate required {rq!r}: not all five less report_only {ro!r}')
-        except ValueError as exc:
+            got = gate_c8.check_so_do(sd)
+        except gate_c8.GateFileError as exc:
             raise LogError(f'gate {exc}')
-        if sha is None and ro:
-            raise LogError(f'gate report_only {ro!r} without gate_file_sha256: no condition is exempt without the '
-                           'C8 gate file (O1 v11.33, OG2-7)')
-    got = tuple(c for c in GATE_CONDS if c not in set(ro))
+        if list(got) != sd:
+            raise LogError(f'gate so_do {sd!r}: in the order {gate_c8.MASKABLE}')
+        if not isinstance(sha, str) or len(sha) != 64 or any(ch not in '0123456789abcdef' for ch in sha):
+            raise LogError(f'gate gate_file_sha256 {sha!r}: the source of so_do (OG2-7), 64 lowercase hex digits')
     if got != want:
-        raise LogError(f'gate report-only conditions {list(ro)!r}, the C8 gate file gives '
-                       f'{[c for c in GATE_CONDS if c not in want]!r} for this run (O1 v11.33 3.9 rule 2b, OG2-7)')
-    return want
+        raise LogError(f'gate so_do conditions {list(got)!r}, the C8 gate file gives {list(want)!r} for this run '
+                       '(O1 3.9 rule 2b decided by the measured value, CODE 23/11; OG2-7)')
+    for c in GATE_CONDS:
+        b = gate.get(c)
+        has = isinstance(b, dict) and ('nhanh' in b or 'state_ba_nhanh' in b)
+        if c in got and isinstance(b, dict) and b.get('nhanh', gate_c8.NHANH_SO_DO) != gate_c8.NHANH_SO_DO:
+            raise LogError(f'gate {c} nhanh {b.get("nhanh")!r}: {gate_c8.NHANH_SO_DO!r} for a so_do condition')
+        if c not in got and has:
+            raise LogError(f'gate {c}: nhanh / state_ba_nhanh on a condition that is not so_do')
+    return got
 
 
-def validate_gate(gate: dict, platform: Optional[str] = None, required=None) -> dict:
+def validate_gate(gate: dict, platform: Optional[str] = None, so_do=None) -> dict:
     """GV3-5, GV3-R2-3: a gate JSON checked key by key (a missing key is an error, null is 'unknown';
     booleans by type; thresholds), then every state and outcome recomputed (_recompute); any difference
     is an error. The outcome fields of the JSON are never trusted. platform: the run's platform, whose
-    deciding sets the JSON must match (GV3-R2-2). Returns the recomputed outcomes."""
+    deciding sets the JSON must match (GV3-R2-2); so_do: the so_do conditions of the run from the gate file
+    (row_so_do; None = no gate file), each with nhanh 'so_do' and state_ba_nhanh in the JSON. Returns the recomputed
+    outcomes."""
     if not isinstance(gate, dict):
         raise LogError(f'gate: {gate!r} is not an object')
     for k in _TOP_KEYS + GATE_CONDS:
@@ -1050,11 +1091,21 @@ def validate_gate(gate: dict, platform: Optional[str] = None, required=None) -> 
     for k in _BOOL_KEYS:
         if not isinstance(gate[k], bool):
             raise LogError(f'gate {k}: {gate[k]!r} is not a boolean')
-    ev = _recompute(gate, platform, required)
+    if gate.get('version') == gate_c8.GATE_VERSION_SO_DO:
+        for c in gate.get('so_do') or []:
+            if not isinstance(gate.get(c), dict) or gate[c].get('nhanh') != gate_c8.NHANH_SO_DO \
+                    or gate[c].get('state_ba_nhanh') not in o1_gate_states():
+                raise LogError(f'gate {c}: a so_do condition without nhanh {gate_c8.NHANH_SO_DO!r} and its '
+                               'state_ba_nhanh (CODE 23/11)')
+    ev = _recompute(gate, platform, so_do)
     for k, v in ev.items():
         if type(gate[k]) is not type(v) or gate[k] != v:
             raise LogError(f'gate {k}: {gate[k]!r}, recomputed: {v!r}')
     return ev
+
+
+def o1_gate_states() -> tuple:
+    return ('dat', 'khong_dat', 'chua_ket_luan')
 
 
 def gate_from_row(row: dict) -> dict:
@@ -1075,14 +1126,16 @@ def gate_from_row(row: dict) -> dict:
 
     g = {'version': row.get('gate_version'), 'decide': [c for c in row.get('gate_decide', '').split(',') if c],
          'u_t': num(row.get('gate_u_t')), 'g1': {'q': row.get('g1_q'), 'state': row.get('g1_state')}}
-    if row.get('gate_version') == o1_gate.GATE_VERSION_V1133:                   # O1 v11.33
-        ro = [c for c in row.get('gate_report_only', '').split(',') if c]
-        try:
-            rq = list(o1_gate.required_of(ro))
-        except ValueError as exc:
-            raise LogError(f"{row.get('run_uid')}: gate_report_only: {exc}")
-        g.update(report_only=ro, required=rq, gate_file_sha256=row.get('gate_file_sha256') or None,
-                 level=row.get('trajectory') or None)
+    if row.get('gate_version') in (o1_gate.GATE_VERSION_V1133, gate_c8.GATE_VERSION_SO_DO):   # O1 v11.33
+        sd = [c for c in row.get('gate_so_do', '').split(',') if c]
+        if row.get('gate_version') == o1_gate.GATE_VERSION_V1133:
+            if sd:
+                raise LogError(f"{row.get('run_uid')}: gate_so_do {sd} on a {o1_gate.GATE_VERSION_V1133} row (so_do "
+                               f"is {gate_c8.GATE_VERSION_SO_DO})")
+            g.update(gate_file_sha256=row.get('gate_file_sha256') or None, level=row.get('trajectory') or None)
+        else:
+            g.update(so_do=sd, gate_file_sha256=row.get('gate_file_sha256') or None,
+                     level=row.get('trajectory') or None)
         if row.get('luoi_n_nut', ''):                                           # C8b grid (design v2)
             letters = {v: k for k, v in _G1_LETTER.items()}
 
@@ -1105,8 +1158,8 @@ def gate_from_row(row: dict) -> dict:
             raise LogError(f"{row.get('run_uid')}: luoi_* columns without luoi_n_nut")
     elif any(row.get(c) for c in LUOI_COLS):
         raise LogError(f"{row.get('run_uid')}: luoi_* columns on a {row.get('gate_version')!r} row")
-    elif row.get('gate_file_sha256') or row.get('gate_report_only'):
-        raise LogError(f"{row.get('run_uid')}: gate_file_sha256 / gate_report_only on a "
+    elif row.get('gate_file_sha256') or row.get('gate_so_do'):
+        raise LogError(f"{row.get('run_uid')}: gate_file_sha256 / gate_so_do on a "
                        f"{row.get('gate_version')!r} row")
     ways = row.get('g1_ways', '')                                               # B81-3
     if ways:
@@ -1125,12 +1178,20 @@ def gate_from_row(row: dict) -> dict:
         g[c].update(n_undef=num(row.get(f'{c}_n_undef'), whole=True), state=row.get(f'{c}_state'))
         if any(row.get(f'{c}_{k}_chung') for k in DOMAIN_FIELDS):
             g[c]['chung'] = {k: num(row.get(f'{c}_{k}_chung'), whole=k == 'n_undef') for k in DOMAIN_FIELDS}
+    for c in gate_c8.MASKABLE:                         # CODE 23/11 (2)
+        if row.get(f'{c}_so_do_nut', '') != '':
+            if c not in (g.get('so_do') or []):
+                raise LogError(f"{row.get('run_uid')}: {c}_so_do_nut on a condition that is not so_do")
+            g[c]['q_so_do'] = dict(nut=num(row.get(f'{c}_so_do_nut'), whole=True), q=num(row.get(f'{c}_so_do_q')),
+                                   q_chung=num(row.get(f'{c}_so_do_q_chung')))
+        elif row.get(f'{c}_so_do_q', '') != '' or row.get(f'{c}_so_do_q_chung', '') != '':
+            raise LogError(f"{row.get('run_uid')}: {c}_so_do_q without {c}_so_do_nut")
     return g
 
 
 def map_refused(decide) -> bool:
-    """The gate of a HIL run whose run_active edge was not mapped (only G1, G2 decide, O1 v11.12 §3.4; O1 v11.33: G1,
-    G2 less a report-only G2): G4, never report only, does not decide."""
+    """The gate of a HIL run whose run_active edge was not mapped (only G1, G2 decide, O1 v11.12 §3.4): G4 does not
+    decide."""
     d = set(decide)
     return bool(d) and d <= set(o1_gate.DECIDE_HIL)
 
@@ -1362,12 +1423,12 @@ def check_score_final(r: dict, path: str, ds: str) -> tuple:
             fc = VIOL_BEFORE if viol_before_exception(g1) else ''
             try:
                 # O1 v11.33: the H1 score uses the gate file of the logged row (checked against the file at end and in
-                # the summary): same SHA, the required set of the row; GT1-6: a lost H0 without a gate carries them too
+                # the summary): same SHA, the so_do set of the row; GT1-6: a lost H0 without a gate carries them too
                 if isinstance(g1, dict) and (g1.get('gate_file_sha256') or '') != r.get('gate_file_sha256', ''):
                     raise LogError('gate file SHA of the H1 score differs from the logged run')
-                req = (list(o1_gate.required_of([c for c in r.get('gate_report_only', '').split(',') if c]))
-                       if r.get('gate_version') == o1_gate.GATE_VERSION_V1133 or r.get('gate_file_sha256') else None)
-                check_outcome_vs_gate(o1, g1, 'HW', fc, req)
+                sd = ([c for c in r.get('gate_so_do', '').split(',') if c]
+                      if r.get('gate_version') == gate_c8.GATE_VERSION_SO_DO or r.get('gate_file_sha256') else None)
+                check_outcome_vs_gate(o1, g1, 'HW', fc, sd)
             except LogError as exc:
                 raise LogError(f'run {uid}: outcome_h1 {o1} and the gate of the H1 score: {exc} (C9D-5, C9D2-2)')
     final, want = so_h_outcome(o0, o1, vuot, thieu)
@@ -1569,14 +1630,14 @@ def confirm_block_problem(tun_after: List[dict], ds: str, campaign: str, gain_se
     return None
 
 
-def row_required(r: dict, gate_file=None):
-    """O1 v11.33: the conditions that must decide for a run (row fields trajectory, platform, stage, campaign) from
-    the C8 gate file (gate_c8.GateC8); None without a gate file (all five)."""
+def row_so_do(r: dict, gate_file=None):
+    """The conditions of a run decided by q (row fields trajectory, platform, stage, campaign) from the C8 gate file
+    (gate_c8.GateC8.run_so_do; CODE 23/11); None without a gate file (none)."""
     if gate_file is None:
         return None
     try:
-        return gate_file.required(r.get('trajectory', ''), r.get('platform', ''), r.get('stage', ''),
-                                  r.get('campaign', ''))
+        return gate_file.run_so_do(r.get('trajectory', ''), r.get('platform', ''), r.get('stage', ''),
+                                   r.get('campaign', ''))
     except gate_c8.GateFileError as exc:
         raise LogError(f"{r.get('run_uid')}: {exc}")
 
@@ -1584,11 +1645,11 @@ def row_required(r: dict, gate_file=None):
 def gate_file_problem(r: dict, gate_sha: str, gate_file=None) -> Optional[str]:
     """O1 v11.33 (OG2-7): None when the gate file SHA of a run's gate (gate_sha, '' = none) fits the gate file in use,
     else why not. A gate scored with a gate file needs that file here; a campaign run whose level may carry
-    report-only conditions (gate_c8.mask_applies: the floor, the HIL candidate check of B) must be scored with the
+    so_do conditions (gate_c8.mask_applies: the floor, the HIL candidate check of B) must be scored with the
     gate file in use (the run record carries its level and the file SHA)."""
     if gate_sha and gate_file is None:
         return (f'its gate was scored with the C8 gate file {gate_sha[:12]}..., not given here (--gate-file): the '
-                'report-only conditions are recomputed from the file (OG2-7)')
+                'so_do conditions are recomputed from the file (OG2-7)')
     if gate_file is None:
         return None
     if gate_sha and gate_sha != gate_file.sha256:
@@ -1605,30 +1666,29 @@ def gate_file_problem(r: dict, gate_sha: str, gate_file=None) -> Optional[str]:
 
 def lost_gate_file_cols(r: dict, gate_file=None) -> dict:
     """GT1-6 (Codex round 1 of CODE_GATE): the gate file columns of a run lost to the measurement whose scorer file has
-    no gate (CC1-2): the SHA of the C8 gate file and the report-only conditions of the run's level from it, so the H1
-    score of so-h is checked against the same file and required set. {} without a gate file."""
+    no gate (CC1-2): the SHA of the C8 gate file and the so_do conditions of the run's level from it, so the H1
+    score of so-h is checked against the same file and so_do set. {} without a gate file."""
     if gate_file is None:
         return {}
-    req = row_required(r, gate_file)
-    return dict(gate_file_sha256=gate_file.sha256, gate_report_only=','.join(c for c in GATE_CONDS if c not in req))
+    return dict(gate_file_sha256=gate_file.sha256, gate_so_do=','.join(row_so_do(r, gate_file)))
 
 
 def gate_file_cols_problem(r: dict, gate_file=None) -> Optional[str]:
-    """GT1-6 on a logged row without a gate: gate_file_sha256 / gate_report_only only on a lost run with its scorer
+    """GT1-6 on a logged row without a gate: gate_file_sha256 / gate_so_do only on a lost run with its scorer
     file SHA (CC1-2), equal to what the gate file in use gives (lost_gate_file_cols). GT2-1 (Codex round 2): a lost
     run logged without a gate file keeps the CC1-2 path (no columns, all five required)."""
-    sha, ro = r.get('gate_file_sha256', ''), r.get('gate_report_only', '')
+    sha, ro = r.get('gate_file_sha256', ''), r.get('gate_so_do', '')
     if not sha and not ro:
         return None
     if r.get('run_outcome') != 'hong_he_do' or not r.get('gate_json_sha256'):
-        return 'gate_file_sha256 / gate_report_only without a gate: only for a lost run with its scorer file (GT1-6)'
+        return 'gate_file_sha256 / gate_so_do without a gate: only for a lost run with its scorer file (GT1-6)'
     if gate_file is None:
-        return (f'scored with the C8 gate file {sha[:12]}..., not given here (--gate-file): the report-only conditions '
+        return (f'scored with the C8 gate file {sha[:12]}..., not given here (--gate-file): the so_do conditions '
                 'are recomputed from the file (OG2-7, GT1-6)')
     want = lost_gate_file_cols(r, gate_file)
-    if (sha, ro) != (want['gate_file_sha256'], want['gate_report_only']):
-        return (f'gate_file_sha256 {sha[:12]}... / gate_report_only {ro!r}: the gate file in use gives '
-                f'{want["gate_file_sha256"][:12]}... / {want["gate_report_only"]!r} (GT1-6)')
+    if (sha, ro) != (want['gate_file_sha256'], want['gate_so_do']):
+        return (f'gate_file_sha256 {sha[:12]}... / gate_so_do {ro!r}: the gate file in use gives '
+                f'{want["gate_file_sha256"][:12]}... / {want["gate_so_do"]!r} (GT1-6)')
     return None
 
 
@@ -1637,8 +1697,8 @@ def check_gate_rows(tun: List[dict], gate_file=None) -> None:
     (version, deciding set of its platform, thresholds, states); its run_outcome must agree as at `end`.
     Rows whose gate columns are ALL empty (before gate v3, or written without --gate-json) are not
     checked; any non-empty gate cell makes the row a gate row, with a supported version (GV3-R3-1).
-    O1 v11.33: gate_file (gate_c8.GateC8, the summary's --gate-file) gives the required set of every gate row
-    (row_required) and the SHA its gate must carry (gate_file_problem)."""
+    O1 v11.33: gate_file (gate_c8.GateC8, the summary's --gate-file) gives the so_do set of every gate row
+    (row_so_do) and the SHA its gate must carry (gate_file_problem)."""
     for r in tun:
         judged = r.get('run_outcome') in VALID
         camp = r.get('campaign') in CAMPAIGNS           # [CACH HIEU] historic rows (no campaign): SC3-2 note above
@@ -1677,7 +1737,7 @@ def check_gate_rows(tun: List[dict], gate_file=None) -> None:
         if gbad:
             raise LogError(f"{r.get('run_uid')}: {gbad}")
         try:
-            ev = _recompute(g, r.get('platform'), row_required(r, gate_file))
+            ev = _recompute(g, r.get('platform'), row_so_do(r, gate_file))
         except LogError as exc:
             raise LogError(f"{r.get('run_uid')}: {exc}")
         why = (outcome_vs_gate(r.get('run_outcome', ''), ev, g['decide'], r.get('fail_cause', ''))
@@ -1694,7 +1754,7 @@ def gate_columns(gate: dict, gate_sha256: str = '') -> dict:
            'gate_json_sha256': gate_sha256, 'gate_u_t': _num(gate.get('u_t')),
            'g1_q': str(gate['g1'].get('q')), 'g1_state': gate['g1'].get('state', ''),
            'gate_file_sha256': gate.get('gate_file_sha256') or '',                       # O1 v11.33
-           'gate_report_only': ','.join(gate.get('report_only') or [])}
+           'gate_so_do': ','.join(gate.get('so_do') or [])}
     lb = gate.get('luoi')                                                          # C8b grid (design v2)
     out.update({c: '' for c in LUOI_COLS})
     if lb is not None:
@@ -1716,6 +1776,12 @@ def gate_columns(gate: dict, gate_sha256: str = '') -> dict:
         for k in ('q', 'lo', 'hi'):
             out[f'{g}_{k}_chung'] = cell(com.get(k))
         out[f'{g}_n_undef_chung'] = str(int(com['n_undef'])) if com.get('n_undef') is not None else ''
+    for g in gate_c8.MASKABLE:                         # CODE 23/11 (2): the middle node of a grid so_do condition
+        qs = (gate.get(g) or {}).get('q_so_do')
+        out.update({f'{g}_so_do_{k}': '' for k in ('nut', 'q', 'q_chung')})
+        if qs is not None:
+            out.update({f'{g}_so_do_nut': str(int(qs['nut'])), f'{g}_so_do_q': cell(qs['q']),
+                        f'{g}_so_do_q_chung': cell(qs['q_chung'])})
     g1 = gate.get('g1') or {}
     if g1.get('t_done') is not None:                   # B81-3: the G1 fields (checked by validate_gate first)
         td = g1['t_done']
@@ -1768,10 +1834,10 @@ def viol_before_problem(outcome: str, fail_cause: str, gate: Optional[dict]) -> 
 
 
 def check_outcome_vs_gate(outcome: str, gate: dict, platform: Optional[str] = None, fail_cause: str = '',
-                          required=None) -> None:
+                          so_do=None) -> None:
     """The run outcome typed by the operator against the gate, validated and recomputed first (GV3-5);
-    required: the required set of the run from the gate file (row_required; None = all five)."""
-    ev = validate_gate(gate, platform, required)
+    so_do: the so_do set of the run from the gate file (row_so_do; None = no gate file, none)."""
+    ev = validate_gate(gate, platform, so_do)
     why = outcome_vs_gate(outcome, ev, gate['decide'], fail_cause) or viol_before_problem(outcome, fail_cause, gate)
     if why:
         raise LogError(f'--outcome {outcome} disagrees with the gate ({why}); check the scoring')
@@ -2558,8 +2624,8 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     queries (R134C4-1): the two answers as read by gain_line_check.read_query (before, after; None = missing);
     end checks them itself (query_problem, without the run's boot) and takes boot_before / boot_after from them.
     A judged car / final_hil run needs them: two boot strings alone do not show two questions.
-    gate_file (O1 v11.33): the C8 gate file (gate_c8.GateC8, CLI --gate-file); the run's required set is taken from it
-    (row_required), and a gate scored with a gate file needs it (gate_file_problem)."""
+    gate_file (O1 v11.33): the C8 gate file (gate_c8.GateC8, CLI --gate-file); the run's so_do set is taken from it
+    (row_so_do), and a gate scored with a gate file needs it (gate_file_problem)."""
     run = _require_open(ds)
     if outcome not in OUTCOMES:
         raise LogError(f'--outcome one of {OUTCOMES}')
@@ -2636,7 +2702,7 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
         if gbad:
             raise LogError(f'--gate-json: {gbad}')
         check_outcome_vs_gate(outcome, gate, run['row'].get('platform'), fail_cause,
-                              row_required(run['row'], gate_file))
+                              row_so_do(run['row'], gate_file))
     if outcome == 'hong_he_do' and not fail_cause:
         raise LogError('hong_he_do needs --fail-cause (S05 §6.1)')
     if run['row'].get('platform') == 'HIL' and outcome in VALID and gate is None:
@@ -3407,16 +3473,16 @@ def fake_gate(e_trk: float = 0.03, mapped: bool = True, completed: str = 'true',
               e_theta_deg: float = 3.0) -> dict:
     """A made-up gate (FAKE: demo and tests only, no measurement): 20 frames of constant errors, e_trk as given;
     mapped: U_t known and all five decide, else the HIL set without the run_active edge mapping (G1, G2).
-    gate_file (gate_c8.GateC8, O1 v11.33): a gate_v3.3 gate scored with it, the report-only conditions of `level`
-    for a run of platform / stage / campaign."""
+    gate_file (gate_c8.GateC8, O1 v11.33): a gate_v3.4 gate scored with it, the so_do conditions of `level` for a
+    run of platform / stage / campaign decided by q (CODE 23/11)."""
     n = 20
     frames = {'e_perp': [0.02] * n, 'e_trk': [e_trk] * n, 'e_bao': [0.04] * n, 'e_theta_cmd_deg': [e_theta_deg] * n}
-    kw = {}
+    g = _plain(o1_gate.gate(frames, completed, v_cmd_max=0.729, wz_cmd_max=1.634, u_t=0.0015 if mapped else None,
+                            decide=o1_gate.DECIDE_ALL if mapped else o1_gate.DECIDE_HIL, note='FAKE'))
     if gate_file is not None:
-        kw = dict(report_only=gate_file.run_report_only(level, platform, stage, campaign), level=level,
-                  gate_file_sha256=gate_file.sha256)
-    return _plain(o1_gate.gate(frames, completed, v_cmd_max=0.729, wz_cmd_max=1.634, u_t=0.0015 if mapped else None,
-                               decide=o1_gate.DECIDE_ALL if mapped else o1_gate.DECIDE_HIL, note='FAKE', **kw))
+        g = _plain(gate_c8.apply_so_do(g, gate_file.run_so_do(level, platform, stage, campaign), level,
+                                       gate_file.sha256))
+    return g
 
 
 _FAKE_Q = {'dir': None, 'n': 0}
@@ -3464,7 +3530,7 @@ def floor_gate(g: dict, t_done=None, t_deadline: float = 20.0) -> dict:
     g['g1'].update(t_done=list(t_done), t_deadline=t_deadline)
     st = gate_g1_state(gate_g1_fields(g['g1'], 'HW'))
     g['g1'].update(state=st, q={'dat': 'true', 'khong_dat': 'false'}.get(st, 'inconclusive'))
-    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g.get('required')))
+    g.update(o1_gate.evaluate_outcomes(g, g['decide'], GATE_CONDS))
     return g
 
 
@@ -3708,7 +3774,7 @@ def main(argv=None) -> int:
     e.add_argument('--c8b-gio', default='', help=f'C8b time file of the run ({C8B_GIO_FORMAT}, ok false) with '
                    f'--fail-cause {C8B_GIO_FAIL} (O1 v11.37)')
     e.add_argument('--gate-file-fake', action='store_true', help='accept a FAKE gate file (tests, demo only; GC6-14)')
-    e.add_argument('--gate-file', default='', help='the locked C8 gate file (gate_c8_v1): report-only conditions of '
+    e.add_argument('--gate-file', default='', help='the locked C8 gate file (gate_c8_v2): so_do conditions of '
                    'the level (O1 v11.33); needed when the scorer used it')
     e.add_argument('--query-before', default='', help='gain_send.py --query output just before the run (R134 (b))')
     e.add_argument('--query-after', default='', help='gain_send.py --query output just after the run (R134 (b))')

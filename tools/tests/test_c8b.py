@@ -644,23 +644,50 @@ def test_domain_key_camera_clock():
     assert LU.domain_key(sc, g) == (5.5, None)               # 2.0 + 5.0 - 1.5 on the camera clock
 
 
-def test_cat_only_report_only_is_lost():
-    # C8BS-7: the exception rests only on G5, which is report-only: the node is lost, not khong_dat
-    st = ['chua_ket_luan', 'dat', 'dat', 'dat', 'khong_dat']
-    n = [node(st, rows_with(0.2, c='g5', lo=8.0), cat=True) for _ in range(3)]
-    assert LU.combine(n)['outcome'] == 'khong_dat'
-    res = LU.combine(n, frozenset({'g5'}))
-    assert res['outcome'] == 'hong_he_do' and res['hong_nut'] == [True] * 3 and res['cat_nut'] == [False] * 3
-
-
-def test_gate_block_decide_follows_mask():
-    # C8BS-8: G5 report-only: the combined block decides G1-G4 and its outcome_decide is dat
+def _so_do_nodes(q_mid, n_nodes=3, mid_ok=True, other_ok=True):
+    """G5 three-branch khong_dat at every node (lo 8.0); q of G5 per node: q_mid at the middle node, 9.0 elsewhere."""
     st = ['dat', 'dat', 'dat', 'dat', 'khong_dat']
-    n = [node(st, rows_with(0.2, c='g5', lo=8.0)) for _ in range(2)]
-    res = LU.combine(n, frozenset({'g5'}))
-    g = LU.gate_block(n, res, dict(nodes_s=[1.0, 1.001]), 'a' * 64, 'O1-F08', 'b' * 64)
-    assert g['decide'] == ['g1', 'g2', 'g3', 'g4'] and g['outcome_decide'] == 'dat' and g['outcome'] == 'khong_dat'
-    assert g['report_only'] == ['g5'] and g['gate_file_sha256'] == 'b' * 64 and g['level'] == 'O1-F08'
+    out = []
+    for i in range(n_nodes):
+        ok = mid_ok if i == n_nodes // 2 else other_ok
+        x = node(st, rows_with(0.2, c='g5', lo=8.0), ok=ok, kind='loi')
+        if ok:
+            q = q_mid if i == n_nodes // 2 else 9.0
+            x['nums']['g5'].update(q=q, q_chung=q)
+        out.append(x)
+    return out
+
+
+def test_code_23_11_so_do_at_the_middle_node():
+    # CODE 23/11 (2): a so_do condition decides by q of the middle node of the grid (U not added), (4): a node not
+    # scored leaves q below the threshold chua_ket_luan; the three-branch grid state is kept
+    ns = [1.0, 1.001, 1.002]
+    res = LU.combine(_so_do_nodes(7.0), frozenset({'g5'}), ns)
+    assert res['states']['g5'] == 'dat' and res['states_ba_nhanh'] == {'g5': 'khong_dat'} and res['outcome'] == 'dat'
+    assert res['q_so_do']['g5'] == dict(nut=1, q=7.0, q_chung=7.0) and res['decide'] == list(LU.CONDS)
+    assert LU.combine(_so_do_nodes(7.6), frozenset({'g5'}), ns)['states']['g5'] == 'khong_dat'
+    r = LU.combine(_so_do_nodes(7.0, other_ok=False), frozenset({'g5'}), ns)
+    assert r['states']['g5'] == 'chua_ket_luan' and r['outcome'] == 'chua_ket_luan'
+    r = LU.combine(_so_do_nodes(7.0, mid_ok=False), frozenset({'g5'}), ns)          # the nearest scored node, lower
+    assert r['q_so_do']['g5']['nut'] == 0 and r['states']['g5'] == 'khong_dat'      # index on a tie (q 9.0 there)
+    assert LU.combine(_so_do_nodes(7.0), frozenset(), ns)['states']['g5'] == 'khong_dat'   # no so_do: three branches
+    assert LU.nut_giua([1.0, 1.001, 1.002, 1.004], [True] * 4) == 2                 # by time: middle 1.002
+    import gate_c8
+    for nodes_s, ok in [([1.0, 1.001, 1.002, 1.004], [True] * 4), ([1.0, 1.001], [True, True]),
+                        ([1.0, 1.001, 1.002], [True, False, True]), ([1.0], [False]), (None, [True, True, True])]:
+        assert LU.nut_giua(nodes_s, ok) == gate_c8._nut_giua(nodes_s, ok)
+
+
+def test_code_23_11_gate_block_so_do():
+    # every condition decides; G5 by q of the middle node (gate_v3.4, q_so_do), its three-branch state kept
+    n = _so_do_nodes(7.0)
+    res = LU.combine(n, frozenset({'g5'}), [1.0, 1.001, 1.002])
+    g = LU.gate_block(n, res, dict(nodes_s=[1.0, 1.001, 1.002]), 'a' * 64, 'O1-F08', 'b' * 64)
+    assert g['decide'] == list(LU.CONDS) and g['outcome_decide'] == g['outcome'] == 'dat' and g['version'] == 'gate_v3.4'
+    assert g['so_do'] == ['g5'] and g['gate_file_sha256'] == 'b' * 64 and g['level'] == 'O1-F08'
+    assert g['g5']['state_ba_nhanh'] == 'khong_dat' and g['g5']['q_so_do'] == dict(nut=1, q=7.0, q_chung=7.0)
+    with pytest.raises(LU.LuoiError, match='without its source'):
+        LU.gate_block(n, res, dict(nodes_s=[1.0, 1.001, 1.002]), 'a' * 64, 'O1-F08', None)
 
 
 def test_node_state_must_follow_numbers(tmp_path):
@@ -682,12 +709,13 @@ def test_single_node_uses_its_state():
     assert res['states']['g2'] == 'chua_ket_luan' and res['states']['g3'] == 'khong_dat'
 
 
-def test_report_only_not_in_outcome():
+def test_so_do_in_outcome():
+    # CODE 23/11: a so_do condition decides (report only before: left out of the outcome)
     st = ['dat', 'dat', 'dat', 'dat', 'khong_dat']
     n = [node(st, rows_with(0.2, c='g5', lo=8.0)) for _ in range(2)]
     assert LU.combine(n)['outcome'] == 'khong_dat'
-    res = LU.combine(n, frozenset({'g5'}))
-    assert res['states']['g5'] == 'khong_dat' and res['outcome'] == 'dat' and 'g5' not in res['decide']
+    res = LU.combine(n, frozenset({'g5'}), [1.0, 1.001])
+    assert res['states']['g5'] == 'khong_dat' and res['outcome'] == 'khong_dat' and 'g5' in res['decide']
 
 
 def test_state_from_numbers_matches_rq3_log():
@@ -700,14 +728,21 @@ def test_state_from_numbers_matches_rq3_log():
         assert LU._state_from_numbers(lo_c, lo_u, hi_u, nu, 0.1) == rq3_log.cond_state2(lo_c, lo_u, hi_u, nu, 0.1)
 
 
-def _write_node(d, k, states, rows, u_t=0.031):
+def _write_node(d, k, states, rows, u_t=0.031, so_do=(), sha=None):
+    import gate_c8
     g = {'g1': dict(state=states[0])}
     for i, (c, s) in enumerate(zip(LU.MEASURED, states[1:])):
         lo = max(r[2][i] for r in rows)                  # numbers that follow the rows and the state (C8BS-17)
         hi = lo + 0.02 if s != 'dat' else min(lo + 0.02, LU.THRESHOLDS[c])
         g[c] = dict(state=s, q=lo + 0.01, lo=lo, hi=hi, n_undef=0, chung=dict(q=lo + 0.01, lo=lo, hi=hi, n_undef=0))
+    for c in so_do:                                      # a node scored with so_do (CODE 23/11): c7_score's block
+        g[c].update(state_ba_nhanh=g[c]['state'], nhanh='so_do',
+                    state=gate_c8.so_do_state(g[c]['q'], g[c]['q'], 0, LU.THRESHOLDS[c]))
+    if so_do:
+        g.update(version='gate_v3.4', so_do=list(so_do), gate_file_sha256=sha)
     with open(os.path.join(d, f'nut_{k:03d}.json'), 'w', encoding='utf-8') as f:
-        json.dump(dict(outcome='dat', gate_v3=g, U_t_s=u_t, t0_log_us=5e6, gio_c8b=dict(D=1.0 + 0.001 * k)), f)
+        json.dump(dict(outcome='dat', gate_v3=g, U_t_s=u_t, t0_log_us=5e6, gio_c8b=dict(D=1.0 + 0.001 * k),
+                       so_do=list(so_do)), f)
     with open(os.path.join(d, f'nut_{k:03d}_rows.csv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
         w.writerow(['t', 't_cam_s', 'mien_chung', 'mien_hop'] + [f'lo_{c}' for c in LU.MEASURED])
@@ -797,9 +832,9 @@ def test_ct3_3_node_not_a_c8_scoring_is_not_taken(tmp_path):
     assert r['n_nut_cham'] == 0 and r['trang_thai_luot'] == 'chua_ket_luan_khong_nut' and r['gate_v3'] is None
 
 
-def test_ct4_4_g5_of_f08_reports_only_without_a_gate_mask(tmp_path):
-    # Codex CAM CT4-4: G5 of the figure 8 at F08 is report only by the J source (J v6 section 6, L130), also when no
-    # gate file (empty mask) is given: a G5 over its threshold does not make the run khong_dat
+def test_ct4_4_g5_of_f08_so_do_without_a_gate_mask(tmp_path):
+    # Codex CAM CT4-4: G5 of the figure 8 at F08 is in the mask by the J source (J v6 section 6, L130), also when no
+    # gate file (empty mask) is given; since 23/11 it decides by q (CODE, Liam): G5 10 deg makes the run khong_dat
     d = str(tmp_path / 'luoi')
     os.makedirs(d)
     gio = dict(format='c8b_gio_v1', task='O1-F08', ok=True, nodes_s=[1.0, 1.001])
@@ -811,11 +846,19 @@ def test_ct4_4_g5_of_f08_reports_only_without_a_gate_mask(tmp_path):
             json.dump(dict(scorer=dict(commit='abc1234', dirty=False), gio_sha256=c8_u_imu.sha256(gp),
                            D_s=gio['nodes_s'][k]), f)
         _write_node(d, k, ['dat', 'dat', 'dat', 'dat', 'khong_dat'], [(10.000001, 1, [0.05, 0.05, 0.05, 10.0])])
+    assert LU.main(['--gio', gp, '--out-dir', d, '--gop-only']) != 0      # nodes scored without the so_do of J
+    for k in range(2):
+        _write_node(d, k, ['dat', 'dat', 'dat', 'dat', 'khong_dat'], [(10.000001, 1, [0.05, 0.05, 0.05, 10.0])],
+                    so_do=('g5',), sha=LU.J_V6_SHA256)
     assert LU.main(['--gio', gp, '--out-dir', d, '--gop-only']) == 0
     r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
-    assert r['states']['g5'] == 'khong_dat' and r['report_only'] == ['g5'] and 'g5' not in r['decide']
-    assert r['outcome'] == 'dat'
-    assert LU.report_only_of(None, 'O1-F05') == (frozenset(), None)
+    assert r['states']['g5'] == 'khong_dat' and r['so_do'] == ['g5'] and 'g5' in r['decide']
+    assert r['outcome'] == 'khong_dat' and r['q_so_do']['g5']['nut'] == 0 and r['gate_v3']['version'] == 'gate_v3.4'
+    assert r['gate_v3']['gate_file_sha256'] == LU.J_V6_SHA256
+    assert LU.so_do_of(None, 'O1-F05') == (frozenset(), None)
+    assert LU.so_do_of(None, 'O1-F08') == (frozenset({'g5'}), LU.J_V6_SHA256)
+    import c7_score
+    assert LU.J_V6_SHA256 == c7_score.J_V6_SHA256
 
 
 def test_f19_luoi_chain_files(tmp_path):
@@ -2348,7 +2391,7 @@ def _pair(rid, task, half, outcome, ut, nodes=None, gio_ok=True, ctrl='PID'):
              ket_luan='ok' if gio_ok else 'hong_he_do', controller=ctrl)
     sha = _gsha(rid)
     g['sha256'] = dict(frames=_fsha(rid), esp32='0' * 64)       # the clock file names its frames (c8b_gio)
-    l = dict(version='c8b_luoi_v1', gio_sha256=sha, task=task, nodes_s=nodes, report_only=[], outcome=outcome,
+    l = dict(version='c8b_luoi_v1', gio_sha256=sha, task=task, nodes_s=nodes, so_do=[], outcome=outcome,
              u_t_nodes=ut, script=SCRIPT, scorer=SCORER, nhanh_tick=['bo'])
     return g, l, sha
 
@@ -2714,3 +2757,15 @@ def test_repo_state_marks_untracked_scorer(tmp_path):
     st = G.repo_state(os.path.join(HERE, '..', 'c7_score.py'))
     assert st['file'] == 'tools/c7_score.py' and st['tracked'] is True
 
+
+
+def test_code_23_11_scorer_cmd_passes_so_do():
+    # CODE 23/11 (3): every node is scored with the so_do of the run and the SHA of its source (C8 gate file or J v6)
+    import argparse
+    a = argparse.Namespace(scorer=None, frames='f.csv', esp32='e.csv', hang_so='h.json', sender=None, scorer_arg=None,
+                           so_do_run=frozenset({'g5'}), so_do_sha_run=LU.J_V6_SHA256)
+    cmd = LU.scorer_cmd('gio.json', 0, a, 's.json', 'r.csv', 'O1-F08')
+    i = cmd.index('--so-do')
+    assert cmd[i + 1:i + 4] == ['g5', '--so-do-sha', LU.J_V6_SHA256]
+    a.so_do_run = frozenset()
+    assert '--so-do' not in LU.scorer_cmd('gio.json', 0, a, 's.json', 'r.csv', 'O1-F05')

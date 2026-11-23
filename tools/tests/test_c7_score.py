@@ -1628,19 +1628,25 @@ def test_v11_33_tick_branch_value_checked(tmp_path):
 
 
 # ---------------------------------------------------------------- O1 v11.33 3.5 (OG2-3): report-only conditions and R2V-4
-def test_v11_33_report_only_condition_does_not_make_a_violation_before_t1(tmp_path):
-    """A certain violation of G3 only (lo 0.12 > D) before t1: the exception R2V-4 sees it; with G3 report-only at the
-    level of the run it does not; G4 is never report-only."""
+def test_code_23_11_so_do_condition_violates_before_t1_by_q(tmp_path):
+    """CODE 23/11 (3): before t1 a so_do condition (rule 2b by the measured value; report only and not looked at
+    before) violates when q_k is above the threshold, the others when lo_k is; G4 is never so_do."""
     n = 4
     lo = {c: np.zeros(n) for c in cs.o1_gate.MEASURED}
-    lo['g3'][1] = 0.12
+    q = {c: np.zeros(n) for c in cs.o1_gate.MEASURED}
+    lo['g3'][1], q['g3'][1] = 0.12, 0.13
     mask = np.ones(n, bool)
     assert cs.certain_violations(lo, mask) == ['g3']
-    assert cs.certain_violations(lo, mask, frozenset({'g3'})) == []
-    lo['g4'][2] = 0.12
-    assert cs.certain_violations(lo, mask, frozenset({'g2', 'g3', 'g5'})) == ['g4']
-    with pytest.raises(ValueError, match='report_only'):
-        run(tmp_path, report_only=frozenset({'g4'}))
+    assert cs.certain_violations(lo, mask, frozenset({'g3'}), q) == ['g3']
+    q['g5'][2] = 7.6                                       # q above 7.5 deg, lo not: a so_do G5 violates
+    assert cs.certain_violations(lo, mask, frozenset({'g3'}), q) == ['g3']
+    assert cs.certain_violations(lo, mask, frozenset({'g3', 'g5'}), q) == ['g3', 'g5']
+    with pytest.raises(ValueError, match='per-frame q'):
+        cs.certain_violations(lo, mask, frozenset({'g5'}))
+    with pytest.raises(ValueError, match='so_do'):
+        run(tmp_path, so_do=frozenset({'g4'}), so_do_sha='a' * 64)
+    with pytest.raises(ValueError, match='so-do-sha'):
+        run(tmp_path, so_do=frozenset({'g3'}))
 
 
 def test_v11_33_window_narrower_than_the_grid_uses_its_ends():
@@ -1908,27 +1914,27 @@ def test_vg1_3_adjacent_nodes_at_most_1_ms(tmp_path, nodes, ok):
 
 
 @pytest.mark.parametrize('task', ['O1-K1', 'O1-K2'])
-def test_vg1_4_k_tasks_refuse_report_only(tmp_path, task):
-    """CODE_GATE 4: K1, K2 decide on all five conditions: a report-only set is refused (an empty one is the default)."""
+def test_vg1_4_k_tasks_refuse_so_do(tmp_path, task):
+    """CODE_GATE 4: K1, K2 take the three branches on all five conditions: a so_do set is refused (empty: default)."""
     with pytest.raises(ValueError, match='VG1-4'):
-        run(tmp_path, task, frames=make_frames(task), k_start=K1S, allow_final_set=True, report_only=frozenset({'g3'}))
-    out, _ = run(tmp_path, task, frames=make_frames(task), k_start=K1S, allow_final_set=True, report_only=frozenset())
+        run(tmp_path, task, frames=make_frames(task), k_start=K1S, allow_final_set=True, so_do=frozenset({'g3'}),
+            so_do_sha='a' * 64)
+    out, _ = run(tmp_path, task, frames=make_frames(task), k_start=K1S, allow_final_set=True, so_do=frozenset())
     assert out['outcome'] == 'dat'
 
 
-def test_kt4_report_only_through_score_on_a_figure_8(tmp_path):
+def test_kt4_so_do_through_score_on_a_figure_8(tmp_path):
     """KT4 through score(): F05 with a camera gap [8.0, 8.3] s (t1 = 8.0). (a) the car pulled back up to 0.3 s in
-    [5, 6] s: a certain G3 violation only (lo above D); khong_dat, and hong_he_do when G3 is report-only (G5 alone
-    report-only changes nothing). (b) the heading turned 14 deg in [5, 6] s (camera and IMU alike): G5 only;
-    report-only G5 gives hong_he_do. (c) 0.13 m off the lane: G2, G3, G4 violated; with G2, G3, G5 report-only the G4
-    violation still gives khong_dat."""
+    [5, 6] s: a certain G3 violation only (lo above D); khong_dat, also with G3 so_do (q above D; report only gave
+    hong_he_do before 23/11). (b) the heading turned 14 deg in [5, 6] s (camera and IMU alike): G5 only; so_do G5
+    still gives khong_dat (CODE 23/11, Liam's 15 deg example). (c) 0.13 m off the lane: G2, G3, G4 violated."""
     fr = make_frames('O1-F05', drop=[(8.0, 8.3)], back=(5.0, 6.0, 0.3))
     out, _ = run(tmp_path, frames=fr)
     assert out['outcome'] == 'khong_dat' and out['cat_t1']
-    out, _ = run(tmp_path, frames=fr, report_only=frozenset({'g5'}))
-    assert out['outcome'] == 'khong_dat'
-    out, _ = run(tmp_path, frames=fr, report_only=frozenset({'g3'}))
-    assert out['outcome'] == 'hong_he_do' and not out['cat_t1']
+    out, _ = run(tmp_path, frames=fr, so_do=frozenset({'g5'}), so_do_sha='a' * 64)
+    assert out['outcome'] == 'khong_dat' and out['gate_v3']['version'] == 'gate_v3.4' and out['so_do'] == ['g5']
+    out, _ = run(tmp_path, frames=fr, so_do=frozenset({'g3'}), so_do_sha='a' * 64)
+    assert out['outcome'] == 'khong_dat' and out['cat_t1']
     off = math.radians(14.0)
     fr = make_frames('O1-F05', drop=[(8.0, 8.3)])
     for r in fr:
@@ -1938,10 +1944,10 @@ def test_kt4_report_only_through_score_on_a_figure_8(tmp_path):
     out, rows = run(tmp_path, frames=fr, log_kw=lk)
     assert out['outcome'] == 'khong_dat'
     assert not any(r[f'lo_{c}'] > 0.1 for r in rows for c in ('g2', 'g3', 'g4') if np.isfinite(r[f'lo_{c}']))
-    out, _ = run(tmp_path, frames=fr, log_kw=lk, report_only=frozenset({'g5'}))
-    assert out['outcome'] == 'hong_he_do'
+    out, _ = run(tmp_path, frames=fr, log_kw=lk, so_do=frozenset({'g5'}), so_do_sha='a' * 64)
+    assert out['outcome'] == 'khong_dat' and out['cat_t1']
     fr = make_frames('O1-F05', drop=[(8.0, 8.3)], lat_fn=lambda t: 0.13 if 5.0 <= t < 6.0 else 0.0)
-    out, _ = run(tmp_path, frames=fr, report_only=frozenset({'g2', 'g3', 'g5'}))
+    out, _ = run(tmp_path, frames=fr, so_do=frozenset({'g2', 'g3', 'g5'}), so_do_sha='a' * 64)
     assert out['outcome'] == 'khong_dat' and out['fail_cause'] == cs.FAIL_VIOL
 
 
@@ -2017,9 +2023,9 @@ def test_kt6_drop_tick_still_needs_the_log_over_the_domain(tmp_path):
     assert out['U_t_parts']['nhanh_tick'] == 'bo' and not math.isfinite(out['U_t_parts']['tick_s'])
 
 
-def test_kt6_drop_tick_with_u_t_before_t1_and_report_only(tmp_path):
+def test_kt6_drop_tick_with_u_t_before_t1_and_so_do(tmp_path):
     """KT6: branch 'bo', the log covering [0, t1] but not the union domain (U_t holds before t1, CS3-1), a G3 violation
-    before t1: khong_dat with U_t_scope truoc_t1; with G3 report-only no certain violation is left: hong_he_do."""
+    before t1: khong_dat with U_t_scope truoc_t1; with G3 so_do its q is above D too: khong_dat (CODE 23/11)."""
     T = lane_of('O1-F05').Tcmd
     assert T > 9.0
     fr = make_frames('O1-F05', drop=[(8.0, 8.3)], back=(5.0, 6.0, 0.3))
@@ -2027,8 +2033,9 @@ def test_kt6_drop_tick_with_u_t_before_t1_and_report_only(tmp_path):
     out, _ = run_gio(tmp_path, **kw)
     assert out['outcome'] == 'khong_dat' and out['U_t_scope'] == 'truoc_t1'
     assert out['U_t_s'] == pytest.approx(sum(out['U_t_parts'][k] for k in ('luoi_s', 'drift_s', 'man_trap_s')))
-    out, _ = run_gio(tmp_path, report_only=frozenset({'g3'}), **kw)
-    assert out['outcome'] == 'hong_he_do' and 'no certain violation before t1' in out['outcome_reasons'][0]
+    out, _ = run_gio(tmp_path, so_do=frozenset({'g3'}), so_do_sha='a' * 64, **kw)
+    assert out['outcome'] == 'khong_dat' and out['U_t_scope'] == 'truoc_t1'
+    assert out['gate_v3']['g3']['nhanh'] == 'so_do'
 
 
 def test_kt8_cli_gio_nut_rows(tmp_path, monkeypatch, capsys):

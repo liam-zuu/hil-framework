@@ -56,22 +56,28 @@ def _gate(gf=None, level='O1-F08', platform='HIL', stage='hil_check', campaign='
                         **kw)
 
 
-def test_end_hil_b_with_g5_report_only_is_dat(ds):
+def test_end_hil_b_with_g5_so_do(ds):
+    # CODE 23/11 (Liam "duyệt bảng luật mới"): G5 of the mask decides by q: 9 deg blocks (report only before: dat)
     d, gf, tmp = ds
     _hil_b(d)
     g = _gate(gf)
-    assert g['g5']['state'] == 'khong_dat' and g['outcome_decide'] == 'dat'
-    row = rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_sha256='x', gate_file=gf)
-    assert row['gate_version'] == 'gate_v3.3' and row['gate_report_only'] == 'g5'
-    assert row['gate_file_sha256'] == gf.sha256 and row['gate_decide'] == 'g1,g2,g3,g4'
-    rl.summary(d, gate_file=gf)                                               # the row passes the summary checks
+    assert g['g5']['state'] == 'khong_dat' and g['outcome_decide'] == 'khong_dat' and g['g5']['nhanh'] == 'so_do'
+    row = rl.end(d, 'khong_dat', completed=1, results_dir=str(tmp), gate=g, gate_sha256='x', gate_file=gf)
+    assert row['gate_version'] == 'gate_v3.4' and row['gate_so_do'] == 'g5'
+    assert row['gate_file_sha256'] == gf.sha256 and row['gate_decide'] == 'g1,g2,g3,g4,g5'
+    # 7.4 deg: hi above 7.5 (three branches chua_ket_luan), q below it: dat by q
+    _hil_b(d)
+    g = _gate(gf, th=7.4)
+    assert g['g5']['state_ba_nhanh'] == 'chua_ket_luan' and g['g5']['state'] == 'dat' and g['outcome_decide'] == 'dat'
+    rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_sha256='y', gate_file=gf)
+    rl.summary(d, gate_file=gf)                                               # the rows pass the summary checks
 
 
-def test_end_refuses_khong_dat_by_a_report_only_condition(ds):
+def test_end_refuses_dat_with_a_so_do_condition_above_the_threshold(ds):
     d, gf, tmp = ds
     _hil_b(d)
-    with pytest.raises(rl.LogError, match='gate outcome dat'):
-        rl.end(d, 'khong_dat', completed=1, results_dir=str(tmp), gate=_gate(gf), gate_file=gf)
+    with pytest.raises(rl.LogError, match='gate outcome khong_dat'):
+        rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=_gate(gf), gate_file=gf)
 
 
 def test_end_masked_gate_needs_the_gate_file(ds):
@@ -91,13 +97,13 @@ def test_end_refuses_another_gate_file(ds):
 
 
 def test_end_refuses_a_self_declared_exemption(ds):
-    # OG2-7: the run says G5 is report only at F05, the gate file says it decides there
+    # OG2-7: the run says G5 is so_do at F05, the gate file says it takes the three branches there
     d, gf, tmp = ds
     _hil_b(d, 'O1-F05')
     n = 20
-    frames = {'e_perp': [0.02] * n, 'e_trk': [0.03] * n, 'e_bao': [0.04] * n, 'e_theta_cmd_deg': [9.0] * n}
-    g = rl._plain(o1_gate.gate(frames, 'true', v_cmd_max=0.729, wz_cmd_max=1.634, u_t=0.0015, report_only=['g5'],
-                               level='O1-F05', gate_file_sha256=gf.sha256))
+    frames = {'e_perp': [0.02] * n, 'e_trk': [0.03] * n, 'e_bao': [0.04] * n, 'e_theta_cmd_deg': [7.4] * n}
+    g = rl._plain(GC.apply_so_do(rl._plain(o1_gate.gate(frames, 'true', v_cmd_max=0.729, wz_cmd_max=1.634,
+                                                        u_t=0.0015)), ['g5'], 'O1-F05', gf.sha256))
     with pytest.raises(rl.LogError, match='gate file gives'):
         rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_file=gf)
 
@@ -107,7 +113,7 @@ def test_end_refuses_an_exemption_without_any_gate_file(ds):
     _hil_b(d)
     g = _gate(gf)
     g['gate_file_sha256'] = None
-    with pytest.raises(rl.LogError, match='no condition is exempt'):
+    with pytest.raises(rl.LogError, match='source of so_do'):
         rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=g)
 
 
@@ -144,14 +150,13 @@ def test_summary_refuses_a_floor_campaign_run_scored_without_the_gate_file(ds):
         rl.summary(d, gate_file=gf)
 
 
-def test_summary_refuses_a_row_whose_report_only_was_edited(ds):
+def test_summary_refuses_a_row_whose_so_do_was_edited(ds):
     d, gf, tmp = ds
     _hil_b(d)
-    rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=_gate(gf), gate_file=gf)
+    rl.end(d, 'khong_dat', completed=1, results_dir=str(tmp), gate=_gate(gf), gate_file=gf)
     p = os.path.join(d, rl.TUNING)
     rows = rl.read_rows(p)
-    rows[-1]['gate_report_only'] = 'g3,g5'
-    rows[-1]['gate_decide'] = 'g1,g2,g4'
+    rows[-1]['gate_so_do'] = 'g3,g5'
     rl._write_all(p, rl.TUNING_COLS, rows)
     with pytest.raises(rl.LogError, match='gate file gives'):
         rl.summary(d, gate_file=gf)
@@ -161,11 +166,11 @@ def test_floor_run_masked_at_f08(ds):
     d, gf, tmp = ds
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F08', '0.8', 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
-    g = rl.floor_gate(_gate(gf, platform='HW', stage='screen', campaign='A-PID'))
-    assert g['outcome_decide'] == 'dat' and g['g5']['state'] == 'khong_dat'
+    g = rl.floor_gate(_gate(gf, platform='HW', stage='screen', campaign='A-PID', th=7.4))
+    assert g['outcome_decide'] == 'dat' and g['g5']['state'] == 'dat' and g['g5']['state_ba_nhanh'] == 'chua_ket_luan'
     row = rl.end(d, 'dat', completed=1, e_perp_max=0.02, results_dir=str(tmp), gate=g, gate_file=gf,
                  queries=rl.fake_queries())
-    assert row['gate_report_only'] == 'g5'
+    assert row['gate_so_do'] == 'g5'
     rl.summary(d, gate_file=gf)
 
 
@@ -204,15 +209,18 @@ def test_hil_score_with_and_without_the_gate_file(tmp_path, monkeypatch):
     plain = H.score(p, 'O1-F08', esp_log='esp.csv')['gate_v3']
     b = H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp, gate_file_fake=True, stage='hil_check', campaign='B-PID')['gate_v3']
     fin = H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp, gate_file_fake=True, stage='final_hil', campaign='RQ2')['gate_v3']
-    assert plain['version'] == b['version'] == fin['version'] == 'gate_v3.3'   # per-frame U (U_t known)
-    assert plain['u_mode'] == 'khung' and plain['gate_file_sha256'] is None and plain['report_only'] == []
-    assert b['report_only'] == ['g5'] and b['decide'] == ['g1', 'g2', 'g3', 'g4'] and b['complete'] is True
-    assert b['gate_file_sha256'] == GC.sha256_file(gp) and b['level'] == 'O1-F08'
-    assert fin['report_only'] == [] and fin['decide'] == list(o1_gate.CONDS)
+    assert plain['version'] == 'gate_v3.3' and b['version'] == fin['version'] == 'gate_v3.4'   # per-frame U
+    assert plain['u_mode'] == b['u_mode'] == 'khung' and plain['gate_file_sha256'] is None
+    assert plain['report_only'] == []
+    assert b['so_do'] == ['g5'] and b['decide'] == list(o1_gate.CONDS) and b['complete'] is True
+    assert b['gate_file_sha256'] == GC.sha256_file(gp) and b['level'] == 'O1-F08' and b['g5']['nhanh'] == 'so_do'
+    assert fin['so_do'] == [] and fin['decide'] == list(o1_gate.CONDS) and 'nhanh' not in fin['g5']
     for c in o1_gate.MEASURED:                                                # every condition still computed, same
         for k in ('q', 'lo', 'hi', 'n_undef', 'state'):
-            assert plain[c][k] == b[c][k] == fin[c][k] or all(
-                isinstance(x, float) and math.isnan(x) for x in (plain[c][k], b[c][k], fin[c][k]))
+            kb = 'state_ba_nhanh' if (k == 'state' and c == 'g5') else k
+            assert plain[c][k] == b[c][kb] == fin[c][k] or all(
+                isinstance(x, float) and math.isnan(x) for x in (plain[c][k], b[c][kb], fin[c][k]))
+    assert b['g5']['state'] == GC.so_do_state(b['g5']['chung']['q'], b['g5']['q'], b['g5']['n_undef'], 7.5)
     # the per-frame U is not above the constant one, and below it somewhere (frames near t = 0)
     v, wz = o1_gate.fig8_cmd_max(H.Schedule(H.FIG8['O1-F08']))
     assert plain['g3']['u'] <= v * 0.008 * (1 + 1e-9) and plain['g5']['u'] <= math.degrees(wz * 0.008) * (1 + 1e-9)
@@ -223,7 +231,7 @@ def test_hil_score_gate_accepted_by_rq3_log(tmp_path, monkeypatch):
     gp = _write(tmp_path, _good())
     g = rl._plain(H._json_safe(H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp, gate_file_fake=True, stage='hil_check',
                                        campaign='B-PID')['gate_v3']))
-    req = rl.read_gate_file(gp, allow_fake=True).required('O1-F08', 'HIL', 'hil_check', 'B-PID')
+    req = rl.read_gate_file(gp, allow_fake=True).run_so_do('O1-F08', 'HIL', 'hil_check', 'B-PID')
     ev = rl.validate_gate(g, 'HIL', req)
     assert ev['complete'] is True
 
@@ -247,7 +255,7 @@ def _grid_gate(gf, g1_nut, hong=None, cat=None, nut_tam=None, base=None):
                      g1_state=rl.luoi_g1(g1_nut))
     st = g['luoi']['g1_state']
     g['g1'].update(state=st, q={'dat': 'true', 'khong_dat': 'false'}.get(st, 'inconclusive'))
-    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g['required']))
+    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g.get('required')))
     return g
 
 
@@ -282,7 +290,7 @@ def test_grid_g1_state_must_be_the_grid_one(ds):
     _floor_run(d)
     g = _grid_gate(gf, ['dat', 'dat', 'khong_dat'])
     g['g1'].update(state='dat', q='true')
-    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g['required']))
+    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g.get('required')))
     with pytest.raises(rl.LogError, match='grid gives'):
         rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_file=gf, queries=rl.fake_queries())
 
@@ -580,7 +588,7 @@ def test_cc1_2_lost_run_without_gate_through_end_and_so_h(ds):
                     '--results-dir', folder, '--gate-json', sp]) == 0      # GT2-1: no gate file, as CC1-2
     row = rl.read_rows(os.path.join(d, rl.TUNING))[-1]
     assert row['gate_json_sha256'] == rl.sha256_file(sp) and not rl.has_gate(row)
-    assert (row['gate_file_sha256'], row['gate_report_only']) == ('', '')
+    assert (row['gate_file_sha256'], row['gate_so_do']) == ('', '')
     r = rl.so_h(d, row['run_uid'], rl.fake_score_final(folder, 0.8))
     assert r['outcome_sau'] == 'hong_he_do'
     rl.summary(d)
@@ -616,7 +624,7 @@ def _f05(gf, **kw):
 
 
 def _req(gf, level='O1-F05'):
-    return gf.required(level, 'HW', 'screen', 'A-PID')
+    return gf.run_so_do(level, 'HW', 'screen', 'A-PID')
 
 
 def _t1_base(gf, t_done=(10.0, 10.0), cat=False):
@@ -625,7 +633,7 @@ def _t1_base(gf, t_done=(10.0, 10.0), cat=False):
     g['g1'].update(t1=6.0, cat_t1=cat)
     st = rl.gate_g1_state(rl.gate_g1_fields(g['g1'], 'HW'))
     g['g1'].update(state=st, q={'dat': 'true', 'khong_dat': 'false'}.get(st, 'inconclusive'))
-    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g['required']))
+    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g.get('required')))
     return g
 
 
@@ -636,7 +644,7 @@ def _undef(g):
         g[c]['n_undef'] = 1
         com = g[c].get('chung') or g[c]
         g[c]['state'] = rl.cond_state2(com['lo'], g[c]['lo'], g[c]['hi'], 1, thr)
-    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g['required']))
+    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g.get('required')))
     return g
 
 
@@ -724,20 +732,20 @@ def test_gt1_6_a_lost_run_without_gate_keeps_its_gate_file_for_so_h(ds):
     assert rl.main(['--dataset', d, 'end', '--outcome', 'hong_he_do', '--fail-cause', 'mat_khung_FAKE',
                     '--results-dir', folder, '--gate-json', sp, '--gate-file', str(tmp / 'gate_c8.json'), '--gate-file-fake']) == 0
     row = rl.read_rows(os.path.join(d, rl.TUNING))[-1]
-    assert (row['gate_file_sha256'], row['gate_report_only']) == (gf.sha256, 'g5') and not rl.has_gate(row)
+    assert (row['gate_file_sha256'], row['gate_so_do']) == (gf.sha256, 'g5') and not rl.has_gate(row)
     h1 = rl.floor_gate(rl.fake_gate(gate_file=gf, level='O1-F08', platform='HW', stage='screen', campaign='A-PID'))
-    assert h1['report_only'] == ['g5'] and h1['outcome_decide'] == 'dat'
+    assert h1['so_do'] == ['g5'] and h1['outcome_decide'] == 'dat'
     sf = rl.fake_score_final(folder, 3.0, h1=dict(FAKE=True, outcome='dat', gate_v3=h1))   # above eps_H
     assert rl.so_h(d, row['run_uid'], sf)['outcome_sau'] == 'hong_he_do'
     rl.summary(d, gate_file=gf)
     p = os.path.join(d, rl.TUNING)
     rows = rl.read_rows(p)
-    rows[-1]['gate_report_only'] = ''                                        # edited by hand: refused (by the
+    rows[-1]['gate_so_do'] = ''                                              # edited by hand: refused (by the
     rl._write_all(p, rl.TUNING_COLS, rows)                                   # so-h check again, or the row check)
-    with pytest.raises(rl.LogError, match='GT1-6|report-only'):
+    with pytest.raises(rl.LogError, match='GT1-6|so_do'):
         rl.summary(d, gate_file=gf)
     rows[-1]['gate_file_sha256'] = 'ab' * 32
-    rows[-1]['gate_report_only'] = 'g5'
+    rows[-1]['gate_so_do'] = 'g5'
     rl._write_all(p, rl.TUNING_COLS, rows)
     with pytest.raises(rl.LogError, match='GT1-6|gate file SHA'):
         rl.summary(d, gate_file=gf)
@@ -923,7 +931,7 @@ def test_gt2_1_a_lost_run_without_gate_needs_no_gate_file(ds):
     rl.step(d, 'run')
     row = rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', results_dir=folder, gate=None,
                  gate_sha256=rl.sha256_file(sp))                             # CC1-2 without the gate file
-    assert (row.get('gate_file_sha256', ''), row.get('gate_report_only', '')) == ('', '')
+    assert (row.get('gate_file_sha256', ''), row.get('gate_so_do', '')) == ('', '')
     rl.summary(d)
     rl.summary(d, gate_file=gf)
 
@@ -1109,7 +1117,7 @@ def test_gc6_8_one_g5_domain_when_t_som_is_the_deadline():
 
 def _t_som_grid(g1_nut, cat=None, g5_common_deg=5.0, t_som=8.0):
     g = _t_som_gate(t_som=t_som, g5_common_deg=g5_common_deg)
-    g.update(version=o1_gate.GATE_VERSION_V1133, report_only=[], required=list(o1_gate.CONDS))  # grid: gate_v3.3
+    g.update(version=o1_gate.GATE_VERSION_V1133, report_only=[], required=list(o1_gate.CONDS))  # grid: gate_v3.3, no mask
     n = len(g1_nut)
     g['luoi'] = dict(format='luoi_v1', gio_sha256='cd' * 32, n_nut=n, d_dau_s=0.010, d_cuoi_s=0.010 + 0.001 * (n - 1),
                      buoc_max_s=0.001 if n > 1 else 0.0, nut_tam=n // 2, g1_nut=list(g1_nut), hong_nut=[False] * n,
@@ -1140,7 +1148,7 @@ def test_gc6_16_an_old_log_read_after_migrate(ds):
     d, gf, tmp = ds
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F08', '0.8', 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
-    g = rl.floor_gate(_gate(gf, platform='HW', stage='screen', campaign='A-PID'))
+    g = rl.floor_gate(_gate(gf, platform='HW', stage='screen', campaign='A-PID', th=7.4))   # G5 so_do dat by q
     rl.end(d, 'dat', completed=1, e_perp_max=0.02, results_dir=str(tmp), gate=g, gate_file=gf,
            queries=rl.fake_queries())
     path = os.path.join(d, rl.TUNING)
@@ -1275,3 +1283,33 @@ def test_gc6_14_a_fake_gate_is_no_c8_gate(ds):
     with pytest.raises(rl.LogError, match='FAKE'):
         rl.read_gate_file(str(tmp / 'gate_c8.json'))
     assert rl.read_gate_file(str(tmp / 'gate_c8.json'), allow_fake=True).fake
+
+
+def test_code_23_11_grid_so_do_at_the_middle_node_through_rq3_log(ds):
+    """CODE 23/11 (2): a grid gate whose so_do G5 is decided at the middle node (q_so_do): validated, its row columns
+    read back and recomputed; a node out of the grid, a lost node, a q above the grid maximum are refused."""
+    d, gf, tmp = ds
+    base = rl.floor_gate(_gate(gf, platform='HW', stage='screen', campaign='A-PID', th=7.4))
+    g = _grid_gate(gf, ['dat'] * 3, base=base)
+    assert g['version'] == 'gate_v3.4' and g['so_do'] == ['g5']
+    g['g5']['q'] = g['g5']['chung']['q'] = 7.4                  # the grid maxima
+    g['g5']['q_so_do'] = dict(nut=1, q=7.2, q_chung=7.2)
+    g['g5']['state'] = 'dat'
+    g.update(o1_gate.evaluate_outcomes(g, g['decide'], None))
+    rl.validate_gate(g, 'HW', ('g5',))
+    cols = rl.gate_columns(g, 'a' * 64)
+    assert (cols['g5_so_do_nut'], cols['g5_so_do_q']) == ('1', repr(7.2)) and cols['g2_so_do_nut'] == ''
+    back = rl.gate_from_row(dict(cols, run_uid='X', trajectory='O1-F08'))
+    assert back['g5']['q_so_do'] == dict(nut=1, q=7.2, q_chung=7.2)
+    rl._recompute(back, 'HW', ('g5',))
+    for edit, msg in [(lambda x: x['g5']['q_so_do'].update(nut=3), 'q_so_do'),
+                      (lambda x: x['luoi']['hong_nut'].__setitem__(1, True), 'q_so_do|lost|n_undef'),
+                      (lambda x: x['g5']['q_so_do'].update(q=7.6), 'above the grid maxima'),
+                      (lambda x: x['g5'].update(state='chua_ket_luan'), 'so_do')]:
+        y = json.loads(json.dumps(g))
+        edit(y)
+        y.update(o1_gate.evaluate_outcomes(y, y['decide'], None))
+        with pytest.raises(rl.LogError, match=msg):
+            rl.validate_gate(y, 'HW', ('g5',))
+    with pytest.raises(rl.LogError, match='not so_do'):
+        rl.gate_from_row(dict(cols, run_uid='X', trajectory='O1-F08', g3_so_do_nut='1'))

@@ -261,11 +261,11 @@ def test_plate_moved_imu_certain_violation_is_khong_dat(tmp_path):
     assert g['g5']['state'] == 'khong_dat'                      # J5-6: IMU 10 deg, bound about 1 deg
 
 
-def test_f08_g5_report_only(tmp_path):
+def test_f08_g5_so_do(tmp_path):
     lane_rows = B.make_frames('O1-F08')
     fl, chain = to_floor('O1-F08', lane_rows)
     out, _ = score(tmp_path, 'O1-F08', fl, rel=rel_for('O1-F08', fl, chain))
-    assert 'g5' in out['report_only']
+    assert out['so_do'] == ['g5'] and out['gate_v3']['g5']['nhanh'] == 'so_do'
 
 
 def test_reference_window_lost(tmp_path):
@@ -372,10 +372,10 @@ def test_cli_relative_inputs_need_the_flag(tmp_path):
 
 
 # ---------------------------------------------------------------- Codex round 1 (CT1-*): each test fails on 921e839
-def test_ct1_1_f08_g5_report_only_does_not_decide(tmp_path):
+def test_ct1_1_f08_g5_so_do_decides(tmp_path):
     """CT1-1, CT1-20: F08 with G1-G4 passing and a CERTAIN G5 violation (camera and IMU turn together 15 deg, so the
-    frames are not yaw-suspect): G5 keeps its numbers and lo > 7.5 deg, but the run is not 'khong_dat'; the gate
-    leaves G5 out of its decide set and passes rq3_log with that required set."""
+    frames are not yaw-suspect): G5 keeps its numbers and lo > 7.5 deg; since 23/11 (CODE, Liam "duyệt bảng luật
+    mới", this very example) G5 decides by q: the run is khong_dat, the gate (gate_v3.4, J v6 sha) passes rq3_log."""
     lane_rows = B.make_frames('O1-F08')
     bump = lambda r: math.radians(15.0) if 2.0 <= r['t_s'] + B.OFFSET - B.T0 <= 3.0 else 0.0
     fl, chain = to_floor('O1-F08', lane_rows, psi_extra=bump)
@@ -383,9 +383,10 @@ def test_ct1_1_f08_g5_report_only_does_not_decide(tmp_path):
                    log_kw=dict(yaw_err=lambda t: math.radians(15.0) if 2.0 <= t <= 3.0 else 0.0))
     g = out['gate_v3']
     assert g['g5']['lo'] > 7.5 and g['g5']['state'] == 'khong_dat'
-    assert 'g5' not in g['decide'] and g['report_only'] == ['g5'] and g['gate_file_sha256'] == cs.J_V6_SHA256
-    rq3_log.validate_gate(g, 'HW', g['required'])
-    assert out['outcome'] != 'khong_dat' and all(g[c]['state'] != 'khong_dat' for c in ('g2', 'g3', 'g4'))
+    assert 'g5' in g['decide'] and g['so_do'] == ['g5'] and g['gate_file_sha256'] == cs.J_V6_SHA256
+    assert g['g5']['state_ba_nhanh'] == 'khong_dat' and g['g5']['nhanh'] == 'so_do'
+    rq3_log.validate_gate(g, 'HW', g['so_do'])
+    assert out['outcome'] == 'khong_dat' and all(g[c]['state'] != 'khong_dat' for c in ('g2', 'g3', 'g4'))
 
 
 @pytest.mark.parametrize('case', ['other_12b', 'other_clip', 'no_common_key', 'no_lan_lap_id'])
@@ -896,16 +897,16 @@ def test_ct2_4_short_a6_loss_is_undefined_frames_not_a_gap(tmp_path):
 
 
 def test_ct2_5_f08_mask_does_not_depend_on_the_call(tmp_path):
-    """CT2-5: F08 relative with a certain G5 violation: report_only={'g5'} passed by the caller gives the same gate
-    (gate_v3.3, J v6 sha) and outcome as the default call."""
+    """CT2-5: F08 relative with a certain G5 violation: so_do={'g5'} passed by the caller gives the same gate
+    (gate_v3.4, J v6 sha) and outcome as the default call (khong_dat since 23/11)."""
     lane_rows = B.make_frames('O1-F08')
     bump = lambda r: math.radians(15.0) if 2.0 <= r['t_s'] + B.OFFSET - B.T0 <= 3.0 else 0.0
     fl, chain = to_floor('O1-F08', lane_rows, psi_extra=bump)
     kw = dict(log_kw=dict(yaw_err=lambda t: math.radians(15.0) if 2.0 <= t <= 3.0 else 0.0))
     a, _ = score(tmp_path / 'a', 'O1-F08', fl, rel=rel_for('O1-F08', fl, chain), **kw)
-    b, _ = score(tmp_path / 'b', 'O1-F08', fl, rel=rel_for('O1-F08', fl, chain), report_only={'g5'}, **kw)
+    b, _ = score(tmp_path / 'b', 'O1-F08', fl, rel=rel_for('O1-F08', fl, chain), so_do={'g5'}, **kw)
     assert b['gate_v3']['version'] == a['gate_v3']['version'] and b['gate_v3']['gate_file_sha256'] == cs.J_V6_SHA256
-    assert b['outcome'] == a['outcome'] != 'khong_dat'
+    assert b['outcome'] == a['outcome'] == 'khong_dat'
 
 
 def test_ct2_8_absolute_no_frame_before_the_sender(tmp_path):
@@ -1071,12 +1072,15 @@ def test_ct1_20_g5_after_t_som_before_a_gap_is_lost(tmp_path):
 
 
 # ---------------------------------------------------------------- Codex round 3 (CT3-*, residuals): fail on 7e8b291
-def test_ct3_2_only_g5_of_f08_is_exempt(tmp_path):
-    """CT3-2: in the relative mode a caller mask beyond G5 of F08 (here G3) is refused, it cannot borrow the J sha."""
+def test_ct3_2_only_g5_of_f08_without_the_gate_file(tmp_path):
+    """CT3-2: in the relative mode a caller mask beyond G5 of F08 (here G3) without the C8 gate file SHA is refused, it
+    cannot borrow the J sha; with the gate file SHA it is taken (CODE 23/11: c8b_luoi passes the gate file mask)."""
     lane_rows = B.make_frames('O1-F08')
     fl, chain = to_floor('O1-F08', lane_rows)
-    with pytest.raises(ValueError, match='only g5'):
-        score(tmp_path, 'O1-F08', fl, rel=rel_for('O1-F08', fl, chain), report_only={'g3', 'g5'})
+    with pytest.raises(ValueError, match='so-do-sha'):
+        score(tmp_path, 'O1-F08', fl, rel=rel_for('O1-F08', fl, chain), so_do={'g3', 'g5'})
+    out, _ = score(tmp_path / 'b', 'O1-F08', fl, rel=rel_for('O1-F08', fl, chain), so_do={'g3'}, so_do_sha='c' * 64)
+    assert out['so_do'] == ['g3', 'g5'] and out['gate_v3']['gate_file_sha256'] == 'c' * 64
 
 
 def _gio(log, fsha, final=True):

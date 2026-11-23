@@ -13,7 +13,7 @@ section 3):
   check(d)              the content alone: types, keys, the chain of every C8 cell recounted (reruns cap, M2), the
                         runs of each level rebuilt from the chains, the three kinds of evidence and the gate levels
                         recomputed from the copied evidence, Uhat recomputed from the schedule (section 4), the
-                        report-only conditions recomputed (section 5). Every read (read_gate_c8).
+                        so_do conditions recomputed (section 5). Every read (read_gate_c8).
   check_nguon(d, goc)   the sources under the C8 folder goc: every {duong_dan, sha256} hashed again (a path inside
                         goc), and the plan, scoring files, time files, premise file, U-standard dossier and U
                         manifests read back and compared with what the gate copied. When the gate is written
@@ -23,12 +23,19 @@ Any difference refuses the whole file (GateFileError). A case J v6 does not deci
 Uhat that cannot be told from half the threshold within the budget, J section 0b) is refused with "CAN LIAM QUYET"
 unless the gate carries Liam's choice (quyet_liam).
 
-required(level, platform, stage, campaign): the conditions that decide a run:
-  SIM                                   all five
-  HW at a gate level                    all five minus report_only(level)
-  HW at another task (K1, K2, ...)      all five (Liam 17/11, "Không áp, cả năm quyết")
-  HIL, stage hil_check, campaign B-*    all five minus report_only(level) (S05 4.5)
-  HIL otherwise                         all five
+Rule 2b decided by the measured value (CODE 23/11, 03_CODE/docs/2026-11-23_Chot_luat_mat_na_quyet_bang_so_do_v1.md,
+root 7b6b7652; Liam at CODE, verbatim: "duyệt bảng luật mới"): every condition decides a run. A condition of the
+level's mask (so_do(level): Uhat above half the threshold at C8, and G5 at F08) decides by its measured value q, U
+not added (so_do_state; the branch 'so_do', the three-branch state kept as state_ba_nhanh); the others by the three
+branches with U. The mask (which condition takes which branch) is locked once at C8 as before. Before 23/11 the
+masked conditions were only reported ("chỉ báo cáo"), the gate_v3.3 field report_only: refused now.
+
+run_so_do(level, platform, stage, campaign): the conditions that decide by q:
+  SIM                                   none
+  HW at a gate level                    so_do(level)
+  HW at another task (K1, K2, ...)      none (Liam 17/11, "Không áp, cả năm quyết")
+  HIL, stage hil_check, campaign B-*    so_do(level) (S05 4.5)
+  HIL otherwise                         none
 """
 from __future__ import annotations
 
@@ -56,7 +63,10 @@ from o1_tasks import FIG8                                               # noqa: 
 
 FORMAT = 'gate_c8_v2'
 OLD_FORMATS = ('gate_c8_v1',)
-MASKABLE = ('g2', 'g3', 'g5')           # O1 3.9 rule 2b: G1, G4 always decide
+MASKABLE = ('g2', 'g3', 'g5')           # O1 3.9 rule 2b: G1, G4 always take the three branches
+NHANH_SO_DO = 'so_do'                   # the branch of a masked condition: decided by q (CODE 23/11, Liam)
+GATE_VERSION_SO_DO = 'gate_v3.4'        # a run gate with the so_do conditions of its level (o1_gate.py is in the
+# S04 SIM_SOURCES lock, fwsim/s04_ga.py, so the branch is applied here on its gate_v3.2 / v3.3 dict)
 CONTROLLERS = ('PID', 'LADRC')
 U_T_BRANCHES = ('bo_tick', 'giu_tick')
 B_CAMPAIGNS = ('B-PID', 'B-LADRC')
@@ -64,13 +74,14 @@ MASK_HIL_STAGE = 'hil_check'            # S05 4.5: the HIL candidate check of pr
 PLATFORMS = ('SIM', 'HIL', 'HW')
 REL_TOL = 1e-9                          # recomputed numbers: relative difference allowed
 LICH = 'o1_feasibility.Schedule'        # the schedule of the comparison (G-7, owner CODE_GATE)
-G5_F08 = 'O1-F08'                       # J v6 section 6, Liam 19/11 at CODE: "chỉ báo cáo, không làm bù"
+G5_F08 = 'O1-F08'                       # J v6 section 6 (Liam 19/11 "không làm bù"): G5 at F08 always in the mask,
+# decided by q since 23/11 (CODE, Liam "duyệt bảng luật mới": no longer "always report only")
 
 # Uhat (design section 4)
 DELTA0_S = 1e-3                         # first grid step
 DELTA_MIN_S = 1e-6                      # no refinement step below this
 BUDGET = 10 ** 7                        # evaluations of (V, W, u, r) per level, the first grid included
-UH_STATES = ('quyet', 'chi_bao_cao', 'thieu', 'bien_nguong')
+UH_STATES = ('quyet', 'so_do', 'thieu', 'bien_nguong')     # so_do: Uhat above half (chi_bao_cao before 23/11)
 
 # Chains of the C8 cells (design section 6; J v6 section 5)
 OUTCOMES = ('dat', 'khong_dat', 'chua_ket_luan', 'hong')
@@ -121,7 +132,7 @@ TD_ROLES = ('dau1', 'dau2', 'cuoi')
 BAND_KEYS_C8B = ('u_lo_m_s', 'u_hi_m_s', 'P4_m', 'A4_deg', 'trang_thai')   # c8b_khoa_v5 M5b (CODE 19/11)
 BAND_STATES_C8B = ('dat', 'gioi_han', 'thieu')           # C8B term states (data contract 2.G (3))
 DRIFT_KIND = 'c7_calib_drift'                            # F18 (2): drift.json of c7_calib_drift so (CODE 19/11)
-LEVEL_KEYS = ('a_m', 'u_p', 'u_psi', 'u_t_c8_s', 'uhat', 'report_only', 'ly_do_report_only')
+LEVEL_KEYS = ('a_m', 'u_p', 'u_psi', 'u_t_c8_s', 'uhat', 'so_do', 'ly_do_so_do')
 UH_KEYS = ('uhat', 'uhat_duoi', 'delta_cuoi_s', 'so_lan_tinh', 'trang_thai')
 
 
@@ -484,23 +495,23 @@ def uhat_level(level: str, blk: dict, u_t: float, budget: int = BUDGET) -> Dict[
         f_up, mnull, f_lo, _ = rr
         up, lo, delta, cnt, st = float(f_up.max()), float(f_lo.max()), DELTA0_S, 0, None
         # GC6-9: a cell stays alive while it may exceed half the threshold (only until the lower bound shows it) or
-        # may meet a null band (until refined away or found certain); report only for exceeding needs both settled
+        # may meet a null band (until refined away or found certain); so_do for exceeding needs both settled
         alive = mnull | ((f_up > half) if lo <= half else False)
         maybe_null = bool(mnull.any())
         rest = float(f_up[~alive].max()) if (~alive).any() else -math.inf
         ivs = _runs_of(alive, ta, tb)
         while True:
             if not ivs:
-                st = 'chi_bao_cao' if lo > half else 'quyet'
+                st = 'so_do' if lo > half else 'quyet'
                 break
             if lo > half and not maybe_null:
-                st = 'chi_bao_cao'
+                st = 'so_do'
                 break
             d2 = delta / 2.0
             if d2 < DELTA_MIN_S or used + sum(grid_points(u_t, a, b, d2) for a, b in ivs) > budget:
-                # GC7-1: the lower bound above half already decides report only; only cells that may meet a null
+                # GC7-1: the lower bound above half already decides so_do; only cells that may meet a null
                 # band are left: the number is not known (uhat null), the mask is
-                st = 'chi_bao_cao' if lo > half else 'bien_nguong'
+                st = 'so_do' if lo > half else 'bien_nguong'
                 break
             new_ivs, ups = [], [rest]
             certain_null, maybe_null = False, False
@@ -528,29 +539,30 @@ def uhat_level(level: str, blk: dict, u_t: float, budget: int = BUDGET) -> Dict[
         if st == 'thieu':
             out[tm.cond] = dict(uhat=None, uhat_duoi=None, delta_cuoi_s=delta, so_lan_tinh=n + cnt, trang_thai='thieu')
         else:
-            unknown = st == 'chi_bao_cao' and maybe_null and bool(ivs)          # GC7-1: may still be missing
+            unknown = st == 'so_do' and maybe_null and bool(ivs)          # GC7-1: may still be missing
             out[tm.cond] = dict(uhat=None if unknown else up, uhat_duoi=lo, delta_cuoi_s=delta, so_lan_tinh=n + cnt,
                                 trang_thai=st)
     return out
 
 
-def report_only_of(level: str, uh: Dict[str, dict], quyet: Optional[dict] = None) -> Tuple[Tuple[str, ...], dict]:
-    """(report-only conditions in MASKABLE order, their reasons) at a level (design section 5). A bien_nguong
-    condition needs Liam's choice in quyet (J v6 section 0b), else GateFileError CAN LIAM QUYET."""
+def so_do_of(level: str, uh: Dict[str, dict], quyet: Optional[dict] = None) -> Tuple[Tuple[str, ...], dict]:
+    """(conditions decided by the measured value in MASKABLE order, their reasons) at a level (design section 5; the
+    mask of rule 2b, report only before 23/11). A bien_nguong condition needs Liam's choice in quyet (J v6 section
+    0b), else GateFileError CAN LIAM QUYET."""
     ro, why = [], {}
     for c in MASKABLE:
         rs = []
         st = uh[c]['trang_thai']
         if level == G5_F08 and c == 'g5':
-            # GC6-7: J v6 section 6 decides G5 at F08 before any look at Uhat (Liam 19/11): report only, Uhat kept for
-            # the report; no choice of Liam is needed nor taken for it
+            # GC6-7: J v6 section 6 puts G5 at F08 in the mask before any look at Uhat (Liam 19/11), Uhat kept for the
+            # report; no choice of Liam is needed nor taken for it (decided by q since 23/11, CODE, Liam)
             if (quyet or {}).get(c) is not None:
-                raise GateFileError(f'quyet_liam.{level}.{c}: not needed, J v6 section 6 already makes G5 at F08 '
-                                    'report only')
+                raise GateFileError(f'quyet_liam.{level}.{c}: not needed, J v6 section 6 already puts G5 at F08 in '
+                                    'the mask (so_do)')
             ro.append(c)
             why[c] = ['liam_g5_f08']
             continue
-        if st == 'chi_bao_cao':
+        if st == 'so_do':
             rs.append('vuot_nua_nguong')
             if uh[c].get('uhat') is None:
                 rs.append('thieu_chua_phan_giai')            # GC7-1: a null band may still be met
@@ -563,12 +575,97 @@ def report_only_of(level: str, uh: Dict[str, dict], quyet: Optional[dict] = None
                                     f'(bien_nguong): J v6 does not decide the mask, C8 is not locked; CAN LIAM QUYET '
                                     f'(J section 0b), recorded in quyet_liam.{level}.{c} {{chon, ngay, phien, '
                                     'nguyen_van}')
-            if q['chon'] == 'chi_bao_cao':
+            if q['chon'] == 'so_do':
                 rs.append('quyet_liam')
         if rs:
             ro.append(c)
             why[c] = rs
     return tuple(ro), why
+
+
+# ── the branch so_do on a run gate (CODE 23/11, Liam "duyệt bảng luật mới") ──────────────────────────────────────
+
+def _fin(x) -> bool:
+    return not isinstance(x, bool) and isinstance(x, (int, float)) and math.isfinite(x)
+
+
+def so_do_state(q_common, q_union, n_undef_union, threshold: float) -> str:
+    """A condition of the mask decided by its measured value q (the maximum over the frames, U not added): khong_dat
+    (blocks) when q of the common domain is above the threshold; dat when q of the union is a number not above it
+    and no frame of the union is undefined; else chua_ket_luan (blocks: a frame that may lie above it is not
+    measured; as cond_state2, a value above it only in the union is chua_ket_luan)."""
+    if _fin(q_common) and float(q_common) > threshold:
+        return 'khong_dat'
+    if not isinstance(n_undef_union, int) or isinstance(n_undef_union, bool) or n_undef_union != 0:
+        return 'chua_ket_luan'
+    if not _fin(q_union) or float(q_union) > threshold:
+        return 'chua_ket_luan'
+    return 'dat'
+
+
+def _nut_giua(nodes_s, ok) -> Optional[int]:
+    """CODE 23/11 (2): the node of a so_do condition on a C8b grid, the scored node nearest the middle of the grid
+    ((first + last offset) / 2, the lower index on a tie; c8b_luoi.nut_giua, a test keeps the two equal)."""
+    scored = [i for i in range(len(ok or [])) if ok[i]]
+    if not scored:
+        return None
+    if not nodes_s:
+        c = len(ok) // 2
+        return min(scored, key=lambda i: (abs(i - c), i))
+    mid = 0.5 * (float(nodes_s[0]) + float(nodes_s[-1]))
+    return min(scored, key=lambda i: (abs(float(nodes_s[i]) - mid), i))
+
+
+def q_common_of(b: dict):
+    """q of the common domain of a condition block (its 'chung' block, B81-3), else q (one domain)."""
+    ch = b.get('chung')
+    return ch.get('q') if isinstance(ch, dict) else b.get('q')
+
+
+def apply_so_do(gate: dict, so_do: Iterable[str], level: str, gate_file_sha256: str,
+                q_nut: Optional[Dict[str, dict]] = None) -> dict:
+    """The run gate (o1_gate.gate: gate_v3.2, or gate_v3.3 without a mask; c7_score.build_gate) with the so_do
+    conditions of its level: a new gate_v3.4 dict; each condition of so_do keeps its three-branch state as
+    state_ba_nhanh, lo and hi, and takes nhanh 'so_do' and the state of so_do_state; decide, the outcomes as
+    o1_gate.evaluate_outcomes (every condition decides; complete when decide is all five). level, gate_file_sha256:
+    the task and the C8 gate file (or the J source) giving so_do; written even when so_do is empty. q_nut (a C8b
+    grid, CODE 23/11 (2)): {cond: {nut, q, q_chung}} of the middle node of the grid (c8b_luoi.nut_giua), the q of a
+    so_do condition (kept as q_so_do), with n_undef of the grid; without it q and chung.q of the block."""
+    sd = list(so_do)
+    if len(set(sd)) != len(sd) or set(sd) - set(MASKABLE):
+        raise GateFileError(f'so_do {sd!r}: distinct conditions of {MASKABLE}')
+    sd = [c for c in MASKABLE if c in set(sd)]
+    if gate.get('version') not in (o1_gate.GATE_VERSION, o1_gate.GATE_VERSION_V1133):
+        raise GateFileError(f'gate version {gate.get("version")!r}: so_do is applied to a {o1_gate.GATE_VERSION} or '
+                            f'{o1_gate.GATE_VERSION_V1133} gate')
+    if gate.get('report_only'):
+        raise GateFileError(f'gate report_only {gate.get("report_only")!r}: report only is no rule since 23/11 '
+                            '(CODE, Liam "duyệt bảng luật mới"); score with every condition, then apply so_do')
+    if not isinstance(level, str) or not level:
+        raise GateFileError(f'level {level!r}: the task of the run')
+    if not isinstance(gate_file_sha256, str) or len(gate_file_sha256) != 64 \
+            or any(ch not in '0123456789abcdef' for ch in gate_file_sha256):
+        raise GateFileError(f'gate_file_sha256 {gate_file_sha256!r}: 64 lowercase hex digits')
+    g = json.loads(json.dumps(gate))                     # a copy; the caller's dict is not changed
+    for k in ('report_only', 'required'):
+        g.pop(k, None)
+    if q_nut is not None and (not isinstance(q_nut, dict) or set(q_nut) != set(sd)):
+        raise GateFileError(f'q_nut {q_nut!r}: one entry per so_do condition {sd}')
+    for c in sd:
+        b = g[c]
+        b['state_ba_nhanh'] = b['state']
+        b['nhanh'] = NHANH_SO_DO
+        if q_nut is None:
+            b['state'] = so_do_state(q_common_of(b), b.get('q'), b.get('n_undef'), o1_gate.THRESHOLDS[c])
+        else:
+            x = q_nut[c]
+            if not isinstance(x, dict) or set(x) != {'nut', 'q', 'q_chung'}:
+                raise GateFileError(f'q_nut.{c} {x!r}: {{nut, q, q_chung}}')
+            b['q_so_do'] = json.loads(json.dumps(x))
+            b['state'] = so_do_state(x['q_chung'], x['q'], b.get('n_undef'), o1_gate.THRESHOLDS[c])
+    g.update(o1_gate.evaluate_outcomes(g, list(g['decide']), o1_gate.CONDS))
+    g.update(version=GATE_VERSION_SO_DO, so_do=sd, level=level, gate_file_sha256=gate_file_sha256)
+    return g
 
 
 # ── the level block (writer side) ──────────────────────────────────────────────────────────────────────────────
@@ -595,8 +692,8 @@ def level_block(level: str, a_m: float, u_p: dict, u_psi: dict, runs: list, quye
         raise GateFileError(f'{level}: no eligible C8 run')
     u_t = max(_num(r['u_t_s'], f'{level} u_t_s', positive=True) for r in runs)
     uh = uhat_level(level, t, u_t)
-    ro, why = report_only_of(level, uh, quyet)
-    return dict(a_m=a_m, u_p=u_p, u_psi=u_psi, u_t_c8_s=u_t, uhat=uh, report_only=list(ro), ly_do_report_only=why)
+    sd, why = so_do_of(level, uh, quyet)
+    return dict(a_m=a_m, u_p=u_p, u_psi=u_psi, u_t_c8_s=u_t, uhat=uh, so_do=list(sd), ly_do_so_do=why)
 
 
 # ── chains, runs, evidence (design sections 6, 7) ──────────────────────────────────────────────────────────────
@@ -1106,8 +1203,8 @@ def check(d) -> dict:
             raise GateFileError(f'quyet_liam.{k}: keyed by conditions of {MASKABLE}')
         for c, y in x.items():
             _liam(y, f'quyet_liam.{k}.{c}')
-            if y.get('chon') not in ('chi_bao_cao', 'quyet'):
-                raise GateFileError(f'quyet_liam.{k}.{c}.chon {y.get("chon")!r}: chi_bao_cao or quyet')
+            if y.get('chon') not in ('so_do', 'quyet'):
+                raise GateFileError(f'quyet_liam.{k}.{c}.chon {y.get("chon")!r}: so_do or quyet')
     b = _obj(d['dieu_2b'], ('thresholds', 'per_level'), 'dieu_2b')
     th = b['thresholds']
     if not isinstance(th, dict) or set(th) != set(MASKABLE):
@@ -1144,11 +1241,11 @@ def check(d) -> dict:
                     or not _close(x['delta_cuoi_s'], y['delta_cuoi_s']) or not _close(x['uhat'], y['uhat']) \
                     or not _close(x['uhat_duoi'], y['uhat_duoi']):
                 raise GateFileError(f'{w}.uhat.{c} {x!r}: recomputed {y!r}')
-        ro, why = report_only_of(name, want, q.get(name))
-        if not isinstance(e['report_only'], list) or tuple(e['report_only']) != ro:
-            raise GateFileError(f'{w}.report_only {e["report_only"]!r}: recomputed {list(ro)!r} (design section 5)')
-        if e['ly_do_report_only'] != why:
-            raise GateFileError(f'{w}.ly_do_report_only {e["ly_do_report_only"]!r}: recomputed {why!r}')
+        sd, why = so_do_of(name, want, q.get(name))
+        if not isinstance(e['so_do'], list) or tuple(e['so_do']) != sd:
+            raise GateFileError(f'{w}.so_do {e["so_do"]!r}: recomputed {list(sd)!r} (design section 5)')
+        if e['ly_do_so_do'] != why:
+            raise GateFileError(f'{w}.ly_do_so_do {e["ly_do_so_do"]!r}: recomputed {why!r}')
     _check_camera(d)
     return d
 
@@ -1468,22 +1565,26 @@ GRID_STATES = ('dat', 'khong_dat', 'chua_ket_luan')
 
 def _grid_outcome(fc: dict, nodes: list, w: str) -> None:
     """GC9-5: the outcome of a scored grid recomputed from its states (the c8b_luoi combine rule, f613db9): over the
-    deciding conditions (all but report_only) khong_dat, else chua_ket_luan, else dat; a violation before t1 at every
-    node (fail_cause vi_pham_truoc_loi_he_do) is khong_dat only when every node score is khong_dat."""
+    five conditions (every one decides since 23/11; a so_do one by its state from q) khong_dat, else chua_ket_luan,
+    else dat; a violation before t1 at every node (fail_cause vi_pham_truoc_loi_he_do) is khong_dat only when every
+    node score is khong_dat."""
     if fc['trang_thai_luot'] != 'cham':
         return
-    st, ro = fc.get('states'), fc.get('report_only', [])
+    if 'report_only' in fc:
+        raise GateFileError(f'{w}: luoi.json report_only {fc.get("report_only")!r}: report only is no rule since 23/11 '
+                            '(CODE, Liam "duyệt bảng luật mới"); the grid is scored again with so_do')
+    st, sd = fc.get('states'), fc.get('so_do')
     if not isinstance(st, dict) or any(st.get(c) not in GRID_STATES for c in o1_gate.CONDS) \
-            or not isinstance(ro, list) or any(c not in MASKABLE for c in ro):
-        raise GateFileError(f'{w}: luoi.json states {{g1..g5: dat / khong_dat / chua_ket_luan}}, report_only of '
+            or not isinstance(sd, list) or any(c not in MASKABLE for c in sd):
+        raise GateFileError(f'{w}: luoi.json states {{g1..g5: dat / khong_dat / chua_ket_luan}}, so_do of '
                             f'{MASKABLE} (GC9-5)')
-    ds = [st[c] for c in o1_gate.CONDS if c not in ro]
+    ds = [st[c] for c in o1_gate.CONDS]
     if fc.get('fail_cause') == 'vi_pham_truoc_loi_he_do':
         want = 'khong_dat' if nodes and all(s.get('outcome') == 'khong_dat' for s in nodes) else None
     else:
         want = 'khong_dat' if 'khong_dat' in ds else 'chua_ket_luan' if 'chua_ket_luan' in ds else 'dat'
     if fc.get('outcome') != want:
-        raise GateFileError(f'{w}: luoi.json outcome {fc.get("outcome")!r}; from its states {st} (report only {ro}) '
+        raise GateFileError(f'{w}: luoi.json outcome {fc.get("outcome")!r}; from its states {st} (so_do {sd}) '
                             f'it is {want!r} (c8b_luoi combine; GC9-5)')
 
 
@@ -1491,13 +1592,39 @@ def _grid_states(fc: dict, idx: list, cell: dict, w: str) -> None:
     """GC9-5 (round 5): the states of a scored grid against its node states (the c8b_luoi combine rule, f613db9): a node
     not ok counts chua_ket_luan; G1 by g1_rule; a measured condition with one node is that node's state, dat only when
     every node is dat (a domain moving between nodes may still make it chua_ket_luan), else khong_dat or chua_ket_luan
-    (the cell rule needs the cell numbers, not rebuilt here: limit). report_only is that of J for C8 (G5 at F08)."""
+    (the cell rule needs the cell numbers, not rebuilt here: limit). so_do is that of J for C8 (G5 at F08): its
+    three-branch grid state (states_ba_nhanh) follows the node rule, its state is so_do_state of the grid numbers
+    (nums: chung.q, q, n_undef; CODE 23/11, Liam "duyệt bảng luật mới")."""
     if fc['trang_thai_luot'] != 'cham':
         return
-    ro = ['g5'] if cell['muc'] == G5_F08 else []
-    if sorted(fc.get('report_only', [])) != ro:
-        raise GateFileError(f'{w}: luoi.json report_only {fc.get("report_only")!r}; for {cell["muc"]} J says {ro} (GC9-5)')
-    ok, st = fc['nodes_ok'], fc['states']
+    sd = ['g5'] if cell['muc'] == G5_F08 else []
+    if fc.get('so_do') != sd:
+        raise GateFileError(f'{w}: luoi.json so_do {fc.get("so_do")!r}; for {cell["muc"]} J says {sd} (GC9-5)')
+    sb, nums = fc.get('states_ba_nhanh'), fc.get('nums')
+    if not isinstance(sb, dict) or set(sb) != set(sd) or any(sb[c] not in GRID_STATES for c in sd):
+        raise GateFileError(f'{w}: luoi.json states_ba_nhanh {sb!r}: the three-branch state of each so_do condition '
+                            f'{sd} (GC9-5; CODE 23/11)')
+    ok, st = fc['nodes_ok'], dict(fc['states'])
+    qsd = fc.get('q_so_do')
+    if not isinstance(qsd, dict) or set(qsd) != set(sd):
+        raise GateFileError(f'{w}: luoi.json q_so_do {qsd!r}: the middle node q of each so_do condition {sd} (CODE '
+                            '23/11 (2))')
+    m = _nut_giua(fc.get('nodes_s'), ok)
+    for c in sd:
+        b = nums.get(c) if isinstance(nums, dict) else None
+        x = qsd[c]
+        if not isinstance(x, dict) or x.get('nut') != m:
+            raise GateFileError(f'{w}: luoi.json q_so_do.{c} {x!r}: the node is {m}, the scored node nearest the middle '
+                                'of the grid (CODE 23/11 (2))')
+        nb = (idx[m].get('gate_v3') or {}).get(c) if m is not None and isinstance(idx[m], dict) else None
+        if m is not None and (not isinstance(nb, dict) or not _close(x.get('q'), nb.get('q'))
+                              or not _close(x.get('q_chung'), q_common_of(nb))):
+            raise GateFileError(f'{w}: luoi.json q_so_do.{c} {x!r}: not the q, chung.q of node {m} (its score file)')
+        if not isinstance(b, dict) or st[c] != so_do_state(x.get('q_chung'), x.get('q'), b.get('n_undef'),
+                                                           o1_gate.THRESHOLDS[c]):
+            raise GateFileError(f'{w}: luoi.json {c} state {st[c]!r}: so_do from the middle node q and the grid '
+                                'n_undef gives another (GC9-5; CODE 23/11)')
+        st[c] = sb[c]                                    # the node rule below checks the three-branch grid state
     node_st = {}
     for c in o1_gate.CONDS:
         v = []
@@ -1506,7 +1633,8 @@ def _grid_states(fc: dict, idx: list, cell: dict, w: str) -> None:
             b = g.get(c) if isinstance(g, dict) else None
             if ok[k] and not (isinstance(b, dict) and b.get('state') in GRID_STATES):
                 raise GateFileError(f'{w}: node {k} scored (nodes_ok) without a {c} state in its gate_v3 (GC9-5)')
-            v.append(b['state'] if ok[k] else 'chua_ket_luan')
+            # a node gate of the scorer is three-branch; a so_do node gate keeps that state as state_ba_nhanh
+            v.append(b.get('state_ba_nhanh', b['state']) if ok[k] else 'chua_ket_luan')
         node_st[c] = v
     g1 = node_st['g1']
     want = g1[0] if len(g1) == 1 else 'dat' if all(x == 'dat' for x in g1) else \
@@ -2042,8 +2170,8 @@ def _check_khoa_c8b(d: dict, goc: str) -> Tuple[dict, dt.datetime]:
     muc = k.get('muc')
     if not isinstance(muc, dict) or any(lv not in muc or not isinstance(muc[lv], dict) for lv in d['muc_kha_thi']):
         raise GateFileError(f'khoa_c8b: muc has no block for every level of muc_kha_thi {d["muc_kha_thi"]}')
-    if G5_F08 in muc and 'g5' not in (muc[G5_F08].get('chi_bao_cao') or []):
-        raise GateFileError('khoa_c8b: G5 at F08 not report only (J v6 section 6)')
+    if G5_F08 in muc and 'g5' not in (muc[G5_F08].get('so_do') or []):
+        raise GateFileError('khoa_c8b: G5 at F08 not in so_do (J v6 section 6; decided by q since 23/11, CODE, Liam)')
     for lv in d['levels']:
         e, w = d['dieu_2b']['per_level'][lv], f'dieu_2b.per_level.{lv}'
         hd, bands = muc[lv].get('hang_dong'), muc[lv].get('hang_theo_u')
@@ -2451,15 +2579,16 @@ def check_nguon(d: dict, goc: str) -> dict:
 
 # ── reader ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
-def required_set(report_only: Iterable[str]) -> Tuple[str, ...]:
-    ro = set(report_only)
-    if ro - set(MASKABLE):
-        raise GateFileError(f'report_only {sorted(ro)!r}: a subset of {MASKABLE}')
-    return tuple(c for c in o1_gate.CONDS if c not in ro)
+def check_so_do(so_do: Iterable[str]) -> Tuple[str, ...]:
+    """so_do as distinct conditions of MASKABLE, in MASKABLE order."""
+    sd = list(so_do)
+    if len(set(sd)) != len(sd) or set(sd) - set(MASKABLE):
+        raise GateFileError(f'so_do {sd!r}: distinct conditions of {MASKABLE}')
+    return tuple(c for c in MASKABLE if c in set(sd))
 
 
 def mask_applies(platform: str, stage: str, campaign: str) -> bool:
-    """Whether the report-only list of the level applies to a run (module docstring)."""
+    """Whether the so_do list of the level applies to a run (module docstring)."""
     if platform not in PLATFORMS:
         raise GateFileError(f'platform {platform!r}: one of {PLATFORMS}')
     if platform == 'HW':
@@ -2479,21 +2608,19 @@ class GateC8:
         self.fake = is_fake(d)                   # GC6-14: a FAKE content (tests, demo); check_nguon refuses it
         self.fake_sign = has_fake_sign(d)        # GC6-14 (round 3): any FAKE mark, even an incomplete set
 
-    def report_only(self, level: str) -> Tuple[str, ...]:
-        """The report-only conditions of a gate level; () for a task that is not a gate level."""
+    def so_do(self, level: str) -> Tuple[str, ...]:
+        """The so_do conditions of a gate level (decided by q); () for a task that is not a gate level."""
         e = self.data['dieu_2b']['per_level'].get(level)
-        return tuple(e['report_only']) if e is not None else ()
+        return tuple(e['so_do']) if e is not None else ()
 
-    def run_report_only(self, level: str, platform: str, stage: str, campaign: str) -> Tuple[str, ...]:
-        ro = set(self.report_only(level) if mask_applies(platform, stage, campaign) else ())
+    def run_so_do(self, level: str, platform: str, stage: str, campaign: str) -> Tuple[str, ...]:
+        sd = set(self.so_do(level) if mask_applies(platform, stage, campaign) else ())
         if platform == 'HW' and level == G5_F08:
-            # GC6-7: J v6 section 6 (Liam 19/11, "chỉ báo cáo, không làm bù", in force at once): G5 of every floor run
-            # at F08 reports only, also when F08 is no gate level (J section 4: a dropped level still runs its check)
-            ro.add('g5')
-        return tuple(c for c in MASKABLE if c in ro)
-
-    def required(self, level: str, platform: str, stage: str, campaign: str) -> Tuple[str, ...]:
-        return required_set(self.run_report_only(level, platform, stage, campaign))
+            # GC6-7: J v6 section 6 (Liam 19/11, "không làm bù", in force at once): G5 of every floor run at F08 is in
+            # the mask, also when F08 is no gate level (J section 4: a dropped level still runs its check); decided by
+            # q since 23/11 (CODE, Liam "duyệt bảng luật mới")
+            sd.add('g5')
+        return tuple(c for c in MASKABLE if c in sd)
 
 
 def _finite(x, what: str, lo: float, strict: bool = False) -> float:

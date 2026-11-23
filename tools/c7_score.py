@@ -169,6 +169,7 @@ import o1_gate_eval                                                      # noqa:
 import o1_lanes                                                          # noqa: E402
 import o1_time_sync                                                      # noqa: E402
 import rq3_log                                                           # noqa: E402
+import gate_c8                                                           # noqa: E402  (so_do, CODE 23/11)
 from o1_feasibility import A as A8                                      # noqa: E402
 from o1_feasibility import D, DELTA, HEAD0, T_D, T_LATE, Path8, Schedule, path_point, wrap  # noqa: E402
 from o1_tasks import FIG8, FINAL_SET                                     # noqa: E402
@@ -200,11 +201,12 @@ HS_DYN = {'goc_quay_deg': (0.0, 100000.0), 'wz_dps': (0.0, 5000.0), 'alpha_dps2'
 GIA_DINH = ('dung', 'khong_dung', 'chua_kiem')       # O1 3.3 position-suspect assumption checked at C8 (CS1-18)
 THRESH_KEYS = ('U_p_m', 'U_psi_deg', 'u_t_ghep_s', 'troi_ppm', 't_trong_s', 't_mat_s', 'bump_px', 'pred_m',
                'pred_half', 'pred_min', 'yaw_nghi_deg', 'v_d')      # the 'thresholds' block of every output
-REPORT_ONLY_OK = frozenset(('g2', 'g3', 'g5'))     # O1 v11.33 3.9 rule 2b: G1, G4 always decide
+SO_DO_OK = frozenset(('g2', 'g3', 'g5'))     # O1 3.9 rule 2b, by q since 23/11 (CODE, Liam): G1, G4 three branches
 NHANH_TICK = ('giu', 'bo')       # O1 v11.33 SC-12 (OG2-1, OG3-4): the tick part of U_t kept / dropped, locked before C8
 MAN_TRAP_NHANH = ('alpha', 'mot_khung')    # J v6 6: the shutter branch of a level (no row compensation, Liam 19/11)
-# J v6 (= appendix O1 v11.41, 06_SPECS/2026-11-19_Spec_O1_v11.41_Phu_luc_J_v6.md): the source of the report-only G5 of
-# F08 in the relative mode (J v6 6, Liam 19/11), written as gate_file_sha256 of that gate (no C8 gate file decides it)
+# J v6 (= appendix O1 v11.41, 06_SPECS/2026-11-19_Spec_O1_v11.41_Phu_luc_J_v6.md): the source of G5 of F08 in the mask
+# in the relative mode (J v6 6, Liam 19/11; decided by q since 23/11), written as gate_file_sha256 of that gate when no
+# C8 gate file is given (--so-do-sha)
 J_V6_SHA256 = '98767aa41ac176363795ca87d37f8a7efb4944e6d8d2925d4da293ceafd29d00'
 
 
@@ -1026,18 +1028,20 @@ def yaw_bounds(t_log, psi_cam, wz, speed, t0, hs, level, log_path, t_end, mode='
     return upk, rep
 
 
-def certain_violations(lo, mask, report_only=frozenset()):
-    """Conditions G2-G5 with a certain violation (finite lo_k above the threshold) on the frames of mask (R2V-4);
-    O1 v11.33 3.5 (OG2-3): a condition only reported at the level of the run (3.9 rule 2b) is not looked at."""
-    return [c for c in o1_gate.MEASURED if c not in report_only
-            and bool(np.any(np.isfinite(lo[c][mask]) & (lo[c][mask] > o1_gate.THRESHOLDS[c])))]
+def certain_violations(lo, mask, so_do=frozenset(), q=None):
+    """Conditions G2-G5 with a violation on the frames of mask (R2V-4): a finite lo_k above the threshold; for a
+    condition of so_do (rule 2b decided by the measured value, CODE 23/11, Liam "duyệt bảng luật mới"; report only and
+    not looked at before) a finite q_k above it (q: the per-frame q of every condition, needed with so_do)."""
+    if so_do and q is None:
+        raise ValueError('certain_violations: so_do needs the per-frame q')
+    v = {c: (q if c in so_do else lo)[c][mask] for c in o1_gate.MEASURED}
+    return [c for c in o1_gate.MEASURED if bool(np.any(np.isfinite(v[c]) & (v[c] > o1_gate.THRESHOLDS[c])))]
 
 
 # ---------------------------------------------------------------- gate
-def build_gate(per, dom_common, dom_union, lane, u_t, hs, g1, note, report_only=(), ro_sha=None):
-    """gate_v3 block in the B81-3 floor format (rq3_log.validate_gate 'HW'). report_only (Codex CT1-1): conditions
-    measured and reported but not deciding the run; then a gate_v3.3 block (report_only, required, gate_file_sha256
-    = ro_sha, the source of the exemption) whose decide set leaves them out."""
+def build_gate(per, dom_common, dom_union, lane, u_t, hs, g1, note):
+    """gate_v3 block in the B81-3 floor format (rq3_log.validate_gate 'HW'), every condition by its three branches
+    (gate_v3.2); the so_do conditions are applied on it by gate_c8.apply_so_do (score())."""
     vmax, wzmax = lane.cmd_max
     g = dict(g1=g1)
     for c in o1_gate.MEASURED:
@@ -1049,16 +1053,10 @@ def build_gate(per, dom_common, dom_union, lane, u_t, hs, g1, note, report_only=
         g[c] = dict({k: au[k] for k in ('q', 'lo', 'hi', 'n_undef', 'n_frames', 'ratio')}, threshold=thr, state=st,
                     chung={k: ac[k] for k in ('q', 'lo', 'hi', 'n_undef')})
     ratios = [g[k]['ratio'] for k in o1_gate.MEASURED if o1_gate._finite(g[k]['ratio'])]
-    ro = [c for c in o1_gate.CONDS if c in set(report_only)]
-    if ro:
-        req = o1_gate.required_of(ro)
-        dec = [c for c in o1_gate.DECIDE_ALL if c in set(req)]
-        ver, extra = o1_gate.GATE_VERSION_V1133, dict(report_only=ro, required=list(req), gate_file_sha256=ro_sha)
-    else:
-        req, dec, ver, extra = None, list(o1_gate.DECIDE_ALL), o1_gate.GATE_VERSION, {}
-    return dict(version=ver, D=o1_gate.D, theta_max_deg=o1_gate.THETA_MAX_DEG, v_cmd_max=vmax,
+    dec = list(o1_gate.DECIDE_ALL)
+    return dict(version=o1_gate.GATE_VERSION, D=o1_gate.D, theta_max_deg=o1_gate.THETA_MAX_DEG, v_cmd_max=vmax,
                 wz_cmd_max=wzmax, u_p=hs['U_p_m'], u_psi_deg=hs['U_psi_deg'], u_t=u_t, **g,
-                **o1_gate.evaluate_outcomes(g, dec, req), decide=dec, **extra,
+                **o1_gate.evaluate_outcomes(g, dec, None), decide=dec,
                 conditions='G1,G2,G3,G4,G5', max_ratio=max(ratios) if ratios else float('nan'),
                 track_err=False, note=note)
 
@@ -1961,21 +1959,23 @@ def old_shift_frames(frames):
 
 def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start=None, allow_final_set=False,
           sender=None, events=None, track_info=None, offset_anchor_s=None, offset_err_s=None, frames_sha256=None,
-          report_only=frozenset(), gio=None, rel=None):
+          so_do=frozenset(), gio=None, rel=None, so_do_sha=None):
     if task not in FIG8 and task not in FINAL_SET:
         raise ValueError(f'task {task!r}: one of {tuple(FIG8) + FINAL_SET}')
-    # O1 v11.33 3.9 rule 2b: conditions only reported at the level of the run (from the C8 gate file; G1, G4 always
-    # decide). Used here only by the exception "violation before a measurement-system fault" (OG2-3); the deciding
-    # set of the gate block follows the C8 gate file format (not yet fixed: CODE_GATE)
-    report_only = frozenset(report_only)
-    if not report_only <= REPORT_ONLY_OK:
-        raise ValueError(f'report_only {sorted(report_only)}: only {sorted(REPORT_ONLY_OK)} can be report-only (O1 3.9 2b)')
+    # O1 3.9 rule 2b decided by the measured value (CODE 23/11, Liam "duyệt bảng luật mới"): the so_do conditions of
+    # the run's level (the C8 gate file, so_do_sha its SHA; G5 of F08 from J v6 in the relative mode) decide by q
+    # (gate_c8.apply_so_do), also in the exception "violation before a measurement-system fault" (q_k, CODE 23/11 (3))
+    so_do = frozenset(so_do)
+    if not so_do <= SO_DO_OK:
+        raise ValueError(f'so_do {sorted(so_do)}: only {sorted(SO_DO_OK)} can be so_do (O1 3.9 2b)')
+    if so_do_sha is not None and (len(so_do_sha) != 64 or any(ch not in '0123456789abcdef' for ch in so_do_sha)):
+        raise ValueError(f'so_do_sha {so_do_sha!r}: the SHA-256 of the C8 gate file, 64 lowercase hex digits')
     if task in FINAL_SET and not allow_final_set:
         raise ValueError(f'{task} is the final test set (O1 3.7): only with --allow-final-set')
     if task in FINAL_SET and k_start is None and rel is None:
         raise ValueError(f'{task}: give --k-start X,Y,HEAD_DEG (nominal start pose, locked at C8)')
-    if report_only and task not in FIG8:
-        raise ValueError(f'report_only {sorted(report_only)} on {task}: K1, K2 decide on all five conditions '
+    if so_do and task not in FIG8:
+        raise ValueError(f'so_do {sorted(so_do)} on {task}: K1, K2 take the three branches on all five conditions '
                          '(CODE_GATE 4; Codex VG1-4)')
     if gio is not None and offset_s is not None:
         raise ValueError('--gio-c8b and --offset-s: one clock source only')
@@ -2003,16 +2003,20 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
     # closing corner of K2 takes its incoming side (J v6 0 (f), 3)
     lane = (Fig8Task(task) if task in FIG8 else
             (KTask(task, k_start) if rel is None else KTask(task, (0.0, 0.0, 0.0), end_incoming=True)))
-    ro_sha = None
-    if rel is not None and report_only - ({'g5'} if task == 'O1-F08' else set()):
-        # Codex CT3-2: in the relative mode the only exemption is G5 of F08 from appendix J (J v6 6); a further mask
-        # from the caller has no locked 2b source here and would carry the J sha: refused
-        raise ValueError(f'report_only {sorted(report_only)} in the relative mode: only g5 of O1-F08 (J v6 6)')
+    sd_sha = so_do_sha
+    if so_do - ({'g5'} if task == 'O1-F08' else set()) and so_do_sha is None:
+        # Codex CT3-2: a mask beyond G5 of F08 from appendix J needs its locked 2b source, the C8 gate file
+        raise ValueError(f'so_do {sorted(so_do)}: beyond g5 of O1-F08 (J v6 6) only with the SHA of the C8 gate file '
+                         '(--so-do-sha)')
+    if so_do and so_do_sha is None and rel is None:
+        raise ValueError(f'so_do {sorted(so_do)} without --so-do-sha: the source of the mask is the C8 gate file, or J '
+                         'v6 in the relative mode')
     if rel is not None and task == 'O1-F08':
-        # J v6 6: G5 of F08 report only (Liam 19/11). Codex CT2-5: the source (J v6) is set by the mode and the task,
-        # whatever the caller passed, so the exception, the gate and its check use ONE mask
-        report_only = report_only | {'g5'}
-        ro_sha = J_V6_SHA256
+        # J v6 6: G5 of F08 in the mask (Liam 19/11), by q since 23/11. Codex CT2-5: the source (J v6, or the C8 gate
+        # file that holds it) is set by the mode and the task, whatever the caller passed, so the exception, the gate
+        # and its check use ONE mask
+        so_do = so_do | {'g5'}
+        sd_sha = so_do_sha or J_V6_SHA256
     gate_check = check_track_gates(hs, track_info, frames_sha256)
     if hs['trang_thai'] == 'khoa_c8' and task not in (hs['imu'].get('mien_dong') or {}):
         raise ValueError(f'hang_so imu mien_dong: no locked U_IMU range for {task}')
@@ -2224,7 +2228,7 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         before = sc & ((gi['t'] <= t1 + 1e-12) if gap_case else (gi['t'] < t1 - 1e-12))
         if tsom_case:                    # J v6 5 (J3-3): the evidence must also lie in the common domain [0, t_som]
             before = before & (gi['t'] <= out['t_som_s'] + 1e-12)
-        viol_before = bool(certain_violations(gi['lo'], before, report_only))
+        viol_before = bool(certain_violations(gi['lo'], before, so_do if sd_sha else frozenset(), gi['q']))
     reasons, fail_cause = (['thao tac: ' + '; '.join(thao_why)] if thao else []), ''
     if bumped:
         reasons.append(f'may quay bi va (dich moc {shift_max:.1f} px > {hs["bump_px"]:g} px)')
@@ -2271,7 +2275,9 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
             reasons.append(f'loi theo doi tai t = {out["t_first_track_err"]:.3f} s')
     note = (('relative frame J v6 (CAM v5); ' if R is not None else '') + f'camera O1 v11.28; constants {hs["trang_thai"]} ({hs["file"]}); U_t = {u_t * 1e3:.1f} ms; '
             f'yaw check {"on" if yaw["compared"] else "off: " + yaw["reason"]}')
-    gate = build_gate(per, dom_c, dom_u, lane, u_t, hs, g1, note, report_only if ro_sha else (), ro_sha)
+    gate = build_gate(per, dom_c, dom_u, lane, u_t, hs, g1, note)
+    if sd_sha:
+        gate = gate_c8.apply_so_do(gate, so_do, task, sd_sha)
     # C8b v4 3 (CODE 17/11, interface 1): per frame its camera time (the key that joins a frame across the nodes of
     # the C8b grid) and whether it is in the common / union domain at this node (cat_t1: the part before t1)
     tcv = t_cam[vi]
@@ -2305,9 +2311,9 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
     else:
         gate_rq3 = 'dat'
         try:
-            req = gate.get('required')
-            rq3_log.validate_gate(gate, 'HW', req)
-            rq3_log.check_outcome_vs_gate(outcome, gate, 'HW', fail_cause, req)
+            sd = gate.get('so_do')
+            rq3_log.validate_gate(gate, 'HW', sd)
+            rq3_log.check_outcome_vs_gate(outcome, gate, 'HW', fail_cause, sd)
         except rq3_log.LogError as exc:
             raise RuntimeError(f'gate block refused by rq3_log (bug of this scorer): {exc}')
     # report keys of the earlier version (s05_final_table, people): on the union domain (cat: before t1)
@@ -2351,7 +2357,7 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
                    placement_n=None)
     out.update(base, version=VERSION, car_pose_version=cm.CAR_POSE_VERSION, outcome=outcome, fail_cause=fail_cause,
                outcome_reasons=reasons,
-               completed=g1['q'], gate_v3=gate, gate_rq3=gate_rq3, cat_t1=cat, report_only=sorted(report_only), U_t_s=u_t, U_t_parts=u_t_parts, yaw_check=yaw,
+               completed=g1['q'], gate_v3=gate, gate_rq3=gate_rq3, cat_t1=cat, so_do=sorted(so_do) if sd_sha else [], U_t_s=u_t, U_t_parts=u_t_parts, yaw_check=yaw,
                shift_max_px=shift_max, bumped=bumped, shift_drift_px=drift,
                shift_drift_note=('quay lai clip H truoc luot sau (design 3.6)'
                                  if drift is not None and drift > hs['drift_px'] else ''),
@@ -2784,6 +2790,9 @@ def main(argv=None):
     ap.add_argument('--out', default='')
     ap.add_argument('--rows', default='', help='optional per-frame CSV of the window frames')
     ap.add_argument('--tuong-doi', action='store_true', help='relative frame (J v6; CAM v5)')
+    ap.add_argument('--so-do', default='', help='g2,g3,g5: the so_do conditions of the run (rule 2b by q, CODE 23/11) '
+                    'from the C8 gate file (c8b_luoi passes them); with --so-do-sha')
+    ap.add_argument('--so-do-sha', default=None, help='SHA-256 of the C8 gate file giving --so-do')
     for k in ('--cua-so', '--tham-chieu', '--truc-xe', '--lan-lap', '--a6', '--xoay', '--c8b-khoa', '--luot-id'):
         ap.add_argument(k, default=None)
     a = ap.parse_args(argv)
@@ -2840,7 +2849,8 @@ def main(argv=None):
         else:
             out, rows = score(frames, a.esp32, a.task, hs, a.offset_s, a.offset_reason, ks,
                               a.allow_final_set, a.sender, a.events, track_info, a.offset_anchor_s, a.offset_err_s,
-                              fsha, gio=gio, rel=rel)
+                              fsha, gio=gio, rel=rel, so_do=frozenset(c for c in a.so_do.split(',') if c),
+                              so_do_sha=a.so_do_sha)
         out.update(frames_file=os.path.basename(a.frames), frames_sha256=fsha,
                    esp32_file=os.path.basename(a.esp32), esp32_sha256=cm.sha256(a.esp32),
                    sender_file=os.path.basename(a.sender) if a.sender else None,

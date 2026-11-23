@@ -18,8 +18,8 @@ Per level (O1-F02, O1-F05, O1-F08; the K tasks take the F05 3b numbers only for 
   man_trap      the shutter branch of the level (J v6 J4-13): 'alpha' (|alpha_r| Dr + |alpha_c| Dc, LE x alpha) only when
                 the 3b of that level says use_alpha, else 'mot_khung' (one frame, NO margin); a run outside the checked
                 domain of the alpha branch falls back to one frame (J5-10, the scorer's job).
-  chi_bao_cao   conditions always report only at the level: G5 of the figure 8 at F08 (J v6 section 6, Liam 19/11
-                "chi bao cao, khong lam bu"); the 2b mask of the other conditions is the gate's (rq3_log / gate_c8).
+  so_do         conditions always decided by q at the level: G5 of the figure 8 at F08 (J v6 section 6; by q, CODE 23/11,
+                Liam "duyet bang luat moi"); the 2b mask of the other conditions is the gate's (rq3_log / gate_c8).
   u_beta_cam_deg {goc, K1, K2}: LE x the largest change of beta under the map noise at the two tape footprints,
                 from NHACTAM lan_lap beta_cam_replay (data contract F15 b, F16): max_abs_dbeta_rad per place; missing ->
                 null and u_beta_cam_trang_thai thieu (CAM: u_phi not finite, the lever-arm terms not concluded).
@@ -305,7 +305,7 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
         cq = can_quay(tb, lv)
         bands, bwhy = hang_theo_u(cq, lv, a_m)
         muc[lv] = dict(can_quay=cq, man_trap=man_trap(tb),
-                       chi_bao_cao=['g5'] if lv == 'O1-F08' else [],
+                       so_do=['g5'] if lv == 'O1-F08' else [],
                        hang_theo_u=bands, hang_theo_u_ly_do=bwhy,
                        hang_dong=dict(a_m=a_m, hang_m=None, he_so_r=None, u_phi_rad=None, hang_rad=None),
                        hang_dong_ly_do=dict(
