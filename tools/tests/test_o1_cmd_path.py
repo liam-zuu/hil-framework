@@ -437,23 +437,55 @@ def test_CP2_3_negative_age_on_a_run_active_line_is_a_flag(tmp_path):
     assert any(f.startswith('ra_age_negative') for f in res['flags'])
 
 
+def _pre_edge(rows, age_of):
+    """rows with the age of every line before the first packet (age -1 in make_log) set to age_of(i, row)."""
+    return [dict(r, traj_age_ms=age_of(i, r)) if r['traj_age_ms'] == -1 else r for i, r in enumerate(rows)]
+
+
 def test_start_anchor_age_of_the_run_before_reads_as_no_packet(tmp_path):
     """Liam 23/11 CODE_CAM local_f3c5357d ("Sua (Recommended)"; C8 session 2, 8/17 runs: e.g. C8-L-F05-2 log_seq 22886
-    traj_age_ms 94110 before the edge, 9 at the edge): a pre-edge age from TRAJ_TIMEOUT_MS on is the last packet of the
-    previous run, not of the schedule; (3) counts as with -1. A fresher start anchor age stays a number."""
+    traj_age_ms 94110 before the edge, 9 at the edge; every line from the log start received, each age >= 200 ms): the
+    packet came before the log began (the run before); (3) counts as with -1. Exactly TRAJ_TIMEOUT_MS on every line
+    too (Codex C3N1-4); one line below it keeps the number."""
     rows = make_log()
-    for d in 'abc':
+    for d in 'abcd':
         (tmp_path / d).mkdir()
     base = run(tmp_path / 'a', rows)['cond3']
     assert base['age_minus1_as_0'] == 1 and base['start_age_run_before_ms'] is None
-    old = [dict(r, traj_age_ms=94000 + i) if r['traj_age_ms'] == -1 else r for i, r in enumerate(rows)]
-    c3 = run(tmp_path / 'b', old)['cond3']
+    c3 = run(tmp_path / 'b', _pre_edge(rows, lambda i, r: 94000 + i))['cond3']
     assert c3['value_ms'] == pytest.approx(base['value_ms']) and c3['value_ms'] < 100
-    assert c3['start_age_run_before_ms'] >= cp.TRAJ_TIMEOUT_MS and c3['age_minus1_as_0'] == 0
-    assert c3['at_seq'] == base['at_seq']
-    young = [dict(r, traj_age_ms=cp.TRAJ_TIMEOUT_MS - 1) if r['traj_age_ms'] == -1 else r for r in rows]
-    c3y = run(tmp_path / 'c', young)['cond3']
+    assert c3['start_age_run_before_ms'] >= 94000 and c3['age_minus1_as_0'] == 0 and c3['at_seq'] == base['at_seq']
+    c3e = run(tmp_path / 'c', _pre_edge(rows, lambda i, r: cp.TRAJ_TIMEOUT_MS))['cond3']
+    assert c3e['start_age_run_before_ms'] == cp.TRAJ_TIMEOUT_MS and c3e['value_ms'] == pytest.approx(base['value_ms'])
+    c3y = run(tmp_path / 'd', _pre_edge(rows, lambda i, r: cp.TRAJ_TIMEOUT_MS - 1))['cond3']
     assert c3y['start_age_run_before_ms'] is None and c3y['value_ms'] > cp.TRAJ_TIMEOUT_MS - 1
+
+
+def test_start_anchor_old_age_kept_when_the_packet_may_be_of_the_schedule(tmp_path):
+    """Codex C3N1-1: an old start anchor age is kept as a number when the log cannot show the packet came before it
+    began: a lost line between the log start and the start anchor (AUTO, lines lost), or a line with a fresh age in
+    that stretch (MANUAL, the schedule packet received while run_active 0)."""
+    rows = _pre_edge(make_log(), lambda i, r: 94000 + i)
+    pre = [r['log_seq'] for r in rows if r['traj_age_ms'] >= 94000]
+    for d in 'ab':
+        (tmp_path / d).mkdir()
+    c3 = run(tmp_path / 'a', [r for r in rows if r['log_seq'] != pre[len(pre) // 2]])['cond3']
+    assert c3['start_age_run_before_ms'] is None and c3['value_ms'] > 94000
+    c3 = run(tmp_path / 'b', [dict(r, traj_age_ms=50) if r['log_seq'] == pre[3] else r for r in rows])['cond3']
+    assert c3['start_age_run_before_ms'] is None and c3['value_ms'] > 94000
+
+
+def test_old_age_on_a_later_anchor_stays_a_number(tmp_path):
+    """Codex C3N1-5: only the START anchor is read as -1; an age >= TRAJ_TIMEOUT_MS on a later anchor (packets lost in
+    the schedule) is kept."""
+    rows = make_log()
+    edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
+    mid = [r['log_seq'] for r in rows if r['log_seq'] > edge + 200 and r['run_active'] == 1][:3]
+    rows = _pre_edge(rows, lambda i, r: 94000 + i)
+    rows = [dict(r, traj_age_ms=250 + k) if r['log_seq'] in mid else r
+            for k, r in enumerate(rows)]
+    c3 = run(tmp_path, rows)['cond3']
+    assert c3['start_age_run_before_ms'] >= 94000 and c3['value_ms'] > 250
 
 
 def test_CP2_4_empty_age_before_the_edge(tmp_path):

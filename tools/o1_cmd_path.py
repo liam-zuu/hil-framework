@@ -44,8 +44,11 @@ Anchors (O1 3.5): received data lines sorted by log_seq.
             after t_w1. run_active falls and rises again before the end anchor: no evidence.
   (3)       start anchor: last line with t + L <= t_w0 in the same motor-on stretch; end anchor:
             first line at or after t_w1; a line b is used as a LATER anchor only when the line
-            b+1 (next log_seq, motor on) exists: L = t_(b+1) - t_b. A start anchor age >= TRAJ_TIMEOUT_MS
-            is the last packet of the run before, read as -1 (Liam 23/11 CODE_CAM local_f3c5357d).
+            b+1 (next log_seq, motor on) exists: L = t_(b+1) - t_b. A start anchor age of a packet received
+            before the log began (every line from the first to the start anchor received, each age >=
+            TRAJ_TIMEOUT_MS: the run before) is read as -1 (Liam 23/11 CODE_CAM local_f3c5357d; Codex C3N1-1).
+            The window is mapped from the edge (Liam 15/11): schedule packets lost at the start make the edge
+            late, a phase error that (4) sees, not (3).
   (2), (4): the value of a run is the largest of the deviation ON the anchor lines and of the pair
   bound below over the pairs that HIDE ticks (a lost line, or a tick difference other than 1):
   every control tick pushes one data line (tick + 1 on every consecutive pair, 1030/1030 on
@@ -423,6 +426,19 @@ def read_sender_complete(path, task_id):
     return True, ''
 
 
+def _packet_before_log(rows, start):
+    """(3) start anchor (Liam 23/11; Codex Sol C3N1-1): True when its traj_age_ms is that of a packet received before
+    the log began: every data line from the first one of the log to the start anchor received (consecutive
+    log_seq) and each with traj_age_ms >= TRAJ_TIMEOUT_MS. A packet received inside that stretch would show on the
+    line of the next tick with an age below one tick (MANUAL or AUTO alike); the first line at >= TRAJ_TIMEOUT_MS puts
+    it 200 ms or more before the log. A lost line, an empty cell or an age below TRAJ_TIMEOUT_MS: False (the age
+    stays a number)."""
+    seg = [r for r in rows if r['_seq'] <= start['_seq']]
+    if not seg or any(b['_seq'] != a['_seq'] + 1 for a, b in zip(seg, seg[1:])):
+        return False
+    return all(r['_age'] is not None and r['_age'] >= TRAJ_TIMEOUT_MS for r in seg)
+
+
 def analyse(rows, task, events=(), has_age_col=True, sched=None, bao_s=None, sender_ok=None):
     """sched: (sched_first_s, sched_last_s) of the sender (B81c-1); bao_s: #test_start -> #test_end epoch
     span of the sender (K-1), used when sched is None; sender_ok: (ok, why) of read_sender_complete."""
@@ -682,12 +698,13 @@ def analyse(rows, task, events=(), has_age_col=True, sched=None, bao_s=None, sen
                 if age < 0:                     # -1: no packet since boot; any later packet came after t_a
                     neg += 1
                     age = 0
-                elif pa is start and age >= TRAJ_TIMEOUT_MS:
-                    # Liam 23/11 CODE_CAM local_f3c5357d, box "Dieu (3)": "Sua (Recommended)". The start anchor is
-                    # before the window; an age from TRAJ_TIMEOUT_MS is the last packet of the RUN BEFORE (no
-                    # schedule packet runs that old: the firmware stops at 200 ms), not of this schedule ("from
-                    # the first packet", O1 3.5 (3)): as -1, any packet of the schedule came after t_a, so the pair
-                    # bound counts from t_a, before the first packet (an upper bound). C8 session 2: 8/17 runs.
+                elif pa is start and _packet_before_log(rows, start):
+                    # Liam 23/11 CODE_CAM local_f3c5357d, box "Dieu (3)": "Sua (Recommended)"; condition narrowed after
+                    # Codex Sol C3N1-1 (round 1): the start anchor age is that of a packet received before the log
+                    # began (the run before; the schedule starts after the logger, >= 6.15 s still), not of this
+                    # schedule ("from the first packet", O1 3.5 (3)): as -1, any packet of the schedule came after
+                    # t_a, so the pair bound counts from t_a (an upper bound over the window from the edge). A
+                    # schedule packet lost from the start makes the edge late: a phase error, condition (4).
                     stale = age
                     age = 0
                 b3 = age + 1.0 + (pb['_t'] - pa['_t']) / 1e3 + L_of(pb) / 1e3
