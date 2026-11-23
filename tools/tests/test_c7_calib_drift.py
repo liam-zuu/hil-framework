@@ -303,6 +303,74 @@ def test_k_lanes_are_scored_when_run(s0):
     assert not f['vuot'] and k['vuot']
 
 
+def truth_heading_deg(s_score, cam_true, poses):
+    """As truth_error_mm, tag offset 0: the largest |wrap(psi reported - psi true)| [deg] (v2 heading control)."""
+    fm = file_marks()
+    ids = sorted(fm)
+    obj = np.vstack([cp.mark_corners_floor(*fm[i]) for i in ids])
+    img = cam_true.project(np.column_stack([obj, np.zeros(len(obj))]))
+    a2, _ = cm.refit_pose(cm.cam_from_dict(s_score['camera']), obj, img)
+    worst = 0.0
+    for x, y, psi in poses:
+        c, s = math.cos(psi), math.sin(psi)
+        q = np.array([[x + c * u - s * v, y + s * u + c * v] for u, v in cm.car_corners_body(SIDE)])
+        px = cam_true.project(np.column_stack([q, np.full(4, TAG_H)]))
+        r = cm.car_pose(a2, px, SIDE, s_score['kappa'], s_score['plumb_xy_m'], (0.0, 0.0, 0.0))
+        worst = max(worst, abs(math.atan2(math.sin(r['psi'] - psi), math.cos(r['psi'] - psi))))
+    return math.degrees(worst)
+
+
+def test_v2_fields_same_session_and_missing_end_clip(s0):
+    """c7_calib_drift_v2 (CAM v4 TC3-10, gate_c8 DRIFT_VERSION): position and heading measured (so), heading 0 for
+    one session; no clip H at the end: both quantities thieu, vuot, vuot_do_thieu, vang_H1."""
+    d = cd.compare(s0, json.loads(json.dumps(s0)), FIG)
+    assert d['version'] == cd.DRIFT_VERSION == 'c7_calib_drift_v2' and d['cach'] == 'tuyet_doi'
+    assert d['D_H_vi_tri_mm'] == d['D_H_mm'] and d['D_H_huong_deg'] < 1e-6
+    assert (d['trang_thai_vi_tri'], d['trang_thai_huong'], d['vuot_do_thieu'], d['vang_H1']) == ('so', 'so', False, False)
+    m = cd.compare(s0, None, FIG)
+    assert m['thieu_H1'] and m['vuot'] and m['vuot_do_thieu'] and m['vang_H1']
+    assert (m['trang_thai_vi_tri'], m['trang_thai_huong']) == ('thieu', 'thieu') and m['D_H_huong_deg'] is None
+    cd.check_drift(d)
+    cd.check_drift(m)
+
+
+@pytest.mark.parametrize('name,cam', [('k1_0.01', warped(0.01)), ('zoom_2pc', zoomed(0.02)),
+                                      ('lateral', moved_camera())])
+def test_heading_covers_the_car_heading_error_of_the_truth_camera(s0, name, cam):
+    """D_H_huong_deg (both ways, both hypotheses) is never below the heading error car_pose makes with the truth
+    camera of the end of the session (independent of one_way)."""
+    d = cd.compare(s0, make_session(cam), FIG)
+    truth = truth_heading_deg(s0, cam, truth_poses(FIG, None))
+    assert max(d['D_huong_deg']['h0_to_h1'].values()) >= truth - 1e-4
+    assert d['D_H_huong_deg'] == pytest.approx(max(v for w in d['D_huong_deg'].values() for v in w.values()))
+
+
+def test_heading_threshold_decides_only_when_given(s0):
+    """vuot from the position only while eps_H_huong_deg is not given (not locked); given below D_H_huong_deg: vuot;
+    2 x d_lap_huong_deg above D_H_huong_deg lifts it back. check_drift recomputes vuot with the heading."""
+    s1 = make_session(warped(0.001))
+    d = cd.compare(s0, s1, FIG)
+    assert not d['vuot'] and d['eps_H_huong_deg'] is None and d['D_H_huong_deg'] > 0
+    e = cd.compare(s0, s1, FIG, eps_huong_deg=d['D_H_huong_deg'] / 2)
+    assert e['vuot'] and e['eps_H_huong_deg'] == pytest.approx(d['D_H_huong_deg'] / 2)
+    f = cd.compare(s0, s1, FIG, eps_huong_deg=d['D_H_huong_deg'] / 2, d_lap_huong_deg=d['D_H_huong_deg'])
+    assert not f['vuot'] and f['eps_H_huong_deg'] == pytest.approx(2 * d['D_H_huong_deg'])
+    for x in (d, e, f):
+        cd.check_drift(x)
+    with pytest.raises(ValueError):
+        cd.check_drift(dict(e, vuot=False))
+
+
+def test_gate_recomputes_the_same_vuot(s0):
+    """gate_c8._drift_vuot (the gate rule, GC9-3) on a v2 file: its own eps_H on both quantities."""
+    import gate_c8
+    d = json.loads(json.dumps(cd.compare(s0, make_session(warped(0.001)), FIG)))
+    big = dict(mm=1e3, huong_deg=1e3)
+    assert gate_c8._drift_vuot(d, big, 'x') is False
+    assert gate_c8._drift_vuot(d, dict(mm=1e3, huong_deg=d['D_H_huong_deg'] / 2), 'x') is True
+    assert gate_c8._drift_vuot(d, dict(mm=d['D_H_vi_tri_mm'] / 2, huong_deg=1e3), 'x') is True
+
+
 def test_moved_floor_mark_is_named(s0):
     tm = file_marks()
     x, y, side = tm[14]
