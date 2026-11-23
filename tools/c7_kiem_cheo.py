@@ -2993,6 +2993,224 @@ def e_hieu(a):
          f"{sum(x['trang_thai'] == 'dat' for x in legs)} doan dat; trang_thai {out['trang_thai']}")
 
 
+NEO_LUOT_SCHEMA = 'c7_neo_luot_v1'            # P_neo / A_neo (S7-13 KS7B-3, S7-14.5; CODE 23/11 T12 chot section 5)
+
+
+def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to):
+    """P_neo / A_neo of one C8 run (S7-14.5; CODE 23/11: the bound of hang_m covers EVERY frame t of the run): the
+    reference window W = pre. For every valid frame t of the run (frames.csv valid with a tag pose, from the first W
+    frame to the last post frame), the reference anchor set R_t = (anchors common to every W frame) & S_t; the replay
+    deviation of a frame f on R_t is e_f = pose on its own anchors S_f - pose on R_t (scoring chain, same as iii_leg);
+    value_t = |e_t - mean over W of e_f| (position, heading). A frame whose replay cannot be made (no detection of the
+    car tag, R_t below MIN_TRAIN, refit not trusted) is not valid (S7-14.5) and counted. Returns (dict, reason):
+    P_neo_m, A_neo_rad = max over the valid frames, the frames of the max, counts."""
+    if not ids_w or not ids_post:
+        return None, 'cua so khong co khung'
+    for f in list(ids_w) + list(ids_post):
+        if f not in rows:
+            return None, f'khung {f} cua cua so khong co trong frames.csv'
+    S = {}
+
+    def anchors(f):
+        if f not in S:
+            S[f] = _ids_of(rows[f].get('moc_dung'))
+        return S[f]
+
+    for f in ids_w:
+        if f not in dets or cm.CAR_ID not in dets[f][1]:
+            return None, f'khung W {f} khong co trong dets.npz (hay khong thay ma noc)'
+    W = set.intersection(*[set(anchors(f)) for f in ids_w])
+
+    def dev_on(f, ref):
+        d = dets[f][1]
+        pS = cm.car_pose(fp_.full(anchors(f), d, f'khung {f}'), d[cm.CAR_ID], side, kappa, plumb, to)
+        pR = cm.car_pose(fp_.full(ref, d, f'khung {f} (tap chung)'), d[cm.CAR_ID], side, kappa, plumb, to)
+        return pS, np.array([pS['x'] - pR['x'], pS['y'] - pR['y'], float(cm.cp_wrap(pS['psi'] - pR['psi']))])
+
+    lo, hi = min(ids_w), max(ids_post)
+    run = [f for f in sorted(rows) if lo <= f <= hi and _true(rows[f].get('valid'))
+           and rows[f].get('tag_x') not in ('', None)]
+    cache, bad, dev = {}, {}, 0.0
+    best_p, best_a, f_p, f_a, n_ok = 0.0, 0.0, None, None, 0
+    for t in run:
+        if t not in dets or cm.CAR_ID not in dets[t][1]:
+            bad[t] = 'khong co dets / ma noc'
+            continue
+        ref = tuple(sorted(W & set(anchors(t))))
+        if len(ref) < MIN_TRAIN:
+            bad[t] = f'tap neo chung {len(ref)} moc (< {MIN_TRAIN})'
+            continue
+        if ref not in cache:
+            try:
+                cache[ref] = np.mean([dev_on(f, list(ref))[1] for f in ids_w], axis=0)
+            except KCError as ex:
+                cache[ref] = str(ex)[:160]
+        m = cache[ref]
+        if isinstance(m, str):
+            bad[t] = f'W tren tap chung: {m}'
+            continue
+        try:
+            pS, et = dev_on(t, list(ref))
+        except KCError as ex:
+            bad[t] = str(ex)[:160]
+            continue
+        dev = max(dev, abs(pS['tag_x'] - float(rows[t]['tag_x'])), abs(pS['tag_y'] - float(rows[t]['tag_y'])))
+        dd = et - m
+        p, ang = float(math.hypot(dd[0], dd[1])), abs(float(cm.cp_wrap(dd[2])))
+        if not (math.isfinite(p) and math.isfinite(ang)):
+            bad[t] = 'khong huu han'
+            continue
+        n_ok += 1
+        if f_p is None or p > best_p:
+            best_p, f_p = p, t
+        if f_a is None or ang > best_a:
+            best_a, f_a = ang, t
+    if not dev <= TOL_REPLAY_M:
+        raise KCError(f'neo: the replayed scoring pose differs from frames.csv by {dev:.3g} m (another session, '
+                      'detections or anchors)')
+    if not n_ok:
+        return None, 'khong khung nao phat lai duoc'
+    return dict(P_neo_m=best_p, A_neo_rad=best_a, khung_max_P=f_p, khung_max_A=f_a, n_khung=len(run),
+                n_khung_hop_le=n_ok, n_khung_khong_hop_le=len(bad),
+                khong_hop_le_mau=[dict(khung=k, ly_do=v) for k, v in sorted(bad.items())[:20]],
+                n_tap_chung=len(cache), tap_W=sorted(W), lech_phat_lai_max_m=dev,
+                doi_tap=any(set(anchors(t)) != W for t in run if t not in bad)), ''
+
+
+def neo_luot(a):
+    """P_neo / A_neo (S7-13 KS7B-3, S7-14.5; CODE 23/11 T12: names c7_neo_luot_v1, the bound over EVERY frame of the
+    run): for every C8 run with a pre and a post window in the merged F2 (cua_so_v1.jsonl, khung_ma_hop_le = the frames
+    the scorer averages), replay of the anchor sets REALLY used by each frame (frames.csv moc_dung) through the scoring
+    chain of the final track (track.json, frames.csv, dets.npz of CODE_CAM, session of the window), neo_run: P_neo_m /
+    A_neo_rad = max over the valid frames t of the run of |replay deviation at t - mean replay deviation over W = pre|
+    (position / heading), before margin; info.hai_dau keeps post - pre (iii_leg). A run whose replay cannot be made:
+    chua_ket_luan + reason. theo_cho: max over the runs of each place; not dat when a run of the place is not."""
+    with open(a.cua_so, 'rb') as f:
+        cb = f.read()
+    cs_sha = hashlib.sha256(cb).hexdigest()                     # KCF1-7: hash of the bytes parsed
+    try:
+        rows_cs = [json.loads(x) for x in cb.decode('utf-8').splitlines() if x.strip()]
+    except ValueError as e:
+        raise KCError(f'cua_so_v1: {e}')
+    win = {}
+    for r in rows_cs:
+        if isinstance(r, dict) and r.get('loai') in ('pre', 'post'):
+            lid = r.get('luot_id')
+            if not isinstance(lid, str) or not lid:
+                raise KCError('cua_so_v1: a pre/post window without luot_id')
+            if r['loai'] in win.setdefault(lid, {}):
+                raise KCError(f'cua_so_v1: two {r["loai"]} windows of {lid}')
+            win[lid][r['loai']] = r
+    if not win:
+        raise KCError('cua_so_v1: no pre/post window (the merged F2 of the C8 runs is needed)')
+    tracks = {}                                                  # frames sha -> (dir, track, track sha)
+    for d in a.track:
+        tr, tr_sha = load_json_sha(os.path.join(d, 'track.json'))
+        fs = _hex(tr.get('frames_sha256'), f'{d} track.frames_sha256')
+        if sha256_file(os.path.join(d, 'frames.csv')) != fs:
+            raise KCError(f'{d}: frames.csv is not the one of track.json')
+        if fs in tracks:
+            raise KCError(f'--track {d}: same frames.csv as {tracks[fs][0]}')
+        tracks[fs] = (d, tr, tr_sha)
+    sessions = {}
+    for sp_ in a.session:
+        s_, sha_ = load_json_sha(sp_)
+        if sha_ in sessions:
+            raise KCError(f'--session {sp_} given twice')
+        sessions[sha_] = sp_
+    out_l = {}
+    for lid in sorted(win):
+        w = win[lid]
+        rec = dict(cho=next(iter(w.values())).get('cho'), P_neo_m=None, A_neo_rad=None, n_pre=None, n_post=None,
+                   info=None)          # cho of the window there is: a run without post still counts at its place
+        why = []
+        if set(w) != {'pre', 'post'}:
+            why.append(f'thieu cua so {sorted({"pre", "post"} - set(w))}')
+        else:
+            pre, post = w['pre'], w['post']
+            rec['cho'] = pre.get('cho')
+            for k in ('cho', 'clip_sha256', 'session_sha256', 'frames_sha256'):
+                if pre.get(k) != post.get(k):
+                    raise KCError(f'cua_so_v1 {lid}: pre and post with another {k}')
+            ids = {}
+            for nm, r in (('pre', pre), ('post', post)):
+                # khung_ma_hop_le: the frame ids the scorer averages (ints, c7_score cua-so); else khung [{id, pts_s}]
+                kh = r.get('khung_ma_hop_le') if r.get('khung_ma_hop_le') is not None else r.get('khung')
+                kh = [x.get('id') if isinstance(x, dict) else x for x in kh] if isinstance(kh, list) else None
+                if not kh or not all(isinstance(x, int) and not isinstance(x, bool) for x in kh) \
+                        or len(set(kh)) != len(kh):
+                    raise KCError(f'cua_so_v1 {lid} {nm}: khung_ma_hop_le / khung empty, malformed or repeated')
+                ids[nm] = kh
+            rec.update(n_pre=len(ids['pre']), n_post=len(ids['post']))
+            fs = pre.get('frames_sha256')
+            if fs not in tracks:
+                why.append('khong co --track co frames.csv cua cua so')
+            elif pre.get('session_sha256') not in sessions:
+                why.append('khong co --session cua cua so')
+            else:
+                d, tr, tr_sha = tracks[fs]
+                if tr.get('session_sha256') != pre['session_sha256'] or tr.get('video_sha256') != pre['clip_sha256']:
+                    raise KCError(f'{lid}: the track of the window was made from another session / clip')
+                s, ses_sha, mk, pc, full, kappa, C = _session_ctx(sessions[pre['session_sha256']],
+                                                                  tr.get('session_sha256'), a.model)
+                dp_ = tr.get('dets_file') or os.path.join(d, 'dets.npz')
+                dets, dets_sha, _ = load_dets_checked(dp_, _hex(tr.get('dets_sha256'), f'{lid} track.dets_sha256'),
+                                                      None, tr.get('video_sha256'), f'{lid} dets.npz')
+                rows = {int(r_['idx']): r_ for r_ in _read_csv(os.path.join(d, 'frames.csv'))}
+                to = tuple(tr.get('tag_offset') or s.get('tag_offset') or (0.0, 0.0, 0.0))
+                cfg = (float(s['car_side_m']), float(s['kappa']), np.asarray(s['plumb_xy_m'], float), to)
+                fp_ = FramePoses(s, pc)
+                res, w3 = neo_run(fp_, rows, dets, ids['pre'], ids['post'], *cfg)
+                if w3:
+                    why.append(w3)
+                else:
+                    # kept in info (CODE 23/11): the two-end number post - pre, as e_hieu (iii)
+                    m2, psi2, w2, i2 = iii_leg(fp_, rows, dets, ids['pre'], ids['post'], *cfg)
+                    res['hai_dau'] = dict(P_m=m2, A_rad=psi2, ly_do=w2 or None, tap_chung=(i2 or {}).get('tap_chung'))
+                    rec.update(P_neo_m=res.pop('P_neo_m'), A_neo_rad=res.pop('A_neo_rad'), info=res)
+                rec['nguon'] = dict(track=dict(duong_dan=os.path.abspath(os.path.join(d, 'track.json')),
+                                               sha256=tr_sha),
+                                    frames=dict(duong_dan=os.path.abspath(os.path.join(d, 'frames.csv')), sha256=fs),
+                                    dets=dict(duong_dan=os.path.abspath(dp_), sha256=dets_sha),
+                                    session=dict(duong_dan=os.path.abspath(sessions[ses_sha]), sha256=ses_sha))
+        rec.update(trang_thai='dat' if not why else 'chua_ket_luan', ly_do=why)
+        out_l[lid] = rec
+    theo_cho = {}                     # CODE 23/11: {P_neo_m, A_neo_rad, n_luot, trang_thai, ly_do}; C8B reads goc
+    for lid, r in sorted(out_l.items()):
+        c = theo_cho.setdefault(r['cho'], dict(P_neo_m=None, A_neo_rad=None, n_luot=0, luot_max_P=None,
+                                               luot_max_A=None, ly_do=[]))
+        if r['trang_thai'] != 'dat':
+            c['ly_do'].append(f'{lid} chua_ket_luan')
+            continue
+        if c['P_neo_m'] is None or r['P_neo_m'] > c['P_neo_m']:
+            c.update(P_neo_m=r['P_neo_m'], luot_max_P=lid)
+        if c['A_neo_rad'] is None or r['A_neo_rad'] > c['A_neo_rad']:
+            c.update(A_neo_rad=r['A_neo_rad'], luot_max_A=lid)
+        c['n_luot'] += 1
+    for c in theo_cho.values():
+        c['trang_thai'] = 'dat' if not c['ly_do'] and c['n_luot'] else 'chua_ket_luan'
+    out = dict(schema=NEO_LUOT_SCHEMA, model=a.model, luot=out_l, theo_cho=theo_cho,
+               luot_chua_ket_luan=sorted(k for k, v in out_l.items() if v['trang_thai'] != 'dat'),
+               nguon=dict(cua_so=dict(duong_dan=os.path.abspath(a.cua_so), sha256=cs_sha)),
+               loai='chi so thuc nghiem truoc le (S7-13 KS7B-3, S7-14.5): max tren moi khung hop le cua luot '
+                    '|lech phat lai khung t - trung binh lech phat lai tren W (pre)|',
+               gioi_han=['phat lai tap neo that tung khung (frames.csv moc_dung) tren khung that (dets.npz) qua chuoi '
+                         'cham, so voi tap tham chieu R_t = (neo chung moi khung W) giao S_t (doi chung dinh nghia o '
+                         'neo_run); chi thay phan do doi tap neo, khong thay sai chung cua ca tap',
+                         'khung luot: hop le trong frames.csv, co tu the ma, tu khung W dau toi khung post cuoi; khung '
+                         'phat lai khong duoc (thieu dets, R_t < MIN_TRAIN, refit khong tin) khong hop le, dem rieng',
+                         'dem trung mot phan voi P7 / A5 (lech khung theo thoi gian): phia than trong (CODE 23/11)',
+                         'info.hai_dau: so hai dau post - pre nhu e_hieu (iii), chi de doi chieu'],
+               commit_hil=commit_hil())
+    write_new(a.out, out)
+    _say(f"neo_luot: {len(out_l)} luot, {sum(v['trang_thai'] == 'dat' for v in out_l.values())} dat; theo_cho "
+         + ', '.join(f"{c} {v['trang_thai']}: P "
+                     f"{'-' if v['P_neo_m'] is None else round(v['P_neo_m'] * 1000, 3)} mm, A "
+                     f"{'-' if v['A_neo_rad'] is None else round(math.degrees(v['A_neo_rad']), 4)} deg"
+                     for c, v in sorted(theo_cho.items()))
+         + f"; chua ket luan {out['luot_chua_ket_luan']}")
+
+
 def xuat(a):
     kc = _load_json(a.kiem_cheo)
     if kc.get('version') != VERSION:
@@ -3121,10 +3339,17 @@ def main(argv=None):
     b.add_argument('--dets', action='append', required=True,
                    help='dets.npz of every clip of the anchor frames (run ends, calibration windows), repeated')
     b.add_argument('--out', required=True)
+    n = sub.add_parser('neo_luot', help='P_neo / A_neo of every C8 run (pre -> post anchor-set replay)')
+    n.add_argument('--model', required=True)
+    n.add_argument('--cua-so', dest='cua_so', required=True, help='merged F2 cua_so_v1.jsonl with pre/post windows')
+    n.add_argument('--track', action='append', required=True,
+                   help='final track dir of a run (track.json, frames.csv; dets_file of track.json), repeated')
+    n.add_argument('--session', action='append', required=True, help='scoring session(s) of the windows, repeated')
+    n.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
         {'phan_tich': phan_tich, 'xuat': xuat, 'kiem_h': kiem_h_cli, 'tung_khung': tung_khung, 'tien_de': tien_de,
-         'e_hieu': e_hieu, 'meo_E': meo_E, 'meo_bang': meo_bang}[a.cmd](a)
+         'e_hieu': e_hieu, 'meo_E': meo_E, 'meo_bang': meo_bang, 'neo_luot': neo_luot}[a.cmd](a)
     except (KCError, OSError, ValueError, KeyError) as e:
         print(f'loi: {e}')
         print('#ket_qua,ma=2')

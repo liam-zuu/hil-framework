@@ -2610,6 +2610,96 @@ def test_e_hieu_iii_refuses_other_dets(tmp_path, scene):
     assert kc.main(['e_hieu', '--kiem-cheo', str(kcp), '--doan', str(dop), '--out', str(tmp_path / 'e.json')]) == 2
 
 
+# ---------------------------------------------------------------- P_neo / A_neo (CODE 23/11 T12, S7-14.5 v1 hai dau)
+def _neo_files(tmp_path, scene, drop_b=(), tape_off=None, windows=('pre', 'post'), lid='C8-P-F02-1'):
+    """The 12b scene of _f5_iii seen as one C8 run: pre window = frames 1-3, post window = frames 8-10, in a merged F2
+    (cua_so_v1.jsonl, khung_ma_hop_le) naming the session, frames and clip of the track."""
+    kcp, dop, ses, dets, frp = _f5_iii(tmp_path, scene, drop_b=drop_b, tape_off=tape_off)
+    src = {x['vai_tro']: x for x in json.loads(dop.read_text(encoding='utf-8'))['nguon']}
+    sp, ids = src['session']['duong_dan'], dict(pre=(1, 2, 3), post=(8, 9, 10))
+    lines = [json.dumps(dict(schema='cua_so_v1', luot_id=lid, cho='goc', loai=w, clip_sha256='b' * 64,
+                             session_sha256=src['session']['sha256'], frames_sha256=src['frames']['sha256'],
+                             khung=[dict(id=k, pts_s=k / 60) for k in ids[w]],
+                             khung_ma_hop_le=list(ids[w]))) for w in windows]          # ints, as c7_score writes
+    csp = tmp_path / 'cua_so_v1.jsonl'
+    csp.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return csp, sp, ses, dets, frp, dop
+
+
+def _neo_run(tmp_path, csp, sp, track_dir=None):
+    out = tmp_path / 'neo.json'
+    rc = kc.main(['neo_luot', '--model', 'B1', '--cua-so', str(csp), '--track', str(track_dir or tmp_path),
+                  '--session', str(sp), '--out', str(out)])
+    return rc, (json.loads(out.read_text(encoding='utf-8')) if out.exists() else None)
+
+
+def test_neo_luot_zero_without_anchor_change(tmp_path, scene):
+    csp, sp, *_ = _neo_files(tmp_path, scene)
+    rc, o = _neo_run(tmp_path, csp, sp)
+    r = o['luot']['C8-P-F02-1']
+    assert rc == 0 and o['schema'] == kc.NEO_LUOT_SCHEMA and r['trang_thai'] == 'dat'
+    assert r['P_neo_m'] == 0.0 and r['A_neo_rad'] == 0.0 and r['info']['doi_tap'] is False
+    assert r['n_pre'] == 3 and r['n_post'] == 3 and r['info']['n_khung'] == 6 and r['info']['n_khung_hop_le'] == 6
+    c = o['theo_cho']['goc']
+    assert c['n_luot'] == 1 and c['trang_thai'] == 'dat' and c['ly_do'] == [] and c['P_neo_m'] == 0.0
+
+
+def test_neo_luot_max_over_every_frame_independent(tmp_path, scene):
+    """Mark 25 taped 3 mm off and lost in the post window: P_neo = max over the valid run frames t (1-3, 8-10; 4-7
+    have no tag pose) of |e_t - mean over W of e_f| on R_t = W & S_t, recomputed independently with c7_measure; it is
+    >= the two-end number kept in info.hai_dau, which equals e_hieu (iii) on the same windows."""
+    import c7_measure as cmeas
+    csp, sp, ses, dets, frp, dop = _neo_files(tmp_path, scene, drop_b=(25,), tape_off=(25, 0.003))
+    rc, o = _neo_run(tmp_path, csp, sp)
+    assert rc == 0
+    r = o['luot']['C8-P-F02-1']
+    ctx = cmeas.ChainCtx(ses)
+    rows = {int(x['idx']): x for x in kc._read_csv(str(frp))}
+    S = {k: kc._ids_of(rows[k]['moc_dung']) for k in (1, 2, 3, 8, 9, 10)}
+    W = set.intersection(*(set(S[k]) for k in (1, 2, 3)))
+
+    def e(k, ref):
+        a = cmeas.car_pose(ctx.pose('xe', S[k], dets[k])[0], dets[k][0], 0.1445, ses['kappa'], ses['plumb_xy_m'])
+        b = cmeas.car_pose(ctx.pose('xe', ref, dets[k])[0], dets[k][0], 0.1445, ses['kappa'], ses['plumb_xy_m'])
+        return np.array([a['x'] - b['x'], a['y'] - b['y']])
+    want = 0.0
+    for t in (1, 2, 3, 8, 9, 10):
+        ref = sorted(W & set(S[t]))
+        m = np.mean([e(f, ref) for f in (1, 2, 3)], axis=0)
+        want = max(want, float(np.linalg.norm(e(t, ref) - m)))
+    assert r['P_neo_m'] == pytest.approx(want, abs=1e-12) and want > 1e-5 and r['info']['doi_tap'] is True
+    assert r['info']['n_tap_chung'] == 2 and r['info']['khung_max_P'] in (8, 9, 10)
+    e_ = tmp_path / 'e.json'
+    assert kc.main(['e_hieu', '--kiem-cheo', str(tmp_path / 'kc.json'), '--doan', str(dop), '--out', str(e_)]) == 0
+    leg = json.loads(e_.read_text(encoding='utf-8'))['doan'][0]
+    assert r['info']['hai_dau']['P_m'] == leg['phan_iii_m'] and r['P_neo_m'] >= leg['phan_iii_m'] - 1e-15
+    assert o['theo_cho']['goc']['P_neo_m'] == r['P_neo_m'] and o['theo_cho']['goc']['luot_max_P'] == 'C8-P-F02-1'
+
+
+def test_neo_luot_missing_window_or_track_is_not_concluded(tmp_path, scene):
+    csp, sp, *_ = _neo_files(tmp_path, scene, windows=('pre',))
+    rc, o = _neo_run(tmp_path, csp, sp)
+    assert rc == 0 and o['luot']['C8-P-F02-1']['trang_thai'] == 'chua_ket_luan'
+    assert o['luot_chua_ket_luan'] == ['C8-P-F02-1']
+    c = o['theo_cho']['goc']                       # a place with a run not concluded is not dat (C8B: hang thieu)
+    assert c['trang_thai'] == 'chua_ket_luan' and c['P_neo_m'] is None and c['ly_do'] == ['C8-P-F02-1 chua_ket_luan']
+    lines = [json.loads(x) for x in csp.read_text(encoding='utf-8').splitlines()]
+    lines.append(dict(lines[0], loai='post', frames_sha256='c' * 64))
+    lines[0]['frames_sha256'] = 'c' * 64
+    csp.write_text('\n'.join(json.dumps(x) for x in lines) + '\n', encoding='utf-8')
+    (tmp_path / 'neo.json').unlink()
+    rc, o = _neo_run(tmp_path, csp, sp)
+    assert rc == 0 and o['luot']['C8-P-F02-1']['ly_do'] == ['khong co --track co frames.csv cua cua so']
+
+
+def test_neo_luot_refuses_a_track_of_another_clip(tmp_path, scene):
+    csp, sp, *_ = _neo_files(tmp_path, scene)
+    lines = [dict(json.loads(x), clip_sha256='d' * 64) for x in csp.read_text(encoding='utf-8').splitlines()]
+    csp.write_text('\n'.join(json.dumps(x) for x in lines) + '\n', encoding='utf-8')
+    rc, o = _neo_run(tmp_path, csp, sp)
+    assert rc == 2 and o is None
+
+
 # ---------------------------------------------------------------- camera segments (Liam 20/11 "Theo doan, bo H giua")
 def _doan(k, u, t, cuoi=True):
     """Make the tien_de fixture a camera segment: no H_m (session, kiem_h, plan); without cuoi no H_z either."""
