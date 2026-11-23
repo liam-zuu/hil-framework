@@ -97,6 +97,8 @@ HANG_DONG = ('a_m', 'hang_m', 'he_so_r', 'u_phi_rad', 'hang_rad')
 CHO_MUC = 'goc'             # CODE 23/11 muc 5: the 12 level cells of the plan are figure 8 at goc (gate 888, 1955)
 U_THANG_THUOC = 1.0e-3      # CODE 23/11 muc 5: tape class III max error (0.6 + 0.4 L) mm at L = 1 m (OIML R 35-1)
 DQ_LECH_TAM_M = 0.00057     # CODE 23/11 Chot_F8_rong_buoi2_v1 muc 1: plate shift bound of session 1 (P3), F8 null
+U_BETA_LECH_TAM_DEG = 0.234  # CODE 23/11 chot T12 muc 4 cach A (Liam 23/11 at CODE, box 'phi buoi 2', verbatim:
+                             # 'Cach A (Recommended)'): u_beta = heading bound of session 1 plate re-seating (A2)
 CHO_THIEU = dict(           # sources not delivered yet (CODE 23/11 muc 5): the term stays null with this reason
     P6_rieng_i='P6 rieng dau (i) lan lap: theo lua chon cua Liam o muc 4 (cach A: 0; cach B: thieu)',
     P6_rieng_ii='P6 rieng dau (ii) dong: C8B chua tinh (thiet ke v7 muc 3, track cac luot C8)',
@@ -139,6 +141,27 @@ def hang_dong_tinh(src, side):
     part = {}
     kcs = [k for k in (src.get('kiem_cheo') or []) if isinstance(k, dict)]
     a6, xo, uh = src.get('a6'), src.get('xoay'), src.get('u_h')
+    rong = f8_rong(src.get('lan_lap'))
+    if rong:
+        part['P6_rieng_i_m'] = 0.0                        # cach A: one mounting assumed (CODE 23/11 muc 4)
+    f7 = src.get('truc_xe')
+    f7_ok = (isinstance(f7, dict) and f7.get('schema') == 'truc_xe_v1' and f7.get('cho') == CHO_MUC
+             and f7.get('trang_thai') == 'khoa')
+    if f7_ok and _num(f7.get('u_a_k_deg')) is not None:
+        part['u_theta_rad'] = math.radians(float(f7['u_a_k_deg']))
+    if f7_ok and rong and _num(f7.get('u_phi_hat_chuan_k_deg')) is not None:
+        part['u_phi_rad'] = math.radians(float(f7['u_phi_hat_chuan_k_deg']) + U_BETA_LECH_TAM_DEG)
+    neo = src.get('neo')
+    ng = ((neo or {}).get('theo_cho') or {}).get(CHO_MUC) if isinstance(neo, dict) else None
+    if isinstance(neo, dict) and neo.get('schema') == 'c7_neo_luot_v1' and isinstance(ng, dict) \
+            and ng.get('trang_thai', neo.get('trang_thai')) == 'dat' \
+            and _num(ng.get('P_neo_m')) is not None and _num(ng.get('A_neo_rad')) is not None:
+        part['P_neo_m'], part['A_neo_rad'] = float(ng['P_neo_m']), float(ng['A_neo_rad'])
+    um = [u for u in (src.get('u_moc') or []) if isinstance(u, dict)]
+    if um and all(_num(u.get('U_moc_hieu_xy_m')) is not None and _num(u.get('U_moc_hieu_psi_rad')) is not None
+                  for u in um):
+        part['U_moc_hieu_xy_m'] = max(float(u['U_moc_hieu_xy_m']) for u in um)
+        part['U_moc_hieu_psi_rad'] = max(float(u['U_moc_hieu_psi_rad']) for u in um)
     if not kcs:
         for k in ('hang_m', 'hang_rad', 'he_so_r'):
             why[k].append('khong co kiem_cheo.json (KIEMCHEO luot3_g4, --kiem-cheo)')
@@ -208,12 +231,23 @@ def hang_dong_tinh(src, side):
             part['dq_khong_u_theta_m'] = uq + DQ_LECH_TAM_M
     else:
         why['hang_m'].append(f'khong co xoay_v1 {CHO_MUC} (--xoay)')
-    why['hang_m'].append(CHO_THIEU['u_theta'])
-    for k in ('P6_rieng_i', 'P6_rieng_ii', 'neo', 'U_moc', 'W'):
-        why['hang_m'].append(CHO_THIEU[k])
+    w = src.get('W')                                          # names to agree with CAM (T11); no CLI yet
+    if isinstance(w, dict) and _num(w.get('W_xy_m')) is not None and _num(w.get('W_psi_rad')) is not None:
+        part['W_xy_m'], part['W_psi_rad'] = float(w['W_xy_m']), float(w['W_psi_rad'])
+    p6 = src.get('P6_rieng_ii')                               # C8B, design v7 section 3 (waits W; CODE asked)
+    if isinstance(p6, dict) and _num(p6.get('gia_tri_m')) is not None:
+        part['P6_rieng_ii_m'] = float(p6['gia_tri_m'])
+    have = dict(u_theta='u_theta_rad' in part, P6_rieng_i='P6_rieng_i_m' in part,
+                P6_rieng_ii='P6_rieng_ii_m' in part, neo='P_neo_m' in part, U_moc='U_moc_hieu_xy_m' in part,
+                W='W_xy_m' in part)
+    for k in ('u_theta', 'P6_rieng_i', 'P6_rieng_ii', 'neo', 'U_moc', 'W'):
+        if not have[k]:
+            why['hang_m'].append(CHO_THIEU[k])
     for k in ('neo', 'U_moc', 'W'):
-        why['hang_rad'].append(CHO_THIEU[k])
-    why['u_phi_rad'].append(CHO_THIEU['u_phi'])
+        if not have[k]:
+            why['hang_rad'].append(CHO_THIEU[k])
+    if 'u_phi_rad' not in part:
+        why['u_phi_rad'].append(CHO_THIEU['u_phi'])
     if 'thang_lech' in part:
         part['U_thang'] = U_THANG_THUOC + part['thang_lech']
     val = dict(hang_m=None, he_so_r=None, hang_rad=None, u_phi_rad=None)
@@ -221,8 +255,25 @@ def hang_dong_tinh(src, side):
         val['he_so_r'] = part['U_thang'] + part['P6_chung_he_so'] + part['P5_he_so']
     if not why['hang_rad'] and all(k in part for k in ('A3_rad', 'A6du_rad', 'A5_rad')):
         val['hang_rad'] = 2 * part['A3_rad'] + 2 * part['A6du_rad'] + part['A5_rad']
-    # hang_m and the lever L wait for u_theta (F7) and the sources above: never a partial sum (design 0.2)
-    return val, {k: v for k, v in why.items() if v}, part, None
+    if not why['u_phi_rad']:
+        val['u_phi_rad'] = part['u_phi_rad']                 # margin once in build (1.25 (u_phi_hat + u_beta))
+    lever = None
+    if all(k in part for k in ('q_hat_m', 'dq_khong_u_theta_m', 'u_theta_rad')):
+        dq0 = part['dq_khong_u_theta_m']
+        part['dq_m'] = dq0 + (part['q_hat_m'] + dq0) * part['u_theta_rad']    # design v7 section 1 step (4)
+        lever = part['L_m'] = part['q_hat_m'] + part['dq_m']
+    need_m = ('P1_m', 'A3_rad', 'A6du_rad', 'A5_rad', 'thi_sai_m', 'P7_m', 'dq_m', 'P6_rieng_i_m', 'P6_rieng_ii_m',
+              'P_neo_m', 'U_moc_hieu_xy_m', 'W_xy_m')
+    if not why['hang_m'] and all(k in part for k in need_m):
+        val['hang_m'] = (part['P1_m'] + lever * (2 * part['A3_rad'] + 2 * part['A6du_rad'] + part['A5_rad'])
+                         + 2 * part['thi_sai_m'] + part['P7_m'] + 2 * part['dq_m'] + part['P6_rieng_i_m']
+                         + part['P6_rieng_ii_m'] + part['P_neo_m'] + part['U_moc_hieu_xy_m'] + part['W_xy_m'])
+    if val['hang_rad'] is not None:
+        if all(k in part for k in ('A_neo_rad', 'U_moc_hieu_psi_rad', 'W_psi_rad')):
+            val['hang_rad'] += part['A_neo_rad'] + part['U_moc_hieu_psi_rad'] + part['W_psi_rad']
+        else:
+            val['hang_rad'] = None
+    return val, {k: v for k, v in why.items() if v}, part, lever
 
 
 def hang_theo_u(cq, level, a_m):
@@ -307,6 +358,14 @@ LL_E_NULL_CAN_CU = ('F8 khong xac minh duoc lan lap (moi lan_lap_id null; Liam o
                     '03_CODE/docs/2026-11-23_Chot_F8_rong_buoi2_v1.md')
 
 
+def f8_rong(lan_lap):
+    """True when the F8 is a lan_lap_v1-like dict with runs and every lan_lap_id null (identity checks of the
+    plate are done by lan_lap_E; CODE 23/11 chot F8 rong and chot T12 muc 4)."""
+    rows = lan_lap.get('luot') if isinstance(lan_lap, dict) else None
+    return isinstance(rows, list) and bool(rows) and all(isinstance(x, dict) and x.get('lan_lap_id') is None
+                                                          for x in rows)
+
+
 def lan_lap_E(a6, lan_lap):
     """A6C1-7 (CODE 20/11): the E-clip mounting of every place of the A6 file against F8 lan_lap_v1.
     Returns ({cho: dict(lan_lap_id, luot_id_E, trang_thai, ly_do)}, trang_thai, reasons); KhoaError on a contradiction."""
@@ -323,7 +382,7 @@ def lan_lap_E(a6, lan_lap):
     # tao"; Liam 23/11 at CODE, box "Khoa T12", verbatim: "Dung mot lan lap (Recommended)"): an F8 whose every run
     # has lan_lap_id null determined no mounting: no comparison,
     # dat with the label LL_E_NULL (an assumption, written in the lock); an F8 with any id keeps the rule below.
-    f8_null = bool(rows) and all(isinstance(x, dict) and x.get('lan_lap_id') is None for x in rows)
+    f8_null = f8_rong(lan_lap)
     for cho, v in a6['lan_lap_cho'].items():
         lid, le = (v or {}).get('lan_lap_id'), (v or {}).get('luot_id_E')
         r = dict(lan_lap_id=lid, luot_id_E=le, trang_thai='chua_ket_luan', ly_do=None)
@@ -423,6 +482,10 @@ def man_trap(tb):
 
 def u_beta_cam(lan_lap):
     """u_beta_cam_deg {goc, K1, K2} after the margin from NHACTAM beta_cam_replay (F15 b); missing -> null."""
+    if f8_rong(lan_lap):
+        # cach A (CODE 23/11 chot T12 muc 4): beta not measured, so no map noise of a beta measurement: 0, dat
+        return ({c: 0.0 for c in CHO}, 'dat', [], dict(nhan=LL_E_NULL, gia_dinh=LL_E_NULL_CAN_CU +
+                                                        '; cach A: beta = 0, u_beta_cam = 0'))
     rep = (lan_lap or {}).get('beta_cam_replay') if isinstance(lan_lap, dict) else None
     out, why = {}, []
     for c in CHO:
@@ -433,36 +496,44 @@ def u_beta_cam(lan_lap):
             why.append(f'{c}: beta_cam_replay missing or not dat ({st!r})')
         else:
             out[c] = LE * math.degrees(v)
-    return out, ('dat' if not why else 'thieu'), why
+    return out, ('dat' if not why else 'thieu'), why, None
 
 
 def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None, muc_kha_thi=LEVELS, nguong=None,
-          a6=None, ses=None, cam=None, commit_hil=None, kiem_cheo=None, xoay=None, u_h=None):
+          a6=None, ses=None, cam=None, commit_hil=None, kiem_cheo=None, xoay=None, u_h=None, truc_xe=None,
+          neo=None, u_moc=None):
     muc = {}
     side = a_m
-    hd, hd_why, hd_part, _lever = (hang_dong_tinh(dict(kiem_cheo=kiem_cheo, a6=a6, xoay=xoay, u_h=u_h,
+    hd, hd_why, hd_part, lever = (hang_dong_tinh(dict(kiem_cheo=kiem_cheo, a6=a6, xoay=xoay, u_h=u_h,
+                                                       lan_lap=lan_lap, truc_xe=truc_xe, neo=neo, u_moc=u_moc,
                                                        cam=cam if isinstance(cam, list) else [cam] if cam else []),
                                                   side)
-                                   if side is not None else (dict(hang_m=None, he_so_r=None, hang_rad=None,
-                                                                  u_phi_rad=None), {}, {}, None))
+                                  if side is not None else (dict(hang_m=None, he_so_r=None, hang_rad=None,
+                                                                 u_phi_rad=None), {}, {}, None))
     for lv in LEVELS:
         tb = tbs.get(lv)
         cq = can_quay(tb, lv)
         bands, bwhy = hang_theo_u(cq, lv, a_m)
+        if lever is not None:                                 # (|q_hat| + dq) A4(u) into P4 (v7 10, GATE RT4-3)
+            for b in bands:
+                if b.get('P4_m') is not None and b.get('A4_deg') is not None:
+                    b['P4_tay_don_m'] = lever * math.radians(b['A4_deg'])
+                    b['P4_m'] = b['P4_m'] + b['P4_tay_don_m']
         muc[lv] = dict(can_quay=cq, man_trap=man_trap(tb),
                        chi_bao_cao=['g5'] if lv == 'O1-F08' else [],
                        hang_theo_u=bands, hang_theo_u_ly_do=bwhy,
                        hang_dong=dict(a_m=a_m, **{k: (None if hd[k] is None else LE * hd[k])
                                                   for k in ('hang_m', 'he_so_r', 'u_phi_rad', 'hang_rad')}),
                        hang_dong_truoc_le=dict(hd), hang_dong_thanh_phan=dict(hd_part),
-                       P4_tay_don=dict(gia_tri_m=None, ly_do='(|q_hat| + dq) A4(u) them vao P4_m khi co dq day du '
-                                       '(u_theta F7); CODE 23/11 muc 5, GATE RT4-3'),
+                       P4_tay_don=dict(L_m=lever, ly_do=None if lever is not None else
+                                       '(|q_hat| + dq) A4(u) them vao P4_m khi co dq day du (u_theta F7); '
+                                       'CODE 23/11 muc 5, GATE RT4-3'),
                        hang_dong_ly_do=dict(
                            a_m=None if a_m is not None else 'thieu --canh-ma-m',
                            **{k: ('; '.join(hd_why[k]) if k in hd_why else None)
                               for k in ('hang_m', 'he_so_r', 'u_phi_rad', 'hang_rad')}),
                        khac={k: dict(gia_tri=None, trang_thai='thieu', ly_do='chua co nguon') for k in KHAC})
-    ub, ust, uwhy = u_beta_cam(lan_lap)
+    ub, ust, uwhy, ugd = u_beta_cam(lan_lap)
     # F17 bo_cham.bang_man_trap: each level and K one branch; alpha needs the 3b source; K (0.5 m/s, F05 speeds)
     # takes the branch of the F05 3b (J v6 J4-13)
     src = {n['vai'][3:]: n for n in (nguon or []) if n.get('vai', '').startswith('3b ')}
@@ -477,7 +548,7 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
             bang[key]['nguon_3b'] = dict(duong_dan=n.get('duong_dan', n['file']), sha256=n['sha256'])
     eh, ehw = eps_h_of(nguong)
     lle, lle_st, lle_why = lan_lap_E(a6, lan_lap)
-    out = dict(lan_lap_E=lle, lan_lap_E_trang_thai=lle_st, lan_lap_E_ly_do=lle_why, version=VERSION, le=LE, muc=muc, bang_man_trap=bang, u_beta_cam_deg=ub, u_beta_cam_trang_thai=ust,
+    out = dict(lan_lap_E=lle, lan_lap_E_trang_thai=lle_st, lan_lap_E_ly_do=lle_why, version=VERSION, le=LE, muc=muc, bang_man_trap=bang, u_beta_cam_deg=ub, u_beta_cam_trang_thai=ust, u_beta_cam_gia_dinh=ugd,
                u_beta_cam_ly_do=uwhy, nhanh_tick=nhanh_tick, commit_hil=commit_hil, muc_kha_thi=list(muc_kha_thi),
                eps_H=eh, eps_H_ly_do=ehw, mien_car_pose=mien_car_pose(a6, ses, cam),
                khoa_truoc=dict(nguon=nguon or [], script=script, commit_hil=commit_hil,
@@ -528,6 +599,10 @@ def main(argv=None):
                     help='KIEMCHEO kiem_cheo.json (luot3_g4) of a camera segment with C8 runs; repeat (largest used)')
     ap.add_argument('--xoay', default=None, help='F4 xoay_v1 (q_tag_m, u_q_m of goc) for dq and the lever')
     ap.add_argument('--u-h-chung', default=None, help='c8b_u_h_chung_v1 (P6 common, thi sai goc)')
+    ap.add_argument('--truc-xe', default=None, help='F7 truc_xe_v1 of goc (u_a_k_deg, u_phi_hat_chuan_k_deg)')
+    ap.add_argument('--neo', default=None, help='KIEMCHEO neo_luot.json (c7_neo_luot_v1, theo_cho.goc)')
+    ap.add_argument('--u-moc', action='append', default=None,
+                    help='CAM U_moc file with U_moc_hieu_xy_m, U_moc_hieu_psi_rad; repeat (largest used)')
     ap.add_argument('--commit-hil', default=None,
                     help='40-hex hil commit that will score the runs; required with bo_tick (O1 v11.34 Q4)')
     ap.add_argument('--out', required=True)
@@ -579,11 +654,12 @@ def main(argv=None):
         extra = {}
         for key, path, vai in (('nguong', a.nguong, 'nguong'), ('a6', a.a6, 'a6'), ('ses', a.session, 'session'),
                                ('cam', a.camera, 'camera'), ('kiem_cheo', a.kiem_cheo, 'kiem_cheo'),
-                               ('xoay', a.xoay, 'xoay'), ('u_h', a.u_h_chung, 'u_h_chung')):
+                               ('xoay', a.xoay, 'xoay'), ('u_h', a.u_h_chung, 'u_h_chung'),
+                               ('truc_xe', a.truc_xe, 'truc_xe'), ('neo', a.neo, 'neo'), ('u_moc', a.u_moc, 'u_moc')):
             for pth in (path if isinstance(path, list) else [path] if path else []):   # da session (A): repeatable
                 with open(pth, encoding='utf-8') as f:
                     d = json.load(f)
-                if key in ('ses', 'cam', 'kiem_cheo'):
+                if key in ('ses', 'cam', 'kiem_cheo', 'u_moc'):
                     extra.setdefault(key, []).append(d)
                 else:
                     extra[key] = d

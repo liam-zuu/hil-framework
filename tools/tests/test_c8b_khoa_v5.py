@@ -338,3 +338,62 @@ def test_build_puts_the_margin_once(monkeypatch):
     m = k['muc']['O1-F05']
     assert m['hang_dong']['he_so_r'] == pytest.approx(K.LE * m['hang_dong_truoc_le']['he_so_r'])
     assert m['hang_dong']['hang_m'] is None and 'u_theta' in m['hang_dong_ly_do']['hang_m']
+
+
+def _f8null():
+    return _f8([dict(luot_id='r1', cho='goc', lan_lap_id=None), dict(luot_id='r2', cho='K1', lan_lap_id=None)])
+
+
+def test_cach_a_u_beta_cam_and_p6_i():
+    """CODE 23/11 chot T12 muc 4, cach A (Liam at CODE 'Cach A (Recommended)'): F8 all null -> u_beta_cam 0 dat with the
+    assumption label, P6 rieng (i) 0; an F8 with ids keeps the beta_cam_replay rule."""
+    ub, st, why, gd = K.u_beta_cam(_f8null())
+    assert st == 'dat' and ub == dict(goc=0.0, K1=0.0, K2=0.0) and gd['nhan'] == K.LL_E_NULL and not why
+    ub, st, _, gd = K.u_beta_cam(_f8())
+    assert st == 'thieu' and gd is None
+    _, why, part, _ = K.hang_dong_tinh(_src(lan_lap=_f8null()), 0.1445)
+    assert part['P6_rieng_i_m'] == 0.0 and not any('P6 rieng dau (i)' in w for w in why['hang_m'])
+    _, why, part, _ = K.hang_dong_tinh(_src(lan_lap=_f8()), 0.1445)
+    assert 'P6_rieng_i_m' not in part and any('P6 rieng dau (i)' in w for w in why['hang_m'])
+
+
+def _f7(st='khoa', uphi=0.5, uak=0.4):
+    return dict(schema='truc_xe_v1', cho='goc', trang_thai=st, u_a_k_deg=uak, u_phi_hat_chuan_k_deg=uphi)
+
+
+def test_full_hang_m_hang_rad_u_phi_and_lever(monkeypatch):
+    import c8b_a6 as a6m
+    monkeypatch.setattr(a6m, 'a6du_rad', lambda a6, rho: 0.0078)
+    full = dict(lan_lap=_f8null(), truc_xe=_f7(),
+                neo=dict(schema='c7_neo_luot_v1', theo_cho=dict(goc=dict(trang_thai='dat', P_neo_m=3e-4,
+                                                                          A_neo_rad=2e-4))),
+                u_moc=[dict(U_moc_hieu_xy_m=1e-4, U_moc_hieu_psi_rad=1e-4),
+                       dict(U_moc_hieu_xy_m=2e-4, U_moc_hieu_psi_rad=5e-5)],
+                W=dict(W_xy_m=5e-4, W_psi_rad=3e-4), P6_rieng_ii=dict(gia_tri_m=6e-4))
+    v, why, p, lever = K.hang_dong_tinh(_src(**full), 0.1445)
+    assert not why, why
+    dq0 = 0.0013 + K.DQ_LECH_TAM_M
+    dq = dq0 + (5e-4 + dq0) * math.radians(0.4)
+    assert p['dq_m'] == pytest.approx(dq) and lever == pytest.approx(5e-4 + dq)
+    a3, a5 = math.radians(0.25), math.radians(0.13)
+    want_m = (0.004 + lever * (2 * a3 + 2 * 0.0078 + a5) + 2 * p['thi_sai_m'] + 1e-4 + 2 * dq + 0.0 + 6e-4 + 3e-4
+              + 2e-4 + 5e-4)
+    assert v['hang_m'] == pytest.approx(want_m, rel=1e-12)
+    assert v['hang_rad'] == pytest.approx(2 * a3 + 2 * 0.0078 + a5 + 2e-4 + 1e-4 + 3e-4, rel=1e-12)
+    assert v['u_phi_rad'] == pytest.approx(math.radians(0.5 + K.U_BETA_LECH_TAM_DEG))
+    for drop in ('neo', 'u_moc', 'W', 'P6_rieng_ii', 'truc_xe'):
+        v2, _, _, _ = K.hang_dong_tinh(_src(**dict(full, **{drop: None})), 0.1445)
+        assert v2['hang_m'] is None, drop
+    v3, _, _, _ = K.hang_dong_tinh(_src(**dict(full, truc_xe=_f7(st='chan_doan'))), 0.1445)
+    assert v3['u_phi_rad'] is None and v3['hang_m'] is None
+    v4, _, _, _ = K.hang_dong_tinh(_src(**dict(full, lan_lap=_f8())), 0.1445)
+    assert v4['u_phi_rad'] is None                                       # cach A only when F8 all null
+    s = _src(**full)
+    k = K.build({'O1-F05': _tb('O1-F05')}, lan_lap=s['lan_lap'], a_m=0.1445, kiem_cheo=s['kiem_cheo'], a6=s['a6'],
+                xoay=s['xoay'], u_h=s['u_h'], cam=s['cam'], truc_xe=s['truc_xe'], neo=s['neo'], u_moc=s['u_moc'])
+    m = k['muc']['O1-F05']
+    assert m['hang_dong']['u_phi_rad'] == pytest.approx(K.LE * math.radians(0.5 + K.U_BETA_LECH_TAM_DEG))
+    b = m['hang_theo_u'][0]
+    assert b['P4_tay_don_m'] == pytest.approx(m['P4_tay_don']['L_m'] * math.radians(b['A4_deg']))
+    assert b['P4_m'] == pytest.approx(m['can_quay']['p_m'] + b['P4_tay_don_m'], rel=1e-12)
+    assert k['u_beta_cam_trang_thai'] == 'dat' and k['u_beta_cam_gia_dinh']['nhan'] == K.LL_E_NULL
