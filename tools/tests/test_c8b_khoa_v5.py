@@ -254,3 +254,23 @@ def test_da_session_mien_car_pose(tmp_path):
     assert [n['vai'] for n in d['khoa_truoc']['nguon']].count('session') == 2
     assert [n['vai'] for n in d['khoa_truoc']['nguon']].count('camera') == 2
     assert d['mien_car_pose']['kappa'][1] == pytest.approx((0.1250 + 0.0012) / (2.632 - 0.02))
+
+
+def test_commit_hil_with_bo_tick():
+    """CODE 23/11 (Chot_T12_khoa_C8B_v1 muc 3; O1 v11.34 Q4): bo_tick needs the 40-hex scoring commit, written at the
+    top and in khoa_truoc; giu_tick does not; a bad value is refused at the CLI."""
+    ng = [dict(vai='ke_hoach_c8', file='k', sha256='0' * 64)]
+    k = K.build({}, nguon=ng, nhanh_tick='bo_tick')
+    assert k['trang_thai'] == 'chua_khoa' and 'commit_hil' in k['ly_do_chua_khoa']
+    c = 'a' * 40
+    k = K.build({}, nguon=ng, nhanh_tick='bo_tick', commit_hil=c)
+    assert k['commit_hil'] == c and k['khoa_truoc']['commit_hil'] == c and 'commit_hil' not in k['ly_do_chua_khoa']
+    assert 'commit_hil' not in K.build({}, nguon=ng, nhanh_tick='giu_tick')['ly_do_chua_khoa']
+    assert not K._hex40('A' * 40) and not K._hex40('a' * 39) and K._hex40('0123456789abcdef' * 2 + '01234567')
+
+
+def test_cli_refuses_bad_commit_hil(tmp_path, capsys):
+    tb = tmp_path / 'tb.json'
+    tb.write_text(json.dumps(_tb('O1-F05')), encoding='utf-8')
+    rc = K.main(['--tb', f'O1-F05={tb}', '--commit-hil', 'xyz', '--out', str(tmp_path / 'o.json')])
+    assert rc == 2 and not (tmp_path / 'o.json').exists()

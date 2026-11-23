@@ -33,6 +33,9 @@ Per level (O1-F02, O1-F05, O1-F08; the K tasks take the F05 3b numbers only for 
   hang_dong     the constant closed terms the gate takes {a_m, hang_m, he_so_r, u_phi_rad, hang_rad} (names GATE
                 F19): a_m = the tag side; the others null until their sources come (hang_dong_ly_do says which).
   nhanh_tick    the U_t branch of the C8 plan (bo_tick / giu_tick), copied from it (GATE: = u_t_branch).
+  commit_hil    (CODE 23/11, Chot_T12_khoa_C8B_v1 muc 3; O1 v11.34 Q4 / OG3-4) the 40-hex hil commit that will
+                score the runs (gio + grid scoring through Codex D1), written here and in khoa_truoc before any
+                scoring; required with bo_tick (missing -> chua_khoa); GATE checks luoi.json scorer = commit_hil.
   eps_H         {mm, huong_deg} copied from the C8 threshold file nguong_khoa_c8_v1 (CODE writes it when Liam fixes
                 eps_H at C8; CODE 20/11: not the CAM constant EPS_MM); SHA in khoa_truoc.nguon (vai 'nguong').
   mien_car_pose {side_m, phien_ban, h_m [lo, hi], kappa [lo, hi]} (GATE camera.c8b; CODE 20/11): h_m = the hull of
@@ -54,7 +57,7 @@ khoa_truoc: SHA-256 of every input and of this script (commit, dirty) and the ti
 is looked at (design 0.3); the C8 plan with vai 'ke_hoach_c8' (GATE GC6-1).
 
   python tools/c8b_khoa_v5.py --tb O1-F02=3b_F02.json --tb O1-F05=3b_F05.json --tb O1-F08=3b_F08.json \
-      [--lan-lap lan_lap.json] [--canh-ma-m 0.0964] [--ke-hoach ke_hoach_c8.json] [--nhanh-tick bo_tick] \
+      [--lan-lap lan_lap.json] [--canh-ma-m 0.1445] [--ke-hoach ke_hoach_c8.json] [--nhanh-tick bo_tick] \
       [--muc O1-F02,O1-F05] --out c8b_khoa_v5.json
 Last line: #ket_qua,ma=0 written / 2 refused or error.
 """
@@ -248,6 +251,8 @@ def trang_thai_khoa(out, muc_kha_thi):
         why.append('mien_car_pose thieu' + (f' ({"; ".join(mc.get("ly_do") or [])})' if isinstance(mc, dict) else ''))
     if out.get('nhanh_tick') not in BRANCHES:
         why.append('nhanh_tick chua co (ke hoach C8)')
+    elif out['nhanh_tick'] == 'bo_tick' and not _hex40(out.get('commit_hil')):
+        why.append('bo_tick can commit_hil (40 hex) ghi truoc khi cham (O1 v11.34 Q4, CODE 23/11)')
     if not any(n.get('vai') == 'ke_hoach_c8' for n in out['khoa_truoc']['nguon']):
         why.append('ke hoach C8 khong co trong khoa_truoc.nguon')
     for lv in muc_kha_thi:
@@ -258,6 +263,10 @@ def trang_thai_khoa(out, muc_kha_thi):
         if not m['hang_theo_u'] or all(b['trang_thai'] == 'thieu' for b in m['hang_theo_u']):
             why.append(f'{lv}: hang_theo_u thieu')
     return ('khoa', None) if not why else ('chua_khoa', '; '.join(why))
+
+
+def _hex40(x):
+    return isinstance(x, str) and len(x) == 40 and all(c in '0123456789abcdef' for c in x)
 
 
 def _num(x):
@@ -313,7 +322,7 @@ def u_beta_cam(lan_lap):
 
 
 def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None, muc_kha_thi=LEVELS, nguong=None,
-          a6=None, ses=None, cam=None):
+          a6=None, ses=None, cam=None, commit_hil=None):
     muc = {}
     for lv in LEVELS:
         tb = tbs.get(lv)
@@ -347,9 +356,9 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
     eh, ehw = eps_h_of(nguong)
     lle, lle_st, lle_why = lan_lap_E(a6, lan_lap)
     out = dict(lan_lap_E=lle, lan_lap_E_trang_thai=lle_st, lan_lap_E_ly_do=lle_why, version=VERSION, le=LE, muc=muc, bang_man_trap=bang, u_beta_cam_deg=ub, u_beta_cam_trang_thai=ust,
-               u_beta_cam_ly_do=uwhy, nhanh_tick=nhanh_tick, muc_kha_thi=list(muc_kha_thi),
+               u_beta_cam_ly_do=uwhy, nhanh_tick=nhanh_tick, commit_hil=commit_hil, muc_kha_thi=list(muc_kha_thi),
                eps_H=eh, eps_H_ly_do=ehw, mien_car_pose=mien_car_pose(a6, ses, cam),
-               khoa_truoc=dict(nguon=nguon or [], script=script,
+               khoa_truoc=dict(nguon=nguon or [], script=script, commit_hil=commit_hil,
                                luc=datetime.datetime.now().astimezone().isoformat(timespec='seconds')))
     st, why = trang_thai_khoa(out, muc_kha_thi)
     out.update(trang_thai=st, ly_do_chua_khoa=why)
@@ -393,6 +402,8 @@ def main(argv=None):
                          'camera session of the C8 session (da session (A)): they must agree, else mien thieu')
     ap.add_argument('--camera', action='append', default=None,
                     help='camera file c8_cam_u_vao (day_doi.dzc_m); repeatable, the largest dzc is used')
+    ap.add_argument('--commit-hil', default=None,
+                    help='40-hex hil commit that will score the runs; required with bo_tick (O1 v11.34 Q4)')
     ap.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
@@ -435,6 +446,8 @@ def main(argv=None):
         mk = [x.strip() for x in a.muc.split(',') if x.strip()]
         if not mk or any(x not in LEVELS for x in mk) or len(set(mk)) != len(mk):
             raise KhoaError(f'--muc {a.muc!r}: levels of {LEVELS}, once each')
+        if a.commit_hil is not None and not _hex40(a.commit_hil):
+            raise KhoaError(f'--commit-hil {a.commit_hil!r}: 40 lowercase hex digits')
         if a.canh_ma_m is not None and not (0.0 < a.canh_ma_m < 1.0):
             raise KhoaError(f'--canh-ma-m {a.canh_ma_m}: the tag side in metres')
         extra = {}
@@ -449,7 +462,7 @@ def main(argv=None):
                     extra[key] = d
                 nguon.append(dict(vai=vai, file=os.path.basename(pth), duong_dan=os.path.abspath(pth),
                                   sha256=cu.sha256(pth)))
-        out = build(tbs, ll, nguon, script_state(), a.canh_ma_m, nt, mk, **extra)
+        out = build(tbs, ll, nguon, script_state(), a.canh_ma_m, nt, mk, commit_hil=a.commit_hil, **extra)
         with open(a.out, 'x', encoding='utf-8') as f:
             f.write(json.dumps(_clean(out), indent=1, ensure_ascii=False, allow_nan=False))
     except (KhoaError, cu.InputError, OSError, ValueError) as exc:
