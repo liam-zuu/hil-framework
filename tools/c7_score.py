@@ -1250,11 +1250,14 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t, upk_add=None, rel_m
 
 
 # ---------------------------------------------------------------- relative frame (J v6 2, 5; CAM v5 3)
-def tam_doi_of(lan_lap):
+def tam_doi_of(lan_lap, f8_rong_ok=False):
     """Plate check of the run (lan_lap_v1 tam_doi_trong_luot, J v6 5): khong_doi / doi / khong_xac_dinh; missing
-    check (no lan_lap_v1, null) -> khong_xac_dinh."""
+    check (no lan_lap_v1, null) -> khong_xac_dinh. f8_rong_ok (ctd.f8_rong, cach A of Liam 23/11): khong_doi by the
+    one-mounting assumption (ctd.F8_RONG_GIA_DINH), labelled by build_rel."""
     if lan_lap is None:
         return 'khong_xac_dinh'
+    if f8_rong_ok:
+        return 'khong_doi'
     v = lan_lap.get('tam_doi_trong_luot')
     if isinstance(v, dict):
         v = v.get('ket_qua', v.get('gia_tri'))
@@ -1265,11 +1268,24 @@ def tam_doi_of(lan_lap):
     return 'khong_xac_dinh'
 
 
-def build_rel(task, chain, tc, truc_xe, lan_lap, u_beta_cam_deg=None, sources=None):
+def co_ref_12b(cua_rows, cho):
+    """True when the window file (F2 cua_so_v1 rows) has a ref_12b window of the place cho (F8 rong identity check,
+    CODE 23/11 Chot F8 rong muc 1b)."""
+    return any(r.get('loai') == 'ref_12b' and r.get('cho') == cho for r in cua_rows)
+
+
+def build_rel(task, chain, tc, truc_xe, lan_lap, u_beta_cam_deg=None, sources=None, a6_sha256=None, co_ref_12b=None):
     """The relative-frame inputs of score(): chain rows (c7_chuoi_khung), the reference tc (c7_tuong_doi.tham_chieu),
-    phi by the beta path, the plate check, and whether the position basis holds (else the t_som case, J v6 5)."""
-    phi, u_phi, phi_ok, phi_why = ctd.phi_beta(task, truc_xe, lan_lap, tc, u_beta_cam_deg)
-    tam = tam_doi_of(lan_lap)
+    phi by the beta path, the plate check, and whether the position basis holds (else the t_som case, J v6 5).
+    a6_sha256 (the A6 used), co_ref_12b (the window file has a ref_12b window of the place): the F8 rong case
+    (ctd.f8_rong, cach A of Liam 23/11), recorded in f8_rong {ok, nhan, gia_dinh, beta_deg, u_beta_deg, ly_do}."""
+    f8_ok, f8_why = ctd.f8_rong(lan_lap, a6_sha256, co_ref_12b, truc_xe)
+    phi, u_phi, phi_ok, phi_why = ctd.phi_beta(task, truc_xe, lan_lap, tc, u_beta_cam_deg, f8_rong_ok=f8_ok)
+    tam = tam_doi_of(lan_lap, f8_rong_ok=f8_ok)
+    beta = (math.degrees(ck.wrap(tc['psi_tc_rad'] - math.radians(truc_xe['psi_chuan_k_deg'])))
+            if f8_ok and phi_ok else None)
+    f8 = (dict(ok=True, nhan=ctd.F8_RONG_NHAN, gia_dinh=ctd.F8_RONG_GIA_DINH, beta_deg=beta,
+               u_beta_deg=ctd.U_BETA_F8_RONG_DEG, ly_do=[]) if f8_ok else dict(ok=False, ly_do=f8_why))
     why = []
     if not phi_ok:
         why += ['phi: ' + w for w in phi_why]
@@ -1282,7 +1298,7 @@ def build_rel(task, chain, tc, truc_xe, lan_lap, u_beta_cam_deg=None, sources=No
     if tc['trang_thai'] != 'dat':
         why.append(f'tham chieu {tc["trang_thai"]}')
     return dict(task=task, chain=chain, tc=tc, phi=phi, u_phi=u_phi, phi_ok=phi_ok, phi_why=phi_why, tam_doi=tam,
-                can_cu=not why, ly_do_can_cu=why, sources=sources or {})
+                can_cu=not why, ly_do_can_cu=why, sources=sources or {}, f8_rong=f8)
 
 
 def rel_pose(frames, vi, rel, lane):
@@ -1292,7 +1308,7 @@ def rel_pose(frames, vi, rel, lane):
     no centre (NaN), a frame without q no centre. tam_ok: the centre of the frame is defined (A6 and q; speeds need
     only that, Codex CT1-5); speed_def: tam_ok and the plate did not move in the run (a moved plate is no car motion);
     pos_def: tam_ok with the reference and phi (positions on the lane); yaw_def: A6 and a reference heading on a set of
-    J v6 2 (giao or ma_mat_neo)."""
+    J v6 2 (giao or ma_mat_neo), or the tag-gate set of cach A (ctd.TAP_MA_CACH_A, F8 rong)."""
     ch = {c['frame_id']: c for c in rel['chain']}
     rows = [ch.get(int(frames[k]['idx'])) for k in vi]
     if any(r is None for r in rows):
@@ -1318,7 +1334,7 @@ def rel_pose(frames, vi, rel, lane):
     arm = np.where(np.nan_to_num(r_k) > 0.0, (2.0 * r_k * math.sin(min(u, math.pi) / 2.0)) if math.isfinite(u)
                    else np.inf, 0.0)
     upk_add = np.where(pos_def, arm, np.inf)
-    yaw_def = a6 & bool(tc['psi_ok']) & (tc['tap'] in ('giao', 'ma_mat_neo'))
+    yaw_def = a6 & bool(tc['psi_ok']) & (tc['tap'] in ('giao', 'ma_mat_neo', ctd.TAP_MA_CACH_A))
     speed_def = tam_ok & (rel['tam_doi'] != 'doi')
     return dict(x=x, y=y, psi=psi, psi_cam=psi_p, upk_add=upk_add, pos_def=pos_def, yaw_def=yaw_def, dpsi=dpsi, q_ok=qok,
                 tam_ok=tam_ok, speed_def=speed_def, bx=bx, by=by, r_k=r_k, px=px, py=py, psi_tc=psi_tc, psi_dd=psi_dd,
@@ -2158,7 +2174,7 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
     # relative frame (J v6 2, Codex CT1-4): the camera and IMU yaws aligned on the frames and the merge of the
     # reference heading (tham_chieu_v1 ids) when that reference is on a set of J v6 2
     ar = None
-    if R is not None and rel['tc']['psi_ok'] and rel['tc']['tap'] in ('giao', 'ma_mat_neo'):
+    if R is not None and rel['tc']['psi_ok'] and rel['tc']['tap'] in ('giao', 'ma_mat_neo', ctd.TAP_MA_CACH_A):
         # Codex CT2-3: exactly the ids of tham_chieu_v1 (F12), times and psi' from the chain
         chm = {c['frame_id']: c for c in rel['chain']}
         rr = [chm[int(i)] for i in rel['tc']['ids']]
@@ -2483,20 +2499,21 @@ def _track_beside(frames_path):
         return json.load(f)
 
 
-def _ref_from(pre, chain, lan_lap, hs, frames, extra):
+def _ref_from(pre, chain, lan_lap, hs, frames, extra, f8_rong_ok=False):
     return ctd.tham_chieu(pre, chain, lan_lap, khung_tc_of(hs), hs['t_trong_s'],
-                          ctd._frame_dt([r['t_s'] for r in frames]), extra)
+                          ctd._frame_dt([r['t_s'] for r in frames]), extra, f8_rong_ok=f8_rong_ok, v_d=hs['v_d'])
 
 
-def chain_and_ref(frames, a6, xoay, ll, track, task, truc, pre, hs, extra):
+def chain_and_ref(frames, a6, xoay, ll, track, task, truc, pre, hs, extra, f8_rong_ok=False):
     """(chain, tham_chieu_v1) of a run. Another mounting (lan_lap_v1 cung_lan_lap not true): the C8B q composition
     needs u_psi_w_rad, the noise of the mean tag heading over the run window (F16): the largest deviation of psi'
     (after A6, no q needed) from its mean over the reference set, psi_lech_max_rad of a first pass (a bound by the
-    data, not a guess); then the chain again with it."""
+    data, not a guess); then the chain again with it. f8_rong_ok (F8 rong, ctd.f8_rong; CODE 23/11 chot T12 muc 4): q as
+    for one mounting, u_q + 0.57 mm (c7_chuoi_khung.q_luot), K2 from K1 (F8_RONG_Q_TU)."""
     cho = ctd.cho_of(task)
-    chain = ck.chuoi_khung(frames, a6, xoay, ll, track=track, cho=cho, truc_xe=truc)
-    tc = _ref_from(pre, chain, ll, hs, frames, extra)
-    if ll is not None and ll.get('cung_lan_lap') is not True:
+    chain = ck.chuoi_khung(frames, a6, xoay, ll, track=track, cho=cho, truc_xe=truc, f8_rong_ok=f8_rong_ok)
+    tc = _ref_from(pre, chain, ll, hs, frames, extra, f8_rong_ok=f8_rong_ok)
+    if ll is not None and ll.get('cung_lan_lap') is not True and not f8_rong_ok:
         u_w = tc.get('psi_lech_max_rad')
         chain = ck.chuoi_khung(frames, a6, xoay, ll, track=track, cho=cho, truc_xe=truc, u_psi_w_rad=u_w)
         tc = _ref_from(pre, chain, ll, hs, frames, extra)
@@ -2699,7 +2716,12 @@ def main_rel(argv):
                          a6_sha256=None if a6 is None else a6['sha256'],
                          xoay_sha256=a.xoay and cm.sha256(a.xoay), nguon=ck.nguon(a.frames, a6, a.xoay, ll),
                          truc_xe_sha256=a.truc_xe and cm.sha256(a.truc_xe))
-            chain, tc = chain_and_ref(frames, a6, a.xoay, ll, track, a.task, truc, pre, hs, extra)
+            f8_ok = ctd.f8_rong(ll, None if a6 is None else a6['sha256'],
+                                co_ref_12b(cua_rows, ctd.cho_of(a.task)), truc)[0]
+            chain, tc = chain_and_ref(frames, a6, a.xoay, ll, track, a.task, truc, pre, hs, extra, f8_rong_ok=f8_ok)
+            if f8_ok:
+                tc['f8_rong'] = dict(ok=True, nhan=ctd.F8_RONG_NHAN, u_lech_tam_m=ck.U_LECH_TAM_BUOI1_M,
+                                     q_tu=ck.F8_RONG_Q_TU.get(ctd.cho_of(a.task), ctd.cho_of(a.task)))
             with open(a.out, 'x', encoding='utf-8') as f:
                 f.write(json.dumps(cm._json(tc), ensure_ascii=False, indent=1) + '\n')
             print(f'tham chieu: {tc["trang_thai"]} tap {tc["tap"]} n {tc["n"]} {"; ".join(tc["ly_do"])}')
@@ -2735,8 +2757,10 @@ def load_rel(a, frames, track, fsha, esha, task, hs):
     truc = ctd.read_json(a.truc_xe) if a.truc_xe else None
     if tcf.get('truc_xe_sha256') not in (None, a.truc_xe and cm.sha256(a.truc_xe)):
         raise ValueError('tham_chieu_v1 truc_xe_sha256 differs from --truc-xe')
+    f8_ok = ctd.f8_rong(ll, None if a6 is None else a6['sha256'], co_ref_12b(cua, cho), truc)[0]
     chain, tc = chain_and_ref(frames, a6, a.xoay, ll, track, task, truc, pre, hs,
-                              {k: tcf.get(k) for k in ('cua_so_v1_sha256', 'frames_sha256', 'a6_sha256', 'xoay_sha256')})
+                              {k: tcf.get(k) for k in ('cua_so_v1_sha256', 'frames_sha256', 'a6_sha256', 'xoay_sha256')},
+                              f8_rong_ok=f8_ok)
     for k in ('ids_sha256', 'tap', 'trang_thai', 'p_ok', 'psi_ok'):
         if tc[k] != tcf.get(k):
             raise ValueError(f'tham_chieu_v1 {k} {tcf.get(k)!r} != recomputed {tc[k]!r}')
@@ -2755,7 +2779,9 @@ def load_rel(a, frames, track, fsha, esha, task, hs):
     src = {k: dict(duong_dan=os.path.abspath(v), sha256=cm.sha256(v)) for k, v in
            (('cua_so_v1', a.cua_so), ('tham_chieu_v1', a.tham_chieu), ('truc_xe_v1', a.truc_xe),
             ('lan_lap_v1', a.lan_lap), ('c8b_a6_v2', a.a6), ('xoay_v1', a.xoay), ('c8b_khoa_v5', a.c8b_khoa)) if v}
-    rel = build_rel(task, chain, tc, truc, ll, ubc, src)
+    ref12 = co_ref_12b(cua, cho)
+    rel = build_rel(task, chain, tc, truc, ll, ubc, src, a6_sha256=None if a6 is None else a6['sha256'],
+                    co_ref_12b=ref12)
     rel['chuoi_gio_c8'] = chuoi_gio
     return rel
 

@@ -1355,3 +1355,33 @@ def test_ct1_20_t_som_follows_the_stencil_result(tmp_path, monkeypatch):
     monkeypatch.setattr(ctd, 'wz_usable', lambda yaw_ok, half: np.zeros(len(yaw_ok), bool))
     b, _ = score(tmp_path / 'b', 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain), log_kw=dict(post=5.0))
     assert b['gate_v3']['g1']['t_som_s'] < a['gate_v3']['g1']['t_som_s']
+
+
+def test_f8_rong_cach_a_scores_as_the_beta_path(tmp_path):
+    """F8 rong, cach A (Liam 23/11 at CODE 'Cach A (Recommended)'; CODE chot T12 muc 4, 934301af, 77991725, 6812dcf6):
+    W = the tag-gate set (anchors lost in the middle do not matter), beta = wrap(psi'_tc - psi_chuan_k), the plate
+    khong_doi: the run scores like the beta path of J (same G2-G5 values, same outcome) and the yaw is defined."""
+    lane_rows = B.make_frames('O1-F05', lat_fn=lambda t: 0.02 * min(1.0, max(0.0, t)))
+    fl, chain = to_floor('O1-F05', lane_rows)
+    out_b, _ = score(tmp_path / 'b', 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain))
+    pre, ids = ref_of(fl, chain)
+    a6 = 'a' * 64
+    ll = ll_of('O1-F05', [i for k, i in enumerate(ids) if not 40 <= k < 60], lan_lap_id=None, chuan_12b=None,
+               cung_lan_lap=None, trang_thai={'beta': 'chua_ket_luan', 'delta_c_B': 'chua_ket_luan'},
+               tam_doi_trong_luot=None, beta_deg=-0.5, u_beta_deg=None, tam_id='T1', a6={'sha256': a6},
+               _moi_lan_lap_id_null=True, _sha256='f' * 64)
+    kt = dict(ctd.KHUNG_TC_DE_XUAT, nguon='test')
+    assert ctd.tham_chieu(pre, chain, ll, kt, 0.10, 1 / B.FPS)['trang_thai'] == 'hong_cua_so_tc'   # J 2: the hole
+    tc = ctd.tham_chieu(pre, chain, ll, kt, 0.10, 1 / B.FPS, f8_rong_ok=True)
+    assert tc['trang_thai'] == 'dat' and tc['tap'] == ctd.TAP_MA_CACH_A and tc['n'] == len(ids)
+    tx = tx_of('O1-F05', math.degrees(PHI0 - BETA), u=0.1, psi_chuan_k_deg=math.degrees(tc['psi_tc_rad'] - BETA))
+    rel = cs.build_rel('O1-F05', chain, tc, tx, ll, 0.02, None, a6_sha256=a6, co_ref_12b=True)
+    assert rel['can_cu'] and rel['f8_rong']['ok'] and abs(rel['phi'] - PHI0) < 1e-12
+    out_a, rows = score(tmp_path / 'a', 'O1-F05', fl, rel=rel)
+    gb, ga = gate_ok(out_b), gate_ok(out_a)
+    assert out_a['outcome'] == out_b['outcome']
+    for c in ('g2', 'g3', 'g4', 'g5'):
+        assert abs(ga[c]['q'] - gb[c]['q']) < 1e-6, c
+    assert out_a['khung_tuong_doi_v1']['tap'] == ctd.TAP_MA_CACH_A
+    y = out_a['yaw_check']                                  # the IMU aligned on exactly the W ids (Codex CT2-3)
+    assert y['compared'] and y['align_set'] == 'tham_chieu_ids' and y['n_align'] == tc['n']
