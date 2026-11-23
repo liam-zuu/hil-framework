@@ -1247,7 +1247,8 @@ def test_cua_so_run2_refuses_other_f8(tmp_path, monkeypatch):
 
 def test_tinh_doan_of_run2_carries_lan_lap_id(tmp_path, monkeypatch, capsys):
     """T9b: tinh --e-hieu --doan reads the F5 of run 2 (its folder), checks it is the F5 of the issued attempt and
-    writes its lan_lap_id in F7 mien_hieu_luc; another attempt's F5 is refused."""
+    writes its lan_lap_id in F7 mien_hieu_luc; another attempt's F5 is refused; tinh without the A6, xoay files that
+    F5 was made from is refused (cap_f2_f5: the F5 of --doan is the one checked)."""
     d, f2, a6, f8, run2 = _f8_setup(tmp_path, monkeypatch)
     rc, f5 = run2(f8('ll', [_rec('C8_1', 'K2', 'L0', 'HC_K2_1')]), 'r2')
     assert rc == 0 and f5['trang_thai'] == 'khoa'
@@ -1255,13 +1256,15 @@ def test_tinh_doan_of_run2_carries_lan_lap_id(tmp_path, monkeypatch, capsys):
     f9 = write_json(str(tmp_path / 'f9.json'), dict(doan_12b_sha256=f5['sha256'], trang_thai='dat',
                                                     doan=[dict(i=x['i'], e_hieu_m=0.0) for x in f5['doan']]))
     out = str(tmp_path / 'f7.json')
-    assert ca.main(tinh_args(d, 'K2', '--e-hieu', f9, '--doan', dp, '--out', out)) in (0, 1)
+    src = ('--a6', a6, '--xoay', str(tmp_path / 'xoay.json'))          # the sources run 2 was made from
+    assert ca.main(tinh_args(d, 'K2', *src, '--e-hieu', f9, '--doan', dp, '--out', out)) in (0, 1)
     assert json.load(open(out, encoding='utf-8'))['mien_hieu_luc']['lan_lap_id'] == 'L0'
+    assert ca.main(tinh_args(d, 'K2', '--e-hieu', f9, '--doan', dp, '--out', str(tmp_path / 'f7x.json'))) == 2
     assert ca.main(tinh_args(d, 'K2', '--e-hieu', f9, '--out', str(tmp_path / 'f7b.json'))) == 2   # run-1 F5: sha
     d2, _ = make(tmp_path, 'HC_K2_2', cho='K2')
     run_cua_so(d2)                                     # d2 has its own files: only the F5 attempt check refuses
     capsys.readouterr()
-    assert ca.main(tinh_args(d2, 'K2', '--e-hieu', f9, '--doan', dp, '--out', str(tmp_path / 'f7c.json'))) == 2
+    assert ca.main(tinh_args(d2, 'K2', *src, '--e-hieu', f9, '--doan', dp, '--out', str(tmp_path / 'f7c.json'))) == 2
     assert 'khong phai luot cap HC_K2_2' in capsys.readouterr().out
 
 
@@ -2226,3 +2229,83 @@ def test_q_f8_rong_needs_label_on_this_side_in_tinh(tmp_path):
     k1x = _f5_file(tmp_path, 'f5_k1_ox', 'K1', 'HC_K1_1', None, other, a6, lan_lap_v1_sha256='S8',
                    lan_lap_nhan=ca.NGUON_LECH_TAM)
     assert 'u_them_m' not in ca.q_cung_lan_lap(x, 'K2', k1x, None, ll_sha='S8', a6_path=a6, xoay_path=xv)
+
+
+def test_tinh_reads_f2_f5_of_run2_folder(tmp_path, monkeypatch):
+    """T9b: run 2 of cua_so writes F2 + F5 to its --ra folder; tinh --e-hieu --doan checks THAT F2 and F5 against the
+    sources (A6, xoay of run 2), not the run-1 files of the attempt folder (no A6: refused before), and records that F2;
+    without --doan the attempt folder's own files are used (run 1: other A6 -> refused, code 2)."""
+    d, f2, a6, f8, run2 = _f8_setup(tmp_path, monkeypatch)
+    rc, f5 = run2(f8('ll', [_rec('C8_1', 'K2', 'L0', 'HC_K2_1')]), 'r2')
+    assert rc == 0 and f5['trang_thai'] == 'khoa'
+    dp = str(tmp_path / 'r2' / 'doan_12b_v1.json')
+    f9 = write_json(str(tmp_path / 'f9.json'), dict(doan_12b_sha256=f5['sha256'], trang_thai='dat',
+                                                    doan=[dict(i=x['i'], e_hieu_m=0.0) for x in f5['doan']]))
+    xoay = str(tmp_path / 'xoay.json')
+    out = str(tmp_path / 'f7.json')
+    assert ca.main(tinh_args(d, 'K2', '--a6', a6, '--xoay', xoay, '--e-hieu', f9, '--doan', dp, '--out', out)) in (0, 1)
+    r = json.load(open(out, encoding='utf-8'))
+    f2_used = [n['duong_dan'] for n in r['nguon'] if n['vai_tro'] == 'cua_so_v1']
+    assert f2_used == [os.path.abspath(str(tmp_path / 'r2' / 'cua_so_v1.jsonl'))]
+    assert ca.cap_f2_f5(d) == (os.path.join(d, 'cua_so_v1.jsonl'), os.path.join(d, 'doan_12b_v1.json'))
+    assert ca.cap_f2_f5(d, dp)[0] == os.path.join(str(tmp_path / 'r2'), 'cua_so_v1.jsonl')
+    f9_1 = write_json(str(tmp_path / 'f9_1.json'), dict(doan_12b_sha256=json.load(open(
+        os.path.join(d, 'doan_12b_v1.json'), encoding='utf-8'))['sha256'], trang_thai='dat',
+        doan=[dict(i=x['i'], e_hieu_m=0.0) for x in f5['doan']]))
+    assert ca.main(tinh_args(d, 'K2', '--a6', a6, '--xoay', xoay, '--e-hieu', f9_1,
+                             '--out', str(tmp_path / 'f7b.json'))) == 2      # run-1 F5 has no A6
+    os.remove(str(tmp_path / 'r2' / 'cua_so_v1.jsonl'))
+    assert ca.main(tinh_args(d, 'K2', '--a6', a6, '--xoay', xoay, '--e-hieu', f9, '--doan', dp,
+                             '--out', str(tmp_path / 'f7c.json'))) == 2      # run-2 F2 missing: refused
+
+
+def test_tinh_psi_chuan_k_from_ref_12b_without_f6(tmp_path, monkeypatch):
+    """CODE 23/11 (chot T12 muc 4): no F6 'dat' -> psi_chuan_k = circular mean of psi' over the ref_12b window of
+    the issued attempt on a locked chain; phi_hat = wrap(psi_chuan_k - a), u_phi_hat = u_a_k, labelled; turning
+    every camera heading by +0.3 rad turns psi_chuan_k by +0.3 rad and leaves phi_hat; chain not locked: none."""
+    d, f2, a6, f8, run2 = _f8_setup(tmp_path, monkeypatch)
+    rc, f5 = run2(f8('ll', [_rec('C8_1', 'K2', 'L0', 'HC_K2_1')]), 'r2')
+    dp = str(tmp_path / 'r2' / 'doan_12b_v1.json')
+    f9 = write_json(str(tmp_path / 'f9.json'), dict(doan_12b_sha256=f5['sha256'], trang_thai='dat',
+                                                    doan=[dict(i=x['i'], e_hieu_m=0.0) for x in f5['doan']]))
+    src = ('--a6', a6, '--xoay', str(tmp_path / 'xoay.json'), '--e-hieu', f9, '--doan', dp)
+
+    def f7(name, turn=0.0, chuoi='khoa'):
+        def chain(fr, a6_, xo, track=None, cho=None, **k):
+            F = dict(ca.frames_basic(fr, track), chuoi=chuoi)
+            F['psi'] = np.asarray(F['psi']) + turn
+            return F
+        monkeypatch.setattr(ca, 'frames_chain', chain)
+        out = str(tmp_path / f'{name}.json')
+        assert ca.main(tinh_args(d, 'K2', *src, '--out', out)) in (0, 1)
+        return json.load(open(out, encoding='utf-8'))
+    r0, r1 = f7('r0'), f7('r1', turn=0.3)
+    for r in (r0, r1):
+        assert r['psi_chuan_k_nguon'] == ca.PSI_K_NGUON_CAM == 'ref_12b_camera_khong_F6'
+        assert 'thieu psi_chuan_k (F6)' not in r['ly_do']
+        assert r['phi_hat_chuan_k_deg'] == pytest.approx(math.degrees(ca.wrap(math.radians(
+            r['psi_chuan_k_deg'] - r['a_k_deg']))))
+        assert r['u_phi_hat_chuan_k_deg'] == r['u_a_k_deg']
+    assert r1['psi_chuan_k_deg'] - r0['psi_chuan_k_deg'] == pytest.approx(math.degrees(0.3), abs=1e-6)
+    assert r1['phi_hat_chuan_k_deg'] == pytest.approx(r0['phi_hat_chuan_k_deg'], abs=1e-6)
+    rb = f7('rb', chuoi='chan_doan')                                         # chain not locked: no camera psi
+    assert rb.get('psi_chuan_k_deg') is None and rb.get('phi_hat_chuan_k_deg') is None
+    assert 'thieu psi_chuan_k (F6)' in rb['ly_do'] and rb['trang_thai'] != 'khoa'
+
+
+def test_cap_f2_picked_by_f5_sha(tmp_path, monkeypatch):
+    """cap_f2_f5 with --doan: of the F2 beside that F5 and the attempt folder's, the one whose sha256 is the
+    cua_so_v1_sha256 of the F5 (an F5 copied next to another attempt's F2 still finds its own)."""
+    import shutil
+    d, f2, a6, f8, run2 = _f8_setup(tmp_path, monkeypatch)
+    run2(f8('ll', [_rec('C8_1', 'K2', 'L0', 'HC_K2_1')]), 'r2')
+    r3 = tmp_path / 'r3'
+    r3.mkdir()
+    shutil.copy(os.path.join(d, 'doan_12b_v1.json'), str(r3 / 'doan_12b_v1.json'))          # run-1 F5
+    shutil.copy(str(tmp_path / 'r2' / 'cua_so_v1.jsonl'), str(r3 / 'cua_so_v1.jsonl'))        # another F2
+    dp = str(r3 / 'doan_12b_v1.json')
+    assert ca.cap_f2_f5(d, dp) == (os.path.join(d, 'cua_so_v1.jsonl'), dp)
+    f5 = json.load(open(dp, encoding='utf-8'))
+    f9 = write_json(str(tmp_path / 'f9r3.json'), dict(doan_12b_sha256=f5['sha256'], trang_thai='dat',
+                                                      doan=[dict(i=x['i'], e_hieu_m=0.0) for x in f5['doan']]))
+    assert ca.main(tinh_args(d, 'K2', '--e-hieu', f9, '--doan', dp, '--out', str(tmp_path / 'f7r3.json'))) in (0, 1)

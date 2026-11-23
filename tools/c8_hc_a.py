@@ -47,7 +47,9 @@ DIR is one attempt folder of c8_hc_seq.py (log.csv, sender.txt, lich.csv, gain_q
 the frames CSV of c7_measure track run with tag_offset 0 (tag_x, tag_y, psi = tag heading). The common frame chain of
 CAM (tools/c7_chuoi_khung.py: A6 -> psi', centre p after q, frame gates) is used when importable AND its inputs are
 given; otherwise every output is 'chan_doan' (raw tag heading, tag centre, gate valid & car_seen) and must not be
-used for scoring. Locked values need: F1, c8b_a6_v2, xoay_v1 (q, du_m), F6 psi_chuan_k, F9 e_hieu_m, and the C8B
+used for scoring. Locked values need: F1, c8b_a6_v2, xoay_v1 (q, du_m), F6 psi_chuan_k (no F6 'dat': psi' of the
+ref_12b window of the issued attempt on the locked chain, psi_chuan_k_nguon ref_12b_camera_khong_F6; CODE 23/11
+chot T12 muc 4), F9 e_hieu_m, and the C8B
 two-end camera heading bound (u_psi_cuc; not yet agreed: always chan_doan until it is).
 Every angle written to F7 is in degrees (_deg); every index is BEFORE the 1.25 margin.
 Last line: #ket_qua,ma=0 pass / 1 checked and failed / 2 error or refused.
@@ -109,6 +111,7 @@ DUR_TOL_S = 0.10
 # q of the place with E, u_q + the plate shift bound of session 1 (lift, put back: position 0.57 mm, P3; CAM f126d362)
 U_LECH_TAM_BUOI1_M = 0.00057
 NGUON_LECH_TAM = 'can_lech_tam_buoi1_chua_xac_minh_lan_lap'
+PSI_K_NGUON_CAM = 'ref_12b_camera_khong_F6'   # CODE 23/11 chot T12 muc 4: psi_chuan_k without F6 dat
 LY_DO_F8_KHONG_ID = 'F8 khong co luot nao'   # read_lan_lap: F8 read, no record gives this 12b an id (muc 1b)
 
 
@@ -1323,8 +1326,15 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
         gates['vet_thuc'] = vet['khe_m'] > 0.0
     if cap['chuoi'] != 'khoa':
         res['ly_do'].append('chuoi khung chua khoa (F1, A6, q)')
+    # CODE 23/11 (chot T12 muc 4 dinh chinh, goc 77991725): no F6 'dat' -> psi_chuan_k = circular mean of psi' over
+    # the ref_12b window of the issued attempt (camera after A6, same session), only on a locked chain
+    psi_k_cam = None
     if neo is None:
-        res['ly_do'].append('thieu psi_chuan_k (F6)')
+        w0 = (cap.get('windows') or [{}])[0]
+        if cap['chuoi'] == 'khoa' and w0.get('cs') is not None:
+            psi_k_cam = math.atan2(w0['cs'][1], w0['cs'][0])
+        else:
+            res['ly_do'].append('thieu psi_chuan_k (F6)')
     failed = [k for k, v in gates.items() if not v]
     res['ly_do'] += bad + [f'can C8B: {w}' for w in can_why]
     if failed:
@@ -1362,7 +1372,12 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
                                             'hanh_lang_12b.du_bien_dang_rad; file cu -> asin(2 du_m / L), L = doan '
                                             'dai ngan nhat cua cac luot khac session luot cap; cung session: 0'))
     if neo is not None:
+        out['psi_chuan_k_deg'], out['psi_chuan_k_nguon'] = float(neo), 'F6_hieu_chuan_neo'
         out['phi_hat_chuan_k_deg'] = math.degrees(wrap(math.radians(neo) - a))
+        out['u_phi_hat_chuan_k_deg'] = out['u_a_k_deg']
+    elif psi_k_cam is not None:     # no camera term added here: it goes to u_beta_cam (C8B), psi' cancels in phi
+        out['psi_chuan_k_deg'], out['psi_chuan_k_nguon'] = math.degrees(psi_k_cam), PSI_K_NGUON_CAM
+        out['phi_hat_chuan_k_deg'] = math.degrees(wrap(psi_k_cam - a))
         out['u_phi_hat_chuan_k_deg'] = out['u_a_k_deg']
     return out
 
@@ -1987,10 +2002,29 @@ def read_can_c8b(path, cho):
     return vals[0], None if hd is None else vals[1], bool(b.get('chot', False))
 
 
-def check_cap_sources(d, frames, track, log_path, a6, xoay, need):
+def cap_f2_f5(d, doan=None):
+    """(F2 path, F5 path) of the issued attempt. Without --doan: DIR's own files. With --doan (run 2 of cua_so writes
+    F2 + F5 to its --ra folder, T9b; the attempt folder holds run 1 or nothing): that F5, and of the cua_so_v1.jsonl
+    beside it and DIR's, the first whose sha256 = cua_so_v1_sha256 of that F5 (else the first present, so
+    check_cap_sources refuses it by that sha; neither present: the one beside, refused as missing)."""
+    own = os.path.join(d, 'cua_so_v1.jsonl')
+    if not doan:
+        return own, os.path.join(d, 'doan_12b_v1.json')
+    side = os.path.join(os.path.dirname(os.path.abspath(doan)), 'cua_so_v1.jsonl')
+    cand = [p for p in (side, own) if os.path.isfile(p)]
+    try:
+        want = json.load(open(doan, encoding='utf-8')).get('cua_so_v1_sha256')
+    except (OSError, ValueError, AttributeError):
+        want = None
+    hit = [p for p in cand if want and sha256(p) == want]
+    return (hit or cand or [side])[0], doan
+
+
+def check_cap_sources(d, frames, track, log_path, a6, xoay, need, doan=None):
     """HCC2-5: the F2 rows and the F5 of the issued attempt must have been made from the very frames, track and log
-    tinh analyses now (and the same A6, xoay files); need=True (F6/F9 given) and a file missing -> AError."""
-    p2, p5 = os.path.join(d, 'cua_so_v1.jsonl'), os.path.join(d, 'doan_12b_v1.json')
+    tinh analyses now (and the same A6, xoay files); need=True (F6/F9 given) and a file missing -> AError. doan: the
+    F5 of --doan (run 2; its F2 beside it, cap_f2_f5)."""
+    p2, p5 = cap_f2_f5(d, doan)
     if not need:                                          # HCC3-4: diagnosis from the current sources only
         return
     if not (os.path.isfile(p2) and os.path.isfile(p5)):
@@ -2143,9 +2177,10 @@ def cmd_tinh(a):
             continue
         attempts.append((A['thu_id'], an, failed))
         if is_cap:
-            check_cap_sources(d, frames, track, A['log_path'], a.a6, a.xoay, need=bool(a.neo or a.e_hieu))
+            check_cap_sources(d, frames, track, A['log_path'], a.a6, a.xoay, need=bool(a.neo or a.e_hieu),
+                              doan=a.doan)
             cap_F, cap_A, cap_an = F, A, an
-            p = os.path.join(d, 'cua_so_v1.jsonl')
+            p = cap_f2_f5(d, a.doan)[0]                    # run 2 (--doan): the F2 of that F5, not of run 1
             if os.path.isfile(p):
                 rows = [json.loads(x) for x in open(p, encoding='utf-8')]
                 cap_ref = next((r for r in rows if r.get('loai') == 'ref_12b'), None)
