@@ -42,6 +42,15 @@ it writes is under the sealed folder it is given (section 3.1b item 13).
   12  determinism: the first DET_ROWS rows of S1 without a run_error (and not ngoai_bang) run
       again in new processes through the same scoring path; log SHA-256 and every field from
       'status' on must be equal bit for bit.
+
+  Codex round 3: the numbers file is regenerated in memory from (mode, r, t) and checked bit
+  for bit and as text at every load (C3-36); a worker that dies while running a gain set makes
+  that set a run_error (one diagnosis rerun in a new process, never replacing it), the rest of
+  its job runs in a new worker and the step goes on; wait limits JOB_WAIT_MAX_S per job and
+  DIAG_WAIT_MAX_S per diagnosis (C3-40); the phases run with live notes entries (trang_thai,
+  moc_bat_dau/moc_ket_thuc, n_luot_tong) that also survive a stop (C3-39, D2A-2);
+  sealed/sangloc_thu/loi_S0.json holds the S0 error runs' text only (D2A-3); a PID run without
+  the clamp indicator stops S03 (C3-48).
 """
 from __future__ import annotations
 
@@ -68,6 +77,8 @@ import s03_doe as s3                                    # noqa: E402
 import s04_ga as s4                                     # noqa: E402
 
 SCREEN_U = os.path.join(HERE, 's03_screen_u.csv')       # committed reference file, r = 0
+SCREEN_U_THU = os.path.join(HERE, 's03_screen_u_thu.csv')   # committed tool-check numbers file (S03 8.11)
+SOURCE_MODES = ('chinh', 'thu')
 SCREEN_COLS = ['set', 'row'] + [f'u{k}' for k in range(1, 8)]
 SETS = ('S0', 'S1', 'S2', 'S2b', 'S3')                  # set index t = 0..4
 SET_ROWS = dict(S0=1000, S1=10000, S2=10000, S2b=10000, S3=1000)
@@ -95,7 +106,24 @@ SCORE_COLS = (['controller', 'set', 'row', 'che_do', 'ngoai_bang', 'phan_loai_du
 DET_FIELDS = EVAL_SL_COLS[EVAL_SL_COLS.index('status'):]       # item 12: compared bit for bit
 DET_COLS = ['controller', 'set', 'row', 'v', 'mu', 'log_arrays_equal', 'fields_equal']
 
-_clock = time.time        # the wall clock, replaceable by the tests
+# Wait limits of the worker pool (Codex C3-40). A job holds at most CHUNK = 20 gain sets x 9
+# first-attempt runs (3 gate speeds x 3 mu) = 180 runs, about 376 s at the 2.09 s per run of spec
+# S03 section 3.4; every run may be rerun once for diagnosis in a new process (752 s). 7200 s is
+# about 19 times the error-free job and 9.6 times the job with every run rerun, which leaves room
+# for the workers sharing the machine: a worker over it is hung, not slow.
+JOB_WAIT_MAX_S = 7200.0
+# The diagnosis rerun of a gain set whose worker died: at most 3 runs (the gate speeds at the
+# middle mu), about 6.3 s at 2.09 s per run, in one new process; 600 s is about 96 times that.
+DIAG_WAIT_MAX_S = 600.0
+KILL_WAIT_S = 30.0              # wait for a killed worker to end
+POLL_S = 0.1                    # poll period of the pool loop (as before)
+
+_clock = time.monotonic   # the monotonic clock of the phase seconds, replaceable by the tests
+
+
+def _stamp(t=None):
+    """Local wall-clock label of a phase boundary (notes.json moc_*; only a label)."""
+    return time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(t))
 
 
 # ── items 3: the root numbers file ───────────────────────────────────────────────────
@@ -132,14 +160,73 @@ def parse_screen_u(text):
     return out
 
 
-def load_screen_u(path=SCREEN_U, trial=False):
+def generate_sets(r=0, base=SEED_BASE):
+    """{set: np.ndarray (n, 7) float64}: set t of SETS is default_rng(base + 10*r + t) (PCG64).
+    In memory only: the regeneration check of the numbers file (S03 3.1b item 3; Codex C3-36)."""
+    return {s: np.random.default_rng(base + 10 * r + t).random((SET_ROWS[s], 7))
+            for t, s in enumerate(SETS)}
+
+
+def canonical_text(sets):
+    """The text make_s03_screen_u.write writes, with LF line ends: header SCREEN_COLS, then per
+    set the rows [set, j + 1, repr(float(u))...]."""
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator='\n')
+    w.writerow(SCREEN_COLS)
+    for s in SETS:
+        for j, u in enumerate(sets[s]):
+            w.writerow([s, j + 1] + [repr(float(x)) for x in u])
+    return buf.getvalue()
+
+
+def source_seeds(che_do, r):
+    """(base, {set: seed}) of the numbers the file must hold (C3-36): 'chinh' base SEED_BASE,
+    'thu' base TRIAL_SEED_BASE and only r = 0; the seed of set t is base + 10 r + t. A mode
+    outside SOURCE_MODES or an r that is not an int >= 0 (bool refused) is a ValueError."""
+    if che_do not in SOURCE_MODES or not isinstance(r, int) or isinstance(r, bool) or r < 0 \
+            or (che_do == 'thu' and r != 0):
+        raise ValueError(f'source_seeds: che_do {che_do!r} or r {r!r} is not a generation source')
+    base = SEED_BASE if che_do == 'chinh' else TRIAL_SEED_BASE
+    return base, {s: base + 10 * r + t for t, s in enumerate(SETS)}
+
+
+def verify_screen_source(sets, sha256_lf, che_do='chinh', r=0):
+    """(record, problems) of the generation check of the numbers file (S03 3.1b item 3; Codex
+    C3-36): the numbers are regenerated from (che_do, r) and compared bit for bit (a missing or
+    mis-shaped set, one ulp, or -0.0 vs 0.0 all differ), and the file's LF SHA-256 is compared
+    with the canonical writing of the regenerated sets."""
+    base, seeds = source_seeds(che_do, r)
+    gen = generate_sets(r, base)
+    tap_lech = [s for s in SETS
+                if s not in sets or np.shape(sets[s]) != gen[s].shape
+                or not np.array_equal(np.ascontiguousarray(sets[s], dtype=np.float64).view(np.uint64),
+                                      gen[s].view(np.uint64))]
+    khop_van_ban = hashlib.sha256(canonical_text(gen).encode('utf-8')).hexdigest() == sha256_lf
+    rec = dict(che_do=che_do, r=r, seed_base=base, seeds=seeds, khop_tung_bit=not tap_lech,
+               tap_lech=tap_lech, khop_van_ban=khop_van_ban)
+    problems = []
+    if tap_lech:
+        problems.append(f"che_do {che_do!r}, r {r}, seeds { {s: seeds[s] for s in tap_lech} }: "
+                        f'sets {tap_lech} are not default_rng(seed).random((n, 7)) bit for bit '
+                        '(S03 3.1b item 3; Codex C3-36)')
+    elif not khop_van_ban:
+        problems.append('the numbers are those of the seeds but the text is not the canonical '
+                        'writing (header, set, row, repr(float(u)), LF or CRLF line ends; '
+                        'S03 3.1b item 3; Codex C3-36)')
+    return rec, problems
+
+
+def load_screen_u(path=SCREEN_U, trial=False, r=0, che_do='chinh'):
     """(sets, info) of the committed screening-numbers file, modelled on s3.load_test_points (S03
-    v8.5 section 8 condition 9, SL1-9): the bytes are read ONCE; info = file, sha256, sha256_lf,
-    sha256_crlf, git (s3.file_git_state), head_blob_sha256, matches_head_blob_lf, problems.
-    Problems: not tracked/clean in git; content differs from the HEAD blob after CRLF -> LF
-    (s3._head_blob). A parse failure always raises S03Stop; the problems raise S03Stop unless
-    trial (then only recorded). A raised S03Stop carries .screen_info = info (what was read so
-    far). The script never generates the numbers."""
+    v8.5 section 8 condition 9, SL1-9; v8.6 8.11): the bytes are read ONCE; info = file, sha256,
+    sha256_lf, sha256_crlf, git (s3.file_git_state), head_blob_sha256, matches_head_blob_lf,
+    nguon_sinh (the verify_screen_source record), problems. Problems: for 'thu' a file with the
+    same content as s03_screen_u.csv after CRLF -> LF; the regenerated numbers differing bit for
+    bit or the text differing from the canonical writing (C3-36); not tracked/clean in git;
+    content differs from the HEAD blob after CRLF -> LF (s3._head_blob). A parse failure always
+    raises S03Stop; the problems raise S03Stop unless trial (then only recorded). A raised
+    S03Stop carries .screen_info = info (what was read so far). The script never generates the
+    numbers: the regeneration is an in-memory check."""
     try:
         with open(path, 'rb') as f:
             raw = f.read()
@@ -171,6 +258,14 @@ def load_screen_u(path=SCREEN_U, trial=False):
     info['head_blob_sha256'] = hashlib.sha256(blob).hexdigest() if blob is not None else None
     info['matches_head_blob_lf'] = blob is not None and blob.replace(b'\r\n', b'\n') == lf
     problems = []
+    if che_do == 'thu' and os.path.isfile(SCREEN_U):
+        with open(SCREEN_U, 'rb') as f:
+            ref_lf = hashlib.sha256(f.read().replace(b'\r\n', b'\n')).hexdigest()
+        if info['sha256_lf'] == ref_lf:
+            problems.append('the --sangloc-thu numbers file has the same content as '
+                            'fwsim/s03_screen_u.csv after CRLF -> LF (S03 8.11)')
+    info['nguon_sinh'], probs = verify_screen_source(sets, info['sha256_lf'], che_do, r)
+    problems += probs
     if not (info['git']['tracked'] and info['git']['clean']):
         problems.append('not committed / modified (git status)')
     if not info['matches_head_blob_lf']:
@@ -430,13 +525,33 @@ def _firmware(dll):
     return fwsim.FirmwareSim(dll)
 
 
-def do_job(job):
+def check_kep_rows(ctrl, rows):
+    """C3-48 (S03 v8.6 2.1, 11 item 6 (c)): a PID run without the clamp indicator stops S03 —
+    for every first-attempt row that is not a run_error, kep_note must be empty and every
+    kep_frac_* column a value (NaN is a value). ADRC rows, attempt-2 (diagnosis) rows and
+    run_error rows are exempt."""
+    if ctrl != 'PID':
+        return
+    for r in rows:
+        if r.get('attempt') != 1 or r.get('status') == 'run_error':
+            continue
+        if r.get('kep_note', '') not in ('', None) or \
+                any(r.get(k, '') in ('', None) for k in s3.KEP_FRAC_COLS):
+            raise s3.S03Stop(
+                f"{ctrl} row {r.get('cand_id')}: {r.get('kep_note') or 'no kep_frac value'} "
+                '(S03 v8.6 2.1, 11 item 6 (c); Codex C3-48: a DLL without the kep channel or '
+                'a failed kep_indicator self-check stops S03)')
+
+
+def do_job(job, bao=None):
     """One worker job (dict(name, dll, controller, speeds, mu_levels, rows=[(row_no, g)], work)):
     for every (row_no, gain set) the set runs at the middle mu (g runs, Evaluator ev_mid), and
     only when feasible there at the two other mu levels (2g runs, Evaluator ev_rest) — the
     scoring path of item 5 (safe_run_gate + the tv_duty conversion inside Evaluator.candidate).
     Returns [(row_no, [eval rows appended])]. A set the evaluator marks ngoai_bang, or that
-    appends no row, is a tool error (the parent filters those sets): S03Stop."""
+    appends no row, is a tool error (the parent filters those sets): S03Stop. bao (optional
+    callable, worker processes only) is called bao('bat_dau', row_no) before the work of a gain
+    set and bao('xong', row_no, rows) after its rows are complete and checked."""
     dll, ctrl, speeds, mu_levels = job['dll'], job['controller'], job['speeds'], job['mu_levels']
     mu_mid = mu_levels[len(mu_levels) // 2]
     fw = _firmware(dll)
@@ -444,6 +559,8 @@ def do_job(job):
     ev_rest = s4.Evaluator(fw, dll, ctrl, speeds, [m for m in mu_levels if m != mu_mid], job['work'])
     out = []
     for row_no, g in job['rows']:
+        if bao is not None:
+            bao('bat_dau', row_no)
         n0_ = len(ev_mid.evals)
         s = ev_mid.candidate(g, '', '', row_no)
         if s.get('status') == 'ngoai_bang':
@@ -460,28 +577,108 @@ def do_job(job):
                 raise s3.S03Stop(f'{ctrl} row {row_no}: a ngoai_bang set reached a worker '
                                  '(S03 3.1b item 5: tool error)')
             rows += list(ev_rest.evals[n0_:])
+        check_kep_rows(ctrl, rows)
         out.append((row_no, rows))
+        if bao is not None:
+            bao('xong', row_no, rows)
     return out
 
 
 def job_main(path):
-    """--job <pickle> of a worker process: run the job, write path + '.out' (pickle dict(ok=True,
-    rows) or dict(ok=False, stop)); a S03Stop is reported with exit code 0, any other exception
-    goes to stderr and a non-zero exit."""
+    """--job <pickle> of a worker process: open path + '.part' first and report every gain set
+    over it ('bat_dau', row_no before the work, 'xong', row_no, rows after it — the parent keeps
+    the finished sets when the worker dies, C3-40); run the job, write path + '.out' (pickle
+    dict(ok=True, rows) or dict(ok=False, stop)); a S03Stop is reported with exit code 0, any
+    other exception goes to stderr and a non-zero exit."""
+    part = open(path + '.part', 'wb')
+
+    def bao(kind, row_no, rows=None):
+        pickle.dump((kind, row_no, rows), part)
+        part.flush()
+
     try:
         with open(path, 'rb') as f:
             job = pickle.load(f)
-        res = dict(ok=True, rows=do_job(job))
+        res = dict(ok=True, rows=do_job(job, bao))
     except s3.S03Stop as exc:
         res = dict(ok=False, stop=str(exc))
+    finally:
+        part.close()
     with open(path + '.out', 'wb') as f:
         pickle.dump(res, f)
 
 
+def _worker_cmd(path):
+    """The argv of a worker process ('--job' and the job path at index 2 and 3: the tests
+    substitute the script through subprocess.Popen)."""
+    return [sys.executable, os.path.abspath(__file__), '--job', path]
+
+
+def _read_part(path):
+    """(done, started) of the .part records of a dead worker: 'xong' appends (row_no, rows) to
+    done and clears started, 'bat_dau' sets started = row_no. The read ends at any error of a
+    record cut by the death of the worker (a truncated pickle, a garbage tail, a value that is
+    not a 3-tuple); a missing file -> ([], None)."""
+    done, started = [], None
+    try:
+        with open(path + '.part', 'rb') as f:
+            while True:
+                try:
+                    kind, row_no, rows = pickle.load(f)
+                except Exception:                           # noqa: BLE001
+                    break
+                if kind == 'xong':
+                    done.append((row_no, rows))
+                    started = None
+                else:
+                    started = row_no
+    except OSError:
+        return [], None
+    return done, started
+
+
+def _eval_rec(ctrl, row_no, v, mu, attempt, row, log_sha256=''):
+    """One eval record shaped as s04_ga.Evaluator._rec makes it (the eval rows of a gain set
+    whose worker died, C3-40): the EVAL_COLS fields of row, the S03 identifiers and the
+    pen_ flags of s4.run_values."""
+    r = {k: row.get(k, '') for k in s4.EVAL_COLS if k in row}
+    r.update(controller=ctrl, ga_seed='', gen='', cand_id=row_no, v=v, mu=mu, attempt=attempt,
+             log_sha256=log_sha256, cause='')
+    r.update(s4.run_values(row)[1])
+    return r
+
+
+def _crashed_rows(job, row_no, why):
+    """The eval rows of a gain set whose worker died (C3-40): one attempt-1 'run_error' row per
+    speed at the middle mu (the death reason in 'error'), then one attempt-2 diagnosis row per
+    speed of ONE rerun in ONE new process (s3.run_in_new_process, timeout DIAG_WAIT_MAX_S); when
+    the diagnosis itself fails (child failed, timeout), every attempt-2 row is
+    'diagnosis_failed'. The diagnosis never replaces the attempt-1 rows."""
+    ctrl, speeds = job['controller'], job['speeds']
+    mu_mid = job['mu_levels'][len(job['mu_levels']) // 2]
+    g = dict(job['rows'])[row_no]
+    try:
+        again = s3.run_in_new_process(job['dll'], [(ctrl, g, v, mu_mid) for v in speeds],
+                                      job['work'], timeout=DIAG_WAIT_MAX_S)
+        second = {v: a for v, a in zip(speeds, again)}
+    except Exception as exc:                        # noqa: BLE001 (a failed diagnosis is recorded)
+        second = {v: dict(row=dict(status='diagnosis_failed',
+                                   error=f'{type(exc).__name__}: {exc}'), digest=None)
+                  for v in speeds}
+    out = []
+    for v in speeds:
+        out.append(_eval_rec(ctrl, row_no, v, mu_mid, 1,
+                             dict(status='run_error', completed='', error=why)))
+        a = second[v]
+        out.append(_eval_rec(ctrl, row_no, v, mu_mid, 2, a['row'],
+                             s4.digest_sha(a['digest']) if a.get('digest') else ''))
+    return out
+
+
 def _collect_logs(jobs, paths, work, log_path):
     """Append every non-empty child log to log_path (each part headed by the job name — sealed
-    channel, item 13), then remove the per-job files (.pkl, .out, .log) and the empty folders
-    under work (and work itself when empty)."""
+    channel, item 13), then remove the per-job files (.pkl, .out, .log, .part) and the empty
+    folders under work (and work itself when empty)."""
     parts = []
     for i, p in enumerate(paths):
         lp = p + '.log'
@@ -499,7 +696,7 @@ def _collect_logs(jobs, paths, work, log_path):
                 if not data.endswith(b'\n'):
                     f.write(b'\n')
     for p in paths:
-        for q in (p, p + '.out', p + '.log'):
+        for q in (p, p + '.out', p + '.log', p + '.part'):
             if os.path.exists(q):
                 os.remove(q)
     if os.path.isdir(work):
@@ -513,57 +710,154 @@ def _collect_logs(jobs, paths, work, log_path):
 
 def run_jobs(jobs, work, n_parallel, log_path):
     """Run job dicts as child processes `python s03_sangloc.py --job <pickle>` (at most
-    n_parallel at once), like o1_feas_search.run_jobs but with pickle job files job_<name>.pkl
-    under work and each child's stdout+stderr to <job>.log under work. Returns the do_job
-    results in job order. A child with a non-zero exit code: the others are killed and a
-    S03Stop says a worker failed and names log_path (no gain values). A result ok=False: the
-    S03Stop carries its text."""
+    n_parallel at once): each job's pickle and .log are made when it is started and the child
+    reports every gain set over .part ('bat_dau' / 'xong'). Returns the do_job results in job
+    order, rows in the job's row order. A result ok=False: the S03Stop carries its text.
+    A child dead (non-zero exit) or late (over JOB_WAIT_MAX_S, killed) while running a gain
+    set: the sets it reported 'xong' are kept, the set it was running counts as a run_error of
+    the gain set with ONE diagnosis rerun in a new process (_crashed_rows; S03 goes on, C3-40),
+    and the rest of the job runs in a new worker ('<name>_tiep<k>'). A child dead before or
+    between gain sets is a tool error (S03Stop naming log_path). A raised exception carries
+    .n_luot = (n attempt-1, n attempt-2 rows of the sets finished). When run_jobs returns or
+    raises, no worker is alive and no job file is left."""
     os.makedirs(work, exist_ok=True)
-    paths = []
-    for job in jobs:
-        p = os.path.join(work, f"job_{job['name']}.pkl")
+    all_jobs, orig = list(jobs), list(range(len(jobs)))   # continuations appended, orig -> job index
+    pending = list(range(len(all_jobs)))
+    running, zombies = {}, []             # i -> dict(proc, logf, path, t_start); killed, still alive
+    started_jobs, started_paths = [], []  # every started job (continuations too) for _collect_logs
+    merged_paths = set()                  # .part files already merged into results
+    results = {}                          # original job index -> {row_no: rows}
+    crashed = []                          # (original index, job, row_no, why) for _crashed_rows
+    n_tiep = {}
+    going_up = None
+
+    def start_job(i):
+        p = os.path.join(work, f"job_{all_jobs[i]['name']}.pkl")
         with open(p, 'wb') as f:
-            pickle.dump(job, f)
-        paths.append(p)
-    pending, running, failed = list(range(len(jobs))), {}, False
-    while pending or running:
-        while pending and len(running) < max(1, n_parallel):
-            i = pending.pop(0)
-            logf = open(paths[i] + '.log', 'w')
-            running[i] = (subprocess.Popen([sys.executable, os.path.abspath(__file__), '--job',
-                                            paths[i]], stdout=logf, stderr=subprocess.STDOUT), logf)
-        time.sleep(0.1)
-        for i in list(running):
-            proc, logf = running[i]
-            if proc.poll() is not None:
-                logf.close()
-                del running[i]
-                if proc.returncode != 0:
-                    failed = True
-                    for j in list(running):
-                        running[j][0].kill()
-                        running[j][0].wait()
-                        running[j][1].close()
-                    running.clear()
-                    pending.clear()
-                    break                               # the stale indices of the loop are gone
-    results = []
-    for p in paths:
+            pickle.dump(all_jobs[i], f)
+        logf = open(p + '.log', 'w')
+        started_jobs.append(all_jobs[i])
+        started_paths.append(p)             # recorded even when Popen fails: no job file left
         try:
-            with open(p + '.out', 'rb') as f:
-                results.append(pickle.load(f))
-        except OSError:
-            results.append(None)
-    _collect_logs(jobs, paths, work, log_path)
-    if failed or any(r is None for r in results):
-        raise s3.S03Stop(f'a worker of the screening step failed; its output is in {log_path} '
-                         '(S03 3.1b item 5: tool error)')
-    out = []
-    for r in results:
-        if not r.get('ok'):
-            raise s3.S03Stop(r.get('stop', 'a worker stopped without a reason'))
-        out.append(r['rows'])
-    return out
+            proc = subprocess.Popen(_worker_cmd(p), stdout=logf, stderr=subprocess.STDOUT)
+        except Exception:
+            logf.close()
+            raise
+        running[i] = dict(proc=proc, logf=logf, path=p, t_start=time.monotonic())
+
+    def n_luot():
+        """(attempt-1, attempt-2 rows) of the finished sets: merged results plus the 'xong'
+        records of the .part files of the jobs not merged (best effort at stop time)."""
+        n1 = n2 = 0
+        for per in results.values():
+            for rows in per.values():
+                n1 += sum(1 for e in rows if e.get('attempt') == 1)
+                n2 += sum(1 for e in rows if e.get('attempt') == 2)
+        for p in started_paths:
+            if p in merged_paths:
+                continue
+            for _rn, rows in _read_part(p)[0]:
+                n1 += sum(1 for e in rows if e.get('attempt') == 1)
+                n2 += sum(1 for e in rows if e.get('attempt') == 2)
+        return n1, n2
+
+    try:
+        while pending or running:
+            while pending and len(running) < max(1, n_parallel):
+                start_job(pending.pop(0))
+            time.sleep(POLL_S)
+            for i in list(running):
+                r = running[i]
+                rc = r['proc'].poll()
+                late = rc is None and time.monotonic() - r['t_start'] > JOB_WAIT_MAX_S
+                if late:
+                    try:
+                        r['proc'].kill()
+                        r['proc'].wait(timeout=KILL_WAIT_S)
+                    except Exception:                       # noqa: BLE001
+                        zombies.append(r)
+                    rc = r['proc'].returncode
+                if rc is None and not late:
+                    continue
+                r['logf'].close()
+                del running[i]
+                oi = orig[i]
+                if rc == 0 and not late:
+                    res = None
+                    try:
+                        with open(r['path'] + '.out', 'rb') as f:
+                            res = pickle.load(f)
+                    except Exception:                       # noqa: BLE001
+                        res = None
+                    if res is None:
+                        raise s3.S03Stop('a worker of the screening step failed; its output is '
+                                         f'in {log_path} (S03 3.1b item 5: tool error)')
+                    if not res.get('ok'):
+                        raise s3.S03Stop(res.get('stop', 'a worker stopped without a reason'))
+                    merged_paths.add(r['path'])
+                    results.setdefault(oi, {}).update(res['rows'])
+                    continue
+                done, started = _read_part(r['path'])
+                if started is None:
+                    raise s3.S03Stop('a worker of the screening step failed; its output is '
+                                     f'in {log_path} (S03 3.1b item 5: tool error)')
+                merged_paths.add(r['path'])
+                results.setdefault(oi, {}).update(done)
+                why = (f'worker process exceeded the wait limit of {JOB_WAIT_MAX_S:g} s and was '
+                       'killed while running this gain set' if late
+                       else f'worker process died (exit code {rc}) while running this gain set')
+                why += ': counted as a run_error of the gain set (S03 3.1b item 5; Codex C3-40)'
+                crashed.append((oi, all_jobs[i], started, why))
+                rows = all_jobs[i]['rows']
+                k = [rn for rn, _g in rows].index(started)
+                rest = rows[k + 1:]
+                if rest:
+                    n_tiep[oi] = n_tiep.get(oi, 0) + 1
+                    all_jobs.append(dict(all_jobs[i], rows=rest,
+                                         name=f"{all_jobs[oi]['name']}_tiep{n_tiep[oi]}"))
+                    orig.append(oi)
+                    pending.insert(0, len(all_jobs) - 1)
+        for oi, job, row_no, why in crashed:
+            results[oi][row_no] = _crashed_rows(job, row_no, why)
+        out = []
+        for i, job in enumerate(jobs):
+            have = results.get(i, {})
+            if sorted(have) != sorted(rn for rn, _g in job['rows']):
+                raise s3.S03Stop('a job of the screening step lost or gained gain sets '
+                                 '(S03 3.1b item 5: tool error)')
+            out.append([(rn, have[rn]) for rn, _g in job['rows']])
+        return out
+    except BaseException as exc:
+        going_up = exc
+        raise
+    finally:
+        for i, r in list(running.items()) + [(None, z) for z in zombies]:
+            try:
+                if r['proc'].poll() is None:
+                    r['proc'].kill()
+                r['proc'].wait(timeout=KILL_WAIT_S)
+            except Exception:                               # noqa: BLE001
+                zombies.append(r)
+            try:
+                r['logf'].close()
+            except Exception:                               # noqa: BLE001
+                pass
+        running.clear()
+        stuck = [z for z in zombies if z['proc'].poll() is None]
+        if going_up is not None and not hasattr(going_up, 'n_luot'):
+            try:
+                going_up.n_luot = n_luot()
+            except Exception:                               # noqa: BLE001
+                pass
+        try:
+            _collect_logs(started_jobs, started_paths, work, log_path)
+        except Exception:                                   # noqa: BLE001
+            if going_up is None:
+                raise
+        if stuck:
+            raise s3.S03Stop('a worker of the screening step could not be ended within '
+                             f'{KILL_WAIT_S:g} s (S03 3.1b item 5: tool error; Codex C3-40)') \
+                from going_up
 
 
 def run_set(set_name, rows_by_ctrl, dll, speeds, mu_levels, work, n_proc, log_path):
@@ -684,13 +978,17 @@ def _box_json(box):
 
 
 def _set_phase(set_name, n_use, out_dir, work_dir, log_path, controllers, gate, mu_levels, W,
-               screen, n_proc, dll):
+               screen, n_proc, dll, entry=None):
     """One set: classify every one of its first n_use rows BEFORE any run, write points_<set>.csv,
     run the runnable sets through run_set, write evals_<set>.csv and score_<set>.csv. Returns
     (records {ctrl: [...]}, evals {ctrl: {row: [...]}}, score rows for the CSV, scores
-    {ctrl: {row: {mode: record}}}, seconds, n first-attempt runs, n attempt-2 rows)."""
+    {ctrl: {row: {mode: record}}}, seconds, n first-attempt runs, n attempt-2 rows). entry: the
+    live notes entry of the phase (C3-39), filled as the phase runs — n_bo_gain after the
+    classification, the counts after the runs (from .n_luot of a run_set exception)."""
     records = {ctrl: classify_rows(ctrl, screen[set_name][:n_use], W[ctrl], set_name)
                for ctrl in controllers}
+    if entry is not None:
+        entry['n_bo_gain'] = {c: len(records[c]) for c in controllers}
     point_rows = []
     for ctrl in controllers:
         names = s3.FACTORS[ctrl]
@@ -702,7 +1000,12 @@ def _set_phase(set_name, n_use, out_dir, work_dir, log_path, controllers, gate, 
                                    **{f'x{k + 1}': xs[k] for k in range(7)},
                                    **{f'x{k + 1}_f32': float(np.float32(xs[k])) for k in range(7)}))
     s3.write_csv(os.path.join(out_dir, f'points_{set_name}.csv'), point_rows, POINTS_COLS)
-    evals, seconds = run_set(set_name, records, dll, gate, mu_levels, work_dir, n_proc, log_path)
+    try:
+        evals, seconds = run_set(set_name, records, dll, gate, mu_levels, work_dir, n_proc, log_path)
+    except Exception as exc:
+        if entry is not None:
+            entry['n_luot_thuc'], entry['n_chay_lai_chan_doan'] = getattr(exc, 'n_luot', (0, 0))
+        raise
     eval_rows = [e for ctrl in controllers for e in eval_csv_rows(set_name, records[ctrl], evals[ctrl])]
     s3.write_csv(os.path.join(out_dir, f'evals_{set_name}.csv'), eval_rows, EVAL_SL_COLS)
     scores = {ctrl: {r['row']: score_modes(evals[ctrl].get(r['row'], []), r['flag'], gate, mu_levels)
@@ -715,6 +1018,11 @@ def _set_phase(set_name, n_use, out_dir, work_dir, log_path, controllers, gate, 
                   for ctrl in controllers for r in records[ctrl] for mode in MODES]
     n_runs = sum(e.get('attempt') == 1 for e in eval_rows)
     n_rerun = sum(e.get('attempt') == 2 for e in eval_rows)
+    if entry is not None:
+        entry['n_luot_thuc'], entry['n_chay_lai_chan_doan'] = n_runs, n_rerun
+        entry['n_luot_thuc_theo_controller'] = \
+            {c: sum(e.get('attempt') == 1 for rows in evals[c].values() for e in rows)
+             for c in controllers}
     return records, evals, score_rows, scores, seconds, n_runs, n_rerun
 
 
@@ -727,6 +1035,37 @@ def _mode_stats(records, scores):
                          n_kha_thi=sum(r['kha_thi'] for r in recs),
                          n_khong_phan_loai=sum(not r['phan_loai_duoc'] for r in recs))
     return out
+
+
+LOI_S0_KEYS = ('n_bo_khong_phan_loai', 'luot_loi')
+LOI_LUOT_KEYS = ('controller', 'pha', 'thong_bao')
+
+
+def loi_s0_doc(controllers, records, evals, dem):
+    """sealed/sangloc_thu/loi_S0.json (D2A-3), written always when S0 ended:
+    n_bo_khong_phan_loai = {ctrl: {mode: the n_khong_phan_loai of so_dem.json}}, luot_loi = the
+    error text of the S0 error runs in record order — attempt 1 with status run_error ->
+    pha 'lan_1', the error text; an attempt-2 row -> pha 'chan_doan' with 'status: error' for
+    run_error / diagnosis_failed, else 'ran in the new process without a run_error'. Nothing
+    else: no row number, gain, v, mu, score, f1, q or the status of a run that is not an
+    error."""
+    doc = dict(n_bo_khong_phan_loai={ctrl: {mode: dem[ctrl]['che_do'][mode]['n_khong_phan_loai']
+                                            for mode in MODES} for ctrl in controllers},
+               luot_loi=[])
+    for ctrl in controllers:
+        for r in records[ctrl]:
+            for e in evals[ctrl].get(r['row'], []):
+                if e.get('attempt') == 1 and e.get('status') == 'run_error':
+                    doc['luot_loi'].append(dict(controller=ctrl, pha='lan_1',
+                                                thong_bao=str(e.get('error', ''))))
+                elif e.get('attempt') == 2:
+                    st = e.get('status')
+                    tb = (f"{st}: {e.get('error', '')}"
+                          if st in ('run_error', 'diagnosis_failed')
+                          else 'ran in the new process without a run_error')
+                    doc['luot_loi'].append(dict(controller=ctrl, pha='chan_doan',
+                                                thong_bao=tb))
+    return doc
 
 
 def run_step(sealed, dll, controllers, gate, mu_levels, W, quet, screen, n_proc, tool_check=None):
@@ -752,312 +1091,325 @@ def run_step(sealed, dll, controllers, gate, mu_levels, W, quet, screen, n_proc,
     if n0 > len(screen['S0']):
         raise s3.S03Stop(f'n0 = {n0} is more than the {len(screen["S0"])} rows of S0 '
                          '(S03 3.1b item 3)')
-    pha = []
+    pha, live = [], {}
 
-    def pha_entry(name, n_runs, n_rerun, seconds):
-        return dict(pha=name, controller='all', n_bo_gain={c: None for c in controllers},
-                    n_luot_ke_hoach=None, n_luot_thuc=n_runs, n_luot_thuc_theo_controller=None,
-                    n_chay_lai_chan_doan=n_rerun, giay_may=seconds, so_tien_trinh=n_proc)
+    def pha_start(name):
+        """Append the live notes entry of a phase at its start (C3-39): it exists with
+        trang_thai 'dung_giua_pha' and moc_bat_dau while the phase runs."""
+        e = dict(pha=name, controller='all', n_bo_gain={c: None for c in controllers},
+                 n_luot_ke_hoach=None, n_luot_thuc=0, n_luot_thuc_theo_controller=None,
+                 n_chay_lai_chan_doan=0, n_luot_tong=0, giay_may=None, so_tien_trinh=n_proc,
+                 trang_thai='dung_giua_pha', moc_bat_dau=_stamp(), moc_ket_thuc=None)
+        pha.append(e)
+        live['e'], live['t0'] = e, _clock()
+        return e
 
-    # ── item 10: the S0 try-out (sealed/sangloc_thu/) ──
-    rec0, ev0, score0_rows, sc0, t_s0, n_run0, n_rerun0 = _set_phase(
-        'S0', n0, sl_thu, work_thu, os.path.join(sl_thu, 'tien_trinh_S0.log'), controllers, gate,
-        mu_levels, W, screen, n_proc, dll)
-    n_used0 = len(rec0[controllers[0]]) if controllers else 0
-    thr0 = {ctrl: {m: threshold([sc0[ctrl][r['row']][m] for r in rec0[ctrl]]) for m in MODES}
-            for ctrl in controllers}          # S0's own thresholds: for q and the CSV only
-    for r in score0_rows:
-        t_ = thr0[r['controller']][r['che_do']]
-        r['thuoc_C'] = in_C(r, t_) if t_ is not None else ''
-        r['trong_hop'] = r['hop'] = ''
-    s3.write_csv(os.path.join(sl_thu, 'score_S0.csv'), score0_rows, SCORE_COLS)
-    q_num, s0_over, dem0 = {}, False, {}
-    for ctrl in controllers:
-        n_ngoai0 = sum(r['flag'] == 'ngoai_bang' for r in rec0[ctrl])
-        dem0[ctrl] = dict(n_ngoai_bang=n_ngoai0, che_do=_mode_stats(rec0[ctrl], sc0[ctrl]))
-        for mode in MODES:
-            st = dem0[ctrl]['che_do'][mode]
-            s0_over = s0_over or over_error_limit(st['n_khong_phan_loai'], st['n_bo_gain'])
-            q_num[(ctrl, mode)] = sum(in_C(sc0[ctrl][r['row']][mode], thr0[ctrl][mode])
-                                      for r in rec0[ctrl])
-            dem0[ctrl]['che_do'][mode]['n_trong_C'] = q_num[(ctrl, mode)]
-    sd = sample_size(q_num, n_used0, t_s0, s0_over, tool_n=tool_check['n'] if tool_check else None)
-    write_json(os.path.join(sl_thu, 'so_dem.json'),
-               dict(sd, dem=dem0, kiem_cong_cu=tool_check,
-                    nhanh_dieu_10='chay' if sd['chay'] else 'khong_chay_sang_loc'))
-    pha.append(dict(pha_entry('S0', n_run0, n_rerun0, t_s0),
-                    n_bo_gain={c: len(rec0[c]) for c in controllers},
-                    n_luot_thuc_theo_controller={c: sum(e.get('attempt') == 1
-                                                        for rows in ev0[c].values() for e in rows)
-                                                 for c in controllers}))
+    def pha_end(state='xong', seconds=None):
+        """Close the live phase entry: giay_may (or the given seconds), trang_thai,
+        moc_ket_thuc, n_luot_tong. A no-op when no phase is live."""
+        e = live.pop('e', None)
+        if e is None:
+            return
+        t0 = live.pop('t0')
+        e.update(giay_may=_clock() - t0 if seconds is None else seconds, trang_thai=state,
+                 moc_ket_thuc=_stamp(), n_luot_tong=e['n_luot_thuc'] + e['n_chay_lai_chan_doan'])
 
-    def result_doc(reasons_by):
-        """ket_qua.json skeleton (item 11); reasons_by: {ctrl: [reason strings]}."""
-        doc = dict(N=sd['N'], N_da_dung=0, m_min=M_MIN)
+    try:
+        # ── item 10: the S0 try-out (sealed/sangloc_thu/) ──
+        e0 = pha_start('S0')
+        rec0, ev0, score0_rows, sc0, _s0, n_run0, n_rerun0 = _set_phase(
+            'S0', n0, sl_thu, work_thu, os.path.join(sl_thu, 'tien_trinh_S0.log'), controllers, gate,
+            mu_levels, W, screen, n_proc, dll, entry=e0)
+        n_used0 = len(rec0[controllers[0]]) if controllers else 0
+        thr0 = {ctrl: {m: threshold([sc0[ctrl][r['row']][m] for r in rec0[ctrl]]) for m in MODES}
+                for ctrl in controllers}          # S0's own thresholds: for q and the CSV only
+        for r in score0_rows:
+            t_ = thr0[r['controller']][r['che_do']]
+            r['thuoc_C'] = in_C(r, t_) if t_ is not None else ''
+            r['trong_hop'] = r['hop'] = ''
+        s3.write_csv(os.path.join(sl_thu, 'score_S0.csv'), score0_rows, SCORE_COLS)
+        q_num, s0_over, dem0 = {}, False, {}
         for ctrl in controllers:
-            reasons = reasons_by.get(ctrl, [])
-            nhanh = 'nhan' if not reasons else next(
-                b for b in BRANCH_PRIORITY if any(r.startswith(b) for r in reasons))
-            doc[ctrl] = dict(nhanh=nhanh, trang_thai='hoan_tat', ly_do=reasons,
-                             nguon_mien='sang_loc' if nhanh == 'nhan' else 'du_phong',
-                             nguong={m: None for m in MODES},
-                             hop={b: None for b in ('B_giua', 'B_ba_mu', 'B1', 'B2')}, mien=None,
-                             che_do={m: dict(kiem_duoc_nhan_o_lan=None, can=None,
-                                             tap={s2: dict(n_bo_gain=0, n_phan_loai_duoc=0, n_kha_thi=0,
-                                                           n_thuoc_C=None, m=None, k=None,
-                                                           n_C_lop_ngoai=None)
-                                                  for s2 in SCREEN_SETS})
-                                     for m in MODES},
-                             n_ngoai_bang={s2: 0 for s2 in SCREEN_SETS},
-                             ti_le_kha_thi_trong_mien={m: None for m in MODES},
-                             n_cap_trung_float32=0, kiem_tat_dinh=None)
-        return doc
-
-    if not sd['chay']:
-        write_json(os.path.join(sl_dir, 'ket_qua.json'),
-                   result_doc({c: list(sd['ly_do']) for c in controllers}))
-        return dict(mien={c: None for c in controllers},
-                    nhanh={c: 'khong_chay_sang_loc' for c in controllers},
-                    ly_do={c: list(sd['ly_do']) for c in controllers}, N_da_dung=0, pha=pha)
-
-    N = sd['N_da_dung']
-    for s_name in SCREEN_SETS:
-        if N > len(screen[s_name]):
-            raise s3.S03Stop(f'N = {N} is more than the {len(screen[s_name])} rows of {s_name} '
-                             '(S03 3.1b item 3)')
-
-    # ── S1: thresholds and the boxes (item 6-7) ──
-    rec1, ev1, score1_rows, sc1, sec1, n_run1, n_rerun1 = _set_phase(
-        'S1', N, sl_dir, work_sl, os.path.join(sl_dir, 'tien_trinh_S1.log'), controllers, gate,
-        mu_levels, W, screen, n_proc, dll)
-    pha.append(dict(pha_entry('S1', n_run1, n_rerun1, sec1),
-                    n_bo_gain={c: len(rec1[c]) for c in controllers},
-                    n_luot_thuc_theo_controller={c: sum(e.get('attempt') == 1
-                                                        for rows in ev1[c].values() for e in rows)
-                                                 for c in controllers}))
-    thr = {ctrl: {m: threshold([sc1[ctrl][r['row']][m] for r in rec1[ctrl]]) for m in MODES}
-           for ctrl in controllers}
-    gains1 = {ctrl: {r['row']: r['g'] for r in rec1[ctrl]} for ctrl in controllers}
-    boxes = {}
-    for ctrl in controllers:
-        if all(thr[ctrl].values()):
-            b_giua = box_from_points([r['g'] for r in rec1[ctrl]
-                                      if in_C(sc1[ctrl][r['row']]['giua'], thr[ctrl]['giua'])],
-                                     W[ctrl])
-            b_ba = box_from_points([r['g'] for r in rec1[ctrl]
-                                    if in_C(sc1[ctrl][r['row']]['ba_mu'], thr[ctrl]['ba_mu'])],
-                                   W[ctrl])
-            boxes[ctrl] = dict(B_giua=b_giua, B_ba_mu=b_ba, B1=hull(b_giua, b_ba))
-        else:                                       # a mode without threshold: no box (item 7)
-            boxes[ctrl] = dict(B_giua=None, B_ba_mu=None, B1=None)
-    for r in score1_rows:
-        t_ = thr[r['controller']][r['che_do']]
-        r['thuoc_C'] = in_C(r, t_) if t_ is not None else ''
-        b = boxes[r['controller']]['B1']
-        r['trong_hop'] = in_box(gains1[r['controller']][r['row']], b) if b is not None else ''
-        r['hop'] = 'B1' if b is not None else ''
-    s3.write_csv(os.path.join(sl_dir, 'score_S1.csv'), score1_rows, SCORE_COLS)
-    khoa = dict(N=N, sha256={n: s3.sha256_file(os.path.join(sl_dir, n))
-                             for n in ('points_S1.csv', 'evals_S1.csv', 'score_S1.csv')})
-    for ctrl in controllers:
-        khoa[ctrl] = dict(nguong={m: thr[ctrl][m] for m in MODES},
-                          n_thuoc_C={m: (sum(in_C(sc1[ctrl][r['row']][m], thr[ctrl][m])
-                                             for r in rec1[ctrl])
-                                         if thr[ctrl][m] is not None else None)
-                                     for m in MODES},
-                          n_ngoai_bang=sum(r['flag'] == 'ngoai_bang' for r in rec1[ctrl]),
-                          B_giua=_box_json(boxes[ctrl]['B_giua']),
-                          B_ba_mu=_box_json(boxes[ctrl]['B_ba_mu']), B1=_box_json(boxes[ctrl]['B1']),
-                          dem=_mode_stats(rec1[ctrl], sc1[ctrl]),
-                          hon_10_phan_tram={m: over_error_limit(
-                              _mode_stats(rec1[ctrl], sc1[ctrl])[m]['n_khong_phan_loai'],
-                              len(rec1[ctrl])) for m in MODES})
-    write_json(os.path.join(sl_dir, 'khoa_S1.json'), khoa)     # on disk before the first S2 job
-
-    # ── S2: check 1 against B1, then B2 (item 8) ──
-    rec2, ev2, score2_rows, sc2, sec2, n_run2, n_rerun2 = _set_phase(
-        'S2', N, sl_dir, work_sl, os.path.join(sl_dir, 'tien_trinh_S2.log'), controllers, gate,
-        mu_levels, W, screen, n_proc, dll)
-    pha.append(dict(pha_entry('S2', n_run2, n_rerun2, sec2),
-                    n_bo_gain={c: len(rec2[c]) for c in controllers},
-                    n_luot_thuc_theo_controller={c: sum(e.get('attempt') == 1
-                                                        for rows in ev2[c].values() for e in rows)
-                                                 for c in controllers}))
-    gains2 = {ctrl: {r['row']: r['g'] for r in rec2[ctrl]} for ctrl in controllers}
-    kiem1, B2 = {}, {}
-    for ctrl in controllers:
-        b1 = boxes[ctrl]['B1']
-        per = {}
-        if b1 is not None:
+            n_ngoai0 = sum(r['flag'] == 'ngoai_bang' for r in rec0[ctrl])
+            dem0[ctrl] = dict(n_ngoai_bang=n_ngoai0, che_do=_mode_stats(rec0[ctrl], sc0[ctrl]))
             for mode in MODES:
-                recs = [sc2[ctrl][r['row']][mode] for r in rec2[ctrl]]
-                m, k = check_counts(recs, [r['g'] for r in rec2[ctrl]], thr[ctrl][mode], b1)
-                per[mode] = dict(m=m, k=k, duoc_nhan=accepted(m, k), can=bound(m, k))
-        else:
-            # item 11: no box -> k null; a mode with a threshold still reports its count in C_j
-            per = {m: dict(m=(sum(in_C(sc2[ctrl][r['row']][m], thr[ctrl][m]) for r in rec2[ctrl])
-                              if thr[ctrl][m] is not None else None),
-                           k=None, duoc_nhan=None, can=None) for m in MODES}
-        kiem1[ctrl] = per
-        if b1 is not None and not all(per[m]['duoc_nhan'] for m in MODES):
-            out_pts = [r['g'] for r in rec2[ctrl]
-                       if any(in_C(sc2[ctrl][r['row']][m], thr[ctrl][m]) and
-                              not in_box(r['g'], b1) for m in MODES)]
-            B2[ctrl] = extend_box(b1, out_pts, W[ctrl])
-        else:
-            B2[ctrl] = b1
-        boxes[ctrl]['B2'] = B2[ctrl]
-    for r in score2_rows:
-        t_ = thr[r['controller']][r['che_do']]
-        r['thuoc_C'] = in_C(r, t_) if t_ is not None else ''
-        b = boxes[r['controller']]['B1']
-        r['trong_hop'] = in_box(gains2[r['controller']][r['row']], b) if b is not None else ''
-        r['hop'] = 'B1' if b is not None else ''
-    s3.write_csv(os.path.join(sl_dir, 'score_S2.csv'), score2_rows, SCORE_COLS)
-    kiem = dict(N=N, sha256={n: s3.sha256_file(os.path.join(sl_dir, n))
-                             for n in ('points_S2.csv', 'evals_S2.csv', 'score_S2.csv')})
-    for ctrl in controllers:
-        kiem[ctrl] = dict(lan_1=kiem1[ctrl], B2=_box_json(B2[ctrl]))
-    write_json(os.path.join(sl_dir, 'kiem_S2.json'), kiem)     # always, before S2b starts
+                st = dem0[ctrl]['che_do'][mode]
+                s0_over = s0_over or over_error_limit(st['n_khong_phan_loai'], st['n_bo_gain'])
+                q_num[(ctrl, mode)] = sum(in_C(sc0[ctrl][r['row']][mode], thr0[ctrl][mode])
+                                          for r in rec0[ctrl])
+                dem0[ctrl]['che_do'][mode]['n_trong_C'] = q_num[(ctrl, mode)]
+        t_s0 = _clock() - live['t0']          # the whole S0 phase: run, classify, write, score
+        sd = sample_size(q_num, n_used0, t_s0, s0_over, tool_n=tool_check['n'] if tool_check else None)
+        write_json(os.path.join(sl_thu, 'so_dem.json'),
+                   dict(sd, dem=dem0, kiem_cong_cu=tool_check,
+                        nhanh_dieu_10='chay' if sd['chay'] else 'khong_chay_sang_loc'))
+        write_json(os.path.join(sl_thu, 'loi_S0.json'),     # D2A-3: always when S0 ended
+                   loi_s0_doc(controllers, rec0, ev0, dem0))
+        pha_end(seconds=t_s0)
 
-    # ── S2b: check 2 against B2 (item 8) ──
-    rec3, ev3, score3_rows, sc3, sec3, n_run3, n_rerun3 = _set_phase(
-        'S2b', N, sl_dir, work_sl, os.path.join(sl_dir, 'tien_trinh_S2b.log'), controllers, gate,
-        mu_levels, W, screen, n_proc, dll)
-    pha.append(dict(pha_entry('S2b', n_run3, n_rerun3, sec3),
-                    n_bo_gain={c: len(rec3[c]) for c in controllers},
-                    n_luot_thuc_theo_controller={c: sum(e.get('attempt') == 1
-                                                        for rows in ev3[c].values() for e in rows)
-                                                 for c in controllers}))
-    gains3 = {ctrl: {r['row']: r['g'] for r in rec3[ctrl]} for ctrl in controllers}
-    kiem2, nhan_mode = {}, {}
-    for ctrl in controllers:
-        per = {}
-        for mode in MODES:
-            acc1 = kiem1[ctrl][mode]['duoc_nhan']
-            if B2[ctrl] is None:
-                per[mode] = dict(m=(sum(in_C(sc3[ctrl][r['row']][mode], thr[ctrl][mode])
-                                        for r in rec3[ctrl])
-                                    if thr[ctrl][mode] is not None else None),
-                                 k=None, vai_tro=None, duoc_nhan=None, can=None)
-                nhan_mode.setdefault(ctrl, {})[mode] = None
-                continue
-            recs = [sc3[ctrl][r['row']][mode] for r in rec3[ctrl]]
-            m, k = check_counts(recs, [r['g'] for r in rec3[ctrl]], thr[ctrl][mode], B2[ctrl])
-            if acc1:
-                per[mode] = dict(m=m, k=k, vai_tro='chi_bao_cao', duoc_nhan=True, can=bound(m, k))
-                nhan_mode.setdefault(ctrl, {})[mode] = 1
+        def result_doc(reasons_by):
+            """ket_qua.json skeleton (item 11); reasons_by: {ctrl: [reason strings]}."""
+            doc = dict(N=sd['N'], N_da_dung=0, m_min=M_MIN)
+            for ctrl in controllers:
+                reasons = reasons_by.get(ctrl, [])
+                nhanh = 'nhan' if not reasons else next(
+                    b for b in BRANCH_PRIORITY if any(r.startswith(b) for r in reasons))
+                doc[ctrl] = dict(nhanh=nhanh, trang_thai='hoan_tat', ly_do=reasons,
+                                 nguon_mien='sang_loc' if nhanh == 'nhan' else 'du_phong',
+                                 nguong={m: None for m in MODES},
+                                 hop={b: None for b in ('B_giua', 'B_ba_mu', 'B1', 'B2')}, mien=None,
+                                 che_do={m: dict(kiem_duoc_nhan_o_lan=None, can=None,
+                                                 tap={s2: dict(n_bo_gain=0, n_phan_loai_duoc=0, n_kha_thi=0,
+                                                               n_thuoc_C=None, m=None, k=None,
+                                                               n_C_lop_ngoai=None)
+                                                      for s2 in SCREEN_SETS})
+                                         for m in MODES},
+                                 n_ngoai_bang={s2: 0 for s2 in SCREEN_SETS},
+                                 ti_le_kha_thi_trong_mien={m: None for m in MODES},
+                                 n_cap_trung_float32=0, kiem_tat_dinh=None)
+            return doc
+
+        if not sd['chay']:
+            write_json(os.path.join(sl_dir, 'ket_qua.json'),
+                       result_doc({c: list(sd['ly_do']) for c in controllers}))
+            return dict(mien={c: None for c in controllers},
+                        nhanh={c: 'khong_chay_sang_loc' for c in controllers},
+                        ly_do={c: list(sd['ly_do']) for c in controllers}, N_da_dung=0, pha=pha)
+
+        N = sd['N_da_dung']
+        for s_name in SCREEN_SETS:
+            if N > len(screen[s_name]):
+                raise s3.S03Stop(f'N = {N} is more than the {len(screen[s_name])} rows of {s_name} '
+                                 '(S03 3.1b item 3)')
+
+        # ── S1: thresholds and the boxes (item 6-7) ──
+        e1 = pha_start('S1')
+        rec1, ev1, score1_rows, sc1, sec1, n_run1, n_rerun1 = _set_phase(
+            'S1', N, sl_dir, work_sl, os.path.join(sl_dir, 'tien_trinh_S1.log'), controllers, gate,
+            mu_levels, W, screen, n_proc, dll, entry=e1)
+        thr = {ctrl: {m: threshold([sc1[ctrl][r['row']][m] for r in rec1[ctrl]]) for m in MODES}
+               for ctrl in controllers}
+        gains1 = {ctrl: {r['row']: r['g'] for r in rec1[ctrl]} for ctrl in controllers}
+        boxes = {}
+        for ctrl in controllers:
+            if all(thr[ctrl].values()):
+                b_giua = box_from_points([r['g'] for r in rec1[ctrl]
+                                          if in_C(sc1[ctrl][r['row']]['giua'], thr[ctrl]['giua'])],
+                                         W[ctrl])
+                b_ba = box_from_points([r['g'] for r in rec1[ctrl]
+                                        if in_C(sc1[ctrl][r['row']]['ba_mu'], thr[ctrl]['ba_mu'])],
+                                       W[ctrl])
+                boxes[ctrl] = dict(B_giua=b_giua, B_ba_mu=b_ba, B1=hull(b_giua, b_ba))
+            else:                                       # a mode without threshold: no box (item 7)
+                boxes[ctrl] = dict(B_giua=None, B_ba_mu=None, B1=None)
+        for r in score1_rows:
+            t_ = thr[r['controller']][r['che_do']]
+            r['thuoc_C'] = in_C(r, t_) if t_ is not None else ''
+            b = boxes[r['controller']]['B1']
+            r['trong_hop'] = in_box(gains1[r['controller']][r['row']], b) if b is not None else ''
+            r['hop'] = 'B1' if b is not None else ''
+        s3.write_csv(os.path.join(sl_dir, 'score_S1.csv'), score1_rows, SCORE_COLS)
+        khoa = dict(N=N, sha256={n: s3.sha256_file(os.path.join(sl_dir, n))
+                                 for n in ('points_S1.csv', 'evals_S1.csv', 'score_S1.csv')})
+        for ctrl in controllers:
+            khoa[ctrl] = dict(nguong={m: thr[ctrl][m] for m in MODES},
+                              n_thuoc_C={m: (sum(in_C(sc1[ctrl][r['row']][m], thr[ctrl][m])
+                                                 for r in rec1[ctrl])
+                                             if thr[ctrl][m] is not None else None)
+                                         for m in MODES},
+                              n_ngoai_bang=sum(r['flag'] == 'ngoai_bang' for r in rec1[ctrl]),
+                              B_giua=_box_json(boxes[ctrl]['B_giua']),
+                              B_ba_mu=_box_json(boxes[ctrl]['B_ba_mu']), B1=_box_json(boxes[ctrl]['B1']),
+                              dem=_mode_stats(rec1[ctrl], sc1[ctrl]),
+                              hon_10_phan_tram={m: over_error_limit(
+                                  _mode_stats(rec1[ctrl], sc1[ctrl])[m]['n_khong_phan_loai'],
+                                  len(rec1[ctrl])) for m in MODES})
+        write_json(os.path.join(sl_dir, 'khoa_S1.json'), khoa)     # on disk before the first S2 job
+        pha_end()
+
+        # ── S2: check 1 against B1, then B2 (item 8) ──
+        e2 = pha_start('S2')
+        rec2, ev2, score2_rows, sc2, sec2, n_run2, n_rerun2 = _set_phase(
+            'S2', N, sl_dir, work_sl, os.path.join(sl_dir, 'tien_trinh_S2.log'), controllers, gate,
+            mu_levels, W, screen, n_proc, dll, entry=e2)
+        gains2 = {ctrl: {r['row']: r['g'] for r in rec2[ctrl]} for ctrl in controllers}
+        kiem1, B2 = {}, {}
+        for ctrl in controllers:
+            b1 = boxes[ctrl]['B1']
+            per = {}
+            if b1 is not None:
+                for mode in MODES:
+                    recs = [sc2[ctrl][r['row']][mode] for r in rec2[ctrl]]
+                    m, k = check_counts(recs, [r['g'] for r in rec2[ctrl]], thr[ctrl][mode], b1)
+                    per[mode] = dict(m=m, k=k, duoc_nhan=accepted(m, k), can=bound(m, k))
             else:
-                acc2 = accepted(m, k)
-                per[mode] = dict(m=m, k=k, vai_tro='quyet_dinh', duoc_nhan=acc2, can=bound(m, k))
-                nhan_mode.setdefault(ctrl, {})[mode] = 2 if acc2 else None
-        kiem2[ctrl] = per
-    for r in score3_rows:
-        t_ = thr[r['controller']][r['che_do']]
-        r['thuoc_C'] = in_C(r, t_) if t_ is not None else ''
-        b = B2[r['controller']]
-        r['trong_hop'] = in_box(gains3[r['controller']][r['row']], b) if b is not None else ''
-        r['hop'] = 'B2' if b is not None else ''
-    s3.write_csv(os.path.join(sl_dir, 'score_S2b.csv'), score3_rows, SCORE_COLS)
-    kiem_b = dict(N=N, sha256={n: s3.sha256_file(os.path.join(sl_dir, n))
-                               for n in ('points_S2b.csv', 'evals_S2b.csv', 'score_S2b.csv')})
-    for ctrl in controllers:
-        kiem_b[ctrl] = dict(lan_2=kiem2[ctrl])
-    write_json(os.path.join(sl_dir, 'kiem_S2b.json'), kiem_b)
+                # item 11: no box -> k null; a mode with a threshold still reports its count in C_j
+                per = {m: dict(m=(sum(in_C(sc2[ctrl][r['row']][m], thr[ctrl][m]) for r in rec2[ctrl])
+                                  if thr[ctrl][m] is not None else None),
+                               k=None, duoc_nhan=None, can=None) for m in MODES}
+            kiem1[ctrl] = per
+            if b1 is not None and not all(per[m]['duoc_nhan'] for m in MODES):
+                out_pts = [r['g'] for r in rec2[ctrl]
+                           if any(in_C(sc2[ctrl][r['row']][m], thr[ctrl][m]) and
+                                  not in_box(r['g'], b1) for m in MODES)]
+                B2[ctrl] = extend_box(b1, out_pts, W[ctrl])
+            else:
+                B2[ctrl] = b1
+            boxes[ctrl]['B2'] = B2[ctrl]
+        for r in score2_rows:
+            t_ = thr[r['controller']][r['che_do']]
+            r['thuoc_C'] = in_C(r, t_) if t_ is not None else ''
+            b = boxes[r['controller']]['B1']
+            r['trong_hop'] = in_box(gains2[r['controller']][r['row']], b) if b is not None else ''
+            r['hop'] = 'B1' if b is not None else ''
+        s3.write_csv(os.path.join(sl_dir, 'score_S2.csv'), score2_rows, SCORE_COLS)
+        kiem = dict(N=N, sha256={n: s3.sha256_file(os.path.join(sl_dir, n))
+                                 for n in ('points_S2.csv', 'evals_S2.csv', 'score_S2.csv')})
+        for ctrl in controllers:
+            kiem[ctrl] = dict(lan_1=kiem1[ctrl], B2=_box_json(B2[ctrl]))
+        write_json(os.path.join(sl_dir, 'kiem_S2.json'), kiem)     # always, before S2b starts
+        pha_end()
 
-    # ── item 12: the determinism check of the step ──
-    scs = {'S1': sc1, 'S2': sc2, 'S2b': sc3}
-    rec_sets = {'S1': (rec1, ev1), 'S2': (rec2, ev2), 'S2b': (rec3, ev3)}
-    det_rows, det_chosen, det_st = determinism_check(
-        'S1', rec1, ev1, dll, gate, mu_levels, work_sl, n_proc,
-        os.path.join(sl_dir, 'tien_trinh_kiem_tat_dinh.log'))
-    s3.write_csv(os.path.join(sl_dir, 'determinism_sangloc.csv'), det_rows, DET_COLS)
-    if not all(r['log_arrays_equal'] and r['fields_equal'] for r in det_rows):
-        raise s3.S03Stop('determinism check of the screening step failed (S03 3.1b item 12)')
-    pha.append(dict(pha_entry('kiem_tat_dinh_sang_loc', det_st['n_luot_thuc'],
-                              det_st['n_chay_lai'], det_st['seconds']),
-                    n_bo_gain={c: len(det_chosen.get(c, [])) for c in controllers},
-                    n_luot_thuc_theo_controller=None))
+        # ── S2b: check 2 against B2 (item 8) ──
+        e3 = pha_start('S2b')
+        rec3, ev3, score3_rows, sc3, sec3, n_run3, n_rerun3 = _set_phase(
+            'S2b', N, sl_dir, work_sl, os.path.join(sl_dir, 'tien_trinh_S2b.log'), controllers, gate,
+            mu_levels, W, screen, n_proc, dll, entry=e3)
+        gains3 = {ctrl: {r['row']: r['g'] for r in rec3[ctrl]} for ctrl in controllers}
+        kiem2, nhan_mode = {}, {}
+        for ctrl in controllers:
+            per = {}
+            for mode in MODES:
+                acc1 = kiem1[ctrl][mode]['duoc_nhan']
+                if B2[ctrl] is None:
+                    per[mode] = dict(m=(sum(in_C(sc3[ctrl][r['row']][mode], thr[ctrl][mode])
+                                            for r in rec3[ctrl])
+                                        if thr[ctrl][mode] is not None else None),
+                                     k=None, vai_tro=None, duoc_nhan=None, can=None)
+                    nhan_mode.setdefault(ctrl, {})[mode] = None
+                    continue
+                recs = [sc3[ctrl][r['row']][mode] for r in rec3[ctrl]]
+                m, k = check_counts(recs, [r['g'] for r in rec3[ctrl]], thr[ctrl][mode], B2[ctrl])
+                if acc1:
+                    per[mode] = dict(m=m, k=k, vai_tro='chi_bao_cao', duoc_nhan=True, can=bound(m, k))
+                    nhan_mode.setdefault(ctrl, {})[mode] = 1
+                else:
+                    acc2 = accepted(m, k)
+                    per[mode] = dict(m=m, k=k, vai_tro='quyet_dinh', duoc_nhan=acc2, can=bound(m, k))
+                    nhan_mode.setdefault(ctrl, {})[mode] = 2 if acc2 else None
+            kiem2[ctrl] = per
+        for r in score3_rows:
+            t_ = thr[r['controller']][r['che_do']]
+            r['thuoc_C'] = in_C(r, t_) if t_ is not None else ''
+            b = B2[r['controller']]
+            r['trong_hop'] = in_box(gains3[r['controller']][r['row']], b) if b is not None else ''
+            r['hop'] = 'B2' if b is not None else ''
+        s3.write_csv(os.path.join(sl_dir, 'score_S2b.csv'), score3_rows, SCORE_COLS)
+        kiem_b = dict(N=N, sha256={n: s3.sha256_file(os.path.join(sl_dir, n))
+                                   for n in ('points_S2b.csv', 'evals_S2b.csv', 'score_S2b.csv')})
+        for ctrl in controllers:
+            kiem_b[ctrl] = dict(lan_2=kiem2[ctrl])
+        write_json(os.path.join(sl_dir, 'kiem_S2b.json'), kiem_b)
+        pha_end()
 
-    # ── item 11: ket_qua.json, always when the step ends ──
-    reasons_by, mien = {}, {}
-    for ctrl in controllers:
-        reasons = []
-        for mode in MODES:
-            if thr[ctrl][mode] is None:
-                reasons.append(f'du_phong_khong_nguong: che do {mode} has no threshold '
-                               '(S1 has no feasible gain set in it, S03 3.1b item 6)')
-        for s_name, (recs_s, _) in rec_sets.items():
+        # ── item 12: the determinism check of the step ──
+        scs = {'S1': sc1, 'S2': sc2, 'S2b': sc3}
+        rec_sets = {'S1': (rec1, ev1), 'S2': (rec2, ev2), 'S2b': (rec3, ev3)}
+        e_det = pha_start('kiem_tat_dinh_sang_loc')
+        det_rows, det_chosen, det_st = determinism_check(
+            'S1', rec1, ev1, dll, gate, mu_levels, work_sl, n_proc,
+            os.path.join(sl_dir, 'tien_trinh_kiem_tat_dinh.log'))
+        e_det['n_luot_thuc'], e_det['n_chay_lai_chan_doan'] = \
+            det_st['n_luot_thuc'], det_st['n_chay_lai']
+        e_det['n_bo_gain'] = {c: len(det_chosen.get(c, [])) for c in controllers}
+        s3.write_csv(os.path.join(sl_dir, 'determinism_sangloc.csv'), det_rows, DET_COLS)
+        pha_end()                               # closed before the "determinism failed" stop
+        if not all(r['log_arrays_equal'] and r['fields_equal'] for r in det_rows):
+            raise s3.S03Stop('determinism check of the screening step failed (S03 3.1b item 12)')
+
+        # ── item 11: ket_qua.json, always when the step ends ──
+        reasons_by, mien = {}, {}
+        for ctrl in controllers:
+            reasons = []
             for mode in MODES:
-                st = _mode_stats(recs_s[ctrl], scs[s_name][ctrl])[mode]
-                if over_error_limit(st['n_khong_phan_loai'], st['n_bo_gain']):
-                    reasons.append(f'du_phong_loi_chay: {s_name} {mode}: '
-                                   f'{st["n_khong_phan_loai"]}/{st["n_bo_gain"]} gain sets '
-                                   'unclassifiable (> 10 %, S03 3.1b item 5)')
-        if boxes[ctrl]['B1'] is not None:
-            for mode in MODES:
-                if nhan_mode[ctrl][mode] is None:
-                    reasons.append(f'du_phong_kiem: che do {mode} was accepted by neither check '
-                                   f'(k > 0 or m < {M_MIN}, S03 3.1b item 8)')
-        reasons_by[ctrl] = reasons
-        mien[ctrl] = B2[ctrl] if not reasons else None
-    doc = result_doc(reasons_by)
-    doc['N_da_dung'] = N
-    for ctrl in controllers:
-        c = doc[ctrl]
-        c['nguong'] = thr[ctrl]
-        for b in ('B_giua', 'B_ba_mu', 'B1', 'B2'):
-            c['hop'][b] = _box_json(boxes[ctrl][b])
-        c['mien'] = _box_json(mien[ctrl])
-        c['n_ngoai_bang'] = {s_name: sum(r['flag'] == 'ngoai_bang' for r in rec_sets[s_name][0][ctrl])
-                             for s_name in SCREEN_SETS}
-        all_recs = [(r, sc_, s_name) for s_name, (recs_s, _) in rec_sets.items()
-                    for r in recs_s[ctrl]
-                    for sc_ in [(sc1 if s_name == 'S1' else sc2 if s_name == 'S2' else sc3)[ctrl]]]
-        c['n_cap_trung_float32'] = sum(
-            n_ * (n_ - 1) // 2 for n_ in Counter(
-                tuple(float(np.float32(r['g'][f_])) for f_ in s3.FACTORS[ctrl])
-                for r, _, _ in all_recs).values() if n_ > 1)
-        dom = mien[ctrl] if mien[ctrl] is not None else quet[ctrl]
-        for mode in MODES:
-            cm = c['che_do'][mode]
-            cm['kiem_duoc_nhan_o_lan'] = nhan_mode[ctrl][mode]
-            check_m = kiem1[ctrl][mode] if nhan_mode[ctrl][mode] == 1 else kiem2[ctrl][mode]
-            cm['can'] = check_m['can'] if nhan_mode[ctrl][mode] is not None else None
+                if thr[ctrl][mode] is None:
+                    reasons.append(f'du_phong_khong_nguong: che do {mode} has no threshold '
+                                   '(S1 has no feasible gain set in it, S03 3.1b item 6)')
             for s_name, (recs_s, _) in rec_sets.items():
-                sc_s = (sc1 if s_name == 'S1' else sc2 if s_name == 'S2' else sc3)[ctrl]
-                st = _mode_stats(recs_s[ctrl], sc_s)
-                t_ = thr[ctrl][mode]
-                box = boxes[ctrl]['B1'] if s_name != 'S2b' else B2[ctrl]
-                n_c = sum(in_C(sc_s[r['row']][mode], t_) for r in recs_s[ctrl]) \
-                    if t_ is not None else None
-                m_ = n_c                                            # item 11: m = count in C_j
-                k_ = (sum(not in_box(r['g'], box) for r in recs_s[ctrl]
-                          if in_C(sc_s[r['row']][mode], t_))
-                      if box is not None else None)                 # no box -> k null
-                layer = sum(1 for r in recs_s[ctrl]
-                            if in_C(sc_s[r['row']][mode], t_) and any(
-                                r['g'][f_] <= W[ctrl][f_][1] or r['g'][f_] >= W[ctrl][f_][-2]
-                                for f_ in s3.FACTORS[ctrl])) if t_ is not None else None
-                cm['tap'][s_name] = dict(n_bo_gain=st[mode]['n_bo_gain'],
-                                         n_phan_loai_duoc=st[mode]['n_phan_loai_duoc'],
-                                         n_kha_thi=st[mode]['n_kha_thi'],
-                                         n_thuoc_C=n_c, m=m_, k=k_, n_C_lop_ngoai=layer,
-                                         can=bound(m_, k_) if m_ is not None and k_ is not None
-                                         else None)
-            inside = [r for r, _, _ in all_recs if in_box(r['g'], dom)]
-            feas = [r for r, sc_, _ in all_recs
-                    if in_box(r['g'], dom) and sc_[r['row']][mode]['kha_thi']]
-            c['ti_le_kha_thi_trong_mien'][mode] = dict(
-                n_trong=len(inside), n_kha_thi=len(feas),
-                ti_le=(len(feas) / len(inside)) if inside else None)
-        c['kiem_tat_dinh'] = dict(n_dong=len(det_chosen.get(ctrl, [])),
-                                  dong=list(det_chosen.get(ctrl, [])),
-                                  ket_qua='dat' if det_chosen.get(ctrl)
-                                  else 'bo_qua_khong_co_dong')
-    write_json(os.path.join(sl_dir, 'ket_qua.json'), doc)
-    return dict(mien=mien, nhanh={c: doc[c]['nhanh'] for c in controllers},
-                ly_do={c: doc[c]['ly_do'] for c in controllers}, N_da_dung=N, pha=pha)
+                for mode in MODES:
+                    st = _mode_stats(recs_s[ctrl], scs[s_name][ctrl])[mode]
+                    if over_error_limit(st['n_khong_phan_loai'], st['n_bo_gain']):
+                        reasons.append(f'du_phong_loi_chay: {s_name} {mode}: '
+                                       f'{st["n_khong_phan_loai"]}/{st["n_bo_gain"]} gain sets '
+                                       'unclassifiable (> 10 %, S03 3.1b item 5)')
+            if boxes[ctrl]['B1'] is not None:
+                for mode in MODES:
+                    if nhan_mode[ctrl][mode] is None:
+                        reasons.append(f'du_phong_kiem: che do {mode} was accepted by neither check '
+                                       f'(k > 0 or m < {M_MIN}, S03 3.1b item 8)')
+            reasons_by[ctrl] = reasons
+            mien[ctrl] = B2[ctrl] if not reasons else None
+        doc = result_doc(reasons_by)
+        doc['N_da_dung'] = N
+        for ctrl in controllers:
+            c = doc[ctrl]
+            c['nguong'] = thr[ctrl]
+            for b in ('B_giua', 'B_ba_mu', 'B1', 'B2'):
+                c['hop'][b] = _box_json(boxes[ctrl][b])
+            c['mien'] = _box_json(mien[ctrl])
+            c['n_ngoai_bang'] = {s_name: sum(r['flag'] == 'ngoai_bang' for r in rec_sets[s_name][0][ctrl])
+                                 for s_name in SCREEN_SETS}
+            all_recs = [(r, sc_, s_name) for s_name, (recs_s, _) in rec_sets.items()
+                        for r in recs_s[ctrl]
+                        for sc_ in [(sc1 if s_name == 'S1' else sc2 if s_name == 'S2' else sc3)[ctrl]]]
+            c['n_cap_trung_float32'] = sum(
+                n_ * (n_ - 1) // 2 for n_ in Counter(
+                    tuple(float(np.float32(r['g'][f_])) for f_ in s3.FACTORS[ctrl])
+                    for r, _, _ in all_recs).values() if n_ > 1)
+            dom = mien[ctrl] if mien[ctrl] is not None else quet[ctrl]
+            for mode in MODES:
+                cm = c['che_do'][mode]
+                cm['kiem_duoc_nhan_o_lan'] = nhan_mode[ctrl][mode]
+                check_m = kiem1[ctrl][mode] if nhan_mode[ctrl][mode] == 1 else kiem2[ctrl][mode]
+                cm['can'] = check_m['can'] if nhan_mode[ctrl][mode] is not None else None
+                for s_name, (recs_s, _) in rec_sets.items():
+                    sc_s = (sc1 if s_name == 'S1' else sc2 if s_name == 'S2' else sc3)[ctrl]
+                    st = _mode_stats(recs_s[ctrl], sc_s)
+                    t_ = thr[ctrl][mode]
+                    box = boxes[ctrl]['B1'] if s_name != 'S2b' else B2[ctrl]
+                    n_c = sum(in_C(sc_s[r['row']][mode], t_) for r in recs_s[ctrl]) \
+                        if t_ is not None else None
+                    m_ = n_c                                            # item 11: m = count in C_j
+                    k_ = (sum(not in_box(r['g'], box) for r in recs_s[ctrl]
+                              if in_C(sc_s[r['row']][mode], t_))
+                          if box is not None else None)                 # no box -> k null
+                    layer = sum(1 for r in recs_s[ctrl]
+                                if in_C(sc_s[r['row']][mode], t_) and any(
+                                    r['g'][f_] <= W[ctrl][f_][1] or r['g'][f_] >= W[ctrl][f_][-2]
+                                    for f_ in s3.FACTORS[ctrl])) if t_ is not None else None
+                    cm['tap'][s_name] = dict(n_bo_gain=st[mode]['n_bo_gain'],
+                                             n_phan_loai_duoc=st[mode]['n_phan_loai_duoc'],
+                                             n_kha_thi=st[mode]['n_kha_thi'],
+                                             n_thuoc_C=n_c, m=m_, k=k_, n_C_lop_ngoai=layer,
+                                             can=bound(m_, k_) if m_ is not None and k_ is not None
+                                             else None)
+                inside = [r for r, _, _ in all_recs if in_box(r['g'], dom)]
+                feas = [r for r, sc_, _ in all_recs
+                        if in_box(r['g'], dom) and sc_[r['row']][mode]['kha_thi']]
+                c['ti_le_kha_thi_trong_mien'][mode] = dict(
+                    n_trong=len(inside), n_kha_thi=len(feas),
+                    ti_le=(len(feas) / len(inside)) if inside else None)
+            c['kiem_tat_dinh'] = dict(n_dong=len(det_chosen.get(ctrl, [])),
+                                      dong=list(det_chosen.get(ctrl, [])),
+                                      ket_qua='dat' if det_chosen.get(ctrl)
+                                      else 'bo_qua_khong_co_dong')
+        write_json(os.path.join(sl_dir, 'ket_qua.json'), doc)
+        return dict(mien=mien, nhanh={c: doc[c]['nhanh'] for c in controllers},
+                    ly_do={c: doc[c]['ly_do'] for c in controllers}, N_da_dung=N, pha=pha)
+    except BaseException as exc:
+        pha_end('dung_giua_pha')
+        exc.pha_notes = pha
+        raise
 
 
 def skip_step(sealed, controllers, ly_do):
