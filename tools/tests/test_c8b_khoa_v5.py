@@ -404,7 +404,7 @@ def test_full_hang_m_hang_rad_u_phi_and_lever(monkeypatch):
     dq = dq0 + (5e-4 + dq0) * math.radians(0.4)
     assert p['dq_m'] == pytest.approx(dq) and lever == pytest.approx(5e-4 + dq)
     a3, a5 = math.radians(0.25), math.radians(0.13)
-    want_m = (0.004 + lever * (2 * a3 + 2 * 0.0078 + a5) + 2 * p['thi_sai_m'] + 1e-4 + 2 * dq + 0.0 + 6e-4 + 3e-4
+    want_m = (0.004 + lever * (2 * a3 + 2 * 0.0078 + a5 + 2e-4) + 2 * p['thi_sai_m'] + 1e-4 + 2 * dq + 0.0 + 6e-4 + 3e-4
               + 2e-4 + 5e-4)
     assert v['hang_m'] == pytest.approx(want_m, rel=1e-12)
     assert v['hang_rad'] == pytest.approx(2 * a3 + 2 * 0.0078 + a5 + 2e-4 + 1e-4 + 3e-4, rel=1e-12)
@@ -469,10 +469,10 @@ def test_u_beta_cam_flag_missing_is_thieu(monkeypatch):
     assert ub['K2'] is None and stc['K2'] == 'thieu' and ub['K1'] is not None and any('cap_hong' in w for w in why)
 
 
-def _frames(path, rows):
-    cols = 'idx,t_s,valid,tag_x,tag_y'
-    path.write_text(cols + '\n' + '\n'.join(f'{i},{i / 60},{v},{x},{y}' for i, v, x, y in rows) + '\n',
-                    encoding='utf-8')
+def _frames(path, rows, psi=None):
+    cols = 'idx,t_s,valid,tag_x,tag_y' + (',psi' if psi is not None else '')
+    path.write_text(cols + '\n' + '\n'.join(f'{i},{i / 60},{v},{x},{y}' + (f',{psi}' if psi is not None else '')
+                                             for i, v, x, y in rows) + '\n', encoding='utf-8')
 
 
 def test_u_beta_cam_footprints(monkeypatch):
@@ -512,8 +512,8 @@ def test_cli_dau_chan(tmp_path, monkeypatch):
     a6 = tmp_path / 'a6.json'
     a6.write_text(json.dumps(dict(_src()['a6'], plumb_xy_m=[0.0, 0.0])), encoding='utf-8')
     f12, fW = tmp_path / 'f12.csv', tmp_path / 'fW.csv'
-    _frames(f12, [(10, 1, 0.3, 0.4), (11, 1, 0.3, 0.41), (12, 1, 5.0, 5.0)])
-    _frames(fW, [(7, 1, 0.6, 0.0), (8, 1, 0.61, 0.0)])
+    _frames(f12, [(10, 1, 0.3, 0.4), (11, 1, 0.3, 0.41), (12, 1, 5.0, 5.0)], psi=0.1)
+    _frames(fW, [(7, 1, 0.6, 0.0), (8, 1, 0.61, 0.0)], psi=0.1)
     f2 = tmp_path / 'cua_so.jsonl'
     f2.write_text('\n'.join(json.dumps(r) for r in (
         dict(loai='ref_12b', cho='goc', luot_id='HC_goc_2', frames_sha256=cu.sha256(str(f12)),
@@ -533,3 +533,98 @@ def test_cli_dau_chan(tmp_path, monkeypatch):
     assert d['luot_12b'] == ['HC_goc_2'] and any(n['vai'] == 'khung_12b goc' for n in k['khoa_truoc']['nguon'])
     assert K.main(base + ['--khung-12b', f'K2={f12}', '--out', str(tmp_path / 'x.json')]) == 2   # no K2 window
     assert K.main(['--tb', f'O1-F05={tb}', '--khung-12b', f'goc={f12}', '--out', str(tmp_path / 'y.json')]) == 2
+
+
+A6R = dict(g_b=[-0.018, 0.0034], H_m=2.632, h_m=0.124175, plumb_xy_m=[-0.48, -0.033], side_m=0.1445,
+           h_goc_m=[0.123, 0.1226, 0.1252, 0.1257], u_h_goc_m=[0.013] * 4, mien=dict(v_max_m=0.001, rho_max_m=1.615),
+           eps_g=0.025, eps_g_khong_meo=0.024,
+           session=[dict(session_sha256='s1', cam_tam_m=[-0.518, -0.024, 2.632]),
+                    dict(session_sha256='s2', cam_tam_m=[-0.521, -0.0242, 2.632])])
+
+
+def _win(x, y, s, tan=0.0, doan='doan2', **kw):
+    return dict(T_m=[x, y], S_rad=s, tan_rad=tan, doan=doan, rho_m=math.hypot(x + 0.48, y + 0.033), **kw)
+
+
+def test_a6_hieu_replay_common_noise_cancels():
+    """CODE 23/11 (replay of the difference, design v7 6c): one parameter noise on both windows; the same pose cancels
+    exactly, a 90 deg turn does not, a 1 cm shift nearly cancels; the camera pairs are all taken."""
+    r0 = _win(0.0, 0.0, 0.8)
+    same, lv = K.a6_hieu_replay(A6R, r0, [_win(0.0, 0.0, 0.8)], 0.025, [A6R['session'][0]['cam_tam_m']],
+                                [A6R['session'][0]['cam_tam_m']])
+    assert same == 0.0 and lv[-1][0] >= 8
+    turn, _ = K.a6_hieu_replay(A6R, r0, [_win(0.0, 0.0, 0.8 + math.pi / 2)], 0.025, [A6R['session'][0]['cam_tam_m']],
+                               [A6R['session'][0]['cam_tam_m']])
+    shift, _ = K.a6_hieu_replay(A6R, r0, [_win(0.01, 0.0, 0.8)], 0.025, [A6R['session'][0]['cam_tam_m']],
+                                [A6R['session'][0]['cam_tam_m']])
+    assert turn > 1e-3 and 0.0 < shift < turn / 20
+    cams = [s['cam_tam_m'] for s in A6R['session']]
+    two, _ = K.a6_hieu_replay(A6R, r0, [_win(0.0, 0.0, 0.8)], 0.025, cams, cams)
+    assert two > 0.0                                                    # two camera centres: not the same lift
+    assert K._cams(A6R, 's2') == [A6R['session'][1]['cam_tam_m']] and len(K._cams(A6R, 'zz')) == 2
+
+
+def test_u_beta_cam_cho_pairing(monkeypatch):
+    """A3 by pair (u_psi_hai_dau_rad joint term, eps_g without the map part) only when both windows are in one camera
+    segment; else the two-end bound by position with the kiem_cheo of each segment (a segment without one: the others,
+    'thay_the'); a flagged end -> thieu; + replay + tan of W and of ref; the largest over runs."""
+    import c8b_a6 as a6m
+    seen = []
+    monkeypatch.setattr(K, 'a6_hieu_replay', lambda a6, ref, W, eps, cr, cw: (seen.append(eps) or 1e-4, [[8, 1e-4]]))
+    monkeypatch.setattr(a6m, 'u_psi_hai_dau_rad',
+                        lambda a6, kc, p1, p2, tam: dict(trang_thai='dat', ghep='replay_chung_theo_ca',
+                                                         phan=dict(ca_rad=0.001)))
+    monkeypatch.setattr(a6m, '_a3_rad', lambda kc, p, pl: (None, 'co', None) if kc == 'flag' else (0.002, '', 'goc'))
+    ref = _win(0.0, 0.0, 0.8, tan=3e-4, doan='doan1')
+    dc = dict(ref=ref, W=[_win(0.0, 0.0, 0.8, doan='doan2', psi_tan_rad=5e-4),
+                          _win(0.0, 0.0, 0.8, doan='doan3', psi_tan_rad=7e-4)])
+    v, why, parts = K.u_beta_cam_cho(A6R, [], dict(doan2='kc2', doan3='kc3'), 'T1', dc, 'goc')
+    assert not why and [p['A3_cach'] for p in parts] == ['bao_hai_dau_theo_vi_tri (thay_the, rieng)'] * 2
+    assert v == pytest.approx(0.004 + 1e-4 + 7e-4 + 3e-4) and seen == [0.025, 0.025]
+    seen.clear()
+    dc1 = dict(ref=dict(ref, doan='doan2'), W=[_win(0.0, 0.0, 0.8, doan='doan2', psi_tan_rad=5e-4)])
+    v, why, parts = K.u_beta_cam_cho(A6R, [], dict(doan2='kc2'), 'T1', dc1, 'goc')
+    assert parts[0]['A3_cach'] == 'cap_replay_chung_theo_ca' and seen == [0.024]
+    assert v == pytest.approx(0.001 + 1e-4 + 5e-4 + 3e-4)
+    v, why, _ = K.u_beta_cam_cho(A6R, [], dict(doan2='flag', doan3='kc3'), 'T1', dc, 'goc')
+    assert v is None and any('W doan2' in w for w in why)
+    v, why, _ = K.u_beta_cam_cho(dict(A6R, session=[]), [], dict(doan2='kc2'), 'T1', dc, 'goc')
+    assert v is None and 'camera' in why[0]
+
+
+def test_kc_doan_of():
+    assert K.kc_doan_of(['a/kiem_cheo/doan2/luot1/k.json', 'a/kiem_cheo/doan3/luot1/k.json'], [1, 2]) == \
+        dict(doan2=1, doan3=2)
+    with pytest.raises(K.KhoaError):
+        K.kc_doan_of(['a/doan2/x.json', 'b/doan2/y.json'], [1, 2])
+
+
+def test_cua_so_khung(tmp_path):
+    import c8_u_imu as cu
+    d = tmp_path / 'track' / 'doan3' / 'L1'
+    d.mkdir(parents=True)
+    f = d / 'frames.csv'
+    f.write_text('idx,valid,tag_x,tag_y,psi\n1,1,0.3,0.4,3.13\n2,1,0.6,0.8,-3.13\n3,0,9,9,0\n4,1,0.0,0.0,\n',
+                 encoding='utf-8')
+    w = K.cua_so_khung(str(f), [1, 2], cu.sha256(str(f)), [0.0, 0.0])
+    assert w['rho_m'] == pytest.approx(1.0) and w['T_m'] == pytest.approx([0.45, 0.6]) and w['doan'] == 'doan3'
+    assert abs(abs(w['S_rad']) - math.pi) < 1e-9 and w['tan_rad'] == pytest.approx(2 * (math.pi - 3.13))  # wraps
+    for ids in ([1, 3], [1, 4], [1, 9]):
+        with pytest.raises(K.KhoaError):
+            K.cua_so_khung(str(f), ids, cu.sha256(str(f)), [0.0, 0.0])
+
+
+def test_a6_du_cua_so_is_the_a6_module_path():
+    """With the true g = g_b (and the height offset 0) the residual is c8b_a6.ebc_errors of the same configuration:
+    the same car_pose lift, Kabsch and model as the A6 file (no second geometry)."""
+    import numpy as np
+    import c8b_a6 as a6m
+    cam = A6R['session'][0]['cam_tam_m']
+    G = np.array([A6R['g_b'], [-0.01, 0.02]])
+    V = np.array([0.0, 0.0005])
+    got = K._a6_du_cua_so(A6R, [0.7, -0.3], 1.1, G, V, np.zeros(2), cam)
+    T = np.array([[0.7, -0.3]] * 2)
+    want0 = a6m.ebc_errors(T[:1], np.array([1.1]), G[:1], V[:1], A6R['plumb_xy_m'], A6R['H_m'], A6R['h_m'],
+                           A6R['side_m'], cam)
+    assert got[0] == pytest.approx(float(want0[0]), abs=1e-15) and abs(got[0]) > 0
+    assert abs(got[1]) > abs(got[0])                                     # a g off g_b leaves its model error
