@@ -889,7 +889,7 @@ LL_DEFAULTS = dict(
                              #   of the white tape on the dark body, anchors A and B only (no template look, any heading)
     tam_r_px=30,             # tam_trang: half side of the search crop around the predicted centre
     tam_lech_px=15,          # tam_trang: largest blob-centre distance from the prediction (prediction <= 2 px, 12f)
-    tam_dt_ti=(0.6, 1.6),    # tam_trang: blob area / area on the template frame [DE XUAT; camera distance over the
+    tam_dt_ti=[0.6, 1.6],    # tam_trang: blob area / area on the template frame [DE XUAT; camera distance over the
                              #   floor 2.6-3.05 m gives 0.73-1.37]
     still_neo_m=0.0005,      # v4 3: 95th percentile of the anchor deviation in a window
     min_khung=120,           # v4 3: >= 120 frames (3 s) ...
@@ -1116,6 +1116,38 @@ def r_max_hai_neo(G, cfg):
     return L * math.tan(math.radians(cfg['eps_tong_deg'] / 2.0)) / 2.0
 
 
+QUET_H_M, QUET_BUOC_M = 0.05, 0.001     # NBD1-3: h_B scanned over h_n +- 50 mm by 1 mm [DE XUAT]
+
+
+def quet_h_hai_neo(obs, fit, sig, r_max, ctx, cfg):
+    """NBD1-3 (two tapes): the least squares in (L_AB, h_B) can have a second minimum that the local rank and replay
+    tests do not see. h_B is scanned over h_n +- QUET_H_M (every point refitted with the heights fixed); from every
+    local minimum of the scan the full fit is run again. A converged solution more than hang_k sigma from the locked
+    h_B whose largest anchor residual is <= r_max is a second solution: returns their h_B (empty: unique)."""
+    n = len(fit['G'])
+    nG, _ = _pack_info(n, False)
+    hb0 = float(fit['h'][1])
+    x_fix = np.delete(np.asarray(fit['x'], float), fit['idx_h'])
+    h_tran = min(o['H'] for o in obs)
+    grid = [hb for hb in np.arange(ctx.h_n - QUET_H_M, ctx.h_n + QUET_H_M + QUET_BUOC_M / 2, QUET_BUOC_M)
+            if hb < h_tran]
+    ssr, xs = [], []
+    for hb in grid:
+        f = khop_hinh(obs, ctx.h_n, ctx.C, ctx.a_n, fix_h=[ctx.h_n, hb], x0=x_fix)
+        ssr.append(f['ssr'] if f['hoi_tu'] else math.inf)
+        xs.append(f['x'])
+    out = []
+    for k in range(len(grid)):
+        if not math.isfinite(ssr[k]) or (k > 0 and ssr[k - 1] < ssr[k]) or (k + 1 < len(grid) and ssr[k + 1] < ssr[k]):
+            continue
+        x0 = np.concatenate([xs[k][:nG], [grid[k]], xs[k][nG:]])
+        f = khop_hinh(obs, ctx.h_n, ctx.C, ctx.a_n, x0=x0)
+        hb = float(f['h'][1])
+        if f['hoi_tu'] and abs(hb - hb0) > cfg['hang_k'] * sig and float(f['res'].max()) <= r_max                 and all(round(hb, 6) != x for x in out):
+            out.append(round(hb, 6))
+    return out
+
+
 def eps_goc(bang, r_max):
     """eps_neo (deg) of one end with its own geometry and the locked r_max (two fixed tapes, 12f: 0)."""
     if len(bang) == 2:
@@ -1309,18 +1341,20 @@ def kiem_r_neo(neo, kiem_files, mau_clip, mau_idx):
 def tam_bang_dinh(gray, uc, vc, S0, cfg, ti=1.0):
     """v4 12f (Liam 23/11): centre of the white tape near the predicted (uc, vc): Otsu threshold of the crop of half
     side tam_r_px, the bright blob (4-connected: a blob touching another bright region by one diagonal pixel stays
-    apart, CODE 23/11 run03) nearest to the centre (<= tam_lech_px), not touching the crop border, area within
-    tam_dt_ti x S0 (S0 None: any area >= 30 px); centre weighted by the grey level over the blob (the tape pattern is
-    fixed on the tape, so the centre is the same physical point at any heading). ti: local px per metre of this frame
-    over the template frame at the tape (NeoMau.ti_le): the crop, the distance and the area S0 are in template pixels
-    and are brought to this frame by ti (ti^2 for the area), so another camera / focal length / distance keeps the
-    same physical bounds. Returns (u, v, area) or (NaN, NaN, 0)."""
-    if not (math.isfinite(ti) and ti > 0):
+    apart, CODE 23/11 run03) nearest to the centre (<= tam_lech_px), at least TAM_LE px from the crop border (room for
+    the grown mask and the body ring, NBD1-4), area within tam_dt_ti x S0 (S0 None: any area >= 30 px).
+    Centre = GEOMETRIC centre of the tape (NBD1-1): the blob with its holes filled (the drawn pattern) and shrunk by
+    1 px counts 1 per pixel; the 2-px band around it counts by the part of the pixel the tape covers,
+    (grey - body level) / (tape level - body level) clipped to [0, 1] (body level: median of the ring 3-5 px outside,
+    tape level: mean of the bright core within 3 px of the pixel); other bright blobs are kept out (CODE 23/11 run03). The pattern drawn on
+    the tape and the light over it do not move the centre. ti: local px per metre of this frame over the template
+    frame at the tape (NeoMau.ti_le): the crop, the distance and the area S0 are in template pixels and are brought to
+    this frame by ti (ti^2 for the area). Returns (u, v, area) or (NaN, NaN, 0)."""
+    if not (math.isfinite(ti) and ti > 0 and math.isfinite(uc) and math.isfinite(vc)):
         return NAN, NAN, 0
     r = max(8, int(round(cfg['tam_r_px'] * ti)))
     u0, v0 = int(round(uc)) - r, int(round(vc)) - r
-    if not (math.isfinite(uc) and math.isfinite(vc)) or u0 < 0 or v0 < 0 or u0 + 2 * r > gray.shape[1] \
-            or v0 + 2 * r > gray.shape[0]:
+    if u0 < 0 or v0 < 0 or u0 + 2 * r > gray.shape[1] or v0 + 2 * r > gray.shape[0]:
         return NAN, NAN, 0
     c = gray[v0:v0 + 2 * r, u0:u0 + 2 * r]
     if float(c.std()) < 2.0:
@@ -1331,28 +1365,40 @@ def tam_bang_dinh(gray, uc, vc, S0, cfg, ti=1.0):
     best = None
     for i in range(1, n):
         x, y, w, hh, S = st[i]
-        if x == 0 or y == 0 or x + w >= 2 * r or y + hh >= 2 * r or not lo <= S <= hi:
+        if x < TAM_LE or y < TAM_LE or x + w > 2 * r - TAM_LE or y + hh > 2 * r - TAM_LE or not lo <= S <= hi:
             continue
         d = math.hypot(cen[i][0] - (uc - u0), cen[i][1] - (vc - v0))
         if d <= cfg['tam_lech_px'] * ti and (best is None or d < best[0]):
             best = (d, i)
     if best is None:
         return NAN, NAN, 0
-    # weight = grey level above the local body level, over the blob grown by 2 px: an edge pixel counts by the part of
-    # it the tape covers (no threshold cut at the edge); the body level is the median of the ring 3-5 px outside
-    # (other bright blobs next to the tape are kept out of both, CODE 23/11 run03)
     blob = (lab == best[1]).astype(np.uint8)
     khac = (lab > 0) & (lab != best[1])
     k3 = np.ones((3, 3), np.uint8)
-    m2 = cv2.dilate(blob, k3, iterations=2).astype(bool) & ~khac
-    ring = cv2.dilate(blob, k3, iterations=5).astype(bool) & ~cv2.dilate(blob, k3, iterations=3).astype(bool) & ~khac
-    if not ring.any():
+    nen = np.zeros((2 * r + 2, 2 * r + 2), np.uint8)                 # fill the holes: flood the outside from a corner
+    day = 1 - blob
+    cv2.floodFill(day, nen, (0, 0), 2)
+    filled = (day != 2).astype(np.uint8)                              # blob + enclosed holes
+    loi = cv2.erode(filled, k3, iterations=1).astype(bool)
+    bien = cv2.dilate(filled, k3, iterations=2).astype(bool) & ~loi & ~khac
+    ring = cv2.dilate(filled, k3, iterations=5).astype(bool) & ~cv2.dilate(filled, k3, iterations=3).astype(bool) & ~khac
+    sang = loi & blob.astype(bool)
+    if not ring.any() or not sang.any():
         return NAN, NAN, 0
-    w = np.where(m2, np.clip(c.astype(np.float64) - float(np.median(c[ring])), 0.0, None), 0.0)
-    if w.sum() <= 0:
+    cf = c.astype(np.float64)
+    nen_m, tam_m = float(np.median(cf[ring])), float(np.median(cf[sang]))
+    if not tam_m > nen_m:
         return NAN, NAN, 0
+    sf = sang.astype(np.float64)                                     # tape level near each pixel (light over the tape)
+    num, den = cv2.boxFilter(cf * sf, -1, (7, 7), normalize=False), cv2.boxFilter(sf, -1, (7, 7), normalize=False)
+    tam_l = np.where(den > 0, num / np.maximum(den, 1e-12), tam_m)
+    tam_l = np.where(tam_l > nen_m, tam_l, tam_m)
+    w = np.where(loi, 1.0, 0.0) + np.where(bien, np.clip((cf - nen_m) / (tam_l - nen_m), 0.0, 1.0), 0.0)
     ys, xs = np.mgrid[0:2 * r, 0:2 * r]
     return u0 + float((w * xs).sum() / w.sum()), v0 + float((w * ys).sum() / w.sum()), int(st[best[1], 4])
+
+
+TAM_LE = 6                     # NBD1-4: the grown mask (2 px) and the body ring (5 px) fit inside the crop
 
 
 def px_moi_m(cam, xy, e=0.005):
@@ -1390,8 +1436,13 @@ class NeoMau:
                     raise ValueError(f'anchor box {(u, v, w, hh)}: too close to the template frame edge')
                 patch = gray[v_lo:v_lo + 2 * r + 2, u_lo:u_lo + 2 * r + 2].astype(np.float32)
                 self.items.append(dict(name=name, box=(u, v, w, hh), d=d, patch=patch, pc=(uc - u_lo, vc - v_lo),
-                                       wh=(w, hh), S0=S0, k0=px_moi_m(cam, xy0)))
+                                       wh=(w, hh), S0=S0, k0=px_moi_m(cam, xy0), uv0=(uc, vc)))
         self._cache = {}
+        if tam:                                                      # NBD1-5: every tape its own blob
+            for a, b in itertools.combinations(self.items, 2):
+                if math.hypot(a['uv0'][0] - b['uv0'][0], a['uv0'][1] - b['uv0'][1]) < 2 * cfg['tam_r_px']:
+                    raise ValueError(f'anchors {a["name"]}, {b["name"]}: the same tape (centres closer than '
+                                     f'2 tam_r_px on the template frame)')
 
     def _img_ang(self, cam, t, psi):
         a = unlift(np.vstack([t, t + rot2(psi) @ [0.05, 0.0]]), self.kappa_n, self.C)
@@ -1650,10 +1701,8 @@ def do_clip(clip, wins, ctx, mau):
         for i, p in fr:
             want.setdefault(i, []).append((key, p))
     p1, cam = {}, ctx.cam0
-    kmax = max(want) if want else -1                          # 12f: no decoding past the last window frame
-    for k, t, g in cm.iter_frames(clip):
-        if k > kmax:
-            break
+    kmax = max(want) if want else -1                          # 12f: no decoding past the last window frame (NBD1-10)
+    for k, t, g in cm.iter_frames(clip, max_frames=kmax + 1):
         if k in want:
             for key, p in want[k]:
                 if abs(t - p) > 1e-3:
@@ -1679,9 +1728,7 @@ def do_clip(clip, wins, ctx, mau):
         pred[key] = own[keys[near[0][1]]] if near else None
         why.setdefault(key, []).append('du_doan_tu_cua_so_gan_nhat' if near else 'khong_du_doan_neo')
     out = {key: [] for key, _ in wins}
-    for k, t, g in cm.iter_frames(clip):
-        if k > kmax:
-            break
+    for k, t, g in cm.iter_frames(clip, max_frames=kmax + 1):
         if k not in want:
             continue
         r1 = p1[k]
@@ -1697,10 +1744,13 @@ def do_clip(clip, wins, ctx, mau):
                 pts, ok = {}, True
                 tam = ctx.cfg.get('neo_cach', 'mau') == 'tam_trang'
                 ti = mau.ti_le(r1['cam'], *pred[key]) if tam else None
+                uv_tam = []
                 for j, it in enumerate(mau.items):
                     if tam:                                     # 12f: tape centre, no template
                         u, v, _ = tam_bang_dinh(g, uvp[j, 0], uvp[j, 1], it['S0'], ctx.cfg, ti[j])
-                        ok = math.isfinite(u)
+                        ok = math.isfinite(u) and all(math.hypot(u - q[0], v - q[1]) >= 2 * ctx.cfg['tam_r_px'] * ti[j]
+                                                      for q in uv_tam)       # NBD1-5: not a tape already used
+                        uv_tam.append((u, v))
                     else:
                         u, v, c, q = khop_mau(g, mau.tpl(j, rot), uvp[j, 0], uvp[j, 1], ctx.cfg['search_px'])
                         ok = bool(math.isfinite(u) and c >= ctx.cfg['corr_min'] and q < ctx.cfg['peak2_ratio'])
@@ -1958,6 +2008,8 @@ def kiem_f2(rows):
 def _measure(cs_rows, keys, session_path, mau_args, ctx, neo, clip_dir, tien_trinh=1):
     """Records of the windows `keys` (indices into cs_rows), clip by clip; each clip with the camera of its session
     (v4 14: ctx a CtxMap; the windows of one clip must name one session)."""
+    if isinstance(tien_trinh, bool) or not (isinstance(tien_trinh, int) and tien_trinh >= 1):      # NBD1-9
+        raise ValueError(f'tien_trinh {tien_trinh!r}: a positive integer')
     mau = _mau(mau_args, _mot_ctx(ctx), neo)
     by_clip, recs, flags, shas = {}, {}, {}, {}
 
@@ -1996,8 +2048,12 @@ def _measure(cs_rows, keys, session_path, mau_args, ctx, neo, clip_dir, tien_tri
         args = [(path, wins, src[_ses_of(w0)], _cx(ctx, w0).h_n, _cx(ctx, w0).cfg, _ses_of(w0), mau)
                 for path, wins, w0 in jobs]
         import concurrent.futures as cf
-        with cf.ProcessPoolExecutor(max_workers=min(int(tien_trinh), len(args))) as ex:
-            res = list(ex.map(_do_clip_tien_trinh, args))
+        nmax = min(tien_trinh, len(args), 61 if sys.platform == 'win32' else len(args))   # Windows limit 61
+        try:
+            with cf.ProcessPoolExecutor(max_workers=nmax) as ex:
+                res = list(ex.map(_do_clip_tien_trinh, args))
+        except cf.process.BrokenProcessPool as e:                    # NBD1-9: a worker died -> exit code 2 path
+            raise ValueError(f'a measuring process stopped abnormally: {e}') from e
     else:
         res = [do_clip(path, wins, _cx(ctx, w0), mau) for path, wins, w0 in jobs]
     for r, f in res:
@@ -2105,6 +2161,10 @@ def khoa_hieu_chuan(wsum, ctx, cfg, a6):
         tt, out['ly_do'] = 'chua_ket_luan', ['neo_khong_kha_thi']
     elif hg['suy_bien']:
         tt, out['ly_do'] = 'chua_ket_luan', ['thieu_hang']
+    elif len(fit['G']) == 2:                                 # NBD1-3: a second (h_B, L_AB) that fits as well
+        out['hai_nghiem_h_B_m'] = quet_h_hai_neo(obs, fit, float(hg['sigma_h'][0]), r_max, ctx, cfg)
+        if out['hai_nghiem_h_B_m']:
+            tt, out['ly_do'] = 'chua_ket_luan', ['thieu_hang']
     g_b = a6.g_b()
     cua = []
     for (w, s), p, res in zip(use, fit['poses'], fit['res']):
@@ -2429,7 +2489,8 @@ def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, tam_id, tr
     path or a list (v4 14: every session of hieu_chuan_neo.json plus the sessions of the held-out windows)."""
     hc = doc_hieu_chuan(hc_path)
     khoa_ng = {k: v for k, v in hc['nguong'].items() if k in LL_DEFAULTS}
-    doi = sorted(k for k, v in (cfg or {}).items() if k in LL_DEFAULTS and khoa_ng.get(k, LL_DEFAULTS[k]) != v)
+    _l = (lambda v: list(v) if isinstance(v, tuple) else v)          # NBD1-7: a tuple and its JSON list are the same
+    doi = sorted(k for k, v in (cfg or {}).items() if k in LL_DEFAULTS and _l(khoa_ng.get(k, LL_DEFAULTS[k])) != _l(v))
     if doi:                                                    # LLC1-6: thresholds are locked at hieu_chuan
         raise ValueError(f'thresholds differ from the locked ones: {doi}')
     cfg = dict(LL_DEFAULTS, **khoa_ng)

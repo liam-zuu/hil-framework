@@ -50,18 +50,28 @@ def test_tape_centre_any_heading(ang, dx, dy):
     assert 450 < S < 700
 
 
-def test_tape_with_its_pattern_turns_with_the_tape():
-    """The pattern is fixed on the tape: the centre of the turned tape is the turned centre (same physical point)."""
-    g0 = tape_img(100, 100, 24.0, 0.0, scribble=True)
-    u0, v0, _ = nt.tam_bang_dinh(g0, 100.0, 100.0, None, CFG)
-    off = np.array([u0 - 100, v0 - 100])
-    assert np.linalg.norm(off) > 0.05                                  # the stroke moves the weighted centre
-    for ang in (30.0, 90.0, 133.6):
-        g = tape_img(100, 100, 24.0, ang, scribble=True)
+def test_tape_pattern_and_light_do_not_move_the_centre():
+    """NBD1-1: the centre is the geometric centre of the tape: a stroke drawn on it, or two halves lit 225 / 230, do
+    not move it (the grey-weighted centre moved 0.07 px with the light)."""
+    for ang in (0.0, 30.0, 90.0, 133.6):
+        g = tape_img(100.3, 99.6, 24.0, ang, scribble=True)
         u, v, _ = nt.tam_bang_dinh(g, 100.0, 100.0, None, CFG)
-        a = math.radians(ang)
-        want = np.array([[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]]) @ off
-        assert np.linalg.norm(np.array([u - 100, v - 100]) - want) < 0.08, ang
+        assert math.hypot(u - 100.3, v - 99.6) < 0.05, (ang, u, v)
+    g = np.full((200, 200), 20, np.uint8)
+    g[88:112, 88:100] = 225
+    g[88:112, 100:112] = 230
+    u, v, _ = nt.tam_bang_dinh(g, 100.0, 100.0, None, CFG)
+    assert math.hypot(u - 99.5, v - 99.5) < 0.002, (u, v)
+
+
+def test_tape_close_to_the_crop_border_is_refused():
+    """NBD1-4: a blob whose grown mask or body ring would be cut by the crop is not used."""
+    g = np.full((200, 200), 20, np.uint8)
+    g[90:110, 99:129] = 230                                           # crop of uc = 100 is x 70..129
+    assert math.isnan(nt.tam_bang_dinh(g, 100.0, 100.0, None, dict(CFG, tam_lech_px=40))[0])
+    g = np.full((200, 200), 20, np.uint8)
+    g[90:110, 95:118] = 230
+    assert math.isfinite(nt.tam_bang_dinh(g, 100.0, 100.0, None, dict(CFG, tam_lech_px=40))[0])
 
 
 def test_tape_refusals():
@@ -74,6 +84,9 @@ def test_tape_refusals():
     assert math.isnan(nt.tam_bang_dinh(g, 100.0 + 28.0, 100.0, None, dict(CFG, tam_lech_px=40))[0])  # cut by the crop
     assert math.isnan(nt.tam_bang_dinh(np.full((200, 200), 90, np.uint8), 100.0, 100.0, None, CFG)[0])  # flat
     assert math.isnan(nt.tam_bang_dinh(g, 10.0, 100.0, None, CFG)[0])               # crop off the image
+    for bad in (float('nan'), float('inf'), -float('inf')):                         # NBD1-11
+        assert math.isnan(nt.tam_bang_dinh(g, bad, 100.0, None, CFG)[0])
+        assert math.isnan(nt.tam_bang_dinh(g, 100.0, bad, None, CFG)[0])
 
 
 def test_tape_touching_a_bright_region_by_one_diagonal_pixel():
@@ -102,7 +115,17 @@ def test_tape_scale_follows_the_frame_camera():
     c1, c2 = cm.cam_from_dict(cam), cm.cam_from_dict(dict(cam, f=1451.0 / 1675.0 * 900.0))
     for xy in ((0.0, 0.0), (1.2, -0.4)):
         assert nt.px_moi_m(c2, xy) / nt.px_moi_m(c1, xy) == pytest.approx(1451.0 / 1675.0, rel=1e-6)
-    assert nt.px_moi_m(c1, (1.2, -0.4)) < nt.px_moi_m(c1, (0.0, 0.0))   # farther from the camera: fewer px per metre
+        assert nt.px_moi_m(c1, xy) == pytest.approx(900.0 / 2.6, rel=1e-9)  # NBD1-12: straight down, no distortion
+    # NBD1-12: through NeoMau (template on camera 1, frame on camera 2): ti_le is the focal ratio
+    g = np.full((1080, 1920), 20, np.uint8)
+    for (cx, cy) in ((900, 500), (1100, 560)):
+        g[cy - 12:cy + 12, cx - 12:cx + 12] = 230
+    neo = nt.parse_neo('A:892,492,16,16;B:1092,552,16,16')
+    m = nt.NeoMau(g, c1, dict(tag_x=0.0, tag_y=0.0, tag_psi=0.0), neo, T.H_N / T.ZC, T.C, CFG)
+    assert np.allclose(m.ti_le(c2, np.zeros(2), 0.0), 1451.0 / 1675.0, rtol=1e-6)
+    with pytest.raises(ValueError, match='the same tape'):                        # NBD1-5
+        nt.NeoMau(g, c1, dict(tag_x=0.0, tag_y=0.0, tag_psi=0.0), nt.parse_neo('A:892,492,8,8;B:900,500,8,8'),
+                  T.H_N / T.ZC, T.C, CFG)
 
 
 # ---------------------------------------------------------------- two anchors on records (exact forward equation)
@@ -200,6 +223,40 @@ def _hc_args(d, rows, neo, out='hc_r'):
     (d / 'cs_r.json').write_text(json.dumps({'schema': 'cua_so_v1', 'cua_so': rows}), encoding='utf-8')
     return (str(d / 'cs_r.json'), str(d / 'session.json'), neo, (str(d / 'mau.mov'), str(d / 'session.json'), 0),
             str(d / out), str(d / 'a6.json'), 'T1', [str(d / 'kiem.json')], T.H_N)
+
+
+def test_second_height_solution_is_found():
+    """NBD1-3 (Codex counter-example): H 2.60, F = C, three windows along y: (h_B, L_AB) = (0.10, 0.30) and
+    (0.11, 0.2988) fit with zero residual; the scan finds the second one."""
+    H, hn = 2.60, 0.10
+    a = 1.0 - hn / 2.60
+    C0, F0 = np.zeros(2), np.zeros(2)
+    G, h = np.array([[0.0, 0.0], [0.30, 0.0]]), np.array([0.10, 0.10])
+    obs = []
+    for y in (0.0, 0.05, 1.0):
+        B = np.array([75.0 - math.sqrt(74.7 ** 2 - y ** 2), y])
+        obs.append(dict(Ph=nt.thuan(G, h, 0.0, B - [0.30, 0.0], F0, H, C0, a), F=F0, H=H))
+    fit = nt.khop_hinh(obs, hn, C0, a)
+    hg = nt.hang(fit, dict(nt.LL_DEFAULTS))
+    ctx = type('X', (), dict(h_n=hn, C=C0, a_n=a))()
+    assert nt.quet_h_hai_neo(obs, fit, float(hg['sigma_h'][0]), 3.9e-5, ctx, dict(nt.LL_DEFAULTS)) == [0.11]
+    # a generic geometry (three places, headings) has one solution: test_two_tapes_locked_tuple_threshold_...
+
+
+def test_second_height_solution_blocks_the_lock(files2, monkeypatch):
+    """NBD1-3 wiring: a second solution found by the scan makes hieu_chuan chua_ket_luan (thieu_hang), recorded."""
+    monkeypatch.setattr(nt, 'quet_h_hai_neo', lambda *a, **k: [0.123])
+    c, hc, _, _ = T.run(files2, *T.build(), tag='hn', cfg=dict(neo_cach='tam_trang'))
+    assert c == 1 and hc['ly_do'] == ['thieu_hang'] and hc['hai_nghiem_h_B_m'] == [0.123]
+
+
+def test_two_tapes_locked_tuple_threshold_and_bad_process_count(files2):
+    """NBD1-7: the tuple of the defaults and its JSON list are the same locked value; NBD1-9: tien_trinh >= 1."""
+    _, hc, ll, _ = T.run(files2, *T.build(), tag='tp', cfg=dict(neo_cach='tam_trang', tam_dt_ti=(0.6, 1.6)))
+    assert hc['trang_thai'] == 'dat' and hc['hai_nghiem_h_B_m'] == []
+    for bad in (0, -1, 1.5, True):
+        with pytest.raises(ValueError, match='positive integer'):
+            nt._measure([], [], None, None, None, None, None, tien_trinh=bad)
 
 
 def test_eps_terms_are_zero_with_two_anchors():
