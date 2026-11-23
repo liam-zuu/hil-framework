@@ -1306,13 +1306,18 @@ def kiem_r_neo(neo, kiem_files, mau_clip, mau_idx):
     return {n: all(tuple(b) in passed for b in bs) for n, bs in neo.items()}, ev
 
 
-def tam_bang_dinh(gray, uc, vc, S0, cfg):
+def tam_bang_dinh(gray, uc, vc, S0, cfg, ti=1.0):
     """v4 12f (Liam 23/11): centre of the white tape near the predicted (uc, vc): Otsu threshold of the crop of half
-    side tam_r_px, the bright connected blob nearest to the centre (<= tam_lech_px), not touching the crop border,
-    area within tam_dt_ti x S0 (S0 None: any area >= 30 px); centre weighted by the grey level over the blob (the tape
-    pattern is fixed on the tape, so the centre is the same physical point at any heading). Returns (u, v, area) or
-    (NaN, NaN, 0)."""
-    r = int(cfg['tam_r_px'])
+    side tam_r_px, the bright blob (4-connected: a blob touching another bright region by one diagonal pixel stays
+    apart, CODE 23/11 run03) nearest to the centre (<= tam_lech_px), not touching the crop border, area within
+    tam_dt_ti x S0 (S0 None: any area >= 30 px); centre weighted by the grey level over the blob (the tape pattern is
+    fixed on the tape, so the centre is the same physical point at any heading). ti: local px per metre of this frame
+    over the template frame at the tape (NeoMau.ti_le): the crop, the distance and the area S0 are in template pixels
+    and are brought to this frame by ti (ti^2 for the area), so another camera / focal length / distance keeps the
+    same physical bounds. Returns (u, v, area) or (NaN, NaN, 0)."""
+    if not (math.isfinite(ti) and ti > 0):
+        return NAN, NAN, 0
+    r = max(8, int(round(cfg['tam_r_px'] * ti)))
     u0, v0 = int(round(uc)) - r, int(round(vc)) - r
     if not (math.isfinite(uc) and math.isfinite(vc)) or u0 < 0 or v0 < 0 or u0 + 2 * r > gray.shape[1] \
             or v0 + 2 * r > gray.shape[0]:
@@ -1321,24 +1326,26 @@ def tam_bang_dinh(gray, uc, vc, S0, cfg):
     if float(c.std()) < 2.0:
         return NAN, NAN, 0
     _, bw = cv2.threshold(c, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    n, lab, st, cen = cv2.connectedComponentsWithStats(bw)
-    lo, hi = (30, math.inf) if S0 is None else (cfg['tam_dt_ti'][0] * S0, cfg['tam_dt_ti'][1] * S0)
+    n, lab, st, cen = cv2.connectedComponentsWithStats(bw, connectivity=4)
+    lo, hi = (30, math.inf) if S0 is None else (cfg['tam_dt_ti'][0] * S0 * ti * ti, cfg['tam_dt_ti'][1] * S0 * ti * ti)
     best = None
     for i in range(1, n):
         x, y, w, hh, S = st[i]
         if x == 0 or y == 0 or x + w >= 2 * r or y + hh >= 2 * r or not lo <= S <= hi:
             continue
         d = math.hypot(cen[i][0] - (uc - u0), cen[i][1] - (vc - v0))
-        if d <= cfg['tam_lech_px'] and (best is None or d < best[0]):
+        if d <= cfg['tam_lech_px'] * ti and (best is None or d < best[0]):
             best = (d, i)
     if best is None:
         return NAN, NAN, 0
     # weight = grey level above the local body level, over the blob grown by 2 px: an edge pixel counts by the part of
     # it the tape covers (no threshold cut at the edge); the body level is the median of the ring 3-5 px outside
+    # (other bright blobs next to the tape are kept out of both, CODE 23/11 run03)
     blob = (lab == best[1]).astype(np.uint8)
+    khac = (lab > 0) & (lab != best[1])
     k3 = np.ones((3, 3), np.uint8)
-    m2 = cv2.dilate(blob, k3, iterations=2).astype(bool)
-    ring = cv2.dilate(blob, k3, iterations=5).astype(bool) & ~cv2.dilate(blob, k3, iterations=3).astype(bool)
+    m2 = cv2.dilate(blob, k3, iterations=2).astype(bool) & ~khac
+    ring = cv2.dilate(blob, k3, iterations=5).astype(bool) & ~cv2.dilate(blob, k3, iterations=3).astype(bool) & ~khac
     if not ring.any():
         return NAN, NAN, 0
     w = np.where(m2, np.clip(c.astype(np.float64) - float(np.median(c[ring])), 0.0, None), 0.0)
@@ -1346,6 +1353,13 @@ def tam_bang_dinh(gray, uc, vc, S0, cfg):
         return NAN, NAN, 0
     ys, xs = np.mgrid[0:2 * r, 0:2 * r]
     return u0 + float((w * xs).sum() / w.sum()), v0 + float((w * ys).sum() / w.sum()), int(st[best[1], 4])
+
+
+def px_moi_m(cam, xy, e=0.005):
+    """Local image scale (px per metre) of a floor-plane point (z = 0 of the lifted convention, as du_doan): mean of
+    the image lengths of two 5 mm floor steps along x and y."""
+    p = cam.project(np.array([[xy[0], xy[1], 0.0], [xy[0] + e, xy[1], 0.0], [xy[0], xy[1] + e, 0.0]]))
+    return float((np.linalg.norm(p[1] - p[0]) + np.linalg.norm(p[2] - p[0])) / (2.0 * e))
 
 
 class NeoMau:
@@ -1367,7 +1381,8 @@ class NeoMau:
                     uc, vc, S0 = tam_bang_dinh(gray, uc, vc, None, cfg)
                     if not math.isfinite(uc):
                         raise ValueError(f'anchor box {(u, v, w, hh)}: no white tape on the template frame')
-                Ph = lift(cam.pix2floor(np.array([[uc, vc]]), 0.0)[0], kappa_n, self.C)
+                xy0 = cam.pix2floor(np.array([[uc, vc]]), 0.0)[0]
+                Ph = lift(xy0, kappa_n, self.C)
                 d = rot2(-self.psi0) @ (Ph - self.t0)
                 r = int(math.ceil(math.hypot(w, hh) / 2.0)) + 3
                 u_lo, v_lo = int(math.floor(uc)) - r, int(math.floor(vc)) - r
@@ -1375,7 +1390,7 @@ class NeoMau:
                     raise ValueError(f'anchor box {(u, v, w, hh)}: too close to the template frame edge')
                 patch = gray[v_lo:v_lo + 2 * r + 2, u_lo:u_lo + 2 * r + 2].astype(np.float32)
                 self.items.append(dict(name=name, box=(u, v, w, hh), d=d, patch=patch, pc=(uc - u_lo, vc - v_lo),
-                                       wh=(w, hh), S0=S0))
+                                       wh=(w, hh), S0=S0, k0=px_moi_m(cam, xy0)))
         self._cache = {}
 
     def _img_ang(self, cam, t, psi):
@@ -1402,6 +1417,15 @@ class NeoMau:
                 raise ValueError(f'anchor box {it["box"]}: no texture')
             self._cache[key] = t
         return self._cache[key]
+
+    def ti_le(self, cam, t, psi):
+        """Local px per metre at every predicted tape point of this frame camera over the same on the template frame
+        (12f, CODE 23/11 run03: f 1451 px against about 1675 px at session 2)."""
+        out = []
+        for it in self.items:
+            Ph = np.asarray(t, float) + rot2(psi) @ it['d']
+            out.append(px_moi_m(cam, unlift(Ph, self.kappa_n, self.C)) / it['k0'])
+        return np.array(out)
 
     def du_doan(self, cam, t, psi):
         """Predicted pixel centre of every box and the image rotation, from a tag pose (t, psi) and a frame camera."""
@@ -1672,9 +1696,10 @@ def do_clip(clip, wins, ctx, mau):
                 uvp, rot = mau.du_doan(r1['cam'], *pred[key])
                 pts, ok = {}, True
                 tam = ctx.cfg.get('neo_cach', 'mau') == 'tam_trang'
+                ti = mau.ti_le(r1['cam'], *pred[key]) if tam else None
                 for j, it in enumerate(mau.items):
                     if tam:                                     # 12f: tape centre, no template
-                        u, v, _ = tam_bang_dinh(g, uvp[j, 0], uvp[j, 1], it['S0'], ctx.cfg)
+                        u, v, _ = tam_bang_dinh(g, uvp[j, 0], uvp[j, 1], it['S0'], ctx.cfg, ti[j])
                         ok = math.isfinite(u)
                     else:
                         u, v, c, q = khop_mau(g, mau.tpl(j, rot), uvp[j, 0], uvp[j, 1], ctx.cfg['search_px'])

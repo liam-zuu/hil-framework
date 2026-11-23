@@ -76,6 +76,35 @@ def test_tape_refusals():
     assert math.isnan(nt.tam_bang_dinh(g, 10.0, 100.0, None, CFG)[0])               # crop off the image
 
 
+def test_tape_touching_a_bright_region_by_one_diagonal_pixel():
+    """CODE 23/11 run03: the tape meets a bright region that runs to the crop border at one corner pixel only. 4-connected
+    blobs keep the tape apart (8-connected merged them and the merged blob, cut by the border, was refused); the bright
+    region stays out of the weight mask and of the body ring, so the centre is unbiased."""
+    g = np.full((200, 200), 20, np.uint8)
+    g[90:110, 90:110] = 230                                           # tape, centre (99.5, 99.5)
+    g[110:200, 110:200] = 230                                         # touches the tape corner (109, 109) diagonally
+    u, v, S = nt.tam_bang_dinh(g, 100.0, 100.0, None, CFG)
+    assert S == 400 and math.hypot(u - 99.5, v - 99.5) < 1e-9, (u, v, S)
+    n8 = cv2.connectedComponentsWithStats(cv2.threshold(g[70:130, 70:130], 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1])[0]
+    assert n8 == 2                                                    # (the old 8-connected call saw one blob)
+
+
+def test_tape_scale_follows_the_frame_camera():
+    """ti (px per metre of the frame over the template) carries the area, crop and distance bounds: a tape 0.7 x as
+    large in pixels (area 0.49 S0) is refused at ti 1 and found at ti 0.7."""
+    S0 = nt.tam_bang_dinh(tape_img(100, 100, 24.0, 0.0), 100.0, 100.0, None, CFG)[2]
+    g = tape_img(100, 100, 24.0 * 0.7, 30.0)
+    assert math.isnan(nt.tam_bang_dinh(g, 100.0, 100.0, S0, CFG, 1.0)[0])
+    u, v, _ = nt.tam_bang_dinh(g, 100.0, 100.0, S0, CFG, 0.7)
+    assert math.hypot(u - 100, v - 100) < 0.05
+    assert math.isnan(nt.tam_bang_dinh(g, 100.0, 100.0, S0, CFG, float('nan'))[0])
+    cam = dict(model='B2', f=900.0, cx=960.0, cy=540.0, k=[0.0, 0.0], rvec=[math.pi, 0.0, 0.0], tvec=[0.0, 0.0, 2.6])
+    c1, c2 = cm.cam_from_dict(cam), cm.cam_from_dict(dict(cam, f=1451.0 / 1675.0 * 900.0))
+    for xy in ((0.0, 0.0), (1.2, -0.4)):
+        assert nt.px_moi_m(c2, xy) / nt.px_moi_m(c1, xy) == pytest.approx(1451.0 / 1675.0, rel=1e-6)
+    assert nt.px_moi_m(c1, (1.2, -0.4)) < nt.px_moi_m(c1, (0.0, 0.0))   # farther from the camera: fewer px per metre
+
+
 # ---------------------------------------------------------------- two anchors on records (exact forward equation)
 G2 = np.array([[0.0, 0.0], [0.29, 0.0]])
 H2 = np.array([T.H_N, 0.104])
