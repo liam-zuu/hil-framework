@@ -13,6 +13,19 @@ hoac truong duong dan cung khoi); null o truong bat buoc ->
 sha_rong_bat_buoc (ma 3). Null o hash khong kem duong dan -> so_rong
 (thong tin).
 
+Ban do hash suy tu khoa (C3-22 vong 3): dict co it nhat mot khoa duong dan
+mang gia tri hex64 hay null la ban do; nhan dien truoc, roi moi muc khoa
+duong dan duoc xet rieng: hex64 -> kiem; null -> sha_rong_bat_buoc; so,
+bool, object, list, chuoi khong phai hex64 -> sha_khong_hop_le (ma 3).
+Trong ban do khai bao duoi khoa sha256, khoa duong dan mang object/list
+-> kieu_khong_ho_tro (ma 3), khong duyet tiep.
+
+Doc file (C3-34): JSON va file tham chieu mo truoc, st_nlink kiem bang
+os.fstat tren descriptor da mo roi doc tu chinh descriptor do; loi mo/doc
+(file bien mat giua luc liet ke va luc kiem) ghi loi, khong vang: JSON ->
+khong_doc_duoc (ma 3); file tham chieu -> thieu_file (ma 1) neu khong con,
+khong_doc_duoc (ma 3) voi loi OSError khac.
+
 Phan giai duong tuong doi: ten tran -> chi thu muc chua JSON; duong co thu
 muc (ke ca './a.csv', 'F2\\a.jsonl') -> chi goc luot: --goc-luot neu khai
 bao, khong thi thu muc to tien gan nhat cua thu muc JSON (ke ca chinh no)
@@ -20,8 +33,11 @@ co ten khop YYYY-MM-DD_runNN; khong co goc luot -> khong_co_goc_luot
 (ma 3); dich khong ton tai -> thieu_file, khong thu goc repo. Ngoai le
 duy nhat (CODE 23/11): duong bat dau bang '05_DATA/' la duong tinh tu goc
 repo, chi mot dich goc_repo/<duong> (khong co goc repo -> khong_co_goc_luot,
-ma 3); thu muc luot khong bao gio chua thu muc con 05_DATA. Duong tuyet
-doi giu luat cu. File co st_nlink > 1 (JSON hay file tham chieu) khong mo:
+ma 3); thu muc luot khong bao gio chua thu muc con 05_DATA. Gioi han cua
+luat '05_DATA/': duong luon tinh tu goc repo; manifest nao dung
+'05_DATA/x' de chi '<run>/05_DATA/x' se bi doc khac (tro goc_repo/05_DATA/x).
+Quet 23/11: khong thu muc luot nao co thu muc con 05_DATA. Duong tuyet
+doi giu luat cu. File co st_nlink > 1 (JSON hay file tham chieu) khong doc:
 hard_link (ma 3).
 """
 import argparse
@@ -51,7 +67,7 @@ _CHUA_XAC_MINH = frozenset({
     'json_loi', 'sha_khong_hop_le', 'manifest_khoa_khong_phai_file',
     'danh_sach_khong_ghep', 'nhieu_duong_dan', 'kieu_khong_ho_tro',
     'mo_ho_phan_giai', 'sha_rong_bat_buoc', 'khong_co_goc_luot',
-    'hard_link',
+    'hard_link', 'khong_doc_duoc',
 })
 _BO_NHO = {}
 
@@ -67,21 +83,24 @@ def la_duong_dan(s):
             or re.search(r'\.[A-Za-z0-9]{1,6}$', s) is not None)
 
 
-def sha_cac_dang(path):
+def sha_cac_dang(path, f=None):
+    # f: file nhi phan da mo (C3-34: stat va doc tren cung descriptor)
     p = Path(path).resolve()
-    st = p.stat()
+    if f is None:
+        with open(p, 'rb') as f2:
+            return sha_cac_dang(p, f2)
+    st = os.fstat(f.fileno())
     chia_khoa = (str(p), st.st_size, st.st_mtime_ns)
     cu = _BO_NHO.get(chia_khoa)
     if cu is not None:
         return dict(cu)
     if p.suffix.lower() in BIN_EXT:
         bam = hashlib.sha256()
-        with open(p, 'rb') as f:
-            for mieng in iter(lambda: f.read(1 << 20), b''):
-                bam.update(mieng)
+        for mieng in iter(lambda: f.read(1 << 20), b''):
+            bam.update(mieng)
         out = {'tho': bam.hexdigest()}
     else:
-        data = p.read_bytes()
+        data = f.read()
         if b'\x00' in data:
             out = {'tho': hashlib.sha256(data).hexdigest()}
         else:
@@ -100,9 +119,15 @@ def kiem(path, sha_ghi):
     p = Path(path)
     if not p.is_file():
         return 'thieu_file'
-    if p.stat().st_nlink > 1:
-        return 'hard_link'
-    dang = sha_cac_dang(p)
+    try:
+        with open(p, 'rb') as f:
+            if os.fstat(f.fileno()).st_nlink > 1:
+                return 'hard_link'
+            dang = sha_cac_dang(p, f)
+    except FileNotFoundError:
+        return 'thieu_file'
+    except OSError:
+        return 'khong_doc_duoc'
     s = sha_ghi.strip().lower()
     for k in ('tho', 'lf', 'crlf'):
         if dang.get(k) == s:
@@ -128,20 +153,31 @@ def _la_manifest(d):
     return all(la_duong_dan(k) and _hex64(v) for k, v in d.items())
 
 
+def _la_khoa_duong_dan(k):
+    return isinstance(k, str) and 'sha256' not in k.lower() and la_duong_dan(k)
+
+
 def _la_ban_do_hash(d):
+    # C3-22 vong 3: ban do = co khoa duong dan mang hex64 hay null; hoac
+    # (luat cu) moi khoa la duong dan, gia tri null/chuoi khong phai duong dan
     if not d:
         return False
+    co_hash = False
+    tat_ca = True
     co_str = False
     for k, v in d.items():
-        if not (isinstance(k, str) and 'sha256' not in k.lower()
-                and la_duong_dan(k)):
-            return False
+        if not _la_khoa_duong_dan(k):
+            tat_ca = False
+            continue
+        if v is None or _hex64(v):
+            co_hash = True
         if v is None:
             continue
-        if not isinstance(v, str) or la_duong_dan(v):
-            return False
-        co_str = True
-    return co_str
+        if isinstance(v, str) and not la_duong_dan(v):
+            co_str = True
+        else:
+            tat_ca = False
+    return co_hash or (tat_ca and co_str)
 
 
 def _chon_duong_dan(cands, khoa, sha, cap, kh):
@@ -262,6 +298,10 @@ def _xu_sha(k, v, D, path, cap, kh, st):
             elif isinstance(v2, str):
                 kh.append({'khoa': sub, 'gia_tri': v2[:200],
                            'ly_do': 'sha_khong_hop_le'})
+            elif isinstance(v2, (dict, list)) and la_duong_dan(k2):
+                # C3-22 vong 3: khoa duong dan mang object/list khong duyet
+                kh.append({'khoa': sub, 'gia_tri': str(v2)[:200],
+                           'ly_do': 'kieu_khong_ho_tro'})
             elif isinstance(v2, (dict, list)):
                 _duyet(v2, sub, cap, kh, st)
             else:
@@ -280,39 +320,20 @@ def _duyet(v, path, cap, kh, st):
                             'duong_dan': k2, 'sha': v2, 'dang': 'manifest'})
             return
         if _la_ban_do_hash(v):
-            for k2, v2 in v.items():
-                if _hex64(v2):
-                    cap.append({'khoa': _manifest_con(path, k2),
-                                'duong_dan': k2, 'sha': v2,
-                                'dang': 'manifest'})
-                elif v2 is None:
-                    kh.append({'khoa': _manifest_con(path, k2),
-                               'gia_tri': 'null',
-                               'ly_do': 'sha_rong_bat_buoc'})
-                else:
-                    kh.append({'khoa': _manifest_con(path, k2),
-                               'gia_tri': v2[:200],
-                               'ly_do': 'sha_khong_hop_le'})
-            return
-        if any(isinstance(k, str) and 'sha256' not in k.lower()
-               and la_duong_dan(k) and _hex64(v2)
-               for k, v2 in v.items()):
+            # C3-22 vong 3: moi muc khoa duong dan phai la hex64; sai kieu
+            # (so, object, list, chuoi khac) bao tung muc, khong duyet tiep
             for k, v2 in v.items():
-                if (isinstance(k, str) and 'sha256' not in k.lower()
-                        and la_duong_dan(k) and _hex64(v2)):
-                    cap.append({'khoa': _manifest_con(path, k),
-                                'duong_dan': k, 'sha': v2,
-                                'dang': 'manifest'})
-                elif (isinstance(k, str) and 'sha256' not in k.lower()
-                      and la_duong_dan(k) and isinstance(v2, str)):
-                    kh.append({'khoa': _manifest_con(path, k),
-                               'gia_tri': v2[:200],
-                               'ly_do': 'sha_khong_hop_le'})
-                elif (isinstance(k, str) and 'sha256' not in k.lower()
-                      and la_duong_dan(k) and v2 is None):
-                    kh.append({'khoa': _manifest_con(path, k),
-                               'gia_tri': 'null',
-                               'ly_do': 'sha_rong_bat_buoc'})
+                sub = _manifest_con(path, k)
+                if _la_khoa_duong_dan(k):
+                    if _hex64(v2):
+                        cap.append({'khoa': sub, 'duong_dan': k, 'sha': v2,
+                                    'dang': 'manifest'})
+                    elif v2 is None:
+                        kh.append({'khoa': sub, 'gia_tri': 'null',
+                                   'ly_do': 'sha_rong_bat_buoc'})
+                    else:
+                        kh.append({'khoa': sub, 'gia_tri': str(v2)[:200],
+                                   'ly_do': 'sha_khong_hop_le'})
                 elif isinstance(k, str) and 'sha256' in k.lower():
                     _xu_sha(k, v2, v, path, cap, kh, st)
                 else:
@@ -446,12 +467,20 @@ def quet(goc, goc_repo, goc_luot=None):
                             'gia_tri': '',
                             'ly_do': 'json_trong_sealed_khong_doc'})
             continue
-        if pj.stat().st_nlink > 1:
+        try:
+            with open(pj, 'rb') as f:
+                data = (None if os.fstat(f.fileno()).st_nlink > 1
+                        else f.read())
+        except OSError:
+            kh_rows.append({'file_ghi': file_ghi, 'khoa': '',
+                            'gia_tri': '', 'ly_do': 'khong_doc_duoc'})
+            continue
+        if data is None:
             kh_rows.append({'file_ghi': file_ghi, 'khoa': '',
                             'gia_tri': '', 'ly_do': 'hard_link'})
             continue
         try:
-            obj = json.loads(pj.read_text(encoding='utf-8-sig'))
+            obj = json.loads(data.decode('utf-8-sig'))
         except Exception:
             kh_rows.append({'file_ghi': file_ghi, 'khoa': '',
                             'gia_tri': '', 'ly_do': 'json_loi'})
@@ -469,7 +498,8 @@ def quet(goc, goc_repo, goc_luot=None):
                                 'gia_tri': c['duong_dan'],
                                 'ly_do': 'tro_vao_sealed_khong_doc'})
                 continue
-            if kq in ('mo_ho_phan_giai', 'hard_link', 'khong_co_goc_luot'):
+            if kq in ('mo_ho_phan_giai', 'hard_link', 'khong_co_goc_luot',
+                      'khong_doc_duoc'):
                 kh_rows.append({'file_ghi': file_ghi, 'khoa': c['khoa'],
                                 'gia_tri': c['duong_dan'],
                                 'ly_do': kq})
