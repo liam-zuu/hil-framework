@@ -67,7 +67,7 @@ def test_f8_rong_none_lan_lap():
 
 
 def _tcp(psi_deg=45.3, **over):
-    d = dict(tap='giao', psi_ok=True, psi_tc_rad=math.radians(psi_deg))
+    d = dict(tap=ctd.TAP_MA_CACH_A, psi_ok=True, psi_tc_rad=math.radians(psi_deg))
     d.update(over)
     return d
 
@@ -98,8 +98,9 @@ def test_phi_beta_cach_a_needs_both_headings(t, tc, frag):
 
 
 def test_phi_beta_cach_a_keeps_the_anchor_rule_and_truc_xe_checks():
-    _, _, ok, why = ctd.phi_beta('O1-F05', tx(), run_of(), _tcp(tap='ma_mat_neo'), 0.0, f8_rong_ok=True)
-    assert not ok and any('mat_neo' in w for w in why)
+    for tap in ('ma_mat_neo', 'giao'):            # CODE 6812dcf6: W of cach A is the tag-gate set, nothing else
+        _, _, ok, why = ctd.phi_beta('O1-F05', tx(), run_of(), _tcp(tap=tap), 0.0, f8_rong_ok=True)
+        assert not ok and any('khong theo cong ma' in w for w in why)
     _, _, ok, why = ctd.phi_beta('O1-F05', tx(trang_thai='tam'), run_of(), _tcp(), 0.0, f8_rong_ok=True)
     assert not ok and any('khong khoa' in w for w in why)
     with pytest.raises(ValueError, match='place'):
@@ -107,7 +108,7 @@ def test_phi_beta_cach_a_keeps_the_anchor_rule_and_truc_xe_checks():
 
 
 def test_phi_beta_without_the_branch_is_the_old_rule():
-    _, u, ok, why = ctd.phi_beta('O1-F05', tx(), run_of(), _tcp(), 0.0)
+    _, u, ok, why = ctd.phi_beta('O1-F05', tx(), run_of(), _tcp(tap='giao'), 0.0)
     assert not ok and math.isinf(u)
     assert any('trang_thai.beta' in w for w in why) and any('lan_lap_id' in w for w in why)
 
@@ -120,7 +121,7 @@ def test_tam_doi_of_cach_a():
 
 
 def _tc(**over):
-    d = dict(tap='giao', p_ok=True, psi_ok=True, trang_thai='dat', psi_tc_rad=math.radians(45.3))
+    d = dict(tap=ctd.TAP_MA_CACH_A, p_ok=True, psi_ok=True, trang_thai='dat', psi_tc_rad=math.radians(45.3))
     d.update(over)
     return d
 
@@ -180,3 +181,34 @@ def test_session_2_f8_is_the_f8_rong_case():
 def test_co_ref_12b_is_of_the_place():
     rows = [dict(loai='pre', cho='goc'), dict(loai='ref_12b', cho='K1'), dict(loai='dung_12b', cho='goc')]
     assert cs.co_ref_12b(rows, 'K1') and not cs.co_ref_12b(rows, 'goc') and not cs.co_ref_12b([], 'goc')
+
+
+def _chain(ids):
+    return [dict(frame_id=i, t_cam=i / 60.0, tag_x=0.4, tag_y=-0.2, tag_psi=0.3, psi_ma_p=0.3, p_x=0.4, p_y=-0.2,
+                 cong_ok=True, a6_ok=True, q_ok=True) for i in ids]
+
+
+def _ll_neo(ids):
+    return dict(dau={'pre': dict(khung_giao_ma_neo=dict(id=ids, pts_s=[i / 60.0 for i in ids]),
+                                 khung_giao_sha256=ctd.ids_sha(ids), mat_neo=False)})
+
+
+def test_tham_chieu_cach_a_w_is_the_tag_gate_set():
+    """CODE 23/11 (chot T12 muc 4, goc 6812dcf6): in the F8 rong branch W = the tag-gate frames of pre, label
+    w_theo_ma_cach_A; anchors lost in the middle (session 2, segment 3) no longer make a hole; outside the branch the
+    intersection of J v6 2 is kept (and the hole loses the window)."""
+    ma = list(range(180))
+    pre = dict(khung_ma_hop_le=ma, t_ref=3.0, ket_luan=dict(dat=True, ly_do=[]))
+    neo = [i for i in ma if not 60 <= i < 75]                         # 15 anchor frames lost: a 0.25 s hole
+    kt = dict(ctd.KHUNG_TC_DE_XUAT, nguon='test')
+    old = ctd.tham_chieu(pre, _chain(ma), _ll_neo(neo), kt, 0.10, 1 / 60.0)
+    assert old['tap'] == 'giao' and old['n'] == len(neo) and old['trang_thai'] == 'hong_cua_so_tc'
+    assert old['w_nhan'] is None
+    new = ctd.tham_chieu(pre, _chain(ma), _ll_neo(neo), kt, 0.10, 1 / 60.0, f8_rong_ok=True)
+    assert new['tap'] == ctd.TAP_MA_CACH_A and new['w_nhan'] == 'w_theo_ma_cach_A' and not new['mat_neo']
+    assert new['ids'] == ma and new['n'] == 180 and new['trang_thai'] == 'dat'
+    # the sample gate still holds on the tag set: a tag hole loses the window as before
+    ma2 = [i for i in ma if not 60 <= i < 75]
+    pre2 = dict(khung_ma_hop_le=ma2, t_ref=3.0, ket_luan=dict(dat=True, ly_do=[]))
+    g = ctd.tham_chieu(pre2, _chain(ma2), None, kt, 0.10, 1 / 60.0, f8_rong_ok=True)
+    assert g['trang_thai'] == 'hong_cua_so_tc' and g['tap'] == ctd.TAP_MA_CACH_A

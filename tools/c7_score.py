@@ -1308,7 +1308,7 @@ def rel_pose(frames, vi, rel, lane):
     no centre (NaN), a frame without q no centre. tam_ok: the centre of the frame is defined (A6 and q; speeds need
     only that, Codex CT1-5); speed_def: tam_ok and the plate did not move in the run (a moved plate is no car motion);
     pos_def: tam_ok with the reference and phi (positions on the lane); yaw_def: A6 and a reference heading on a set of
-    J v6 2 (giao or ma_mat_neo)."""
+    J v6 2 (giao or ma_mat_neo), or the tag-gate set of cach A (ctd.TAP_MA_CACH_A, F8 rong)."""
     ch = {c['frame_id']: c for c in rel['chain']}
     rows = [ch.get(int(frames[k]['idx'])) for k in vi]
     if any(r is None for r in rows):
@@ -1334,7 +1334,7 @@ def rel_pose(frames, vi, rel, lane):
     arm = np.where(np.nan_to_num(r_k) > 0.0, (2.0 * r_k * math.sin(min(u, math.pi) / 2.0)) if math.isfinite(u)
                    else np.inf, 0.0)
     upk_add = np.where(pos_def, arm, np.inf)
-    yaw_def = a6 & bool(tc['psi_ok']) & (tc['tap'] in ('giao', 'ma_mat_neo'))
+    yaw_def = a6 & bool(tc['psi_ok']) & (tc['tap'] in ('giao', 'ma_mat_neo', ctd.TAP_MA_CACH_A))
     speed_def = tam_ok & (rel['tam_doi'] != 'doi')
     return dict(x=x, y=y, psi=psi, psi_cam=psi_p, upk_add=upk_add, pos_def=pos_def, yaw_def=yaw_def, dpsi=dpsi, q_ok=qok,
                 tam_ok=tam_ok, speed_def=speed_def, bx=bx, by=by, r_k=r_k, px=px, py=py, psi_tc=psi_tc, psi_dd=psi_dd,
@@ -2174,7 +2174,7 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
     # relative frame (J v6 2, Codex CT1-4): the camera and IMU yaws aligned on the frames and the merge of the
     # reference heading (tham_chieu_v1 ids) when that reference is on a set of J v6 2
     ar = None
-    if R is not None and rel['tc']['psi_ok'] and rel['tc']['tap'] in ('giao', 'ma_mat_neo'):
+    if R is not None and rel['tc']['psi_ok'] and rel['tc']['tap'] in ('giao', 'ma_mat_neo', ctd.TAP_MA_CACH_A):
         # Codex CT2-3: exactly the ids of tham_chieu_v1 (F12), times and psi' from the chain
         chm = {c['frame_id']: c for c in rel['chain']}
         rr = [chm[int(i)] for i in rel['tc']['ids']]
@@ -2499,9 +2499,9 @@ def _track_beside(frames_path):
         return json.load(f)
 
 
-def _ref_from(pre, chain, lan_lap, hs, frames, extra):
+def _ref_from(pre, chain, lan_lap, hs, frames, extra, f8_rong_ok=False):
     return ctd.tham_chieu(pre, chain, lan_lap, khung_tc_of(hs), hs['t_trong_s'],
-                          ctd._frame_dt([r['t_s'] for r in frames]), extra)
+                          ctd._frame_dt([r['t_s'] for r in frames]), extra, f8_rong_ok=f8_rong_ok)
 
 
 def chain_and_ref(frames, a6, xoay, ll, track, task, truc, pre, hs, extra, f8_rong_ok=False):
@@ -2512,7 +2512,7 @@ def chain_and_ref(frames, a6, xoay, ll, track, task, truc, pre, hs, extra, f8_ro
     for one mounting, u_q + 0.57 mm (c7_chuoi_khung.q_luot), K2 from K1 (F8_RONG_Q_TU)."""
     cho = ctd.cho_of(task)
     chain = ck.chuoi_khung(frames, a6, xoay, ll, track=track, cho=cho, truc_xe=truc, f8_rong_ok=f8_rong_ok)
-    tc = _ref_from(pre, chain, ll, hs, frames, extra)
+    tc = _ref_from(pre, chain, ll, hs, frames, extra, f8_rong_ok=f8_rong_ok)
     if ll is not None and ll.get('cung_lan_lap') is not True and not f8_rong_ok:
         u_w = tc.get('psi_lech_max_rad')
         chain = ck.chuoi_khung(frames, a6, xoay, ll, track=track, cho=cho, truc_xe=truc, u_psi_w_rad=u_w)

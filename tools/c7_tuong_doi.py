@@ -389,14 +389,24 @@ def cua_so(frames, chain, log_rows, t0_us, nodes, u_nodes, kt, t_trong, t_cmd_en
 
 
 # ---------------------------------------------------------------- reference (F12)
-def tham_chieu(pre, chain, lan_lap, kt, t_trong, dt, extra=None):
+TAP_MA_CACH_A = 'ma_cach_A'
+W_NHAN_CACH_A = 'w_theo_ma_cach_A'
+
+
+def tham_chieu(pre, chain, lan_lap, kt, t_trong, dt, extra=None, f8_rong_ok=False):
     """F12 tham_chieu_v1 from the 'pre' row, the chain rows and lan_lap_v1 (or None). trang_thai: 'dat' (usable),
-    'hong_cua_so_tc' (run lost to the reference window), 'chua_ket_luan' (no pose: missing q or A6 on the set)."""
+    'hong_cua_so_tc' (run lost to the reference window), 'chua_ket_luan' (no pose: missing q or A6 on the set).
+    f8_rong_ok (f8_rong(...)[0], CODE 23/11 chot T12 muc 4, goc 6812dcf6): W = the tag-gate frames of 'pre' (tap
+    TAP_MA_CACH_A, w_nhan W_NHAN_CACH_A), not the tag-anchor intersection of J v6 2: J takes the intersection because
+    beta is measured on the anchors and p_tc, psi(0) must share its set; cach A measures beta by the tag yaw, so the
+    consistent set is the tag gate. The sample gate (n_min, frac_min, t_trong) and the spread gates are unchanged."""
     by = {c['frame_id']: c for c in chain}
     ma = [int(i) for i in (pre.get('khung_ma_hop_le') or [])]
     why, tap = [], 'giao'
-    nb = neo_of(lan_lap, 'pre')
-    if nb is None:
+    nb = None if f8_rong_ok else neo_of(lan_lap, 'pre')
+    if f8_rong_ok:
+        ids, tap = ma, TAP_MA_CACH_A
+    elif nb is None:
         # Codex CT1-3: a MISSING anchor list is not a confirmed loss of every anchor (mat_neo needs an empty list):
         # no set of J v6 2 can be formed, the reference is not concluded (G1-G5)
         ids, tap = ma, 'thieu_neo'
@@ -449,6 +459,7 @@ def tham_chieu(pre, chain, lan_lap, kt, t_trong, dt, extra=None):
         trang = 'chua_ket_luan'
     return dict(schema=THAM_CHIEU_SCHEMA, phien_ban=PHIEN_BAN, chuoi_khung=ck.PHIEN_BAN, phep_gop='trung_binh_go_vong',
                 tap=tap, mat_neo=tap == 'ma_mat_neo', ids=ids, ids_sha256=ids_sha(ids), n=len(ids),
+                w_nhan=W_NHAN_CACH_A if tap == TAP_MA_CACH_A else None,
                 t_tc_s=float(tt.mean()) if len(tt) else None, p_tc_m=p_tc, psi_tc_rad=psi_tc, psi_tan_rad=tan,
                 p_lech_max_m=lp, psi_lech_max_rad=lpsi, p_ok=p_ok, psi_ok=y_ok, trang_thai=trang, ly_do=why,
                 lan_lap_v1_sha256=None if lan_lap is None else lan_lap.get('_sha256'), **(extra or {}))
@@ -548,7 +559,8 @@ def phi_beta(task, truc_xe, lan_lap, tc, u_beta_cam_deg=None, f8_rong_ok=False):
     """(phi [rad] or None, u_phi [rad] (inf when a part is missing), ok, reasons). Same session and same placement
     only (rang_buoc_12b); no Delta-a path. f8_rong_ok (f8_rong(...)[0] of the caller, cach A): beta = wrap(psi_tc_rad
     of tc - psi_chuan_k_deg of truc_xe_v1), u_beta = U_BETA_F8_RONG_DEG, no 12b binding through lan_lap_v1 (it names
-    none) and no trang_thai.beta 'dat'; the anchor-set rule (tc tap 'giao', J 2) and the truc_xe_v1 checks are kept."""
+    none) and no trang_thai.beta 'dat'; W must be the tag-gate set (tc tap TAP_MA_CACH_A, CODE 6812dcf6) instead of
+    the intersection 'giao' of J 2; the truc_xe_v1 checks are kept."""
     why = []
     k = cho_of(task)
     if truc_xe is None:
@@ -592,7 +604,10 @@ def phi_beta(task, truc_xe, lan_lap, tc, u_beta_cam_deg=None, f8_rong_ok=False):
         if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (b, ub)):
             why.append('lan_lap_v1 thieu beta_deg / u_beta_deg')
             b = ub = None
-    if tc['tap'] != 'giao':
+    if f8_rong_ok:
+        if tc['tap'] != TAP_MA_CACH_A:                 # cach A: W of the tag gate (tham_chieu f8_rong_ok)
+            why.append(f"W khong theo cong ma (tap {tc['tap']!r}, cach A can {TAP_MA_CACH_A!r})")
+    elif tc['tap'] != 'giao':
         why.append('mat_neo: beta khong do duoc tren neo (J 2)')
     if why or ph is None or b is None:
         return None, math.inf, False, why
