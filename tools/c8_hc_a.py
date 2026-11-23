@@ -47,7 +47,9 @@ DIR is one attempt folder of c8_hc_seq.py (log.csv, sender.txt, lich.csv, gain_q
 the frames CSV of c7_measure track run with tag_offset 0 (tag_x, tag_y, psi = tag heading). The common frame chain of
 CAM (tools/c7_chuoi_khung.py: A6 -> psi', centre p after q, frame gates) is used when importable AND its inputs are
 given; otherwise every output is 'chan_doan' (raw tag heading, tag centre, gate valid & car_seen) and must not be
-used for scoring. Locked values need: F1, c8b_a6_v2, xoay_v1 (q, du_m), F6 psi_chuan_k, F9 e_hieu_m, and the C8B
+used for scoring. Locked values need: F1, c8b_a6_v2, xoay_v1 (q, du_m), F6 psi_chuan_k (no F6 'dat': psi' of the
+ref_12b window of the issued attempt on the locked chain, psi_chuan_k_nguon ref_12b_camera_khong_F6; CODE 23/11
+chot T12 muc 4), F9 e_hieu_m, and the C8B
 two-end camera heading bound (u_psi_cuc; not yet agreed: always chan_doan until it is).
 Every angle written to F7 is in degrees (_deg); every index is BEFORE the 1.25 margin.
 Last line: #ket_qua,ma=0 pass / 1 checked and failed / 2 error or refused.
@@ -105,6 +107,12 @@ IMU_E_RES_MAX_RAD = 0.030                    # [de xuat] ~2x the largest residua
 SP_INT_TOL_M, SP_INT_TOL_RAD = 0.003, math.radians(0.5)
 REF_TOL_M, STOP_TOL_M = 0.003, 0.015
 DUR_TOL_S = 0.10
+# F8 rong (CODE 23/11, 03_CODE/docs/2026-11-23_Chot_F8_rong_buoi2_v1.md muc 1): F8 read but no lan_lap_id -> K2 borrows
+# q of the place with E, u_q + the plate shift bound of session 1 (lift, put back: position 0.57 mm, P3; CAM f126d362)
+U_LECH_TAM_BUOI1_M = 0.00057
+NGUON_LECH_TAM = 'can_lech_tam_buoi1_chua_xac_minh_lan_lap'
+PSI_K_NGUON_CAM = 'ref_12b_camera_khong_F6'   # CODE 23/11 chot T12 muc 4: psi_chuan_k without F6 dat
+LY_DO_F8_KHONG_ID = 'F8 khong co luot nao'   # read_lan_lap: F8 read, no record gives this 12b an id (muc 1b)
 
 
 class AError(Exception):
@@ -578,9 +586,7 @@ def kiem(A, age_r_max_ms=125.0):
             sign_ok = np.sign(yaw[b['j1']] - yaw[b['j0']]) == np.sign(b['tp_wz'])
             # HCC1-9: a repeated RV value while the wheels turn (a 0.15 s repeat kept corr ~0.95)
             rate = np.convolve(np.abs(dth[sl]) / np.maximum(np.r_[np.diff(t), 0.01], 1e-3), k, 'same')
-            ch = np.flatnonzero(np.diff(L['rv_n'][sl]) != 0) + 1
-            ysl = L['yaw_rad'][sl]
-            same = [j for j0_, j in zip(ch[:-1], ch[1:]) if rate[j] > RV_REPEAT_W and abs(ysl[j] - ysl[j0_]) < 1e-6]
+            same = rv_lap_khi_quay(rate, L['rv_n'][sl], L['yaw_rad'][sl])
             add('imu_e_tuong_quan', fit_ok and sign_ok and not same,
                 f'yaw IMU = k goc encoder: k {kk:.4f}, du max {1e3 * r_max:.1f} mrad (RMS {1e3 * r_rms:.1f}), '
                 f'dung chieu {bool(sign_ok)}, RV lap luc quay {len(same)}')
@@ -649,11 +655,15 @@ def _accepts(fn, name):
         return False
 
 
-def frames_chain(frames_csv, a6, xoay, lan_lap=None, track=None, cho=None, cho_q=None, ll_id=None, ll_id_q=None):
+def frames_chain(frames_csv, a6, xoay, lan_lap=None, track=None, cho=None, cho_q=None, ll_id=None, ll_id_q=None,
+                 u_them_m=None):
     """F1 of CAM when importable: frame_id, t_cam, p_x, p_y, psi_ma_p, cong_ok, a6_ok, q_ok, trang_thai.
     cho_q, ll_id, ll_id_q (CODE 22/11 option A; CAM hil fix/c7-chuoi-khung-q-k2 63dd13d): a place without its own F4
     block (K2) takes q from the place cho_q with E when the lan_lap_id of the two F5 (ll_id here, ll_id_q there, F8
     run 1) are equal non-empty strings; CAM checks them. Passed only when cho_q is given and CAM has the parameter.
+    u_them_m (F8 rong, CODE 23/11 muc 1; set by q_cung_lan_lap only): the two F5 were read against the same F8 and it
+    gave no id, so CAM's id check cannot pass; the block of cho_q is read here with CAM's own doc_xoay, its u_q raised
+    by u_them_m, labelled NGUON_LECH_TAM, and handed to chuoi_khung as a read xoay (CAM takes a dict with ok and q).
     None (caller falls back to frames_basic, chain 'chan_doan') when CAM or C8B (c8b_a6) is not merged yet, when
     the chain refuses its inputs (ValueError: schema, track tag_offset), or when no frame has A6 AND q applied
     (e.g. xoay_v1 without a6_sha256 or of another A6: CAM gives q None, p NaN). A frame is used only when its gate,
@@ -666,7 +676,14 @@ def frames_chain(frames_csv, a6, xoay, lan_lap=None, track=None, cho=None, cho_q
         kw = dict(lan_lap=lan_lap, track=track, cho=cho)
         if lan_lap is None and _accepts(ck.chuoi_khung, 'tam_id'):
             kw['tam_id'] = a6_tam_id(a6)
-        if cho_q is not None and _accepts(ck.chuoi_khung, 'cho_q'):
+        if cho_q is not None and u_them_m is not None:
+            xo = ck.doc_xoay(xoay, cho_q)
+            if xo.get('q') is not None and xo.get('ok') and xo.get('u_q') is not None:
+                xo['u_q'] = float(xo['u_q']) + float(u_them_m)
+                xo['nguon_q'] = dict(cho=cho_q, lan_lap_id=None, u_lech_tam_m=float(u_them_m), nguon_u=NGUON_LECH_TAM,
+                                     cach='khoi F4 cua cho co E, F8 khong xac minh lan lap (CODE 23/11 F8 rong)')
+            xoay = xo                                        # not ok: CAM gives q None, the chain stays chan_doan
+        elif cho_q is not None and _accepts(ck.chuoi_khung, 'cho_q'):
             kw.update(cho_q=cho_q, ll_id=ll_id, ll_id_q=ll_id_q)
         rows = ck.chuoi_khung(frames_csv, ck.doc_a6(a6), xoay, **kw)
     except (ImportError, ValueError):
@@ -1005,6 +1022,11 @@ def analyse(A, F, k_info, min_frames=MIN_FRAMES_TINH, F_gio=None):
             leg.update(trang_thai='thieu', ly_do=f'fewer than 10 frames between windows {ia} and {ib}')
             legs.append(leg)
             continue
+        if not cam['gap'] <= EPS_SMOOTH_S:      # HCL1-9: C summed straight across a frame gap: not a valid leg
+            leg.update(trang_thai='thieu', ho_khung_s=cam['gap'],
+                       ly_do=f"ho khung {cam['gap']:.3f} s > {EPS_SMOOTH_S} s giua cua so {ia} va {ib}")
+            legs.append(leg)
+            continue
         # HCB4: both displacements in the body (co-rotating) frame. Encoder: plain sum of the firmware body
         # increments (no yaw needed); camera: leg_cam (camera heading). a_l_tho = arg E - arg C
         dp = wb['p'] - wa['p']
@@ -1307,8 +1329,15 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
         gates['vet_thuc'] = vet['khe_m'] > 0.0
     if cap['chuoi'] != 'khoa':
         res['ly_do'].append('chuoi khung chua khoa (F1, A6, q)')
+    # CODE 23/11 (chot T12 muc 4 dinh chinh, goc 77991725): no F6 'dat' -> psi_chuan_k = circular mean of psi' over
+    # the ref_12b window of the issued attempt (camera after A6, same session), only on a locked chain
+    psi_k_cam = None
     if neo is None:
-        res['ly_do'].append('thieu psi_chuan_k (F6)')
+        w0 = (cap.get('windows') or [{}])[0]
+        if cap['chuoi'] == 'khoa' and w0.get('cs') is not None:
+            psi_k_cam = math.atan2(w0['cs'][1], w0['cs'][0])
+        else:
+            res['ly_do'].append('thieu psi_chuan_k (F6)')
     failed = [k for k, v in gates.items() if not v]
     res['ly_do'] += bad + [f'can C8B: {w}' for w in can_why]
     if failed:
@@ -1325,11 +1354,18 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     # HCH1-4: with the C8B bound function a missing bound is null, and so is the sum (the gates above used the
     # partial sum: smaller threshold, stricter); without it the earlier output is kept (listed in u_hang_thieu)
     rong = thieu_hang if can_hai_dau is not None else []
+    if e_hieu is None:                                     # HCL1-8: no F9 -> u_map unknown, never 0
+        thieu_hang.append('u_map')
+        rong = sorted(set(rong) | {'u_map'})
     if not khung_ok:                                       # a missing cross-session term is never 0 (contract A)
         rong = sorted(set(rong) | {'u_khung_giua_session'})
     for k in rong:
         hang[k] = None
+    # CODE 23/11 (F7 thu 2): u_a without u_psi_cuc (the part inside one floor map); null when another term is missing
+    thieu_khac = (set(thieu_hang) | set(rong)) - {'u_psi_cuc'}
+    u_noi_bo = None if thieu_khac else math.degrees(u_a - u_cuc)
     out = dict(res, a_k_deg=math.degrees(a), u_a_k_deg=None if rong else math.degrees(u_a),
+               u_a_noi_bo_deg=u_noi_bo,
                do_tan_deg=math.degrees(spread), do_tan_tho_deg=math.degrees(spread_tho),
                truot_cheo=dict(tc, cach='HCB4: sigma = (tb ti_le_tho doan lui - tb ti_le_tho doan toi)/2 tren bon doan dai; '
                                         'E bu = E + sigma*|E_x|*(-1, +1) (duong cheo FL-RR); a_k = tb vong a_l_tho; '
@@ -1346,8 +1382,14 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
                                             'hanh_lang_12b.du_bien_dang_rad; file cu -> asin(2 du_m / L), L = doan '
                                             'dai ngan nhat cua cac luot khac session luot cap; cung session: 0'))
     if neo is not None:
+        out['psi_chuan_k_deg'], out['psi_chuan_k_nguon'] = float(neo), 'F6_hieu_chuan_neo'
         out['phi_hat_chuan_k_deg'] = math.degrees(wrap(math.radians(neo) - a))
         out['u_phi_hat_chuan_k_deg'] = out['u_a_k_deg']
+    elif psi_k_cam is not None:     # no camera term added here: it goes to u_beta_cam (C8B), psi' cancels in phi
+        out['psi_chuan_k_deg'], out['psi_chuan_k_nguon'] = math.degrees(psi_k_cam), PSI_K_NGUON_CAM
+        out['phi_hat_chuan_k_deg'] = math.degrees(wrap(psi_k_cam - a))
+        # CODE 23/11 (F7 thu 2): option A, C8B bounds the camera from each leg start straight to W -> without u_psi_cuc
+        out['u_phi_hat_chuan_k_deg'] = out['u_a_noi_bo_deg']
     return out
 
 
@@ -1459,16 +1501,55 @@ def frames_of(a, A, q_cung=None):
     return F or frames_basic(a.frames, a.track)
 
 
-def q_cung_lan_lap(x, cho, q_tu, ll_id):
+def cach_lan_lap(ll_id, ll_sha, o):
+    """How the mounting of this place (lan_lap_id ll_id, read from the F8 file of sha256 ll_sha) relates to the F5 o of
+    the place with E: 'cung' (both ids non-empty and equal), 'khac' (both non-empty, different: refused), 'rong'
+    (F8 rong, CODE 23/11 muc 1, 1b: an id is null but both F5 name the SAME F8 file, non-null lan_lap_v1_sha256, and
+    each side has an id or, for o, the label lan_lap_nhan = NGUON_LECH_TAM (F8 read, no id; the caller passes ll_sha
+    only when this side has an id or that label): borrow with u_q + U_LECH_TAM_BUOI1_M), 'chua' (otherwise: no F8
+    read on one side, two F8 files, or F8 with two ids for a 12b; not verified, no q)."""
+    ll_o = o.get('lan_lap_id')
+    s = lambda v: isinstance(v, str) and bool(v)               # noqa: E731
+    if s(ll_id) and s(ll_o):
+        return 'cung' if ll_id == ll_o else 'khac'
+    o_ok = s(ll_o) or o.get('lan_lap_nhan') == NGUON_LECH_TAM
+    return 'rong' if (o_ok and s(ll_sha) and ll_sha == o.get('lan_lap_v1_sha256')) else 'chua'
+
+
+def _sha_lan_lap_f5(f5):
+    """lan_lap_v1_sha256 of an F5 when its mounting may be judged from that F8 (an id, or the F8 rong label), else None."""
+    ok = (isinstance(f5.get('lan_lap_id'), str) and f5['lan_lap_id']) or f5.get('lan_lap_nhan') == NGUON_LECH_TAM
+    return f5.get('lan_lap_v1_sha256') if ok else None
+
+
+def q_cung_lan_lap(x, cho, q_tu, ll_id, ll_sha=None, a6_path=None, xoay_path=None):
     """dict(cho_q, ll_id, ll_id_q) for CAM chuoi_khung when this place has no F4 block of its own and --q-tu names the
-    F5 of a place with E (option A), else None. The F5 is read with its content check; CAM decides from the two ids."""
+    F5 of a place with E (option A), else None. The F5 is read with its content check; CAM decides from the two ids.
+    F8 rong (cach_lan_lap 'rong', F5 o made from the same A6 and xoay files): u_them_m = U_LECH_TAM_BUOI1_M is added,
+    frames_chain then reads the block itself (CAM's id check would refuse two null ids)."""
     has_block = isinstance(x, dict) and isinstance(x.get('cho'), dict) and isinstance(x['cho'].get(cho), dict)
     if has_block or not q_tu:
         return None
     o = _f5_checked(q_tu)
     if o.get('cho') == cho:
         raise AError(f'{q_tu}: --q-tu la F5 cua chinh cho {cho}')
-    return dict(cho_q=o.get('cho'), ll_id=ll_id, ll_id_q=o.get('lan_lap_id'))
+    same_src = (o.get('xoay_sha256') == sha256(xoay_path)
+                and o.get('a6_sha256') == (sha256(a6_path) if a6_path else None)) if xoay_path else None
+    if same_src is False:            # HCL1-2: q_cua_cho refuses this F5 (other xoay / A6): CAM gets no ids either
+        return None
+    out = dict(cho_q=o.get('cho'), ll_id=ll_id, ll_id_q=o.get('lan_lap_id'))
+    if cach_lan_lap(ll_id, ll_sha, o) == 'rong' and same_src:
+        out['u_them_m'] = U_LECH_TAM_BUOI1_M
+    return out
+
+
+def rv_lap_khi_quay(rate, rv_n, yaw):
+    """Rows of a turn block (arrays over the block) where a NEW RV report (rv_n changes) repeats the previous value
+    while the wheels turn (rate > RV_REPEAT_W; HCC1-9). HCL1-13: the first new report is compared with the value held
+    at the block start (row 0: the last report before the block), so a repeat across the block edge counts."""
+    ch = np.flatnonzero(np.diff(np.asarray(rv_n)) != 0) + 1
+    prev = np.r_[0, ch[:-1]].astype(int)
+    return [int(j) for j0_, j in zip(prev, ch) if rate[j] > RV_REPEAT_W and abs(yaw[j] - yaw[j0_]) < 1e-6]
 
 
 def window_roles(segs):
@@ -1497,7 +1578,8 @@ def cmd_cua_so(a):
     ses_sha = sha256(a.session) if a.session else a.session_sha256
     # da session (CODE 20/11 khuya): one attempt = one camera segment; the session given (file or sha) must be the
     # session the track was made with; none given -> the track's own session_sha256 goes to F2 and F5
-    for k_t, v in (('video_sha256', clip_sha), ('session_sha256', ses_sha), ('frames_sha256', sha256(a.frames))):
+    for k_t, v in (('video_sha256', clip_sha), ('session_sha256', ses_sha), ('frames_sha256', sha256(a.frames)),
+                   ('dets_sha256', sha256(a.dets) if getattr(a, 'dets', None) else None)):     # HCL1-5: dets too
         if tj0.get(k_t) and v and tj0[k_t] != v:          # HCC2-5 (round 3): the track was made from another file
             raise AError(f'{a.track}: {k_t} khac file dua vao cua_so')
     ses_sha = ses_sha or (tj0.get('session_sha256') if isinstance(tj0.get('session_sha256'), str) else None) or None
@@ -1507,14 +1589,20 @@ def cmd_cua_so(a):
     lan_lap, ra_dir = getattr(a, 'lan_lap', None), getattr(a, 'ra', None)
     if lan_lap:
         ll_id, ll_why, ll_sha = read_lan_lap(lan_lap, A['thu_id'], A['cho'], a.a6, clip_sha, sha256(a.frames),
-                                             ses_sha=ses_sha)
+                                             ses_sha=ses_sha, xoay_path=a.xoay)
+    # muc 1b (CODE 23/11 F8 rong): F8 read and passed every identity check but gives no id (not two ids)
+    ll_nhan = (NGUON_LECH_TAM if (ll_id is None and ll_sha and isinstance(ll_why, str)
+                                  and ll_why.startswith(LY_DO_F8_KHONG_ID)) else None)
+    ll_sha_q = ll_sha if (ll_id is not None or ll_nhan) else None      # the F8 a mounting may be judged from
     # F4 (CODE 22/11): q, u_q from the place block of a xoay_v1 file made on this A6, never the top level; a place
     # without E (K2) from a place with E on the same mounting (--q-tu, option A); read before any file is written
     xo_j = json.load(open(a.xoay, encoding='utf-8')) if a.xoay else None
-    xq, xu, x_why, x_ng = (q_cua_cho(xo_j, A['cho'], a.a6, a.xoay, ll_id, getattr(a, 'q_tu', None)) if a.xoay
+    xq, xu, x_why, x_ng = (q_cua_cho(xo_j, A['cho'], a.a6, a.xoay, ll_id, getattr(a, 'q_tu', None), ll_sha=ll_sha_q)
+                           if a.xoay
                            else (None, None, 'chua co --xoay', None))
     # the chain of CAM gets the same option-A inputs (K2: q of the place with E on the same mounting; CAM checks ids)
-    F = frames_of(a, A, q_cung=q_cung_lan_lap(xo_j, A['cho'], getattr(a, 'q_tu', None), ll_id) if a.xoay else None)
+    F = frames_of(a, A, q_cung=q_cung_lan_lap(xo_j, A['cho'], getattr(a, 'q_tu', None), ll_id, ll_sha=ll_sha_q,
+                                              a6_path=a.a6, xoay_path=a.xoay) if a.xoay else None)
     an = analyse(A, F, info, F_gio=frames_basic(a.frames, a.track))      # option B (CODE 22/11): align off-A6
     ra = ra_dir or a.dir                     # run 2 (with --a6 --xoay --lan-lap) writes to a new folder (mode x)
     if ra_dir:
@@ -1556,9 +1644,10 @@ def cmd_cua_so(a):
                           ('xoay', a.xoay), ('lan_lap', lan_lap)) if v]
     # HCC2-7: 'khoa' needs every source file AND the keys made from them (dets_fp; lan_lap_id of NHACTAM from F8)
     src_ok = (all((a.clip, a.session, a.dets, a.a6, a.xoay)) and dets_fingerprint(a.dets) is not None
-              and ll_id is not None)
+              and (ll_id is not None or ll_nhan is not None)         # muc 1b: F8 rong passes, labelled
+              and xq is not None and xu is not None)                  # HCL1-2: q, du of the F4 actually used
     doan = dict(schema='c8_hc_doan_12b_v1', thu_id=A['thu_id'], cho=A['cho'], lan_lap_id=ll_id,
-                lan_lap_v1_sha256=ll_sha, lan_lap_id_ly_do=ll_why,
+                lan_lap_v1_sha256=ll_sha, lan_lap_id_ly_do=ll_why, lan_lap_nhan=ll_nhan,
                 trang_thai=an['chuoi'] if src_ok else 'chan_doan', clip=a.clip, clip_sha256=clip_sha, session_sha256=ses_sha,
                 frames_sha256=sha256(a.frames), track_sha256=sha256(a.track), cua_so_v1_sha256=sha256(out),
                 esp32_sha256=sha256(A['log_path']), commit_hil=commit_hil(),
@@ -1614,6 +1703,8 @@ def xoay_q(x, cho, a6_path):
         v = x.get('version') if isinstance(x, dict) else None
         return None, None, (f'xoay version {v!r} khong phai xoay_v1 (c8b_xoay_v1 la q chan doan khop tren huong ma '
                             f'chua qua A6)')
+    if a6_path and x.get('tam_id') is not None and x.get('tam_id') != a6_tam_id(a6_path):     # HCL1-4
+        return None, None, f"xoay_v1 tam_id {x.get('tam_id')!r} khac tam_id cua A6 {a6_tam_id(a6_path)!r}"
     b = (x.get('cho') or {}).get(cho) if isinstance(x.get('cho'), dict) else None
     if not isinstance(b, dict):
         return None, None, f'xoay_v1 khong co cho {cho!r}'
@@ -1642,7 +1733,7 @@ def _f5_checked(path):
     return d
 
 
-def q_cua_cho(x, cho, a6_path, xoay_path, ll_id, q_tu=None):
+def q_cua_cho(x, cho, a6_path, xoay_path, ll_id, q_tu=None, ll_sha=None):
     """(q_tag_m, u_q_m, reason, q_nguon) for a place. Own place block of xoay_v1 first (xoay_q). A place without one
     (K2: HC has no E turn there) takes, CODE 22/11 option (A) (contract C8), the block of a place WITH E (K1 or goc) on
     the SAME mounting of the plate: q is the tag centre seen from the turning centre of the car, fixed while the plate
@@ -1650,7 +1741,9 @@ def q_cua_cho(x, cho, a6_path, xoay_path, ll_id, q_tu=None):
     cua_so on the same A6 and xoay files; the mounting is verified by lan_lap_id of this F5 (ll_id) = lan_lap_id of
     q_tu, both from F8 run 1 and not null. Another mounting, a null lan_lap_id (not verified, no F8) or no q_tu ->
     (None, None, reason, None): u_q missing, the place chua_ket_luan / chan_doan. A malformed q_tu, or the F5 of
-    this very place: AError (code 2)."""
+    this very place: AError (code 2). F8 rong (CODE 23/11 muc 1, cach_lan_lap 'rong'; ll_sha = sha256 of the F8 file
+    read for this place): an id null but both F5 read the same F8 file -> the block is borrowed, u_q + 0.57 mm (plate
+    shift bound of session 1), q_nguon labelled NGUON_LECH_TAM; two different non-null ids are still refused."""
     q, u, why = xoay_q(x, cho, a6_path)
     if q is not None:
         return q, u, None, dict(cho=cho, xoay_sha256=sha256(xoay_path), lan_lap_id=ll_id, cach='khoi F4 cua chinh cho')
@@ -1666,17 +1759,23 @@ def q_cua_cho(x, cho, a6_path, xoay_path, ll_id, q_tu=None):
     if o.get('xoay_sha256') != sha256(xoay_path) or o.get('a6_sha256') != (sha256(a6_path) if a6_path else None):
         return None, None, f'F5 {o.get("thu_id")} ({cho_o}) lam tu file xoay / A6 khac', None
     ll_o = o.get('lan_lap_id')
-    if not (isinstance(ll_id, str) and ll_id and isinstance(ll_o, str) and ll_o):
+    cach = cach_lan_lap(ll_id, ll_sha, o)
+    if cach == 'chua':
         return None, None, (f'chua xac minh cung lan lap tam voi {cho_o} (lan_lap_id {cho} {ll_id!r}, '
-                            f'{cho_o} {ll_o!r}; F8 luot 1)'), None
-    if ll_id != ll_o:
+                            f'{cho_o} {ll_o!r}; F8 luot 1; khong cung mot file F8 da doc)'), None
+    if cach == 'khac':
         return None, None, f'khac lan lap tam: {cho} {ll_id!r}, {cho_o} {ll_o!r}', None
     q, u, why_o = xoay_q(x, cho_o, a6_path)
     if q is None:
         return None, None, f'cho {cho_o} cung lan lap: {why_o}', None
-    return q, u, None, dict(cho=cho_o, thu_id=o.get('thu_id'), xoay_sha256=sha256(xoay_path), lan_lap_id=ll_id,
-                            doan_12b_sha256=o.get('sha256'), doan_12b_file_sha256=sha256(q_tu),
-                            cach='khoi F4 cua cho co E cung lan lap tam (CODE 22/11 phuong an A)')
+    ng = dict(cho=cho_o, thu_id=o.get('thu_id'), xoay_sha256=sha256(xoay_path), lan_lap_id=ll_id,
+              doan_12b_sha256=o.get('sha256'), doan_12b_file_sha256=sha256(q_tu),
+              cach='khoi F4 cua cho co E cung lan lap tam (CODE 22/11 phuong an A)')
+    if cach == 'rong':                 # CODE 23/11 F8 rong muc 1: same F8 read, no id -> plate shift bound of session 1
+        ng.update(lan_lap_v1_sha256=ll_sha, u_q_f4_m=u, u_lech_tam_m=U_LECH_TAM_BUOI1_M, nguon_u=NGUON_LECH_TAM,
+                  cach='khoi F4 cua cho co E, F8 khong xac minh lan lap (CODE 23/11 F8 rong muc 1)')
+        u = u + U_LECH_TAM_BUOI1_M
+    return q, u, None, ng
 
 
 _KHAC = object()
@@ -1789,7 +1888,7 @@ def _f2_rows(path):
     return o
 
 
-def read_lan_lap(path, thu_id, cho, a6_path, clip_sha, frames_sha, ses_sha=None):
+def read_lan_lap(path, thu_id, cho, a6_path, clip_sha, frames_sha, ses_sha=None, xoay_path=None):
     """(lan_lap_id or None, reason or None, sha256 of the file) of a 12b attempt from F8 lan_lap_v1 of NHACTAM (run 1
     of lan_lap, without --f15 / --truc-xe; CODE 20/11, sequence T9, T9b). F8 has one luot[] record per car run
     (windows pre/post), none for a 12b attempt: the placement of the 12b is the lan_lap_id that F8 gives to the runs of
@@ -1811,6 +1910,8 @@ def read_lan_lap(path, thu_id, cho, a6_path, clip_sha, frames_sha, ses_sha=None)
         raise AError(f"{path}: tam_id {j.get('tam_id')!r} khac tam_id cua A6 {tam!r}")
     if (j.get('a6') or {}).get('sha256') != sha256(a6_path):
         raise AError(f'{path}: a6.sha256 khac file --a6')
+    if xoay_path and j.get('xoay_sha256') and j['xoay_sha256'] != sha256(xoay_path):          # HCL1-4
+        raise AError(f'{path}: xoay_sha256 khac file --xoay')
     f2, f2_sha = j.get('cua_so_v1_file'), j.get('cua_so_v1_sha256')
     if not f2 or not os.path.isfile(f2) or sha256(f2) != f2_sha:
         raise AError(f'{path}: file F2 cua F8 ({f2}) khong co hay sha256 khac cua_so_v1_sha256')
@@ -1823,13 +1924,15 @@ def read_lan_lap(path, thu_id, cho, a6_path, clip_sha, frames_sha, ses_sha=None)
         raise AError(f'{path}: luot phai la danh sach ban ghi')
     if any(r.get('tam_id') != tam for r in luot):
         raise AError(f'{path}: co luot cua tam khac {tam!r}')
-    ids = {r['lan_lap_id'] for r in luot if r.get('cho') == cho and thu_id in (r.get('chuan_12b'), r.get('luot_id'))
-           and isinstance(r.get('lan_lap_id'), str) and r['lan_lap_id']}
+    mine = [r for r in luot if r.get('cho') == cho and thu_id in (r.get('chuan_12b'), r.get('luot_id'))]
+    if any(r.get('lan_lap_id') is not None and not isinstance(r.get('lan_lap_id'), str) for r in mine):  # HCL1-4
+        raise AError(f'{path}: lan_lap_id cua {cho}|{thu_id} phai la chuoi hay null')
+    ids = {r['lan_lap_id'] for r in mine if isinstance(r.get('lan_lap_id'), str) and r['lan_lap_id']}
     f_sha = sha256(path)
     if len(ids) == 1:
         return ids.pop(), None, f_sha
     if not ids:
-        return None, f'F8 khong co luot nao cua {cho} xac minh lan lap voi 12b {thu_id} (chuan_12b)', f_sha
+        return None, f'{LY_DO_F8_KHONG_ID} cua {cho} xac minh lan lap voi 12b {thu_id} (chuan_12b)', f_sha
     return None, f'F8 cho 12b {thu_id} nhieu lan_lap_id {sorted(ids)}', f_sha
 
 
@@ -1930,10 +2033,65 @@ def read_can_c8b(path, cho):
     return vals[0], None if hd is None else vals[1], bool(b.get('chot', False))
 
 
-def check_cap_sources(d, frames, track, log_path, a6, xoay, need):
+def dau_doan(attempts, att_src, att_ses, cap_id, every=True):
+    """CODE 23/11, format of C8B (F7 thu 2): one record per leg-start window whose psi' a_k takes, over the legs
+    of u_psi_cuc (legs_u: every valid long leg of every attempt of the place with the C8B bound function, else the
+    issued attempt only): thu_id, doan_i, frames_duong_dan, frames_sha256, ids (frame ids of the window: the frames
+    through the gate, A6 and q of the chain, the set psi' of the window is averaged on), plus cua_so, p_tag_m,
+    psi_deg (the values here) and session_sha256."""
+    out = []
+    for tid, an, _ in attempts:
+        if an is None or (not every and tid != cap_id) or tid not in att_src:
+            continue
+        frames, F = att_src[tid]
+        for lg in an['legs']:
+            if not (lg['dai'] and lg['trang_thai'] == 'hop_le'):
+                continue
+            w = an['windows'][lg['a']]
+            ids = [int(v) for v in np.asarray(F['idx'])[np.asarray(w['mask'], bool)]]
+            out.append(dict(thu_id=tid, doan_i=lg['i'], cua_so=lg['a'], frames_duong_dan=os.path.abspath(frames),
+                            frames_sha256=sha256(frames), ids=ids, p_tag_m=[float(v) for v in lg['p_tag_a']],
+                            psi_deg=math.degrees(lg['R_a']), session_sha256=att_ses.get(tid)))
+    return out
+
+
+def _same_num(x, y, tol=1e-12):
+    """Equal numbers or equal-length number lists within tol; None only equals None."""
+    if x is None or y is None:
+        return x is None and y is None
+    seq = (list, tuple)
+    if isinstance(x, seq) != isinstance(y, seq):
+        return False
+    xs, ys = (list(x), list(y)) if isinstance(x, seq) else ([x], [y])
+    if len(xs) != len(ys):
+        return False
+    return all(isinstance(u, (int, float)) and isinstance(v, (int, float)) and abs(float(u) - float(v)) <= tol
+               for u, v in zip(xs, ys))
+
+
+def cap_f2_f5(d, doan=None):
+    """(F2 path, F5 path) of the issued attempt. Without --doan: DIR's own files. With --doan (run 2 of cua_so writes
+    F2 + F5 to its --ra folder, T9b; the attempt folder holds run 1 or nothing): that F5, and of the cua_so_v1.jsonl
+    beside it and DIR's, the first whose sha256 = cua_so_v1_sha256 of that F5 (else the first present, so
+    check_cap_sources refuses it by that sha; neither present: the one beside, refused as missing)."""
+    own = os.path.join(d, 'cua_so_v1.jsonl')
+    if not doan:
+        return own, os.path.join(d, 'doan_12b_v1.json')
+    side = os.path.join(os.path.dirname(os.path.abspath(doan)), 'cua_so_v1.jsonl')
+    cand = [p for p in (side, own) if os.path.isfile(p)]
+    try:
+        want = json.load(open(doan, encoding='utf-8')).get('cua_so_v1_sha256')
+    except (OSError, ValueError, AttributeError):
+        want = None
+    hit = [p for p in cand if want and sha256(p) == want]
+    return (hit or cand or [side])[0], doan
+
+
+def check_cap_sources(d, frames, track, log_path, a6, xoay, need, doan=None):
     """HCC2-5: the F2 rows and the F5 of the issued attempt must have been made from the very frames, track and log
-    tinh analyses now (and the same A6, xoay files); need=True (F6/F9 given) and a file missing -> AError."""
-    p2, p5 = os.path.join(d, 'cua_so_v1.jsonl'), os.path.join(d, 'doan_12b_v1.json')
+    tinh analyses now (and the same A6, xoay files); need=True (F6/F9 given) and a file missing -> AError. doan: the
+    F5 of --doan (run 2; its F2 beside it, cap_f2_f5)."""
+    p2, p5 = cap_f2_f5(d, doan)
     if not need:                                          # HCC3-4: diagnosis from the current sources only
         return
     if not (os.path.isfile(p2) and os.path.isfile(p5)):
@@ -1989,12 +2147,19 @@ def read_khung_giua_session(paths):
             raise AError(f'{p}: hai file cho cung cap session')
         tc = j.get('theo_cho')
         hl = None
+        if tc is None and j.get('mo_hinh') == 'phys_v1':         # HCL1-11: a phys file is never read as an old one
+            raise AError(f'{p}: mo_hinh phys_v1 ma thieu theo_cho')
         if tc is not None:                       # phys_v1 (CODE_KHUNG design 2026-11-21 v1 section 3)
             if not isinstance(tc, dict):
                 raise AError(f'{p}: theo_cho phai la doi tuong theo cho')
             hl = {}
             for cho, b in tc.items():
-                v = ((b or {}).get('hanh_lang_12b') or {}).get('du_bien_dang_rad') if isinstance(b, dict) else None
+                if b is not None and not isinstance(b, dict):
+                    raise AError(f'{p}: theo_cho.{cho} phai la doi tuong')
+                hlb = (b or {}).get('hanh_lang_12b')
+                if hlb is not None and not isinstance(hlb, dict):                       # HCL1-11
+                    raise AError(f'{p}: theo_cho.{cho}.hanh_lang_12b phai la doi tuong')
+                v = (hlb or {}).get('du_bien_dang_rad')
                 if v is None:
                     continue                     # this place has no 12b corridor value: missing for that place
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= math.pi:
@@ -2039,17 +2204,18 @@ def cmd_tinh(a):
     ses_given = {sha256(p) for p in ses_files}
     nguon += [dict(vai_tro='session', duong_dan=os.path.abspath(p), sha256=sha256(p)) for p in ses_files]
     khung_files = read_khung_giua_session(getattr(a, 'khung_giua_session', None))
-    att_ses = {}
+    att_ses, att_src = {}, {}
     # option A (CODE 22/11): the mounting of the issued attempt from its F5 (run 2 of cua_so), read before the chain
-    q_tu, ll_cap_q, q_cung_cap = getattr(a, 'q_tu', None), None, None
+    q_tu, ll_cap_q, q_cung_cap, sha_cap_q = getattr(a, 'q_tu', None), None, None, None
     if a.xoay and q_tu:
         dp_q = a.doan or os.path.join(a.cap, 'doan_12b_v1.json')
         if os.path.isfile(dp_q):
             f5q = _f5_checked(dp_q)
             if f5q.get('thu_id') != cap_id or f5q.get('cho') != a.cho:
                 raise AError(f'{dp_q}: F5 cua {f5q.get("thu_id")} ({f5q.get("cho")}), khong phai luot cap')
-            ll_cap_q = f5q.get('lan_lap_id')
-        q_cung_cap = q_cung_lan_lap(json.load(open(a.xoay, encoding='utf-8')), a.cho, q_tu, ll_cap_q)
+            ll_cap_q, sha_cap_q = f5q.get('lan_lap_id'), _sha_lan_lap_f5(f5q)
+        q_cung_cap = q_cung_lan_lap(json.load(open(a.xoay, encoding='utf-8')), a.cho, q_tu, ll_cap_q, ll_sha=sha_cap_q,
+                                    a6_path=a.a6, xoay_path=a.xoay)
     for d in [a.cap] + list(a.them or []):
         A = load_attempt(d)
         if A['cho'] != a.cho:
@@ -2058,6 +2224,10 @@ def cmd_tinh(a):
         if not fr:
             raise AError(f'{d}: --frames-of {d}=FRAMES,TRACK missing')
         frames, track = fr.split(',')
+        tjd = json.load(open(track, encoding='utf-8'))
+        tjf = tjd.get('frames_sha256') if isinstance(tjd, dict) else None
+        if isinstance(tjf, str) and tjf and tjf != sha256(frames):         # HCL1-7: a frames/track pair of one clip
+            raise AError(f'{track}: frames_sha256 khac {frames}')
         att_ses[A['thu_id']] = s_t = track_session(track)        # da session: session of this attempt's track
         if ses_given and s_t is not None and s_t not in ses_given:
             raise AError(f'{track}: session_sha256 {s_t[:12]} khong nam trong cac --session')
@@ -2084,17 +2254,19 @@ def cmd_tinh(a):
             attempts.append((A['thu_id'], None, failed + [str(exc)]))
             continue
         attempts.append((A['thu_id'], an, failed))
+        att_src[A['thu_id']] = (frames, F)                # dau_doan (F7 thu 2): frame ids of the leg-start windows
         if is_cap:
-            check_cap_sources(d, frames, track, A['log_path'], a.a6, a.xoay, need=bool(a.neo or a.e_hieu))
+            check_cap_sources(d, frames, track, A['log_path'], a.a6, a.xoay, need=bool(a.neo or a.e_hieu),
+                              doan=a.doan)
             cap_F, cap_A, cap_an = F, A, an
-            p = os.path.join(d, 'cua_so_v1.jsonl')
+            p = cap_f2_f5(d, a.doan)[0]                    # run 2 (--doan): the F2 of that F5, not of run 1
             if os.path.isfile(p):
                 rows = [json.loads(x) for x in open(p, encoding='utf-8')]
                 cap_ref = next((r for r in rows if r.get('loai') == 'ref_12b'), None)
                 nguon.append(dict(vai_tro='cua_so_v1', duong_dan=os.path.abspath(p), sha256=sha256(p)))
     e = None
     bao_q = False
-    ll_f5 = None
+    ll_f5 = sha_f5 = f5 = None
     if a.e_hieu:
         dp = a.doan or os.path.join(a.cap, 'doan_12b_v1.json')
         e, bao_q = read_e_hieu(a.e_hieu, dp)
@@ -2104,14 +2276,21 @@ def cmd_tinh(a):
         s5, s_cap = f5.get('session_sha256'), att_ses.get(cap_id)
         if s5 and s_cap and s5 != s_cap:                  # da session: F9 of the issued attempt's own session
             raise AError(f'{dp}: F5 session_sha256 khac session cua track luot cap')
-        ll_f5 = f5.get('lan_lap_id')
+        ll_f5, sha_f5 = f5.get('lan_lap_id'), _sha_lan_lap_f5(f5)
         nguon += [dict(vai_tro='e_hieu_m', duong_dan=os.path.abspath(a.e_hieu), sha256=sha256(a.e_hieu)),
                   dict(vai_tro='doan_12b_v1', duong_dan=os.path.abspath(dp), sha256=sha256(dp))]
     q = du = None
     x_why = x_ng = None
     if a.xoay:                       # F4 (CODE 22/11): place block of xoay_v1 on this A6 only, never the top level
         ll_q = ll_f5 if ll_f5 is not None else ll_cap_q   # option A: mounting of the issued attempt (its F5)
-        q, du, x_why, x_ng = q_cua_cho(json.load(open(a.xoay, encoding='utf-8')), a.cho, a.a6, a.xoay, ll_q, q_tu)
+        sha_q = sha_f5 if sha_f5 is not None else sha_cap_q     # F8 rong: the F8 file that F5 was read against
+        q, du, x_why, x_ng = q_cua_cho(json.load(open(a.xoay, encoding='utf-8')), a.cho, a.a6, a.xoay, ll_q, q_tu,
+                                       ll_sha=sha_q)
+        if f5 is not None:           # HCL1-6: the F9 was made on the F5 legs with ITS q, du: the same ones here
+            c5 = f5.get('car_pose_cfg') or {}
+            if not (_same_num(q, c5.get('q_m')) and _same_num(du, c5.get('du_m'))):
+                raise AError(f'q, du_m tinh lai ({q}, {du}) khac car_pose_cfg cua F5 {cap_id} '
+                             f'({c5.get("q_m")}, {c5.get("du_m")}): --q-tu, --xoay, --a6 khac luc chay cua_so')
         nguon.append(dict(vai_tro='xoay_v1', duong_dan=os.path.abspath(a.xoay), sha256=sha256(a.xoay)))
         if q_tu:
             nguon.append(dict(vai_tro='q_tu_doan_12b_v1', duong_dan=os.path.abspath(q_tu), sha256=sha256(q_tu)))
@@ -2191,8 +2370,13 @@ def cmd_tinh(a):
                      can_hai_dau=can_fn, p_ref_tag=p_ref_tag, khung=kg)
     for x in r['luot_thu']:
         x['session_sha256'] = att_ses.get(x['thu_id'])
+    r['dau_doan'] = dau_doan(attempts, att_src, att_ses, cap_id, every=can_fn is not None)
     if x_why:                                            # why the xoay_v1 file gave no q for this place
         r['ly_do'].append(f'xoay: {x_why}')
+        if r['trang_thai'] == 'khoa':
+            r['trang_thai'] = 'chan_doan'
+    if f5 is not None and f5.get('trang_thai') != 'khoa':  # HCL1-1: F7 never locks on an F5 that did not
+        r['ly_do'].append(f"F5 {cap_id} trang_thai {f5.get('trang_thai')!r} (khong khoa): {f5.get('lan_lap_id_ly_do')}")
         if r['trang_thai'] == 'khoa':
             r['trang_thai'] = 'chan_doan'
     r = dict(schema='truc_xe_v1', version=VERSION, commit_hil=commit_hil(), nguon=nguon,
