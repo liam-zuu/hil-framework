@@ -2501,7 +2501,7 @@ def _track_beside(frames_path):
 
 def _ref_from(pre, chain, lan_lap, hs, frames, extra, f8_rong_ok=False):
     return ctd.tham_chieu(pre, chain, lan_lap, khung_tc_of(hs), hs['t_trong_s'],
-                          ctd._frame_dt([r['t_s'] for r in frames]), extra, f8_rong_ok=f8_rong_ok)
+                          ctd._frame_dt([r['t_s'] for r in frames]), extra, f8_rong_ok=f8_rong_ok, v_d=hs['v_d'])
 
 
 def chain_and_ref(frames, a6, xoay, ll, track, task, truc, pre, hs, extra, f8_rong_ok=False):

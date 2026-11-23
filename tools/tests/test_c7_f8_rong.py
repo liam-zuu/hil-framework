@@ -212,3 +212,36 @@ def test_tham_chieu_cach_a_w_is_the_tag_gate_set():
     pre2 = dict(khung_ma_hop_le=ma2, t_ref=3.0, ket_luan=dict(dat=True, ly_do=[]))
     g = ctd.tham_chieu(pre2, _chain(ma2), None, kt, 0.10, 1 / 60.0, f8_rong_ok=True)
     assert g['trang_thai'] == 'hong_cua_so_tc' and g['tap'] == ctd.TAP_MA_CACH_A
+
+
+def test_w_c8b_four_numbers_and_parts():
+    """C8B 23/11 (local_0b12a551; design C8b v7 6a, 6b): w_dao_dong = |mean of the first half - mean of the second
+    half| of W in time; w_canh = largest deviation over W + joint + largest over W alone + v_d dt + v_d ho (heading:
+    omega_d = v_d / 0.24 m); every part written; before the margin."""
+    ma = list(range(180))
+    ch = _chain(ma)
+    for c in ch:
+        if c['frame_id'] >= 90:                                       # second half of W 0.1 mm east, 0.01 rad
+            c.update(p_x=0.4001, tag_x=0.4001, psi_ma_p=0.31)
+    joint = dict(frame_id=500, t_cam=3.05, tag_x=0.4004, tag_y=-0.2, tag_psi=0.3, psi_ma_p=0.33, p_x=0.4004,
+                 p_y=-0.2, cong_ok=True, a6_ok=True, q_ok=True)
+    far = dict(joint, frame_id=501, t_cam=3.5, p_x=0.5, psi_ma_p=1.0)            # after t_max: not the joint
+    pre = dict(khung_ma_hop_le=ma, t_ref=3.0, t_max=3.1, ket_luan=dict(dat=True, ly_do=[], ho_noi_max_s=0.05))
+    kt = dict(ctd.KHUNG_TC_DE_XUAT, nguon='test', psi_dung_deg=5.0, p_dung_m=0.01)
+    tc = ctd.tham_chieu(pre, ch + [joint, far], None, kt, 0.10, 1 / 60.0, f8_rong_ok=True, v_d=0.01)
+    assert tc['w_dao_dong_xy_m'] == pytest.approx(1e-4, abs=1e-12)
+    assert tc['w_dao_dong_psi_rad'] == pytest.approx(0.01, abs=1e-12)
+    ptc = tc['p_tc_m'][0]
+    assert ptc == pytest.approx(0.40005, abs=1e-12)
+    lw = 0.00005
+    ln = 0.4004 - ptc
+    w = tc['w_c8b']
+    assert w['lech_max_W_m'] == pytest.approx(lw, abs=1e-12) and w['lech_max_m'] == pytest.approx(ln, abs=1e-12)
+    assert tc['w_canh_xy_m'] == pytest.approx(ln + lw + 0.01 / 60.0 + 0.01 * 0.05, abs=1e-12)
+    wd = 0.01 / 0.24
+    lwp, lnp = 0.005, 0.33 - tc['psi_tc_rad']
+    assert tc['psi_tc_rad'] == pytest.approx(0.305, abs=1e-9)
+    assert tc['w_canh_psi_rad'] == pytest.approx(lnp + lwp + wd / 60.0 + wd * 0.05, abs=1e-9)
+    assert w['n_noi'] == 1 and w['v_d'] == 0.01 and w['ho_noi_max_s'] == 0.05 and w['dt_s'] == pytest.approx(1 / 60)
+    none = ctd.tham_chieu(pre, ch, None, kt, 0.10, 1 / 60.0, f8_rong_ok=True)           # no v_d: null, said why
+    assert none['w_canh_xy_m'] is None and none['w_dao_dong_psi_rad'] is None and none['w_c8b']['ly_do']

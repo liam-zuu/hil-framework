@@ -393,13 +393,65 @@ TAP_MA_CACH_A = 'ma_cach_A'
 W_NHAN_CACH_A = 'w_theo_ma_cach_A'
 
 
-def tham_chieu(pre, chain, lan_lap, kt, t_trong, dt, extra=None, f8_rong_ok=False):
+W_CANH_L_M = 0.24                 # the omega_d = v_d / 0.24 m of the G1 still rule (c7_score, J v6 G1)
+
+
+def w_c8b(rows, p_tc, psi_tc, chain, pre, dt, v_d):
+    """The four W numbers of the C8B lock T12 (C8B 23/11, local_0b12a551, design C8b v7 6a, 6b; before the margin):
+      w_dao_dong_xy_m / _psi_rad: the W ids split in time into two adjacent halves, the mean of each (centre after q;
+        heading trung_binh_go_vong): |p1 - p2|, |wrap(psi1 - psi2)| (repeatability of two adjacent windows, v4 6b;
+        session 2 has one ~3 s W per run, so the two halves of that W: about 2x the error of the full mean, safe side).
+      w_canh_xy_m / _psi_rad (v7 6a): the largest deviation from p_tc / psi'_tc over W plus the joint [t_ref, t_max]
+        (chain frames with cong_ok, a6_ok, q_ok there) + the frame error (the largest deviation over W alone, still
+        car: frame noise) + the capture interval (v_d dt / omega_d dt) + v_d ho_noi_max_s / omega_d ho_noi_max_s of the
+        F2 pre row, omega_d = v_d / W_CANH_L_M; the (|q_hat| + dq) omega_d ho_noi_s part is added by C8B.
+    Every part is also written (w_c8b). None when the position or heading of W is not defined, v_d is None, or W has
+    fewer than two frames. Limit: the joint uses the two-sided frame gate of the chain (cong_ok), not the one-sided
+    gate of F2 (mot_phia); the one-sided gate keeps more frames there."""
+    out = dict(w_dao_dong_xy_m=None, w_dao_dong_psi_rad=None, w_canh_xy_m=None, w_canh_psi_rad=None)
+    ho = (pre.get('ket_luan') or {}).get('ho_noi_max_s')
+    if v_d is None or len(rows) < 2 or not (isinstance(ho, (int, float)) and math.isfinite(ho)):
+        out['w_c8b'] = dict(ly_do='thieu v_d, ho_noi_max_s hay W < 2 khung')
+        return out
+    w_d = float(v_d) / W_CANH_L_M
+    rs = sorted(rows, key=lambda r: r['t_cam'])
+    h1, h2 = rs[:len(rs) // 2], rs[len(rs) // 2:]
+    lo, hi = float(pre['t_ref']), float(pre['t_max'])
+    w_ids = {r['frame_id'] for r in rows}
+    noi = [c for c in chain if c['frame_id'] not in w_ids and lo <= c['t_cam'] <= hi and c['cong_ok']]
+    part = dict(v_d=float(v_d), omega_d=w_d, L_m=W_CANH_L_M, dt_s=float(dt), ho_noi_max_s=float(ho),
+                n_W=len(rows), n_nua=[len(h1), len(h2)], n_noi=len(noi), cong_noi='cong_ok (hai phia, chuoi)')
+    if p_tc is not None:
+        P1 = np.array([[r['p_x'], r['p_y']] for r in h1]).mean(axis=0)
+        P2 = np.array([[r['p_x'], r['p_y']] for r in h2]).mean(axis=0)
+        out['w_dao_dong_xy_m'] = float(np.hypot(*(P1 - P2)))
+        PW = np.array([[r['p_x'], r['p_y']] for r in rows])
+        lw = float(np.max(np.hypot(PW[:, 0] - p_tc[0], PW[:, 1] - p_tc[1])))
+        nq = [c for c in noi if c['q_ok']]
+        ln = max([lw] + [float(math.hypot(c['p_x'] - p_tc[0], c['p_y'] - p_tc[1])) for c in nq])
+        out['w_canh_xy_m'] = ln + lw + float(v_d) * float(dt) + float(v_d) * float(ho)
+        part.update(lech_max_m=ln, lech_max_W_m=lw, n_noi_q=len(nq))
+    if psi_tc is not None:
+        a1 = ck.trung_binh_go_vong(np.array([r['psi_ma_p'] for r in h1]))
+        a2 = ck.trung_binh_go_vong(np.array([r['psi_ma_p'] for r in h2]))
+        out['w_dao_dong_psi_rad'] = float(abs(ck.wrap(a1 - a2)))
+        lw = float(np.max(np.abs(ck.wrap(np.array([r['psi_ma_p'] for r in rows]) - psi_tc))))
+        na = [c for c in noi if c['a6_ok']]
+        ln = max([lw] + [float(abs(ck.wrap(c['psi_ma_p'] - psi_tc))) for c in na])
+        out['w_canh_psi_rad'] = ln + lw + w_d * float(dt) + w_d * float(ho)
+        part.update(lech_max_rad=ln, lech_max_W_rad=lw, n_noi_a6=len(na))
+    out['w_c8b'] = part
+    return out
+
+
+def tham_chieu(pre, chain, lan_lap, kt, t_trong, dt, extra=None, f8_rong_ok=False, v_d=None):
     """F12 tham_chieu_v1 from the 'pre' row, the chain rows and lan_lap_v1 (or None). trang_thai: 'dat' (usable),
     'hong_cua_so_tc' (run lost to the reference window), 'chua_ket_luan' (no pose: missing q or A6 on the set).
     f8_rong_ok (f8_rong(...)[0], CODE 23/11 chot T12 muc 4, goc 6812dcf6): W = the tag-gate frames of 'pre' (tap
     TAP_MA_CACH_A, w_nhan W_NHAN_CACH_A), not the tag-anchor intersection of J v6 2: J takes the intersection because
     beta is measured on the anchors and p_tc, psi(0) must share its set; cach A measures beta by the tag yaw, so the
-    consistent set is the tag gate. The sample gate (n_min, frac_min, t_trong) and the spread gates are unchanged."""
+    consistent set is the tag gate. The sample gate (n_min, frac_min, t_trong) and the spread gates are unchanged.
+    v_d (constants file): the four W numbers of the C8B lock (w_c8b), None without it."""
     by = {c['frame_id']: c for c in chain}
     ma = [int(i) for i in (pre.get('khung_ma_hop_le') or [])]
     why, tap = [], 'giao'
@@ -460,6 +512,7 @@ def tham_chieu(pre, chain, lan_lap, kt, t_trong, dt, extra=None, f8_rong_ok=Fals
     return dict(schema=THAM_CHIEU_SCHEMA, phien_ban=PHIEN_BAN, chuoi_khung=ck.PHIEN_BAN, phep_gop='trung_binh_go_vong',
                 tap=tap, mat_neo=tap == 'ma_mat_neo', ids=ids, ids_sha256=ids_sha(ids), n=len(ids),
                 w_nhan=W_NHAN_CACH_A if tap == TAP_MA_CACH_A else None,
+                **w_c8b(rows, p_tc, psi_tc, chain, pre, dt, v_d),
                 t_tc_s=float(tt.mean()) if len(tt) else None, p_tc_m=p_tc, psi_tc_rad=psi_tc, psi_tan_rad=tan,
                 p_lech_max_m=lp, psi_lech_max_rad=lpsi, p_ok=p_ok, psi_ok=y_ok, trang_thai=trang, ly_do=why,
                 lan_lap_v1_sha256=None if lan_lap is None else lan_lap.get('_sha256'), **(extra or {}))
