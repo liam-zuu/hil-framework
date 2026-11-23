@@ -107,7 +107,7 @@ CHO_THIEU = dict(           # sources not delivered yet (CODE 23/11 muc 5): the 
     P6_rieng_ii='P6 rieng dau (ii) dong: C8B chua tinh (thiet ke v7 muc 3, track cac luot C8)',
     neo='neo P_neo, A_neo: KIEMCHEO chua xuat (hop dong F15)',
     U_moc='U_moc_hieu_xy_m, U_moc_hieu_psi_rad: CAM chua xuat (hop dong muc G (6))',
-    W='W (dao dong W, W-canh): CAM T11 tham_chieu_v1 chua chay',
+    W='W (dao dong W, W-canh): thieu tham_chieu_v1 co bon truong w_* dat cua moi luot o cho cua muc (--tham-chieu)',
     u_theta='u_theta cua delta_q: u_a_k_deg cua F7 (HIEUCHUAN tinh) chua co',
     u_phi='u_phi_hat (F7 truc_xe_v1 goc khoa) chua co, hay F8 khong rong (cach A chi khi F8 rong)')
 
@@ -229,15 +229,26 @@ def hang_dong_tinh(src, side):
             part['dq_khong_u_theta_m'] = uq + DQ_LECH_TAM_M
     else:
         why['hang_m'].append(f'khong co xoay_v1 {CHO_MUC} (--xoay)')
-    w = src.get('W')                                          # names to agree with CAM (T11); no CLI yet
+    w = src.get('W')                                          # direct numbers (tests); else from tham_chieu_v1
     if isinstance(w, dict) and _num(w.get('W_xy_m')) is not None and _num(w.get('W_psi_rad')) is not None:
         part['W_xy_m'], part['W_psi_rad'] = float(w['W_xy_m']), float(w['W_psi_rad'])
+    # CAM T11 (hil 34fd9e4; names agreed C8B - CAM 23/11, design v7 6a, 6b), before the margin, the W of the runs at
+    # the level place: w_dao_dong_* (two halves of W) + w_canh_* (largest deviation over W and the join + one frame
+    # + v_d ho_noi); C8B adds the lever below: L (omega_d ho_noi_max_s + the W heading terms)
+    tcw = [t for t in (src.get('tham_chieu') or {}).get(CHO_MUC, []) if isinstance(t, dict)]         if isinstance(src.get('tham_chieu'), dict) else []
+    w_rows = []
+    for t in tcw:
+        c = t.get('w_c8b') or {}
+        v = [_num(t.get(k)) for k in ('w_dao_dong_xy_m', 'w_canh_xy_m', 'w_dao_dong_psi_rad', 'w_canh_psi_rad')]             + [_num(c.get('omega_d')), _num(c.get('ho_noi_max_s'))]
+        w_rows.append(None if any(x is None or x < 0 for x in v) or t.get('trang_thai') != 'dat' else v)
+    if 'W_xy_m' not in part and w_rows and all(r is not None for r in w_rows):
+        part['W_psi_rad'] = max(r[2] + r[3] for r in w_rows)
     p6 = src.get('P6_rieng_ii')                               # C8B, design v7 section 3 (waits W; CODE asked)
     if isinstance(p6, dict) and _num(p6.get('gia_tri_m')) is not None:
         part['P6_rieng_ii_m'] = float(p6['gia_tri_m'])
     have = dict(u_theta='u_theta_rad' in part, P6_rieng_i='P6_rieng_i_m' in part,
                 P6_rieng_ii='P6_rieng_ii_m' in part, neo='P_neo_m' in part, U_moc='U_moc_hieu_xy_m' in part,
-                W='W_xy_m' in part)
+                W='W_psi_rad' in part)
     for k in ('u_theta', 'P6_rieng_i', 'P6_rieng_ii', 'neo', 'U_moc', 'W'):
         if not have[k]:
             why['hang_m'].append(CHO_THIEU[k])
@@ -260,6 +271,10 @@ def hang_dong_tinh(src, side):
         dq0 = part['dq_khong_u_theta_m']
         part['dq_m'] = dq0 + (part['q_hat_m'] + dq0) * part['u_theta_rad']    # design v7 section 1 step (4)
         lever = part['L_m'] = part['q_hat_m'] + part['dq_m']
+        if 'W_xy_m' not in part and w_rows and all(r is not None for r in w_rows):
+            part['W_xy_khong_tay_don_m'] = max(r[0] + r[1] for r in w_rows)
+            part['W_xy_m'] = max(r[0] + r[1] + lever * (r[4] * r[5] + r[2] + r[3]) for r in w_rows)
+            part['W_n_luot'] = len(w_rows)
     need_m = ('P1_m', 'A3_rad', 'A6du_rad', 'A5_rad', 'thi_sai_m', 'P7_m', 'dq_m', 'P6_rieng_i_m', 'P6_rieng_ii_m',
               'P_neo_m', 'U_moc_hieu_xy_m', 'W_xy_m')
     if not why['hang_m'] and all(k in part for k in need_m):
@@ -773,6 +788,7 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
     side = a_m
     hd, hd_why, hd_part, lever = (hang_dong_tinh(dict(kiem_cheo=kiem_cheo, a6=a6, xoay=xoay, u_h=u_h,
                                                        lan_lap=lan_lap, truc_xe=truc_xe, neo=neo, u_moc=u_moc,
+                                                       tham_chieu=tham_chieu,
                                                        cam=cam if isinstance(cam, list) else [cam] if cam else []),
                                                   side)
                                   if side is not None else (dict(hang_m=None, he_so_r=None, hang_rad=None,

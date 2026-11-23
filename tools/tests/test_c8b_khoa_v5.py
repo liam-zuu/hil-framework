@@ -628,3 +628,31 @@ def test_a6_du_cua_so_is_the_a6_module_path():
                            A6R['side_m'], cam)
     assert got[0] == pytest.approx(float(want0[0]), abs=1e-15) and abs(got[0]) > 0
     assert abs(got[1]) > abs(got[0])                                     # a g off g_b leaves its model error
+
+
+def _tcw(dd=1e-5, ca=3e-4, ddp=2e-5, cap=2e-3, om=0.04, ho=0.0, st='dat'):
+    return dict(schema='tham_chieu_v1', trang_thai=st, psi_tan_rad=0.001, w_dao_dong_xy_m=dd, w_canh_xy_m=ca,
+                w_dao_dong_psi_rad=ddp, w_canh_psi_rad=cap, w_c8b=dict(omega_d=om, ho_noi_max_s=ho))
+
+
+def test_w_from_tham_chieu(monkeypatch):
+    """W of hang_dong from the CAM T11 fields (before the margin): per run w_dao_dong + w_canh, plus the lever
+    L (omega_d ho_noi + the W heading terms); the largest over the runs at goc; a run not dat or a field missing ->
+    W missing (hang_m, hang_rad null)."""
+    import c8b_a6 as a6m
+    monkeypatch.setattr(a6m, 'a6du_rad', lambda a6, rho: 0.0078)
+    base = dict(lan_lap=_f8null(), truc_xe=_f7(),
+                neo=dict(schema='c7_neo_luot_v1', theo_cho=dict(goc=dict(trang_thai='dat', P_neo_m=3e-4,
+                                                                          A_neo_rad=2e-4))),
+                u_moc=[dict(U_moc_hieu_xy_m=1e-4, U_moc_hieu_psi_rad=1e-4)], P6_rieng_ii=dict(gia_tri_m=6e-4))
+    tcs = dict(goc=[_tcw(), _tcw(ca=5e-4, cap=1e-3, ho=0.01)], K1=[_tcw(ca=9e-3)])
+    v, why, p, L = K.hang_dong_tinh(_src(tham_chieu=tcs, **base), 0.1445)
+    assert not why, why
+    assert p['W_psi_rad'] == pytest.approx(2e-5 + 2e-3) and p['W_n_luot'] == 2
+    assert p['W_xy_m'] == pytest.approx(1e-5 + 5e-4 + L * (0.04 * 0.01 + 2e-5 + 1e-3), rel=1e-12)
+    assert p['W_xy_khong_tay_don_m'] == pytest.approx(1e-5 + 5e-4)
+    assert v['hang_rad'] == pytest.approx(2 * math.radians(0.25) + 2 * 0.0078 + math.radians(0.13) + 2e-4 + 1e-4
+                                          + p['W_psi_rad'], rel=1e-12)
+    for bad in (dict(goc=[_tcw(), _tcw(st='hong_cua_so_tc')]), dict(goc=[dict(_tcw(), w_canh_xy_m=None)]), dict(K1=[_tcw()])):
+        v2, why2, _, _ = K.hang_dong_tinh(_src(tham_chieu=bad, **base), 0.1445)
+        assert v2['hang_m'] is None and v2['hang_rad'] is None and any('W' in w for w in why2['hang_rad'])
