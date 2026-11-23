@@ -152,8 +152,14 @@ def hang_dong_tinh(src, side):
              and f7.get('trang_thai') == 'khoa')
     if f7_ok and _num(f7.get('u_a_k_deg')) is not None:
         part['u_theta_rad'] = math.radians(float(f7['u_a_k_deg']))
-    if f7_ok and rong and _num(f7.get('u_phi_hat_chuan_k_deg')) is not None:
+    if f7_ok and rong and _num(f7.get('u_a_noi_bo_deg')) is not None and isinstance(f7.get('dau_doan'), list) \
+            and f7['dau_doan']:
+        # CODE 23/11: u_a without u_psi_cuc; the camera part is u_beta_cam between the leg starts and W (build checks)
+        part['u_phi_rad'] = math.radians(float(f7['u_a_noi_bo_deg']) + U_BETA_LECH_TAM_DEG)
+        part['u_phi_cach'] = 'u_a_noi_bo + dau_doan'
+    elif f7_ok and rong and _num(f7.get('u_phi_hat_chuan_k_deg')) is not None:
         part['u_phi_rad'] = math.radians(float(f7['u_phi_hat_chuan_k_deg']) + U_BETA_LECH_TAM_DEG)
+        part['u_phi_cach'] = 'u_phi_hat_chuan_k + ref_12b'
     neo = src.get('neo')
     ng = ((neo or {}).get('theo_cho') or {}).get(CHO_MUC) if isinstance(neo, dict) else None
     if isinstance(neo, dict) and neo.get('schema') == 'c7_neo_luot_v1' and isinstance(ng, dict) \
@@ -656,15 +662,20 @@ def u_beta_cam_cho(a6, kcs, kc_doan, tam_id, dc, cho):
     the two ends); A6 = a6_hieu_replay of the pair with eps_g without the map part when the joint term carried it (else
     eps_g); + psi_tan of W (tham_chieu_v1) + tan of the ref window. Returns (value before the margin or None, reasons,
     per-run parts)."""
-    ref, Ws = dc['ref'], dc['W']
+    # CODE 23/11 (chot T12 muc 5 'u_phi khong dem hai lan cua so chuan', Liam at CODE: "may lam di"): with the leg-
+    # start windows of the 12b long legs (F7 dau_doan, where a_k takes psi') the camera error is taken straight
+    # between each leg start and W (phi = psi'_tc - a, the reference window cancels); without them the ref_12b window
+    refs, Ws = (dc.get('dau_doan') or [dc['ref']]), dc['W']
+    loai = 'dau_doan' if dc.get('dau_doan') else 'ref_12b'
     a2, w2 = _a3_hai_dau_rad(kcs, cho)
     cams_all = _cams(a6)
     if not cams_all:
         return None, ['A6 khong co danh sach camera (session.cam_tam_m)'], []
     vals, why, parts = [], [], []
-    for w in Ws:
+    for ref, w in [(r_, w_) for r_ in refs for w_ in Ws]:
         import c8b_a6 as a6m
-        p = dict(doan_ref=ref.get('doan'), doan_W=w.get('doan'))
+        p = dict(doan_ref=ref.get('doan'), doan_W=w.get('doan'), loai_ref=loai, ref=ref.get('luot_id'),
+                 ref_i=ref.get('doan_i'), W=w.get('frames'))
         a3p, eps, cach = None, a6.get('eps_g'), 'bao_hai_dau'
         kc = (kc_doan or {}).get(w.get('doan')) if ref.get('doan') and ref.get('doan') == w.get('doan') else None
         if kc is not None:
@@ -737,9 +748,11 @@ def u_beta_cam(lan_lap, kiem_cheo=None, a6=None, side=None, tham_chieu=None, dau
             tcs = [t for t in ((tham_chieu or {}).get(c) or []) if isinstance(t, dict)]
             tan = [_num(t.get('psi_tan_rad')) for t in tcs]
             dc = (dau_chan or {}).get(c)
-            if isinstance(dc, dict) and isinstance(dc.get('ref'), dict) and dc.get('W') and isinstance(a6, dict):
+            if isinstance(dc, dict) and (isinstance(dc.get('ref'), dict) or dc.get('dau_doan')) and dc.get('W') \
+                    and isinstance(a6, dict):
                 v, wv, parts = u_beta_cam_cho(a6, kcs, kc_doan, (lan_lap or {}).get('tam_id'), dc, c)
-                cach[c] = dict(cach='replay_hieu_hai_cua_so', theo_luot=parts)
+                cach[c] = dict(cach='replay_hieu_hai_cua_so', loai_ref='dau_doan' if dc.get('dau_doan') else 'ref_12b',
+                               theo_luot=parts)
                 if v is None:
                     out[c], st[c] = None, 'thieu'
                     why.append(f'{c}: ' + '; '.join(map(str, wv)))
@@ -798,8 +811,14 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
     hd = dict(hd)
     u_phi_le = None
     if hd['u_phi_rad'] is not None:
+        cg = ((ugd or {}).get('a6du_cach') or {}).get(CHO_MUC)
         if ub.get(CHO_MUC) is None:
             hd_why = dict(hd_why, u_phi_rad=[f'u_beta_cam {CHO_MUC} thieu ({"; ".join(uwhy) or ust})'])
+            hd['u_phi_rad'] = None
+        elif hd_part.get('u_phi_cach') == 'u_a_noi_bo + dau_doan' \
+                and not (isinstance(cg, dict) and cg.get('loai_ref') == 'dau_doan'):
+            # u_a_noi_bo leaves the camera error of the leg starts out: it must come from u_beta_cam on dau_doan
+            hd_why = dict(hd_why, u_phi_rad=[f'u_a_noi_bo can u_beta_cam {CHO_MUC} tinh tren dau_doan (F7); thieu cua so'])
             hd['u_phi_rad'] = None
         else:
             u_phi_le = LE * hd['u_phi_rad'] + math.radians(ub[CHO_MUC])
@@ -875,19 +894,50 @@ def dau_chan_of(a, extra, nguon):
     """{cho: {rho_12b_m, rho_W_m, ...}} of the two footprints of beta (cach A): the ref_12b window of --khung-12b in
     the F2 --cua-so (same cho, frames_sha256) and the W windows (ids, frames of nguon) of the --tham-chieu at cho."""
     a6 = extra.get('a6')
-    if not isinstance(a6, dict) or not isinstance(a6.get('plumb_xy_m'), list) or not a.cua_so:
-        raise KhoaError('--khung-12b needs --a6 (plumb_xy_m) and --cua-so (F2)')
+    if not isinstance(a6, dict) or not isinstance(a6.get('plumb_xy_m'), list) or (a.khung_12b and not a.cua_so):
+        raise KhoaError('--khung-12b / F7 dau_doan need --a6 (plumb_xy_m); --khung-12b needs --cua-so (F2)')
     rows = []
-    with open(a.cua_so, encoding='utf-8') as f:
-        for line in f:
-            if line.strip():
-                rows.append(json.loads(line))
-    nguon.append(dict(vai='cua_so F2', file=os.path.basename(a.cua_so), duong_dan=os.path.abspath(a.cua_so),
-                      sha256=cu.sha256(a.cua_so)))
+    if a.cua_so:
+        with open(a.cua_so, encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+        nguon.append(dict(vai='cua_so F2', file=os.path.basename(a.cua_so), duong_dan=os.path.abspath(a.cua_so),
+                          sha256=cu.sha256(a.cua_so)))
+
+    def w_of(cho):
+        Ws = []
+        for t in (extra.get('tham_chieu') or {}).get(cho) or []:
+            fr = [n for n in t.get('nguon') or [] if n.get('vai_tro') == 'frames']
+            if len(fr) != 1 or fr[0].get('sha256') != t.get('frames_sha256') or not isinstance(t.get('ids'), list):
+                raise KhoaError(f'tham_chieu_v1 at {cho}: frames source / ids not usable for the W footprint')
+            w = cua_so_khung(fr[0]['duong_dan'], t['ids'], t['frames_sha256'], a6['plumb_xy_m'])
+            w.update(psi_tan_rad=t.get('psi_tan_rad'), frames=os.path.basename(os.path.dirname(fr[0]['duong_dan'])))
+            Ws.append(w)
+        return Ws
+
     out = {}
-    for s in a.khung_12b:
+    # F7 dau_doan (fields proposed to HIEUCHUAN 23/11): one window per long 12b leg start used by a_k:
+    # {thu_id, doan_i, frames_duong_dan, frames_sha256, ids}
+    for cho, f7 in (extra.get('truc_xe_cho') or {}).items():
+        dd = f7.get('dau_doan') if isinstance(f7, dict) else None
+        if not isinstance(dd, list) or not dd:
+            continue
+        wins = []
+        for e in dd:
+            if not isinstance(e, dict) or not isinstance(e.get('ids'), list) \
+                    or not isinstance(e.get('frames_duong_dan'), str) or not isinstance(e.get('frames_sha256'), str):
+                raise KhoaError(f'F7 {cho} dau_doan: each entry {{thu_id, doan_i, frames_duong_dan, frames_sha256, ids}}')
+            w = cua_so_khung(e['frames_duong_dan'], e['ids'], e['frames_sha256'], a6['plumb_xy_m'])
+            w.update(luot_id=e.get('thu_id'), doan_i=e.get('doan_i'), session_sha256=e.get('session_sha256'))
+            wins.append(w)
+        Ws = w_of(cho)
+        if Ws:
+            out[cho] = dict(dau_doan=wins, W=Ws, n_W=len(Ws), n_dau_doan=len(wins),
+                            quy_tac='cua so dau doan dai 12b (F7 dau_doan) so voi W (tham_chieu_v1)')
+    for s in a.khung_12b or []:
         cho, sep, pth = s.partition('=')
-        if not sep or cho not in CHO or cho in out:
+        if not sep or cho not in CHO or 'ref' in (out.get(cho) or {}):
             raise KhoaError(f'--khung-12b {s!r}: CHO=frames.csv, CHO in {CHO}, once each')
         sha = cu.sha256(pth)
         win = [r for r in rows if r.get('loai') == 'ref_12b' and r.get('cho') == cho and r.get('frames_sha256') == sha]
@@ -897,21 +947,13 @@ def dau_chan_of(a, extra, nguon):
             raise KhoaError(f'--khung-12b {s!r}: {len(win)} F2 ref_12b windows of {cho} on these frames, need one')
         ref = cua_so_khung(pth, [k['id'] for k in win[0]['khung']], sha, a6['plumb_xy_m'])
         ref.update(luot_id=win[0].get('luot_id'), session_sha256=win[0].get('session_sha256'))
-        tcs = (extra.get('tham_chieu') or {}).get(cho) or []
-        Ws = []
-        for t in tcs:
-            fr = [n for n in t.get('nguon') or [] if n.get('vai_tro') == 'frames']
-            if len(fr) != 1 or fr[0].get('sha256') != t.get('frames_sha256') or not isinstance(t.get('ids'), list):
-                raise KhoaError(f'tham_chieu_v1 at {cho}: frames source / ids not usable for the W footprint')
-            w = cua_so_khung(fr[0]['duong_dan'], t['ids'], t['frames_sha256'], a6['plumb_xy_m'])
-            w.update(psi_tan_rad=t.get('psi_tan_rad'), frames=os.path.basename(os.path.dirname(fr[0]['duong_dan'])))
-            Ws.append(w)
+        Ws = out[cho]['W'] if cho in out else w_of(cho)
         nguon.append(dict(vai=f'khung_12b {cho}', file=os.path.basename(pth), duong_dan=os.path.abspath(pth),
                           sha256=sha))
         if Ws:
-            out[cho] = dict(rho_12b_m=ref['rho_m'], rho_W_m=max(w['rho_m'] for w in Ws), luot_12b=[ref['luot_id']],
-                            n_W=len(Ws), ref=ref, W=Ws,
-                            quy_tac='max |tam ma - diem doi| tren khung cua so (ref_12b F2; W tham_chieu)')
+            out[cho] = dict(out.get(cho) or {}, rho_12b_m=ref['rho_m'], rho_W_m=max(w['rho_m'] for w in Ws),
+                            luot_12b=[ref['luot_id']], n_W=len(Ws), ref=ref, W=Ws)
+            out[cho].setdefault('quy_tac', 'max |tam ma - diem doi| tren khung cua so (ref_12b F2; W tham_chieu)')
     return out
 
 
@@ -948,7 +990,10 @@ def main(argv=None):
                     help='KIEMCHEO kiem_cheo.json (luot3_g4) of a camera segment with C8 runs; repeat (largest used)')
     ap.add_argument('--xoay', default=None, help='F4 xoay_v1 (q_tag_m, u_q_m of goc) for dq and the lever')
     ap.add_argument('--u-h-chung', default=None, help='c8b_u_h_chung_v1 (P6 common, thi sai goc)')
-    ap.add_argument('--truc-xe', default=None, help='F7 truc_xe_v1 of goc (u_a_k_deg, u_phi_hat_chuan_k_deg)')
+    ap.add_argument('--truc-xe', default=None, help='F7 truc_xe_v1 of goc (u_a_k_deg, u_phi_hat_chuan_k_deg; '
+                                                    'u_a_noi_bo_deg + dau_doan: the camera error straight to W)')
+    ap.add_argument('--truc-xe-cho', action='append', default=None,
+                    help='CHO=F7 truc_xe_v1 of K1 / K2 (dau_doan for u_beta_cam of that place); goc comes from --truc-xe')
     ap.add_argument('--neo', default=None, help='KIEMCHEO neo_luot.json (c7_neo_luot_v1, theo_cho.goc)')
     ap.add_argument('--u-moc', action='append', default=None,
                     help='CAM U_moc file with U_moc_hieu_xy_m, U_moc_hieu_psi_rad; repeat (largest used)')
@@ -1036,8 +1081,25 @@ def main(argv=None):
             extra.setdefault('tham_chieu', {}).setdefault(cho, []).append(d)
             nguon.append(dict(vai=f'tham_chieu {cho}', file=os.path.basename(pth), duong_dan=os.path.abspath(pth),
                               sha256=cu.sha256(pth)))
-        if a.khung_12b:
+        txc = {}
+        if isinstance(extra.get('truc_xe'), dict):
+            txc['goc'] = extra['truc_xe']
+        for s in a.truc_xe_cho or []:
+            cho, sep, pth = s.partition('=')
+            if not sep or cho not in CHO or cho == 'goc' or cho in txc:
+                raise KhoaError(f'--truc-xe-cho {s!r}: CHO=path, CHO K1 or K2, once each (goc: --truc-xe)')
+            with open(pth, encoding='utf-8') as f:
+                d = json.load(f)
+            if not isinstance(d, dict) or d.get('schema') != 'truc_xe_v1' or d.get('cho') != cho:
+                raise KhoaError(f'--truc-xe-cho {pth}: not a truc_xe_v1 of {cho}')
+            txc[cho] = d
+            nguon.append(dict(vai=f'truc_xe {cho}', file=os.path.basename(pth), duong_dan=os.path.abspath(pth),
+                              sha256=cu.sha256(pth)))
+        co_dd = any(isinstance(v.get('dau_doan'), list) and v['dau_doan'] for v in txc.values())
+        if a.khung_12b or co_dd:
+            extra['truc_xe_cho'] = txc
             extra['dau_chan'] = dau_chan_of(a, extra, nguon)
+            extra.pop('truc_xe_cho')
             extra['kc_doan'] = kc_doan_of(a.kiem_cheo, extra.get('kiem_cheo'))
         out = build(tbs, ll, nguon, script_state(), a.canh_ma_m, nt, mk, commit_hil=a.commit_hil, **extra)
         with open(a.out, 'x', encoding='utf-8') as f:

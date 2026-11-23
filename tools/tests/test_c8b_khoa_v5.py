@@ -656,3 +656,89 @@ def test_w_from_tham_chieu(monkeypatch):
     for bad in (dict(goc=[_tcw(), _tcw(st='hong_cua_so_tc')]), dict(goc=[dict(_tcw(), w_canh_xy_m=None)]), dict(K1=[_tcw()])):
         v2, why2, _, _ = K.hang_dong_tinh(_src(tham_chieu=bad, **base), 0.1445)
         assert v2['hang_m'] is None and v2['hang_rad'] is None and any('W' in w for w in why2['hang_rad'])
+
+
+def test_u_phi_dau_doan_no_double_count(monkeypatch):
+    """CODE 23/11 (Liam at CODE: "may lam di"): with F7 u_a_noi_bo_deg + dau_doan, u_phi = LE (u_a_noi_bo + 0.234) +
+    u_beta_cam taken straight between the leg-start windows and W (largest over leg starts x runs); the reference
+    window is not used. u_a_noi_bo without the dau_doan windows -> u_phi null (never an undercount)."""
+    import c8b_a6 as a6m
+    monkeypatch.setattr(a6m, 'a6du_rad', lambda a6, rho: 0.0078)
+    seen = []
+
+    def rep(a6, ref, W, eps, cr, cw):
+        seen.append((ref['luot_id'], ref.get('doan_i')))
+        return (2e-4 if ref.get('doan_i') == 1 else 1e-4), [[8, 1e-4]]
+    monkeypatch.setattr(K, 'a6_hieu_replay', rep)
+    monkeypatch.setattr(a6m, '_a3_rad', lambda kc, p, pl: (0.002, '', 'goc'))
+    f7 = dict(_f7(uphi=0.95, uak=0.95), u_a_noi_bo_deg=0.36, dau_doan=[dict(thu_id='HC_goc_2', doan_i=0)])
+    dd = [dict(_win(0.35, 0.36, 0.8, tan=3e-4, doan='doan1'), luot_id='HC_goc_2', doan_i=0),
+          dict(_win(-0.33, -0.36, 0.8, tan=5e-4, doan='doan1'), luot_id='HC_goc_2', doan_i=1)]
+    W = [_win(0.0, 0.0, 0.8, doan='doan2', psi_tan_rad=1e-3, frames='r1')]
+    dc = dict(goc=dict(dau_doan=dd, W=W, ref=dict(_win(0.0, 0.0, 0.8, tan=9.0, doan='doan1'), luot_id='REF')))
+    s = _src()
+    kw = dict(lan_lap=_f8null(), a_m=0.1445, kiem_cheo=s['kiem_cheo'], a6=dict(A6R), xoay=s['xoay'], u_h=s['u_h'],
+              cam=s['cam'], truc_xe=f7, kc_doan=dict(doan2='kc2'))
+    k = K.build({'O1-F05': _tb('O1-F05')}, dau_chan=dc, **kw)
+    assert seen == [('HC_goc_2', 0), ('HC_goc_2', 1)]                       # the reference window is not replayed
+    ub = k['u_beta_cam_deg']['goc']
+    assert ub == pytest.approx(1.25 * math.degrees(0.004 + 2e-4 + 1e-3 + 5e-4), rel=1e-12)
+    assert k['u_beta_cam_gia_dinh']['a6du_cach']['goc']['loai_ref'] == 'dau_doan'
+    m = k['muc']['O1-F05']
+    assert m['hang_dong_thanh_phan']['u_phi_cach'] == 'u_a_noi_bo + dau_doan'
+    assert m['hang_dong']['u_phi_rad'] == pytest.approx(1.25 * math.radians(0.36 + K.U_BETA_LECH_TAM_DEG)
+                                                        + math.radians(ub), rel=1e-12)
+    # only the ref_12b window: u_a_noi_bo would leave the leg-start camera error out -> null with the reason
+    k2 = K.build({'O1-F05': _tb('O1-F05')}, dau_chan=dict(goc=dict(ref=dc['goc']['ref'], W=W)), **kw)
+    assert k2['muc']['O1-F05']['hang_dong']['u_phi_rad'] is None
+    assert 'dau_doan' in k2['muc']['O1-F05']['hang_dong_ly_do']['u_phi_rad']
+    # F7 without the new fields: the earlier rule (u_phi_hat with the reference window)
+    k3 = K.build({'O1-F05': _tb('O1-F05')}, dau_chan=dict(goc=dict(ref=dict(dc['goc']['ref'], tan_rad=3e-4), W=W)),
+                 **dict(kw, truc_xe=_f7(uphi=0.95, uak=0.95)))
+    m3 = k3['muc']['O1-F05']
+    assert m3['hang_dong_thanh_phan']['u_phi_cach'] == 'u_phi_hat_chuan_k + ref_12b'
+    assert m3['hang_dong']['u_phi_rad'] == pytest.approx(1.25 * math.radians(0.95 + K.U_BETA_LECH_TAM_DEG)
+                                                         + math.radians(k3['u_beta_cam_deg']['goc']), rel=1e-12)
+
+
+def test_cli_dau_doan(tmp_path):
+    """--truc-xe with dau_doan {thu_id, doan_i, frames_duong_dan, frames_sha256, ids}: the windows are read from the
+    frames (SHA, valid ids) with no F2 / --khung-12b; a bad entry or SHA is refused; --truc-xe-cho takes K1 / K2."""
+    import c8_u_imu as cu
+    tb = tmp_path / 'tb.json'
+    tb.write_text(json.dumps(_tb('O1-F05')), encoding='utf-8')
+    a6 = tmp_path / 'a6.json'
+    a6.write_text(json.dumps(dict(_src()['a6'], plumb_xy_m=[0.0, 0.0])), encoding='utf-8')
+    f12, fW = tmp_path / 'f12.csv', tmp_path / 'fW.csv'
+    _frames(f12, [(10, 1, 0.3, 0.4), (11, 1, 0.3, 0.41), (20, 1, -0.3, -0.4), (21, 1, -0.3, -0.4)], psi=0.1)
+    _frames(fW, [(7, 1, 0.6, 0.0), (8, 1, 0.61, 0.0)], psi=0.1)
+    tc = tmp_path / 'tc.json'
+    tc.write_text(json.dumps(dict(_tc(0.002), a6_sha256=cu.sha256(str(a6)), ids=[7, 8],
+                                  frames_sha256=cu.sha256(str(fW)),
+                                  nguon=[dict(vai_tro='frames', duong_dan=str(fW), sha256=cu.sha256(str(fW)))])),
+                  encoding='utf-8')
+
+    def f7file(name, cho='goc', sha=None, ids=(10, 11)):
+        p = tmp_path / name
+        p.write_text(json.dumps(dict(_f7(), cho=cho, u_a_noi_bo_deg=0.3, dau_doan=[
+            dict(thu_id='HC', doan_i=0, frames_duong_dan=str(f12), frames_sha256=sha or cu.sha256(str(f12)),
+                 ids=list(ids)),
+            dict(thu_id='HC', doan_i=1, frames_duong_dan=str(f12), frames_sha256=cu.sha256(str(f12)), ids=[20, 21])])),
+            encoding='utf-8')
+        return p
+    base = ['--tb', f'O1-F05={tb}', '--a6', str(a6), '--tham-chieu', f'goc={tc}']
+    assert K.main(base + ['--truc-xe', str(f7file('f7.json')), '--out', str(tmp_path / 'o.json')]) == 0
+    k = json.loads((tmp_path / 'o.json').read_text(encoding='utf-8'))
+    d = k['u_beta_cam_dau_chan']['goc']
+    assert d['n_dau_doan'] == 2 and 'ref' not in d and d['dau_doan'][1]['T_m'] == pytest.approx([-0.3, -0.4])
+    assert d['dau_doan'][0]['luot_id'] == 'HC' and d['dau_doan'][1]['doan_i'] == 1
+    assert K.main(base + ['--truc-xe', str(f7file('bad.json', sha='ab' * 32)), '--out', str(tmp_path / 'x1.json')]) == 2
+    assert K.main(base + ['--truc-xe', str(f7file('bad2.json', ids=(10, 99))), '--out', str(tmp_path / 'x2.json')]) == 2
+    assert K.main(base + ['--truc-xe', str(f7file('f7.json')), '--truc-xe-cho', f'goc={f7file("g.json")}',
+                          '--out', str(tmp_path / 'x3.json')]) == 2
+    assert K.main(base + ['--truc-xe-cho', f'K1={f7file("k.json", cho="K2")}', '--out', str(tmp_path / 'x4.json')]) == 2
+    assert K.main(base + ['--tham-chieu', f'K1={tc}', '--truc-xe-cho', f'K1={f7file("k1.json", cho="K1")}',
+                          '--out', str(tmp_path / 'o2.json')]) == 0
+    k = json.loads((tmp_path / 'o2.json').read_text(encoding='utf-8'))
+    assert k['u_beta_cam_dau_chan']['K1']['n_dau_doan'] == 2
+    assert any(n['vai'] == 'truc_xe K1' for n in k['khoa_truoc']['nguon'])
