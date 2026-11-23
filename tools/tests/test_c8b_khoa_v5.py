@@ -749,3 +749,55 @@ def test_cli_dau_doan(tmp_path):
     k = json.loads((tmp_path / 'o2.json').read_text(encoding='utf-8'))
     assert k['u_beta_cam_dau_chan']['K1']['n_dau_doan'] == 2
     assert any(n['vai'] == 'truc_xe K1' for n in k['khoa_truoc']['nguon'])
+
+
+def _p6(b0=0.005, b=(0.010, 0.012, 0.011), thieu=()):
+    dai = dict(B0=dict(delta_h_m=b0, trang_thai='dat'))
+    for nm, v in zip(K.P6_BANDS, b):
+        dai[nm] = dict(delta_h_m=None if nm in thieu else v, trang_thai='thieu' if nm in thieu else 'dat')
+    return dict(schema=K.P6_VERSION, dai=dai)
+
+
+def test_p6_dong_bands_and_hang_m(monkeypatch):
+    """c8b_P6_rieng_ii_v2 (Liam 23/11 at CODE: 'Duyet cach moi'): B0 into hang_m as rho_max dh / (H - h_max); each
+    level keeps the bands up to its own u_3b, P4_m = can_quay + LE c dh(band) (+ the lever), A4 unchanged; a band
+    without its number -> thieu and the level not lockable; without the file one band as before."""
+    import c8b_a6 as a6m
+    monkeypatch.setattr(a6m, 'a6du_rad', lambda a6, rho: 0.0078)
+    s = _src()
+    c6 = 1.615 / (2.632 - (0.126 + 0.013))
+    assert K.p6_he_so(s['a6']) == pytest.approx(c6, rel=1e-12) and K.p6_he_so(None) is None
+    full = dict(lan_lap=_f8null(), truc_xe=_f7(),
+                neo=dict(schema='c7_neo_luot_v1', theo_cho=dict(goc=dict(trang_thai='dat', P_neo_m=3e-4,
+                                                                          A_neo_rad=2e-4))),
+                u_moc=[dict(U_moc_hieu_xy_m=1e-4, U_moc_hieu_psi_rad=1e-4)], W=dict(W_xy_m=5e-4, W_psi_rad=3e-4))
+    v, why, p, _ = K.hang_dong_tinh(_src(p6_dong=_p6(), **full), 0.1445)
+    assert not why and p['P6_rieng_ii_m'] == pytest.approx(c6 * 0.005, rel=1e-12)
+    v0, _, _, _ = K.hang_dong_tinh(_src(P6_rieng_ii=dict(gia_tri_m=0.0), **full), 0.1445)
+    assert v['hang_m'] - v0['hang_m'] == pytest.approx(c6 * 0.005, rel=1e-9)
+    v2, why2, _, _ = K.hang_dong_tinh(_src(p6_dong=dict(_p6(), schema='c8b_P6_rieng_ii_v1'), **full), 0.1445)
+    assert v2['hang_m'] is None and any('P6 rieng dau (ii)' in w for w in why2['hang_m'])
+    tbs = {lv: _tb(lv) for lv in K.LEVELS}
+    k = K.build(tbs, a_m=0.1445, a6=s['a6'], p6_dong=_p6())
+    for i, lv in enumerate(K.LEVELS):
+        bs = k['muc'][lv]['hang_theo_u']
+        assert [b['dai'] for b in bs] == list(K.P6_BANDS[:i + 1]) and bs[0]['u_lo_m_s'] == 0.0
+        assert all(bs[j]['u_hi_m_s'] == bs[j + 1]['u_lo_m_s'] for j in range(i)) and bs[-1]['u_hi_m_s'] == K.u_3b(lv, 0.1445)
+        cq = k['muc'][lv]['can_quay']
+        for b, dh in zip(bs, (0.010, 0.012, 0.011)):
+            assert b['P4_m'] == pytest.approx(cq['p_m'] + 1.25 * c6 * dh, rel=1e-12) and b['A4_deg'] == cq['psi_deg']
+    k = K.build(tbs, a_m=0.1445, a6=s['a6'], p6_dong=_p6(thieu=('B2',)))
+    b5 = k['muc']['O1-F05']['hang_theo_u']
+    assert b5[0]['trang_thai'] != 'thieu' and b5[1]['trang_thai'] == 'thieu' and b5[1]['P4_m'] is None
+    assert 'O1-F05: hang_theo_u thieu' in k['ly_do_chua_khoa'] and 'O1-F02: hang_theo_u thieu' not in k['ly_do_chua_khoa']
+    assert len(K.build(tbs, a_m=0.1445, a6=s['a6'])['muc']['O1-F08']['hang_theo_u']) == 1
+
+
+def test_gate_reads_the_p6_bands(tmp_path):
+    """The bands written here are the shape gate_c8 parses (first at 0, adjoining, increasing)."""
+    import gate_c8 as g
+    k = K.build({lv: _tb(lv) for lv in K.LEVELS}, a_m=0.1445, a6=_src()['a6'], p6_dong=_p6())
+    for lv in K.LEVELS:
+        bs = k['muc'][lv]['hang_theo_u']
+        got = g.check_bands([dict(u_lo=b['u_lo_m_s'], u_hi=b['u_hi_m_s'], gia_tri=b['P4_m']) for b in bs], lv)
+        assert len(got) == len(bs) and all(q in b for b in bs for q in g.BAND_KEYS_C8B)

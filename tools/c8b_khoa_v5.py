@@ -249,9 +249,15 @@ def hang_dong_tinh(src, side):
         w_rows.append(None if any(x is None or x < 0 for x in v) or t.get('trang_thai') != 'dat' else v)
     if 'W_xy_m' not in part and w_rows and all(r is not None for r in w_rows):
         part['W_psi_rad'] = max(r[2] + r[3] for r in w_rows)
-    p6 = src.get('P6_rieng_ii')                               # C8B, design v7 section 3 (waits W; CODE asked)
+    p6 = src.get('P6_rieng_ii')                               # a direct number (tests)
     if isinstance(p6, dict) and _num(p6.get('gia_tri_m')) is not None:
         part['P6_rieng_ii_m'] = float(p6['gia_tri_m'])
+    # c8b_p6_ngang (rule c8b_P6_rieng_ii_khoa_v2, Liam 23/11 at CODE: "Duyet cach moi"): the standing band B0 into
+    # hang_m (the tc end, W stands still): rho_max delta_h_dong(B0) / (H - h_max); the bands of u go to P4_m (build)
+    c6, d0 = p6_he_so(a6), p6_delta(src.get('p6_dong'), 'B0')
+    if 'P6_rieng_ii_m' not in part and c6 is not None and d0 is not None:
+        part['P6_rieng_ii_he_so'], part['P6_rieng_ii_B0_m'] = c6, d0
+        part['P6_rieng_ii_m'] = c6 * d0
     have = dict(u_theta='u_theta_rad' in part, P6_rieng_i='P6_rieng_i_m' in part,
                 P6_rieng_ii='P6_rieng_ii_m' in part, neo='P_neo_m' in part, U_moc='U_moc_hieu_xy_m' in part,
                 W='W_psi_rad' in part)
@@ -297,12 +303,48 @@ def hang_dong_tinh(src, side):
     return val, {k: v for k, v in why.items() if v}, part, lever
 
 
-def hang_theo_u(cq, level, a_m):
+P6_VERSION = 'c8b_P6_rieng_ii_v2'
+P6_BANDS = ('B1', 'B2', 'B3')            # lock c8b_P6_rieng_ii_khoa_v2 item 1: up to u_3b of F02, F05, F08
+
+
+def p6_he_so(a6):
+    """rho_max / (H - h_max) of the A6 file (the parallax lever of a height error at the edge of the domain)."""
+    if not isinstance(a6, dict):
+        return None
+    hg, uhg, H = a6.get('h_goc_m'), a6.get('u_h_goc_m'), _num(a6.get('H_m'))
+    rho = _num((a6.get('mien') or {}).get('rho_max_m'))
+    if not isinstance(hg, list) or not isinstance(uhg, list) or len(hg) != 4 or len(uhg) != 4 or H is None or rho is None:
+        return None
+    return rho / (H - max(float(h) + float(u) for h, u in zip(hg, uhg)))
+
+
+def p6_delta(p6, band):
+    """delta_h_dong of a band of a c8b_P6_rieng_ii_v2 file (before the margin), None when absent or not dat."""
+    d = ((p6 or {}).get('dai') or {}).get(band) if isinstance(p6, dict) and p6.get('schema') == P6_VERSION else None
+    return _num(d.get('delta_h_m')) if isinstance(d, dict) and d.get('trang_thai') == 'dat' else None
+
+
+def hang_theo_u(cq, level, a_m, p6=None, c6=None):
+    """The bands of u of a level. Without p6: one band [0, u_3b] with the turning bounds. With a c8b_P6_rieng_ii_v2
+    file: the bands B1 .. of the level (edges u_3b of the levels up to its own), P4_m = can_quay + LE c6 delta_h_dong
+    (band), A4 the same; a band without its delta_h_dong (or without c6) -> thieu (P4_m, A4_deg null)."""
     if a_m is None:
         return [], 'thieu canh ma a (--canh-ma-m): dai u khong xac dinh'
     gone = cq['trang_thai'] == 'thieu'
-    return [dict(u_lo_m_s=0.0, u_hi_m_s=u_3b(level, a_m), P4_m=None if gone else cq['p_m'],
-                 A4_deg=None if gone else cq['psi_deg'], trang_thai=cq['trang_thai'])], None
+    if p6 is None:
+        return [dict(u_lo_m_s=0.0, u_hi_m_s=u_3b(level, a_m), P4_m=None if gone else cq['p_m'],
+                     A4_deg=None if gone else cq['psi_deg'], trang_thai=cq['trang_thai'])], None
+    edges = [0.0] + [u_3b(lv, a_m) for lv in LEVELS[:LEVELS.index(level) + 1]]
+    out, why = [], []
+    for j, nm in enumerate(P6_BANDS[:len(edges) - 1]):
+        d = p6_delta(p6, nm)
+        ok = not gone and d is not None and c6 is not None
+        if not gone and not ok:
+            why.append(f'{nm}: thieu delta_h_dong (c8b_p6_ngang) hay he so rho_max / (H - h_max) cua A6')
+        out.append(dict(u_lo_m_s=edges[j], u_hi_m_s=edges[j + 1], dai=nm,
+                        P4_m=(cq['p_m'] + LE * c6 * d) if ok else None, A4_deg=cq['psi_deg'] if ok else None,
+                        P6_rieng_ii_m=(c6 * d) if ok else None, trang_thai=cq['trang_thai'] if ok else 'thieu'))
+    return out, ('; '.join(why) or None)
 
 
 def eps_h_of(ng):
@@ -455,7 +497,7 @@ def trang_thai_khoa(out, muc_kha_thi):
         miss = [k for k in HANG_DONG if _num(m['hang_dong'].get(k)) is None]
         if miss:
             why.append(f'{lv}: hang_dong {miss} chua co')
-        if not m['hang_theo_u'] or all(b['trang_thai'] == 'thieu' for b in m['hang_theo_u']):
+        if not m['hang_theo_u'] or any(b['trang_thai'] == 'thieu' for b in m['hang_theo_u']):
             why.append(f'{lv}: hang_theo_u thieu')
     return ('khoa', None) if not why else ('chua_khoa', '; '.join(why))
 
@@ -796,12 +838,12 @@ def u_beta_cam(lan_lap, kiem_cheo=None, a6=None, side=None, tham_chieu=None, dau
 
 def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None, muc_kha_thi=LEVELS, nguong=None,
           a6=None, ses=None, cam=None, commit_hil=None, kiem_cheo=None, xoay=None, u_h=None, truc_xe=None,
-          neo=None, u_moc=None, tham_chieu=None, dau_chan=None, kc_doan=None):
+          neo=None, u_moc=None, tham_chieu=None, dau_chan=None, kc_doan=None, p6_dong=None):
     muc = {}
     side = a_m
     hd, hd_why, hd_part, lever = (hang_dong_tinh(dict(kiem_cheo=kiem_cheo, a6=a6, xoay=xoay, u_h=u_h,
                                                        lan_lap=lan_lap, truc_xe=truc_xe, neo=neo, u_moc=u_moc,
-                                                       tham_chieu=tham_chieu,
+                                                       tham_chieu=tham_chieu, p6_dong=p6_dong,
                                                        cam=cam if isinstance(cam, list) else [cam] if cam else []),
                                                   side)
                                   if side is not None else (dict(hang_m=None, he_so_r=None, hang_rad=None,
@@ -834,7 +876,7 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
     for lv in LEVELS:
         tb = tbs.get(lv)
         cq = can_quay(tb, lv)
-        bands, bwhy = hang_theo_u(cq, lv, a_m)
+        bands, bwhy = hang_theo_u(cq, lv, a_m, p6_dong, p6_he_so(a6))
         if lever is not None:                                 # (|q_hat| + dq) A4(u) into P4 (v7 10, GATE RT4-3)
             for b in bands:
                 if b.get('P4_m') is not None and b.get('A4_deg') is not None:
@@ -1004,6 +1046,8 @@ def main(argv=None):
     ap.add_argument('--truc-xe-cho', action='append', default=None,
                     help='CHO=F7 truc_xe_v1 of K1 / K2 (dau_doan for u_beta_cam of that place); goc comes from --truc-xe')
     ap.add_argument('--neo', default=None, help='KIEMCHEO neo_luot.json (c7_neo_luot_v1, theo_cho.goc)')
+    ap.add_argument('--p6-dong', default=None,
+                    help='c8b_p6_ngang tinh output (c8b_P6_rieng_ii_v2): B0 into hang_m, the bands of u into P4_m')
     ap.add_argument('--u-moc', action='append', default=None,
                     help='CAM U_moc file with U_moc_hieu_xy_m, U_moc_hieu_psi_rad; repeat (largest used)')
     ap.add_argument('--tham-chieu', action='append', default=None,
@@ -1065,7 +1109,8 @@ def main(argv=None):
         for key, path, vai in (('nguong', a.nguong, 'nguong'), ('a6', a.a6, 'a6'), ('ses', a.session, 'session'),
                                ('cam', a.camera, 'camera'), ('kiem_cheo', a.kiem_cheo, 'kiem_cheo'),
                                ('xoay', a.xoay, 'xoay'), ('u_h', a.u_h_chung, 'u_h_chung'),
-                               ('truc_xe', a.truc_xe, 'truc_xe'), ('neo', a.neo, 'neo'), ('u_moc', a.u_moc, 'u_moc')):
+                               ('truc_xe', a.truc_xe, 'truc_xe'), ('neo', a.neo, 'neo'), ('u_moc', a.u_moc, 'u_moc'),
+                               ('p6_dong', a.p6_dong, 'p6_dong')):
             for pth in (path if isinstance(path, list) else [path] if path else []):   # da session (A): repeatable
                 with open(pth, encoding='utf-8') as f:
                     d = json.load(f)
@@ -1110,6 +1155,8 @@ def main(argv=None):
             extra['dau_chan'] = dau_chan_of(a, extra, nguon)
             extra.pop('truc_xe_cho')
             extra['kc_doan'] = kc_doan_of(a.kiem_cheo, extra.get('kiem_cheo'))
+        if 'p6_dong' in extra and (not isinstance(extra['p6_dong'], dict) or extra['p6_dong'].get('schema') != P6_VERSION):
+            raise KhoaError(f'--p6-dong: not a {P6_VERSION} file')
         out = build(tbs, ll, nguon, script_state(), a.canh_ma_m, nt, mk, commit_hil=a.commit_hil, **extra)
         with open(a.out, 'x', encoding='utf-8') as f:
             f.write(json.dumps(_clean(out), indent=1, ensure_ascii=False, allow_nan=False))
