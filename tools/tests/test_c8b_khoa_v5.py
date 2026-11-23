@@ -733,6 +733,8 @@ def test_cli_dau_doan(tmp_path):
             dict(thu_id='HC', doan_i=1, frames_duong_dan=str(f12), frames_sha256=cu.sha256(str(f12)), ids=[20, 21])])),
             encoding='utf-8')
         return p
+    ll = tmp_path / 'll.json'
+    ll.write_text(json.dumps(_f8null()), encoding='utf-8')
     base = ['--tb', f'O1-F05={tb}', '--a6', str(a6), '--tham-chieu', f'goc={tc}']
     assert K.main(base + ['--truc-xe', str(f7file('f7.json')), '--out', str(tmp_path / 'o.json')]) == 0
     k = json.loads((tmp_path / 'o.json').read_text(encoding='utf-8'))
@@ -748,6 +750,16 @@ def test_cli_dau_doan(tmp_path):
                           '--out', str(tmp_path / 'o2.json')]) == 0
     k = json.loads((tmp_path / 'o2.json').read_text(encoding='utf-8'))
     assert k['u_beta_cam_dau_chan']['K1']['n_dau_doan'] == 2
+    # HIEUCHUAN HCL2-6/7: an F7 that is not khoa is not used, even with dau_doan and finite numbers in it
+    bad = tmp_path / 'k1_ckl.json'
+    bad.write_text(json.dumps(dict(json.loads(f7file('k1b.json', cho='K1').read_text(encoding='utf-8')),
+                                   trang_thai='chua_ket_luan')), encoding='utf-8')
+    assert K.main(base + ['--tham-chieu', f'K1={tc}', '--truc-xe-cho', f'K1={bad}', '--lan-lap', str(ll),
+                          '--out', str(tmp_path / 'o3.json')]) == 0
+    k = json.loads((tmp_path / 'o3.json').read_text(encoding='utf-8'))
+    assert 'dau_doan' not in k['u_beta_cam_dau_chan']['K1'] and 'khong khoa' in k['u_beta_cam_dau_chan']['K1']['thieu']
+    assert k['u_beta_cam_deg']['K1'] is None and k['u_beta_cam_trang_thai_cho']['K1'] == 'thieu'
+    assert any('khong khoa' in w for w in k['u_beta_cam_ly_do'])
     assert any(n['vai'] == 'truc_xe K1' for n in k['khoa_truoc']['nguon'])
 
 

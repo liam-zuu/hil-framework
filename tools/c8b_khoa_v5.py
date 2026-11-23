@@ -790,6 +790,12 @@ def u_beta_cam(lan_lap, kiem_cheo=None, a6=None, side=None, tham_chieu=None, dau
             tcs = [t for t in ((tham_chieu or {}).get(c) or []) if isinstance(t, dict)]
             tan = [_num(t.get('psi_tan_rad')) for t in tcs]
             dc = (dau_chan or {}).get(c)
+            if isinstance(dc, dict) and dc.get('thieu'):
+                # HIEUCHUAN HCL2-6/7 (23/11): an F7 that is not 'khoa' gives no usable dau_doan / u_a_noi_bo, and
+                # the bounds of the earlier rule are no bound of the leg-start quantity: no number at this place
+                out[c], st[c], cach[c] = None, 'thieu', dict(cach='thieu', ly_do=dc['thieu'])
+                why.append(f'{c}: {dc["thieu"]}')
+                continue
             if isinstance(dc, dict) and (isinstance(dc.get('ref'), dict) or dc.get('dau_doan')) and dc.get('W') \
                     and isinstance(a6, dict):
                 v, wv, parts = u_beta_cam_cho(a6, kcs, kc_doan, (lan_lap or {}).get('tam_id'), dc, c)
@@ -971,6 +977,10 @@ def dau_chan_of(a, extra, nguon):
     # F7 dau_doan (fields proposed to HIEUCHUAN 23/11): one window per long 12b leg start used by a_k:
     # {thu_id, doan_i, frames_duong_dan, frames_sha256, ids}
     for cho, f7 in (extra.get('truc_xe_cho') or {}).items():
+        if isinstance(f7, dict) and f7.get('trang_thai') != 'khoa':
+            out[cho] = dict(thieu=f'F7 {cho} trang_thai {f7.get("trang_thai")!r} (khong khoa): dau_doan, u_a_noi_bo '
+                                  'khong dung (HIEUCHUAN HCL2-6/7)')
+            continue
         dd = f7.get('dau_doan') if isinstance(f7, dict) else None
         if not isinstance(dd, list) or not dd:
             continue
@@ -998,7 +1008,7 @@ def dau_chan_of(a, extra, nguon):
             raise KhoaError(f'--khung-12b {s!r}: {len(win)} F2 ref_12b windows of {cho} on these frames, need one')
         ref = cua_so_khung(pth, [k['id'] for k in win[0]['khung']], sha, a6['plumb_xy_m'])
         ref.update(luot_id=win[0].get('luot_id'), session_sha256=win[0].get('session_sha256'))
-        Ws = out[cho]['W'] if cho in out else w_of(cho)
+        Ws = out[cho]['W'] if 'W' in (out.get(cho) or {}) else w_of(cho)
         nguon.append(dict(vai=f'khung_12b {cho}', file=os.path.basename(pth), duong_dan=os.path.abspath(pth),
                           sha256=sha))
         if Ws:
@@ -1150,7 +1160,7 @@ def main(argv=None):
             nguon.append(dict(vai=f'truc_xe {cho}', file=os.path.basename(pth), duong_dan=os.path.abspath(pth),
                               sha256=cu.sha256(pth)))
         co_dd = any(isinstance(v.get('dau_doan'), list) and v['dau_doan'] for v in txc.values())
-        if a.khung_12b or co_dd:
+        if a.khung_12b or co_dd or any(v.get('trang_thai') != 'khoa' for v in txc.values()):
             extra['truc_xe_cho'] = txc
             extra['dau_chan'] = dau_chan_of(a, extra, nguon)
             extra.pop('truc_xe_cho')
