@@ -24,6 +24,8 @@ gui moi goi k co k/50 < T_lenh, roi goi 0 tren CUNG luoi (khong de goi 0 dau de 
 --o1 gui 0 trong o1_tasks.O1_TAIL_S = t_tre + 0,5 = 2,5 s (bang fwsim: lenh 0 toi han T_lenh + t_tre),
 --test A-K* giu 10 goi 0 (0,2 s) nhu C5. Luoi tinh bang dong ho don dieu (time.monotonic); gio may
 (time.time) chi de in '#test_start', '#test_end'. Ctrl-C: 10 goi 0 ngay.
+'#test_start' co them truong cuoi t_mono_ns = goc luoi t0 (dong ho don dieu, ns, lam tron xuong; cung dong ho
+voi t_mono_ns cua agv_logger khi ca hai chay tren Pi), Liam 23/11 CODE "Chot + gioi han + t_mono (Recommended)".
 """
 import math
 import os
@@ -114,8 +116,15 @@ def test_loop(ip: str, test_id: str, sock=None, clock=time.monotonic, sleep=time
     sock = sock or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     n_total, n_zero = grid_counts(test_id, duration)
     t0, e0 = clock(), wall()
+    # t_mono_ns (last field, the fields before unchanged): t0, the grid origin, on the grid clock in integer ns,
+    # rounded down, so every packet of the run is sent at or after it. With the default clock (time.monotonic,
+    # CLOCK_MONOTONIC on Linux) it is on the same clock as agv_logger's t_mono_ns of each received log line
+    # when both run on the same Pi: a log line received before t_mono_ns carries a packet sent before this
+    # run (o1_cmd_path (3), start anchor; Liam 23/11 CODE local_be52def9 box "Dieu (3)": "Chot + gioi han +
+    # t_mono (Recommended)"). Unlike t_epoch it does not depend on the wall clock not stepping back.
     out(f"#test_start,test={test_id},t_epoch={e0:.3f},iso={time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(e0))},"
-        f"duration_s={duration:g},send_hz={SEND_HZ},tail_zeros={n_zero},dst={ip}:{TRAJ_PORT}")
+        f"duration_s={duration:g},send_hz={SEND_HZ},tail_zeros={n_zero},dst={ip}:{TRAJ_PORT},"
+        f"t_mono_ns={math.floor(t0 * 1e9)}")
 
     def at(k):
         wait = t0 + k / SEND_HZ - clock()

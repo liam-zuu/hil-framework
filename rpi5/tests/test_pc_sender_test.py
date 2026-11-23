@@ -299,3 +299,44 @@ def test_c4_5_ack_before_problem(tmp_path):
         (tmp_path / ps.ACK_NAME).write_text(ACK.replace(',id=7,applied_n', gone + ',applied_n'), encoding='utf-8')
         (tmp_path / 'gain_query_before.txt').write_text(before.replace(',id=7', empty), encoding='utf-8')
         assert 'khong so duoc bo gain' in ps.ack_before_problem(str(tmp_path)), (gone, empty)
+
+
+def test_test_start_keeps_its_fields_then_t_mono_ns_last():
+    """'#test_start': the fields before unchanged in name and order, t_mono_ns appended last (Liam 23/11 CODE
+    local_be52def9 "Chot + gioi han + t_mono (Recommended)"), so a reader by key or by position still works."""
+    sock, clk, lines = FakeSock(), FakeClock(), []
+    t_start = clk.t
+    ps.test_loop('10.0.0.2', 'A-K1', sock=sock, clock=clk, sleep=clk.sleep, out=lines.append)
+    assert _fields(lines[0]) == ['test', 't_epoch', 'iso', 'duration_s', 'send_hz', 'tail_zeros', 'dst',
+                                 't_mono_ns']
+    # the reading of the grid origin itself (first clock() call), not a later one
+    assert int(lines[0].rsplit('t_mono_ns=', 1)[1]) == int((t_start + clk.cost) * 1e9)
+
+
+def test_t_mono_ns_is_the_grid_origin_and_no_packet_is_sent_before_it():
+    """t_mono_ns = floor(t0 * 1e9), t0 the first clock() reading of test_loop (the grid origin): an integer,
+    on the grid clock, and every packet (schedule and zeros) is sent at or after it."""
+    # cost 0 and t0 0.7 ns past an integer ns: packet 0 goes at t0 itself, so rounding up or to nearest is caught
+    sock, clk, lines = FakeSock(), FakeClock(t0=1000.0000000007, cost=0.0), []
+    times = []
+    real_send = sock.sendto
+    sock.sendto = lambda p, a: (times.append(clk.t), real_send(p, a))
+    t_start = clk.t
+    ps.test_loop('10.0.0.2', 'A-K1', sock=sock, clock=clk, sleep=clk.sleep, out=lines.append)
+    kv = dict(p.split('=', 1) for p in lines[0].split(',')[1:])
+    assert kv['t_mono_ns'].isdigit()
+    t_mono_ns = int(kv['t_mono_ns'])
+    t0 = t_start                                        # first clock() call of test_loop (cost 0)
+    assert 0.6 < t0 * 1e9 % 1 < 0.8                     # the case really has 0.7 ns past an integer
+    assert t_mono_ns == int(t0 * 1e9)
+    assert t_mono_ns <= t0 * 1e9
+    assert times and min(times) * 1e9 >= t_mono_ns
+
+
+def test_t_mono_ns_is_not_the_wall_clock():
+    """A wall clock far from the grid clock: t_mono_ns follows the grid clock only (t_epoch keeps the wall)."""
+    sock, clk, lines = FakeSock(), FakeClock(t0=50.0, cost=0.0), []
+    ps.test_loop('10.0.0.2', 'A-K1', sock=sock, clock=clk, sleep=clk.sleep, out=lines.append,
+                 wall=lambda: 1700000000.0)
+    kv = dict(p.split('=', 1) for p in lines[0].split(',')[1:])
+    assert kv['t_mono_ns'] == str(50 * 10**9) and kv['t_epoch'] == '1700000000.000'
