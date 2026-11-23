@@ -202,7 +202,8 @@ def lan_lap_E(a6, lan_lap):
         raise KhoaError(f'F8 lan_lap of plate {lan_lap.get("tam_id")!r}, A6 of {a6.get("tam_id")!r}')
     out, why = {}, []
     # CODE 23/11 (Chot_F8_rong_buoi2_v1 muc 2; Liam at CODE_C8B, verbatim: "may gui cai cau hoi nay cho thang code cho
-    # tao", CODE chose option 1): an F8 whose every run has lan_lap_id null determined no mounting: no comparison,
+    # tao"; Liam 23/11 at CODE, box "Khoa T12", verbatim: "Dung mot lan lap (Recommended)"): an F8 whose every run
+    # has lan_lap_id null determined no mounting: no comparison,
     # dat with the label LL_E_NULL (an assumption, written in the lock); an F8 with any id keeps the rule below.
     f8_null = bool(rows) and all(isinstance(x, dict) and x.get('lan_lap_id') is None for x in rows)
     for cho, v in a6['lan_lap_cho'].items():
