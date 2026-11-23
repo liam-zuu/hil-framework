@@ -93,6 +93,10 @@ USABLE_COMPLETED = ('true', 'false', 'inconclusive')
 S03_PUBLIC = ['meta.yaml', 'levels.csv']   # S04 v6.7 9.6: design.csv is sealed now (never the public one)
 S03_SEALED = ['sealed/runs.csv', 'sealed/notes.json', 'sealed/design.csv', 'sealed/levels_sangloc.csv']
 S03_SEALED_TEST = ['sealed_test/runs_test.csv', 'sealed_test/notes.json']
+# C3-44: every S03 run file any phase touches (s4.fingerprint inside check_inputs hashes the whole lock
+# list: ket_qua.json, so_dem.json, sweep.csv, kiem_ngoai_mien.csv included) is link / hard-link checked
+# from its path entry BEFORE the start row and before anything is opened
+S03_GUARDED = list(dict.fromkeys(S03_PUBLIC + S03_SEALED + list(s4.s03_lock_names(unsealed=True))))
 CLIP_TOL = 1e-9               # RSM-15: largest move of an SLSQP solution back into the box (rounding only)
 PHASES = ('fit', 'opt', 'test')
 RUN_LOCK_PREFIX = 'rsm_compare_'   # RSM4-2: name of the run lock (Windows mutex) of an rsm/ folder
@@ -189,6 +193,10 @@ INTERPRETATIONS = [
     'S04 v6.8 12.3: result.csv ga_tri_sums = omega_c + 2 omega_o per axis of x_GA on its real values, '
     'ga_in_tri_band = true when one is above 199.99 (the band below 200 that the RSM search does not cover); both '
     'empty for PID',
+    'C3-44: check_links refuses links, junctions and files with a second hard link on the WHOLE list of S03 '
+    'run files any phase touches (S03_GUARDED = S03_PUBLIC + S03_SEALED + s04_ga.s03_lock_names(unsealed=True): '
+    'ket_qua.json, so_dem.json, sweep.csv, kiem_ngoai_mien.csv too) before the start row and before anything is '
+    'opened; meta.yaml trial must be exactly the JSON bool (s04_ga.s03_is_trial: trial: "yes", 1, ... stops)',
 ]
 
 EVALUATOR = None              # tests replace it; None = s04_ga.Evaluator on fwsim.FirmwareSim(dll)
@@ -558,7 +566,7 @@ class Inputs:
         """RSM-13, RSM2-1: no source or output path of this script is a link or resolves elsewhere; none resolves
         into sealed_test/ (checked from the path entries, no file content is read)."""
         paths = [self.s04, os.path.join(self.s04, 'rsm')] + [os.path.join(self.s04, p) for p in self.s04_paths()]
-        paths += [os.path.join(self.s03, n) for n in S03_PUBLIC + S03_SEALED]
+        paths += [os.path.join(self.s03, n) for n in S03_GUARDED]      # C3-44: the whole lock list
         paths += [os.path.join(self.out, d) for d in out_dirs]
         paths += [os.path.join(self.out, p) for p in files_under(self.out, [d for d in out_dirs
                                                                              if os.path.isdir(os.path.join(self.out, d))])]
@@ -576,6 +584,10 @@ def check_mode(inp):
     meta = s03_meta(inp)
     if s4.meta_value(meta, 'status') != 'ran to the end':
         raise Stop(f'S03 run {inp.s03} did not run to the end (12.2)')
+    try:                                                    # C3-44: exactly the JSON bool
+        trial = s4.s03_is_trial(meta, inp.s03)
+    except SystemExit as e:
+        raise Stop(str(e)) from None
     fake = False
     try:
         fake = s4.meta_value(meta, 'rsm_fake') in (True, 'true')
@@ -587,7 +599,7 @@ def check_mode(inp):
     else:
         if fake:
             raise Stop('main run on an rsm_fake S03 folder')
-        if s4.meta_value(meta, 'trial') in (True, 'true') or len(set(inp.mu_levels)) != 3:
+        if trial or len(set(inp.mu_levels)) != 3:
             raise Stop('main RSM needs the main S03 run (three mu levels, not --trial)')
         if not inp.common.get('unsealed'):
             raise Stop('main RSM needs an S04 run made with --s03-unsealed (campaign A ended, L56)')

@@ -54,7 +54,7 @@ Information fence (O1 3.9 (5), dossier 4 (6)):
 Sub-commands:
   python fwsim/o1_feas_search.py search  --out 05_DATA/results/O1_FEAS/<date>_runNN --expect-fw 16702ff [--dll D] [--jobs 6]
   python fwsim/o1_feas_search.py recheck --from <search run> --out <new> --levels 0.2,0.8 --a-r A --expect-fw C [--dll D]
-  python fwsim/o1_feas_search.py inbox   --from <search run> --out <new> --s03 <S03 main run>
+  python fwsim/o1_feas_search.py inbox   --from <search run> --out <new> --s03 <S03 main run> --s03-unsealed
   recheck (after C8): --levels is any non-empty subset of {0.2, 0.5, 0.8} (the C8 set is an intersection,
   O1 3.9 (2), C12-2); every set T among T1..T3 whose levels hold it is run (witness, or default gains when
   none: fixed schedule); a controller is 'con_dat' when a witness of such a T passes at every C8 level.
@@ -68,6 +68,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -487,9 +488,10 @@ def write_csv(path, rows, cols=None):
     s3.write_csv(path, clean_json(rows), cols)
 
 
-def sealed_manifest(sealed):
+def sealed_manifest(sealed, extra=None):
     """manifest.json (per-file SHA-256, sealed) and the public commitment: SHA-256 of witness.csv (if any)
-    and of manifest.json; both files hold the nonce (C12-1)."""
+    and of manifest.json; both files hold the nonce (C12-1). extra: top-level keys merged into the
+    manifest (C3-43: the S03 levels commitment of inbox)."""
     files = {}
     for root, _, names in os.walk(sealed):
         for n in sorted(names):
@@ -499,7 +501,8 @@ def sealed_manifest(sealed):
                 files[rel] = s3.sha256_file(p)
     with open(os.path.join(sealed, 'nonce.txt'), encoding='utf-8') as f:
         nonce = f.read().strip()
-    dump_json(dict(nonce=nonce, files=files), os.path.join(sealed, 'manifest.json'), indent=1, sort_keys=True)
+    dump_json(dict(nonce=nonce, files=files, **(extra or {})),
+              os.path.join(sealed, 'manifest.json'), indent=1, sort_keys=True)
     pub = {'manifest.json': s3.sha256_file(os.path.join(sealed, 'manifest.json'))}
     if 'witness.csv' in files:
         pub['witness.csv'] = files['witness.csv']
@@ -853,10 +856,52 @@ def inside(g, L, H):
 S03_INBOX_LEVELS = os.path.join('sealed', 'levels_sangloc.csv')   # S04 v6.7 9.6: B's domain is the sealed file
 
 
+def _s03_meta_line(text, key):
+    """Value of a 'key: <json>' line of an S03 meta.yaml (text after '  #' dropped; json.loads, else the
+    text without quotes). KeyError when the line is absent."""
+    for line in text.splitlines():
+        if line.startswith(key + ':'):
+            v = line[len(key) + 1:].split('  #')[0].strip()
+            try:
+                return json.loads(v)
+            except ValueError:
+                return v.strip('"')
+    raise KeyError(key)
+
+
+def s03_unsealed_gate(a):
+    """C3-43 (L56; as s04_ga.py for a main run): checked on the command line and the PUBLIC
+    <s03>/meta.yaml only, BEFORE anything under <s03>/sealed/ is looked at. FeasStop: without
+    --s03-unsealed (campaign A may not have ended); a missing meta.yaml; a status other than 'ran to
+    the end'; a trial line that is not exactly the bool false (inbox needs the main S03 run)."""
+    if not getattr(a, 's03_unsealed', False):
+        raise FeasStop('L56: inbox reads sealed/levels_sangloc.csv of the S03 run; give --s03-unsealed only '
+                       'after campaign A ended (nothing under sealed/ was opened)')
+    mp = os.path.join(a.s03, 'meta.yaml')
+    if not os.path.isfile(mp):
+        raise FeasStop(f'{mp} missing: inbox needs the public meta.yaml of the S03 run (C3-43)')
+    meta = open(mp, encoding='utf-8').read()
+    try:
+        status = _s03_meta_line(meta, 'status')
+    except KeyError:
+        status = None
+    if status != 'ran to the end':
+        raise FeasStop(f'{mp}: status {status!r} is not "ran to the end": inbox needs the finished main '
+                       f'S03 run (C3-43)')
+    try:
+        trial = _s03_meta_line(meta, 'trial')
+    except KeyError:
+        trial = False
+    if trial is not False:
+        raise FeasStop(f'{mp}: trial is {trial!r}, not the bool false: inbox needs the main S03 run '
+                       f'(C3-43)')
+
+
 def cmd_inbox(a):
-    """After the S03 main run: is each witness inside the [L, H] of S03 sealed/levels_sangloc.csv (B's
-    domain; S04 v6.7 9.6: the sealed levels of the v8.5 screening, never the public levels.csv)?
-    sealed only; a missing sealed levels file stops (FeasStop)."""
+    """After the S03 main run (--s03-unsealed, C3-43): is each witness inside the [L, H] of S03
+    sealed/levels_sangloc.csv (B's domain; S04 v6.7 9.6: the sealed levels of the v8.5 screening,
+    never the public levels.csv)? sealed only; a missing sealed levels file stops (FeasStop)."""
+    s03_unsealed_gate(a)                          # C3-43: BEFORE read_source / new_out: a refused call writes nothing
     wit, _ = read_source(getattr(a, 'from'))
     new_out(a.out)
     say = Console(a.out)
@@ -864,8 +909,9 @@ def cmd_inbox(a):
     lp = os.path.join(a.s03, S03_INBOX_LEVELS)
     if not os.path.isfile(lp):
         raise FeasStop(f'{lp} missing: the sealed levels of the S03 v8.5 screening (S04 v6.7 section 9 item 6)')
-    with open(lp, encoding='utf-8') as f:
-        lv = {(r['controller'], r['factor']): (float(r['L']), float(r['H'])) for r in csv.DictReader(f)}
+    raw = open(lp, 'rb').read()                   # read ONCE: the CSV is parsed from these bytes and their
+    lv = {(r['controller'], r['factor']): (float(r['L']), float(r['H']))   # sha256 goes into the manifest
+          for r in csv.DictReader(io.StringIO(raw.decode('utf-8'), newline=''))}
     rows = []
     for (c, sn), w in sorted(wit.items()):
         if w is None:
@@ -873,12 +919,13 @@ def cmd_inbox(a):
         for n, g in w['gains'].items():
             rows.append(dict(controller=c, set=sn, factor=n, inside=inside(g, *lv[(c, n)])))
     write_csv(os.path.join(sealed, 'inbox.csv'), rows or [dict(controller='', set='', factor='', inside='')])
-    pub = sealed_manifest(sealed)
+    pub = sealed_manifest(sealed, extra=dict(s03_levels=dict(file='sealed/levels_sangloc.csv',
+                                                           sha256=hashlib.sha256(raw).hexdigest())))
     with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
         f.write(f'kind: inbox\nstatus: complete\nscript_version: {SCRIPT_VERSION}\ndate: {time.strftime("%Y-%m-%d")}\n'
                 f'source_run: {json.dumps(getattr(a, "from"))}\ns03_run: {json.dumps(a.s03)}\n'
                 f's03_levels_file: "sealed/levels_sangloc.csv"\n'
-                f's03_levels_sha256: {s3.sha256_file(lp)}\n'
+                f's03_unsealed: true\n'
                 f'sealed_sha256: {json.dumps(pub, sort_keys=True)}\n')
     say('inbox written (sealed)')
 
@@ -909,6 +956,8 @@ def main(argv=None):
     i.add_argument('--from', required=True)
     i.add_argument('--out', required=True)
     i.add_argument('--s03', required=True)
+    i.add_argument('--s03-unsealed', action='store_true',
+                  help='campaign A has ended (L56): the sealed levels of the S03 main run may be read')
     a = ap.parse_args(args)
     try:
         dict(search=cmd_search, recheck=cmd_recheck, inbox=cmd_inbox)[a.cmd](a)

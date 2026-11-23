@@ -552,23 +552,39 @@ def _s03_levels(s03, lo=1e-9, hi=1e9):
                 w.writerow([c, n, lo, hi, 1, 'log', 1, '', '', '', '', '', 'sang_loc', ''])
 
 
+def _s03_meta(s03, status='ran to the end', trial='false'):
+    """The public <s03>/meta.yaml the C3-43 inbox gate checks (before anything under sealed/ is read):
+    a finished main S03 run -> status 'ran to the end', the exact JSON bool trial: false."""
+    (s03 / 'meta.yaml').write_text(f'trial: {trial}\nstatus: "{status}"\n', encoding='utf-8')
+
+
 def test_inbox(fake, tmp_path):
     out = tmp_path / 'run'
     _search(fake, out)
     s03 = tmp_path / 'S03 run'                                         # a space and a backslash path below
     s03.mkdir()
+    _s03_meta(s03)
     _s03_levels(s03)
     # a public levels.csv with different numbers is ignored (S04 v6.7 9.6)
     with open(s03 / 'levels.csv', 'w', newline='', encoding='utf-8') as f:
         f.write('controller,factor,L,H\nPID,pos_kp,-1e9,-1e-9\n')
-    code, text = _main(['inbox', '--from', str(out), '--out', str(tmp_path / 'ib'), '--s03', str(s03)])
+    code, text = _main(['inbox', '--from', str(out), '--out', str(tmp_path / 'ib'), '--s03', str(s03),
+                        '--s03-unsealed'])
     assert code == 0 and text.strip() == 'inbox written (sealed)'
     meta = yaml.safe_load((tmp_path / 'ib' / 'meta.yaml').read_text(encoding='utf-8'))   # Windows paths (C12-11)
     assert meta['s03_run'] == str(s03) and meta['source_run'] == str(out)
     assert meta['s03_levels_file'] == 'sealed/levels_sangloc.csv'
-    assert meta['s03_levels_sha256'] == F.s3.sha256_file(s03 / 'sealed' / 'levels_sangloc.csv')
-    assert meta['s03_levels_sha256'] != F.s3.sha256_file(s03 / 'levels.csv')
+    assert 's03_levels_sha256' not in meta                             # C3-43: it is sealed, not public
+    assert meta['s03_unsealed'] is True
+    import hashlib
+    want = hashlib.sha256(open(s03 / 'sealed' / 'levels_sangloc.csv', 'rb').read()).hexdigest()
+    man = json.loads((tmp_path / 'ib' / 'sealed' / 'manifest.json').read_text(encoding='utf-8'))
+    assert man['s03_levels'] == dict(file='sealed/levels_sangloc.csv', sha256=want)
     assert set(meta['sealed_sha256']) == {'manifest.json'}
+    # C3-43: the sealed commitment stays inside sealed/: neither public file holds the hex string
+    assert want not in (tmp_path / 'ib' / 'meta.yaml').read_text(encoding='utf-8')
+    con = tmp_path / 'ib' / 'console.txt'
+    assert not con.exists() or want not in con.read_text(encoding='utf-8')
     rows = _csv(tmp_path / 'ib' / 'sealed' / 'inbox.csv')
     assert rows and all(r['inside'] == 'true' for r in rows)
 
@@ -579,11 +595,85 @@ def test_inbox_missing_sealed_levels(fake, tmp_path):
     _search(fake, out)
     s03 = tmp_path / 'S03'
     s03.mkdir()
+    _s03_meta(s03)
     with open(s03 / 'levels.csv', 'w', newline='', encoding='utf-8') as f:
         f.write('controller,factor,L,H\nPID,pos_kp,1e-9,1e9\n')
-    code, text = _main(['inbox', '--from', str(out), '--out', str(tmp_path / 'ib'), '--s03', str(s03)])
+    code, text = _main(['inbox', '--from', str(out), '--out', str(tmp_path / 'ib'), '--s03', str(s03),
+                        '--s03-unsealed'])
     assert code == 2 and 'levels_sangloc.csv' in text
     assert not (tmp_path / 'ib' / 'meta.yaml').exists()
+
+
+def _c3_open_spy(monkeypatch):
+    """Wrap builtins.open AND os.open; record the real path of every opened target (C3-43/C3-44)."""
+    import builtins
+    seen = []
+    real_open, real_osopen = builtins.open, os.open
+
+    def spy(f, *a, **kw):
+        fh = real_open(f, *a, **kw)
+        try:
+            if isinstance(f, (str, bytes, os.PathLike)):
+                seen.append(os.path.normcase(os.path.realpath(f)))
+        except (OSError, TypeError, ValueError):
+            pass
+        return fh
+
+    def ospy(f, *a, **kw):
+        fd = real_osopen(f, *a, **kw)
+        try:
+            if isinstance(f, (str, bytes, os.PathLike)):
+                seen.append(os.path.normcase(os.path.realpath(f)))
+        except (OSError, TypeError, ValueError):
+            pass
+        return fd
+
+    monkeypatch.setattr(builtins, 'open', spy)
+    monkeypatch.setattr(os, 'open', ospy)
+    return seen
+
+
+def test_c3_43_inbox_needs_the_unsealed_flag(fake, tmp_path, monkeypatch):
+    """C3-43 (L56): inbox without --s03-unsealed exits 2 naming the flag, writes no output folder and
+    opens nothing under <s03>/sealed (spy on the opened targets, not the names)."""
+    out = tmp_path / 'run'
+    _search(fake, out)
+    s03 = tmp_path / 'S03'
+    s03.mkdir()
+    _s03_meta(s03)
+    _s03_levels(s03)
+    seen = _c3_open_spy(monkeypatch)
+    code, text = _main(['inbox', '--from', str(out), '--out', str(tmp_path / 'ib'), '--s03', str(s03)])
+    assert code == 2 and '--s03-unsealed' in text
+    assert not (tmp_path / 'ib').exists()
+    root = os.path.normcase(os.path.realpath(s03 / 'sealed'))
+    assert not any(p.startswith(root + os.sep) for p in seen)
+
+
+@pytest.mark.parametrize('meta_kw', (dict(status='running'), dict(trial='true'), dict(trial='1')))
+def test_c3_43_inbox_needs_the_finished_main_s03(fake, tmp_path, meta_kw):
+    """C3-43: with the flag but a running S03, a --trial S03 or a non-bool trial value -> exit 2."""
+    out = tmp_path / 'run'
+    _search(fake, out)
+    s03 = tmp_path / 'S03'
+    s03.mkdir()
+    _s03_meta(s03, **meta_kw)
+    _s03_levels(s03)
+    code, text = _main(['inbox', '--from', str(out), '--out', str(tmp_path / 'ib'), '--s03', str(s03),
+                        '--s03-unsealed'])
+    assert code == 2 and 'C3-43' in text and not (tmp_path / 'ib').exists()   # the gate's own message
+
+
+def test_c3_43_inbox_needs_the_public_meta(fake, tmp_path):
+    """C3-43: no public meta.yaml at all -> exit 2, nothing written."""
+    out = tmp_path / 'run'
+    _search(fake, out)
+    s03 = tmp_path / 'S03'
+    s03.mkdir()
+    _s03_levels(s03)
+    code, text = _main(['inbox', '--from', str(out), '--out', str(tmp_path / 'ib'), '--s03', str(s03),
+                        '--s03-unsealed'])
+    assert code == 2 and 'meta.yaml' in text and not (tmp_path / 'ib').exists()
 
 
 def test_child_failure_prints_one_fixed_sentence(tmp_path):

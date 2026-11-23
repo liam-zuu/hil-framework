@@ -104,7 +104,12 @@ def fake(request):
 
 
 def args(fake, *extra):
-    return ['--ip', '127.0.0.1', '--port', str(fake.port), '--timeout', '0.3', '--tries', '3', *extra]
+    # C3-8: a manual send declares its source; --s04-run, --query and an explicit --nguon-gain-tay
+    # replace the default declaration
+    src = [] if any(x in extra for x in ('--s04-run', '--nguon-gain-tay', '--query')) \
+        else ['--nguon-gain-tay', 'test bench']
+    return ['--ip', '127.0.0.1', '--port', str(fake.port), '--timeout', '0.3', '--tries', '3', *extra,
+            *src]
 
 
 def gains_arg(d):
@@ -368,16 +373,14 @@ def _sel_row(ctrl='PID', **kw):
     return r
 
 
-def _s04_run(tmp_path, ctrl='PID', cho=None, notes='default', rows='default', tool_check=True):
-    """<run>/post_checks/notes.json + <run>/selected.csv of a fake S04 run. notes 'default':
-    dict(tool_check, cho_liam); rows 'default': one send_to_HIL row of ctrl."""
+def _s04_run(tmp_path, ctrl='PID', cho=None, notes='default', rows='default', tool_check=False):
+    """<run>/post_checks/notes.json + <run>/selected.csv of a fake S04 run. notes 'default': the C3-8
+    record of a finished post -- dict(tool_check, post_trang_thai='hoan_tat', selected_sha256,
+    selected_sha256_lf of the file's bytes, cho_liam); rows 'default': one send_to_HIL row of ctrl."""
+    import hashlib
     run = tmp_path / 's04'
     (run / 'post_checks').mkdir(parents=True)
-    if notes == 'default':
-        (run / 'post_checks' / 'notes.json').write_text(
-            json.dumps(dict(tool_check=tool_check, cho_liam=list(cho or []))), encoding='utf-8')
-    elif notes is not None:
-        (run / 'post_checks' / 'notes.json').write_text(notes, encoding='utf-8')
+    raw = b''
     if rows is not None:
         cols = ['kind', 'controller', 'feasible'] + gs.NAMES[ctrl]
         with open(run / 'selected.csv', 'w', newline='', encoding='utf-8') as f:
@@ -385,6 +388,15 @@ def _s04_run(tmp_path, ctrl='PID', cho=None, notes='default', rows='default', to
             w.writeheader()
             for r in ([_sel_row(ctrl)] if rows == 'default' else rows):
                 w.writerow({n: r.get(n, '') for n in cols})
+        raw = (run / 'selected.csv').read_bytes()
+    if notes == 'default':
+        (run / 'post_checks' / 'notes.json').write_text(
+            json.dumps(dict(tool_check=tool_check, post_trang_thai='hoan_tat',
+                            selected_sha256=hashlib.sha256(raw).hexdigest(),
+                            selected_sha256_lf=hashlib.sha256(raw.replace(b'\r\n', b'\n')).hexdigest(),
+                            cho_liam=list(cho or []))), encoding='utf-8')
+    elif notes is not None:
+        (run / 'post_checks' / 'notes.json').write_text(notes, encoding='utf-8')
     return run
 
 
@@ -445,7 +457,7 @@ def test_s04_hand_over_cho_liam_blocks_and_overrides(tmp_path):
     assert gs.s04_hand_over(str(run), 'PID', g, 'Liam checked')[0] == 1           # nothing to override
     code, out, err = gs.s04_hand_over(str(run), 'PID', g, None)                   # clean: code 0
     assert code == 0 and err == [] and len(out) == 1
-    assert out[0].startswith('#ban_giao_s04,run=') and 'tool_check=true' in out[0]
+    assert out[0].startswith('#ban_giao_s04,run=') and 'tool_check=false' in out[0]   # C3-47: never a tool check
     assert 'cho_liam=0' in out[0] and 'liam_da_quyet=""' in out[0]
     code, out, err = gs.s04_hand_over(str(_s04_run(tmp_path / 'c', cho=items)), 'PID', g,
                                       'Liam đã xem và duyệt')
@@ -529,3 +541,77 @@ def test_spectral_indicator_failure_still_sends(fake, capsys, monkeypatch):
     assert sum(l.startswith('# ack ') for l in lines) == 1 and lines[-1] == '#ket_qua,ma=0'
     assert out.index('# ban_kinh_pho: not computed (') < out.index('# send')
     assert '# warning: ban_kinh_pho' not in out
+
+
+# ── C3-8 / C3-47: the declared gain source and the hardened hand-over ──
+
+
+def _manual_args(fake, *extra):
+    """args() without the default '--nguon-gain-tay' the helper adds (the source rules are on test)."""
+    return ['--ip', '127.0.0.1', '--port', str(fake.port), '--timeout', '0.3', '--tries', '3', *extra]
+
+
+def test_c3_8_gain_send_needs_a_declared_source(fake, capsys):
+    """C3-8: no --s04-run and no --nguon-gain-tay -> refused (5), nothing sent; a manual gain set
+    names its source with --nguon-gain-tay; both flags or a blank description are usage errors (1)."""
+    base = _manual_args(fake, '--ctrl', 'PID', '--id', '5', '--gains', gains_arg(PID))
+    assert gs.main(base) == 5 and fake.received == []
+    assert capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=5')
+    assert gs.main(base + ['--nguon-gain-tay', 'thu ban']) == 0
+    out = capsys.readouterr().out
+    assert '#nguon_gain,loai=tay,mo_ta="thu ban"' in out
+    assert out.index('#nguon_gain') < out.index('# send')
+    assert gs.main(base + ['--nguon-gain-tay', 'x', '--s04-run', 'y']) == 1
+    assert gs.main(base + ['--nguon-gain-tay', '   ']) == 1
+
+
+def test_c3_47_s04_run_refusals_at_unit_level(fake, tmp_path, capsys):
+    """C3-8/C3-47 through gs.main: a tool_check post, a changed selected.csv, broken cho_liam items
+    and a post that did not run to its end are all refused (5), nothing sent; the LF/CRLF variant of
+    the same content is accepted."""
+    def base(run):
+        return _manual_args(fake, '--ctrl', 'PID', '--id', '5', '--gains', gains_arg(PID),
+                            '--s04-run', str(run))
+
+    run = _s04_run(tmp_path / 'a', tool_check=True)
+    assert gs.main(base(run)) == 5 and fake.received == []
+    assert capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=5')
+    run = _s04_run(tmp_path / 'b')
+    p = run / 'selected.csv'
+    raw = p.read_bytes()
+    p.write_bytes(raw + b'\n')
+    assert gs.main(base(run)) == 5 and fake.received == []
+    p.write_bytes(raw.replace(b'\r\n', b'\n'))                     # same content, LF ends: accepted
+    assert gs.main(base(run)) == 0
+    for i, bad in enumerate([[None], [{}], [{'controller': 'PID', 'check': 'x'}],
+                             [{'controller': 'PID', 'check': 'x', 'reasons': 'r'}]]):
+        run = _s04_run(tmp_path / f'c{i}')
+        np_ = run / 'post_checks' / 'notes.json'
+        n = json.loads(np_.read_text(encoding='utf-8'))
+        n['cho_liam'] = bad
+        np_.write_text(json.dumps(n), encoding='utf-8')
+        n_sent = len(fake.received)
+        assert gs.main(base(run)) == 5 and len(fake.received) == n_sent
+        assert capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=5')
+    for i, st in enumerate(('dang_chay', None)):
+        run = _s04_run(tmp_path / f'd{i}')
+        np_ = run / 'post_checks' / 'notes.json'
+        n = json.loads(np_.read_text(encoding='utf-8'))
+        if st is None:
+            del n['post_trang_thai']
+        else:
+            n['post_trang_thai'] = st
+        np_.write_text(json.dumps(n), encoding='utf-8')
+        n_sent = len(fake.received)
+        assert gs.main(base(run)) == 5 and len(fake.received) == n_sent
+
+
+def test_c3_47_hand_over_exception_is_code_5(fake, tmp_path, capsys, monkeypatch):
+    """C3-47: a crash inside s04_hand_over is a refused send (5) ending with #ket_qua,ma=5, never an
+    exception without the result line."""
+    run = _s04_run(tmp_path)
+    monkeypatch.setattr(gs, 's04_hand_over',
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom')))
+    assert gs.main(_manual_args(fake, '--ctrl', 'PID', '--id', '5', '--gains', gains_arg(PID),
+                                '--s04-run', str(run))) == 5
+    assert fake.received == [] and capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=5')

@@ -120,13 +120,19 @@ _V8_EXTRA = [(i, 'axial') for i in range(257, 271)] + [(i, 'test') for i in rang
 
 def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None, plant_src=None, o1c=None,
              script=None, imu=None, gate=None, nguon_mien='sang_loc', ly_do='', sealed_levels=True,
-             sealed_design=True, sangloc_files=True, screen_u=True, number=b'so goc\n'):
+             sealed_design=True, sangloc_files=True, screen_u=True, number=b'so goc\n',
+             dll=None, ket_qua='default', manifest=True):
     """S03 v8.5 layout: public meta.yaml + levels.csv (old column set: read_domain / mu_rule never open
-    them), sealed/levels_sangloc.csv (levels + L_nguon, H_nguon, b, b_n, nguon_mien, ly_do),
-    sealed/design.csv, sealed/sangloc/ket_qua.json, sealed/sangloc_thu/so_dem.json, and a root number
-    file recorded in meta.yaml under 'screen_u' (S04 v6.7 section 8). levels: {controller:
+    them), sealed/levels_sangloc.csv (levels + a, b, b_n, L_nguon, H_nguon, nguon_mien, ly_do; the
+    default sang_loc domain lies in W = [a, b_n] = [L, H], C3-42), sealed/design.csv,
+    sealed/sangloc/ket_qua.json, sealed/sangloc_thu/so_dem.json, sealed/manifest.json (the raw-byte
+    sha256 of every sealed file, as S03 writes it, C3-41), and a root number file recorded in
+    meta.yaml under 'sang_loc' file_so (S04 v6.7 section 8). levels: {controller:
     {factor: (L, H)}}; default a synthetic domain. plant_src, o1c, imu, script: the S03 source record
-    (S4C-2); default the source of this checkout (HEAD, clean). gate: the gate speeds (default
+    (S4C-2); default the source of this checkout (HEAD, clean). dll: path whose sha256 goes to
+    firmware: dll_sha256 (default the real _DLL). ket_qua: 'default' -> a complete screening result
+    (both controllers 'hoan_tat'), a dict -> written as JSON, a str -> written raw, None -> not
+    written. gate: the gate speeds (default
     s03_doe.SPEEDS); the real GA trials use 0.2 only, where the default gains meet g3-g5 on fwsim (at
     0.8 the PID default heading error is above 7.5 deg; R134 package)."""
     d = tmp_path / 's03'
@@ -143,12 +149,12 @@ def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None, 
         with open(d / 'sealed' / 'levels_sangloc.csv', 'w', newline='', encoding='utf-8') as f:
             w = csv.writer(f)
             w.writerow(['controller', 'factor', 'L', 'H', 'centre', 'scale', 'default', 'rule_note',
-                        'L_nguon', 'H_nguon', 'b', 'b_n', 'nguon_mien', 'ly_do'])
+                        'a', 'b', 'b_n', 'L_nguon', 'H_nguon', 'nguon_mien', 'ly_do'])
             for c in s3.CONTROLLERS:
                 for k, n in enumerate(s3.FACTORS[c]):
                     L, H = levels[c][n] if levels else ((0.5, 8.0) if k % 2 == 0 else (1.0, 3.0))
-                    w.writerow([c, n, L, H, '', 'log' if L > 0 and H / L >= 4 else 'lin', '', '',
-                                '', '', '', '', nguon_mien, ly_do])
+                    w.writerow([c, n, L, H, '', s3.scale_of(L, H)[0], '', '',
+                                L if L > 0 else '', H, H, '', '', nguon_mien, ly_do])
     if sealed_design:
         with open(d / 'sealed' / 'design.csv', 'w', newline='') as f:
             w = csv.writer(f)
@@ -157,12 +163,17 @@ def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None, 
                 for pid, box in _POINTS + _V8_EXTRA:
                     w.writerow([c, pid, box])
     if sangloc_files:
-        (d / 'sealed' / 'sangloc' / 'ket_qua.json').write_text('{}')
+        kq = ({'N': None, 'N_da_dung': 0, 'm_min': 86,
+               **{c: dict(nhanh='nhan', trang_thai='hoan_tat', ly_do=[], nguon_mien='sang_loc')
+                  for c in s3.CONTROLLERS}} if ket_qua == 'default' else ket_qua)
+        if kq is not None:
+            (d / 'sealed' / 'sangloc' / 'ket_qua.json').write_text(
+                kq if isinstance(kq, str) else json.dumps(kq), encoding='utf-8')
         (d / 'sealed' / 'sangloc_thu' / 'so_dem.json').write_text('{}')
     num = tmp_path / 'so_goc.txt'
     num.write_bytes(number)
     y3 = {f'{c} v={v:g}': 5.0 for c in s3.CONTROLLERS for v in s3.SPEEDS}
-    dll_sha = s3.sha256_file(_DLL) if os.path.isfile(_DLL) else 'no dll'
+    dll_sha = s3.sha256_file(dll or _DLL) if os.path.isfile(dll or _DLL) else 'no dll'
     su = ('sang_loc: ' + json.dumps(dict(file_so=dict(file=str(num), sha256=hashlib.sha256(number).hexdigest())))
           + '\n'
           if screen_u else '')
@@ -176,7 +187,23 @@ def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None, 
         f'gate_speeds: {json.dumps(list(gate or s3.SPEEDS))}\ny3_reference: {json.dumps(y3)}\n', encoding='utf-8')
     if runs is not None:
         s3.write_csv(str(d / 'sealed' / 'runs.csv'), runs)
+    if manifest:
+        _reseal(d)
     return d
+
+
+def _reseal(d):
+    """Rewrite <d>/sealed/manifest.json = {'files': {rel: sha256 of the raw bytes}} over every file under
+    sealed/ (rel to sealed/, '/' separators, the manifest itself excluded), as S03 writes it (C3-41):
+    for tests that edit a sealed file and then go through s4.main()."""
+    files = {}
+    for root, _, names in os.walk(d / 'sealed'):
+        for n in names:
+            p = os.path.join(root, n)
+            rel = os.path.relpath(p, d / 'sealed').replace(os.sep, '/')
+            if rel != 'manifest.json':
+                files[rel] = hashlib.sha256(open(p, 'rb').read()).hexdigest()
+    (d / 'sealed' / 'manifest.json').write_text(json.dumps(dict(files=files)), encoding='utf-8')
 
 
 @pytest.fixture(autouse=True)
@@ -1054,6 +1081,8 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
         assert yaml.safe_load(open(out / 'meta.yaml', encoding='utf-8'))['tool_check'] is True    # S4C-12
     lock = json.load(open(out / 'lock.yaml'))
     assert lock['common']['s03_source_diff'] == []                         # S4C-2: S03 record of this checkout
+    # C3-45: the fingerprint locks the union of every phase's sources (screening script + mo_hinh_con too)
+    assert set(lock['common']['fingerprint']['scripts']) == set(s4.LOCKED_SOURCES)
     for ctrl in s3.CONTROLLERS:
         L = lock['controllers'][ctrl]
         assert L['eval_mu'] == [0.5] and L['n_gen'] in (1, 2) and L['hv_ref'][0] == s4.D and L['tool_check']
@@ -1070,6 +1099,7 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
                                           '--s03', str(d), '--seeds', '1', '2', '--dll', _DLL, '--out', str(out)])
         s4.main()
     m_adrc = yaml.safe_load(open(out / 'meta_ADRC.yaml', encoding='utf-8'))
+    assert 'screen_u' not in open(out / 'meta_PID.yaml', encoding='utf-8').read()   # C3-45: stale wording gone
     # S04 v6.8 2: the outside-triangle count of every seed (0 here: the domain lies inside the triangle)
     assert m_adrc['run']['n_ngoai_bang_per_seed'] == {'1': 0, '2': 0}
     assert set(m_adrc['run']['seed_error_rates']) == {'1', '2'}                 # C3-10: one entry per seed run
@@ -1081,6 +1111,10 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
             assert k in e
         if e['controller'] == 'ADRC':
             assert all(e[k] == '' for k in s4.KEP_FRAC_COLS + ['kep_note'])
+        elif e['status'] != 'run_error':
+            # C3-48: a PID run of a DLL with the kep channel has three finite clamp fractions in [0, 1]
+            assert all(math.isfinite(float(e[k])) and 0.0 <= float(e[k]) <= 1.0 for k in s4.KEP_FRAC_COLS)
+            assert e['kep_note'] == ''
         else:
             assert all(e[k] == '' or math.isfinite(float(e[k])) for k in s4.KEP_FRAC_COLS)
     sel = list(csv.DictReader(open(out / 'selected.csv')))
@@ -1110,7 +1144,8 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
     notes = json.load(open(pc / 'notes.json'))
     assert notes['tool_check'] is True                                   # S4C-10
     assert rc == (2 if notes['cho_liam'] else 0) and 'cho_liam_note' in notes  # a cho_liam finding -> rc 2
-    assert all(c['check'] in ('pre_hil', 'three_mu', 'spectral_radius', 'b0_factor', 'r_factor')
+    assert all(c['check'] in ('pre_hil', 'three_mu', 'spectral_radius', 'b0_factor', 'r_factor',
+                              'determinism')                                    # C3-46
                for c in notes['cho_liam'])
     assert notes['notes']['PID three_mu']['done'] is False and 'NOT done' in notes['notes']['PID three_mu']['note']
     for r in sens:                                                       # S04 v6.7 9.7: gate state columns
@@ -1807,32 +1842,39 @@ def test_three_mu_findings_read_states_not_maxima():
     assert s4.three_mu_findings([dict(T(), controller='ADRC')], 'PID') == []
 
 
+_DIG = {'t': ['float64', [3], 'ab' * 32]}   # a fixed log digest the stubbed runs share (C3-46)
+
+
 def _fake_post(tmp_path, monkeypatch, gains=G_PID, ctrl='PID', eval_mu=(0.5,), levels=(0.4, 0.5, 0.6),
-               tool_check=False, mu3_mod=None, sens_mod=None):
-    """The real s4.post without a DLL: GA outputs (lock.yaml, selected.csv with one send_to_HIL row,
-    evals.csv attempt-1 rows) and the S03 meta.yaml check_s03_trial reads are written; every sim call is
-    stubbed; write_root_meta and log_phase run for real. mu3_mod(row, v, mu) modifies a three-mu run row;
-    sens_mod(row, kind, factor, v, mu) modifies a b0/R run row. Returns (return code, notes.json, out,
-    selected.csv bytes before post)."""
+               tool_check=False, mu3_mod=None, sens_mod=None, det_mod=None, evals_mod=None):
+    """The real s4.post through s4.main() without a DLL: GA outputs (lock.yaml with the REAL fingerprint
+    and the real S03 fixture, selected.csv with one send_to_HIL row, evals.csv attempt-1 rows with a
+    valid log_sha256) and every sim call is stubbed; write_root_meta and log_phase run for real.
+    mu3_mod(row, v, mu) modifies a three-mu run row; sens_mod(row, kind, factor, v, mu) modifies a
+    b0/R run row; det_mod(jobs, res) -> res replaces the new-process result list (C3-46);
+    evals_mod(rows) -> rows replaces the GA evals rows before they are written. Returns (return code,
+    notes.json, out, selected.csv bytes before post)."""
     out = tmp_path / 'run'
     out.mkdir(parents=True)
     dll = tmp_path / 'fake.dll'
     dll.write_bytes(b'fake dll')
-    s03 = tmp_path / 's03'
-    s03.mkdir(exist_ok=True)
-    (s03 / 'meta.yaml').write_text(f'trial: {str(tool_check).lower()}\n', encoding='utf-8')
+    s03 = _s03_dir(tmp_path, trial=tool_check, mu=levels, dll=str(dll))
     speeds = [0.2, 0.5]
-    lock = dict(common=dict(tool_check=tool_check, s03_run=str(s03), fingerprint={},
-                            unsealed=not tool_check),
+    lock = dict(common=dict(tool_check=tool_check, s03_run=str(s03),
+                            fingerprint=s4.fingerprint(str(dll), str(s03), unsealed=not tool_check),
+                            unsealed=not tool_check, s03_source_diff=[]),
                 s03_mu_levels=list(levels),
                 controllers={ctrl: dict(eval_mu=list(eval_mu), speeds=speeds)})
     (out / 'lock.yaml').write_text(json.dumps(lock), encoding='utf-8')
     s3.write_csv(str(out / 'selected.csv'),
                  [dict(kind='send_to_HIL', controller=ctrl, ga_seed=1, feasible='true', gen=1, cand_id=0,
                        f1=0.03, f2=5.0, **{n: repr(float(v)) for n, v in gains.items()})])
-    s3.write_csv(str(out / 'evals.csv'),
-                 [dict(controller=ctrl, ga_seed=1, gen=1, cand_id=0, v=v, mu=mu, attempt=1, log_sha256='')
-                  for mu in eval_mu for v in speeds])
+    erows = [dict(controller=ctrl, ga_seed=1, gen=1, cand_id=0, v=v, mu=mu, attempt=1,
+                  log_sha256=s4.digest_sha(_DIG))
+             for mu in eval_mu for v in speeds]
+    if evals_mod:
+        erows = evals_mod(erows)
+    s3.write_csv(str(out / 'evals.csv'), erows)
 
     def row(**kw):
         return dict(dict(status='ok', completed='true', e_perp_max=0.03, tv_duty=5.0, e_trk_max=0.03,
@@ -1853,16 +1895,119 @@ def _fake_post(tmp_path, monkeypatch, gains=G_PID, ctrl='PID', eval_mu=(0.5,), l
                     sens_mod(r, kind, kw[kind], v, mu)
         return r, None, {}, dict(motor_R=1.0), dict(motor_R=1.0)
 
-    monkeypatch.setattr(s4, 'fingerprint', lambda *a, **k: {})
+    def fake_new(dll_, jobs, work):
+        res = [dict(row=row(), digest=dict(_DIG)) for _ in jobs]
+        return det_mod(jobs, res) if det_mod else res
+
     monkeypatch.setattr(fwsim, 'FirmwareSim', lambda dll_: None)
-    monkeypatch.setattr(s3, 'run_in_new_process',
-                        lambda dll_, jobs, work: [dict(row=row(), digest=None) for _ in jobs])
+    monkeypatch.setattr(s3, 'run_in_new_process', fake_new)
     monkeypatch.setattr(s4, 'run_custom', fake_custom)
     monkeypatch.setattr(s3, 'safe_run', fake_safe)
     sel = (out / 'selected.csv').read_bytes()
-    rc = s4.post(argparse.Namespace(out=str(out), dll=str(dll)))
+    monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'post', '--out', str(out), '--dll', str(dll)])
+    rc = s4.main()
     notes = json.load(open(out / 'post_checks' / 'notes.json', encoding='utf-8'))
     return rc, notes, out, sel
+
+
+class _Reached(Exception):
+    """s4.run_seed was entered: every input gate before it passed (C3-41/42/44)."""
+
+
+def _run_main(monkeypatch, tmp_path, d, phase='trial', ctrl='PID', tool_check=True, extra=()):
+    """Run s4.main() on an S03 fixture with a fake dll file and FirmwareSim stub (kep_cols = 7), and
+    run_seed stubbed to raise _Reached. 'Accepted' = pytest.raises(_Reached); 'refused' =
+    pytest.raises(SystemExit) (and no lock.yaml under out for a trial). For --phase main the caller
+    writes the lock by hand with _lock AFTER the tampering, so the fingerprint comparison cannot be
+    what refuses (C3-41)."""
+    fake = tmp_path / 'fake.dll'
+    fake.write_bytes(b'fake dll')
+    out = tmp_path / 'out'
+    fw = types.SimpleNamespace(kep_cols=7, build_info={'esp32': {'dirty': False}})
+    monkeypatch.setattr(fwsim, 'FirmwareSim', lambda dll: fw)
+    monkeypatch.setattr(s4, 'run_seed',
+                        lambda *a, **k: (_ for _ in ()).throw(_Reached()))
+    argv = ['s04_ga.py', '--phase', phase, '--controller', ctrl, '--s03', str(d), '--dll', str(fake),
+            '--out', str(out)]
+    if tool_check:
+        argv += ['--tool-check', '--pop', '4', '--gen-base', '1', '--gen-max', '1']
+    else:
+        pre = tmp_path / 'pre.json'
+        pre.write_text(json.dumps({k: 'checked' for k in s4.PRECONDITIONS}), encoding='utf-8')
+        argv += ['--s03-unsealed', '--preconditions', str(pre)]
+    monkeypatch.setattr(sys, 'argv', argv + list(extra))
+    return s4.main()
+
+
+def _c3_lock(out, s03, tool_check, ctrl='PID', dll=None):
+    """A lock.yaml as the trial of this script writes it, for --phase main tests: the REAL fingerprint
+    and domain of <s03>, computed now (write it AFTER any tampering so the fingerprint comparison is
+    not what refuses, C3-41/C3-44)."""
+    out.mkdir(parents=True, exist_ok=True)
+    dll = dll or _DLL
+    fp = s4.fingerprint(str(dll), str(s03), unsealed=not tool_check)
+    dom = s4.read_domain(str(s03), ctrl)
+    src = s4.domain_source(str(s03), ctrl)
+    lock = dict(common=dict(tool_check=tool_check, s03_run=os.path.abspath(str(s03)), fingerprint=fp,
+                            s03_mu_levels=[0.4, 0.5, 0.6], unsealed=not tool_check, s03_source_diff=[]),
+                s03_mu_levels=[0.4, 0.5, 0.6], rule=s4.SELECTION_RULE, pymoo='0',
+                controllers={ctrl: dict(tool_check=tool_check, domain=dom,
+                                        s03_run=os.path.abspath(str(s03)), speeds=list(s3.SPEEDS),
+                                        eval_mu=[0.5], mu_decision='mid', mu_rule_report={},
+                                        pop=(4 if tool_check else s4.POP), n_gen=1,
+                                        gen_rule=(dict(base=1, max=1) if tool_check else
+                                                  dict(base=s4.GEN_BASE, max=s4.GEN_MAX)),
+                                        seeds=([1] if tool_check else list(s4.SEEDS)),
+                                        preconditions=({k: 'checked' for k in s4.PRECONDITIONS}
+                                                       if not tool_check else {}),
+                                        hv_ref=[s4.D, s4.HV_REF_F2], **src)})
+    (out / 'lock.yaml').write_text(json.dumps(lock), encoding='utf-8')
+    return lock
+
+
+class _OpenSpy:
+    """Wraps builtins.open AND os.open; after the real call records the opened TARGET: the real path of
+    the name and the (st_dev, st_ino) of the opened descriptor. Assertions use the opened target,
+    never only the name (C3-44: a hard link may carry the expected name but open another file)."""
+
+    def __init__(self, monkeypatch):
+        import builtins
+        self.seen = []                                  # real paths and (st_dev, st_ino) pairs
+        real_open, real_osopen = builtins.open, os.open
+
+        def spy(f, *a, **kw):
+            fh = real_open(f, *a, **kw)
+            self._rec(f, fh)
+            return fh
+
+        def ospy(f, *a, **kw):
+            fd = real_osopen(f, *a, **kw)
+            self._rec(f, fd)
+            return fd
+
+        monkeypatch.setattr(builtins, 'open', spy)
+        monkeypatch.setattr(os, 'open', ospy)
+
+    def _rec(self, name, fh):
+        try:
+            if isinstance(name, (str, bytes, os.PathLike)):
+                self.seen.append(os.path.normcase(os.path.realpath(name)))
+        except (OSError, TypeError, ValueError):
+            pass
+        try:
+            st = os.fstat(fh if isinstance(fh, int) else fh.fileno())
+            self.seen.append((st.st_dev, st.st_ino))
+        except (OSError, TypeError, ValueError, AttributeError):
+            pass
+
+    def opened(self, path):
+        st = os.stat(path)
+        return ((st.st_dev, st.st_ino) in self.seen or
+                os.path.normcase(os.path.realpath(path)) in self.seen)
+
+    def under(self, dirpath):
+        root = os.path.normcase(os.path.realpath(dirpath))
+        return any(isinstance(x, str) and x.startswith(root + os.sep) for x in self.seen)
 
 
 @pytest.mark.parametrize('case', 'abcdefg')
@@ -2346,6 +2491,7 @@ def test_sens_after_pre_checks_every_variant_before_any_simulation(tmp_path, mon
                        **{n: '1.0' for n in s3.FACTORS[c]}) for c in s3.CONTROLLERS])
     calls, real_variant = [], s4.apply_plant_variant
     monkeypatch.setattr(s4, 'fingerprint', lambda *a, **k: {})
+    monkeypatch.setattr(s4, 'check_s03_source', lambda *a, **k: [])   # C3-45: fp is stubbed, so this too
     monkeypatch.setattr(s4.fwsim, 'FirmwareSim', lambda *a, **k: object())
     monkeypatch.setattr(s4, 'apply_plant_variant',
                         lambda p, name: (calls.append(('pre', name)), real_variant(p, name))[1])
@@ -2511,3 +2657,779 @@ def test_so_goc_doc_dong_sang_loc_cua_s03_doe(tmp_path):
     assert s4.so_goc(str(tmp_path)) is None
     (tmp_path / 'meta.yaml').write_text('spec: S03 v8.6\n', encoding='utf-8')
     assert s4.so_goc(str(tmp_path)) is None
+
+
+# ---------------- C3: the Codex round-3 input gates (each must fail on the pre-C3 code) ----------------
+
+_C3_MODES = ('tc_trial', 'mm_trial', 'tc_main', 'mm_main')
+
+
+def _fake_dll(tmp_path):
+    """A bytes file standing in for the DLL; write BEFORE _s03_dir so meta.yaml records its sha256."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    p = tmp_path / 'fake.dll'
+    p.write_bytes(b'fake dll')
+    return p
+
+
+def _set_trial(d, value):
+    """Rewrite the first 'trial:' line of <d>/meta.yaml to 'trial: <value>' (a raw YAML scalar)."""
+    p = d / 'meta.yaml'
+    t = p.read_text(encoding='utf-8')
+    p.write_text(re.sub(r'trial: \S+', f'trial: {value}', t, count=1), encoding='utf-8')
+
+
+def _s03_for_mode(tmp_path, mode, **kw):
+    """The S03 fixture of one C3 mode: 'tc' = a --tool-check run on a --trial S03 run, 'mm' = a main
+    run (three mu, sealed/runs.csv) on a main S03 run. Returns (d, tool_check)."""
+    tool_check = mode.startswith('tc')
+    fake = _fake_dll(tmp_path)
+    d = _s03_dir(tmp_path, None if tool_check else _runs(), trial=tool_check, dll=str(fake), **kw)
+    return d, tool_check
+
+
+def _go(monkeypatch, tmp_path, d, mode):
+    """Run s4.main() for one C3 mode; for a *_main phase the lock is written here, AFTER the caller's
+    tampering, so check_fingerprint cannot be what refuses (C3-41). Accepted = _Reached."""
+    tool_check = mode.startswith('tc')
+    phase = mode.rsplit('_', 1)[1]
+    if phase == 'main':
+        _c3_lock(tmp_path / 'out', d, tool_check, dll=tmp_path / 'fake.dll')
+    return _run_main(monkeypatch, tmp_path, d, phase, 'PID', tool_check)
+
+
+@pytest.mark.parametrize('mode', _C3_MODES)
+def test_c3_41_untouched_fixture_accepted(tmp_path, monkeypatch, mode):
+    d, _ = _s03_for_mode(tmp_path, mode)
+    with pytest.raises(_Reached):
+        _go(monkeypatch, tmp_path, d, mode)
+
+
+@pytest.mark.parametrize('mode', _C3_MODES)
+@pytest.mark.parametrize('tamper', ('empty', 'dang_chay', 'not_object', 'not_json', 'missing'))
+def test_c3_41_ket_qua_gate(tmp_path, monkeypatch, mode, tamper):
+    """C3-41 (S03 v8.6 3.1b item 11): a missing, malformed or unfinished sealed/sangloc/ket_qua.json
+    refuses the run in every mode."""
+    d, _ = _s03_for_mode(tmp_path, mode)
+    p = d / 'sealed' / 'sangloc' / 'ket_qua.json'
+    if tamper == 'missing':
+        p.unlink()
+    else:
+        doc = json.loads(p.read_text(encoding='utf-8'))
+        if tamper == 'empty':
+            doc = {}
+        elif tamper == 'dang_chay':
+            doc['PID']['trang_thai'] = 'dang_chay'
+        elif tamper == 'not_object':
+            doc['PID'] = 5
+        p.write_text('{oops' if tamper == 'not_json' else json.dumps(doc), encoding='utf-8')
+        _reseal(d)                                       # only the ket_qua check may refuse
+    with pytest.raises(SystemExit, match='ket_qua'):
+        _go(monkeypatch, tmp_path, d, mode)
+
+
+@pytest.mark.parametrize('mode', _C3_MODES)
+def test_c3_41_every_controller_screened(tmp_path, monkeypatch, mode):
+    """C3-41: a main run needs BOTH controllers hoan_tat; a tool-check needs only the one it runs."""
+    d, _ = _s03_for_mode(tmp_path, mode)
+    p = d / 'sealed' / 'sangloc' / 'ket_qua.json'
+    doc = json.loads(p.read_text(encoding='utf-8'))
+    if mode.startswith('tc'):
+        del doc['ADRC']
+        p.write_text(json.dumps(doc), encoding='utf-8')
+        _reseal(d)
+        with pytest.raises(_Reached):
+            _go(monkeypatch, tmp_path, d, mode)
+    else:
+        doc['ADRC']['trang_thai'] = 'dang_chay'
+        p.write_text(json.dumps(doc), encoding='utf-8')
+        _reseal(d)
+        with pytest.raises(SystemExit, match='ADRC'):
+            _go(monkeypatch, tmp_path, d, mode)
+
+
+_C3_SEALED_FILES = ('sealed/levels_sangloc.csv', 'sealed/design.csv', 'sealed/sangloc/ket_qua.json',
+                    'sealed/sangloc_thu/so_dem.json')
+
+
+@pytest.mark.parametrize('mode', _C3_MODES)
+@pytest.mark.parametrize('rel', _C3_SEALED_FILES)
+def test_c3_41_manifest_catches_a_tampered_sealed_file(tmp_path, monkeypatch, mode, rel):
+    """C3-41: a sealed file whose bytes differ from the manifest the S03 run sealed refuses the run."""
+    d, _ = _s03_for_mode(tmp_path, mode)
+    p = d.joinpath(*rel.split('/'))
+    p.write_bytes(p.read_bytes() + b'\n')                            # tamper WITHOUT _reseal
+    with pytest.raises(SystemExit, match='manifest'):
+        _go(monkeypatch, tmp_path, d, mode)
+
+
+@pytest.mark.parametrize('mode', ('mm_trial', 'mm_main'))
+def test_c3_41_manifest_catches_a_tampered_runs_csv(tmp_path, monkeypatch, mode):
+    d, _ = _s03_for_mode(tmp_path, mode)
+    p = d / 'sealed' / 'runs.csv'
+    p.write_bytes(p.read_bytes() + b'\n')
+    with pytest.raises(SystemExit, match='manifest'):
+        _go(monkeypatch, tmp_path, d, mode)
+
+
+@pytest.mark.parametrize('mode', _C3_MODES)
+@pytest.mark.parametrize('tamper', ('missing', 'not_object', 'no_files'))
+def test_c3_41_manifest_gate(tmp_path, monkeypatch, mode, tamper):
+    """C3-41: a missing or malformed sealed/manifest.json refuses the run."""
+    d, _ = _s03_for_mode(tmp_path, mode, manifest=(tamper != 'missing'))
+    if tamper == 'not_object':
+        (d / 'sealed' / 'manifest.json').write_text('[]')
+    elif tamper == 'no_files':
+        (d / 'sealed' / 'manifest.json').write_text('{}')
+    with pytest.raises(SystemExit, match='manifest'):
+        _go(monkeypatch, tmp_path, d, mode)
+
+
+@pytest.mark.parametrize('mode', _C3_MODES)
+def test_c3_41_manifest_listing_a_deleted_file(tmp_path, monkeypatch, mode):
+    """C3-41: so_dem.json deleted but still listed in the manifest is a manifest/file mismatch (for a
+    main mode the missing sealed input is caught even earlier)."""
+    d, _ = _s03_for_mode(tmp_path, mode)
+    (d / 'sealed' / 'sangloc_thu' / 'so_dem.json').unlink()
+    with pytest.raises(SystemExit, match='manifest|sealed'):
+        _go(monkeypatch, tmp_path, d, mode)
+
+
+def test_c3_41_trial_s03_without_so_dem_accepted(tmp_path, monkeypatch):
+    """C3-41: a --trial S03 run has no sangloc_thu/so_dem.json; absent in the run AND in the manifest
+    (None == None) a tool-check is accepted."""
+    fake = _fake_dll(tmp_path)
+    d = _s03_dir(tmp_path, trial=True, dll=str(fake))
+    (d / 'sealed' / 'sangloc_thu' / 'so_dem.json').unlink()
+    _reseal(d)
+    with pytest.raises(_Reached):
+        _run_main(monkeypatch, tmp_path, d, 'trial', 'PID', True)
+
+
+def _edit_row(d, factor, ctrl='PID', **upd):
+    """row.update(upd) on the {ctrl, factor} row of sealed/levels_sangloc.csv, then _reseal (C3-41)."""
+    import csv as _csv
+    p = d / 'sealed' / 'levels_sangloc.csv'
+    rows = list(_csv.DictReader(open(p, encoding='utf-8')))
+    for r in rows:
+        if r['controller'] == ctrl and r['factor'] == factor:
+            r.update({k: '' if v is None else str(v) for k, v in upd.items()})
+    with open(p, 'w', newline='', encoding='utf-8') as f:
+        w = _csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    _reseal(d)
+
+
+def _s03_with_pos_kp(tmp_path, trial=False, **upd):
+    """S03 fixture + fake dll with the sealed PID pos_kp row updated; returns the s03 dir."""
+    fake = _fake_dll(tmp_path)
+    d = _s03_dir(tmp_path, dll=str(fake), trial=trial)
+    _edit_row(d, 'pos_kp', **upd)
+    return d
+
+
+def test_c3_42_codex_domain_outside_the_reference_box(tmp_path, monkeypatch):
+    """C3-42 (S03 v8.6 3.1b item 2), the Codex counter-example: sang_loc pos_kp L=2, a=0.2, b=20,
+    b_n=40, H=50 -- [2, 50] is not inside W = [0.2, 40]; refused by read_domain and by s4.main."""
+    d = _s03_with_pos_kp(tmp_path, trial=True, L=2, H=50, a=0.2, b=20, b_n=40,
+                         scale=s3.scale_of(2, 50)[0])
+    with pytest.raises(SystemExit, match='W = '):
+        s4.read_domain(str(d), 'PID')
+    with pytest.raises(SystemExit, match='W = '):
+        _run_main(monkeypatch, tmp_path, d, 'trial', 'PID', True)
+    assert not (tmp_path / 'out' / 'lock.yaml').exists()
+
+
+@pytest.mark.parametrize('case,bad', (
+    ('H_eq_bn', False), ('H_above_bn', True), ('H_rel_eps', True), ('L_eq_a', False),
+    ('L_below_a', True), ('a_zero', True), ('a_empty', True), ('a_nan', True), ('bn_inf', True)))
+def test_c3_42_reference_box_edges(tmp_path, case, bad):
+    """C3-42: the W = [a, b_n] check is binary64 and inclusive at the bound: equal is inside, one ulp
+    (or a 5e-10 relative step, far below 1e-9) outside is refused; a > 0; a and b_n finite."""
+    L, H, a, b_n = 2.0, 8.0, 2.0, 8.0                     # the accepted edges: L == a, H == b_n
+    if case == 'H_above_bn':
+        H = math.nextafter(8.0, math.inf)
+    elif case == 'H_rel_eps':
+        H = 8.0 * (1 + 5e-10)
+    elif case == 'L_below_a':
+        L = math.nextafter(2.0, 0.0)
+    upd = dict(L=L, H=H, a=a, b=20.0, b_n=b_n, scale=s3.scale_of(L, H)[0])
+    if case == 'a_zero':
+        upd['a'] = 0.0
+    elif case == 'a_empty':
+        upd['a'] = None
+    elif case == 'a_nan':
+        upd['a'] = 'nan'
+    elif case == 'bn_inf':
+        upd['b_n'] = 'inf'
+    d = _s03_with_pos_kp(tmp_path, **upd)
+    if bad:
+        with pytest.raises(SystemExit):
+            s4.read_domain(str(d), 'PID')
+    else:
+        assert s4.read_domain(str(d), 'PID')
+
+
+@pytest.mark.parametrize('val', ('nan', 'inf', ''))
+@pytest.mark.parametrize('field', ('L', 'H'))
+@pytest.mark.parametrize('nguon', ('sang_loc', 'du_phong'))
+def test_c3_42_non_finite_level_refused(tmp_path, val, field, nguon):
+    fake = _fake_dll(tmp_path)
+    d = _s03_dir(tmp_path, dll=str(fake), nguon_mien=nguon)
+    _edit_row(d, 'pos_kp', **{field: val})
+    with pytest.raises(SystemExit, match='finite'):
+        s4.read_domain(str(d), 'PID')
+
+
+@pytest.mark.parametrize('sc', ('xyz', 'lin'))          # pos_kp [0.5, 8] wants 'log'
+@pytest.mark.parametrize('nguon', ('sang_loc', 'du_phong'))
+def test_c3_42_wrong_scale_refused(tmp_path, sc, nguon):
+    fake = _fake_dll(tmp_path)
+    d = _s03_dir(tmp_path, dll=str(fake), nguon_mien=nguon)
+    _edit_row(d, 'pos_kp', scale=sc)
+    with pytest.raises(SystemExit, match='scale'):
+        s4.read_domain(str(d), 'PID')
+
+
+@pytest.mark.parametrize('nguon', ('sang_loc', 'du_phong'))
+def test_c3_42_exactly_one_row_per_gain(tmp_path, nguon):
+    """C3-42: a factor twice (the last row used to win), a row that is not a gain of the controller,
+    and a missing factor (the old message) are all refused by read_domain and domain_source."""
+    import csv as _csv
+    fake = _fake_dll(tmp_path)
+    d = _s03_dir(tmp_path, dll=str(fake), nguon_mien=nguon)
+    p = d / 'sealed' / 'levels_sangloc.csv'
+    rows = list(_csv.DictReader(open(p, encoding='utf-8')))
+    pos = next(r for r in rows if r['controller'] == 'PID' and r['factor'] == 'pos_kp')
+    keep = [r for r in rows if r['controller'] != 'PID' or r['factor'] != 'pos_kp']
+
+    def wr(rr):
+        with open(p, 'w', newline='', encoding='utf-8') as f:
+            w = _csv.DictWriter(f, fieldnames=list(rows[0]))
+            w.writeheader()
+            w.writerows(rr)
+        _reseal(d)
+
+    wr(keep + [dict(pos, H='9.9')] + [pos])                             # the last row used to win
+    with pytest.raises(SystemExit, match='exactly one row'):
+        s4.read_domain(str(d), 'PID')
+    with pytest.raises(SystemExit, match='exactly one row'):
+        s4.domain_source(str(d), 'PID')
+    wr(keep + [dict(pos, factor='not_a_gain')] + [pos])
+    with pytest.raises(SystemExit, match='not a gain'):
+        s4.read_domain(str(d), 'PID')
+    with pytest.raises(SystemExit, match='not a gain'):
+        s4.domain_source(str(d), 'PID')
+    wr(keep)
+    with pytest.raises(SystemExit, match='has no level for'):
+        s4.read_domain(str(d), 'PID')
+
+
+@pytest.mark.parametrize('case,bad', (('at_cap', False), ('above_cap', True), ('above_cap_f32', True)))
+def test_c3_42_omega_o_cap(tmp_path, case, bad):
+    """C3-42 (S03 2.1): an omega_o upper level above the cap 48 is refused even inside W; H == 48 and
+    b_n == 48 is the accepted edge."""
+    fake = _fake_dll(tmp_path)
+    d = _s03_dir(tmp_path, dll=str(fake))
+    if case == 'at_cap':
+        upd = dict(L=20, H=48.0, a=20.0, b=60.0, b_n=48.0, scale=s3.scale_of(20, 48)[0])
+    elif case == 'above_cap':
+        upd = dict(L=20, H=48.0000001, a=20.0, b=60.0, b_n=60.0, scale=s3.scale_of(20, 48.0000001)[0])
+    else:
+        H = float(np.nextafter(np.float32(48), np.float32(np.inf)))
+        upd = dict(L=20, H=H, a=20.0, b=60.0, b_n=60.0, scale=s3.scale_of(20, H)[0])
+    _edit_row(d, 'omega_o_xy', ctrl='ADRC', **upd)
+    if bad:
+        with pytest.raises(SystemExit, match='omega_o'):
+            s4.read_domain(str(d), 'ADRC')
+    else:
+        assert s4.read_domain(str(d), 'ADRC')
+
+
+def test_c3_42_out_of_range_result_only_at_the_same_point(tmp_path):
+    """C3-42 'same point only': a sang_loc side gets its kiem_ngoai_mien result only when the sealed
+    bound equals the sweep level of that side (the public levels.csv; never read for the domain)."""
+    import csv as _csv
+    d = _s03_dir(tmp_path)
+    cols = ['dong', 'controller', 'factor', 'value', 'can', 'ket_qua']
+    rows = [dict(dong='diem', controller='PID', factor='kp_xy', value=str(9 + i), can='H',
+                 ket_qua='khong cod')
+            for i in range(3)]
+    rows += [dict(dong='diem', controller='PID', factor='kp_xy', value='0.4', can='L',
+                  ket_qua='cod'),
+             dict(dong='tong', controller='PID', ket_qua='da kiem du')]
+    with open(d / 'kiem_ngoai_mien.csv', 'w', newline='', encoding='utf-8') as f:
+        w = _csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        w.writerows(rows)
+    _reseal(d)
+    by = {x['name']: x for x in s4.read_domain(str(d), 'PID')}
+    assert by['kp_xy']['H_kiem'] != '' and by['kp_xy']['L_kiem'] != ''      # sweep H == sealed H == 8
+    _edit_row(d, 'kp_xy', H=9.0, b_n=9.0, scale=s3.scale_of(0.5, 9.0)[0])   # sealed bound moved
+    by = {x['name']: x for x in s4.read_domain(str(d), 'PID')}
+    assert by['kp_xy']['H_kiem'] == '' and by['kp_xy']['L_kiem'] != ''
+    (d / 'levels.csv').unlink()
+    _reseal(d)
+    by = {x['name']: x for x in s4.read_domain(str(d), 'PID')}
+    assert by['kp_xy']['H_kiem'] == '' and by['kp_xy']['L_kiem'] == ''
+    # du_phong: attached as before (no same-point rule)
+    d2 = _s03_dir(tmp_path / 'b', nguon_mien='du_phong')
+    import shutil
+    shutil.copy(d / 'kiem_ngoai_mien.csv', d2 / 'kiem_ngoai_mien.csv')
+    by = {x['name']: x for x in s4.read_domain(str(d2), 'PID')}
+    assert by['kp_xy']['H_kiem'] != '' and by['kp_xy']['L_kiem'] != ''
+
+
+@pytest.mark.parametrize('trial_val', ('1', '"true"'))
+def test_c3_44_trial_must_be_a_bool(tmp_path, monkeypatch, trial_val):
+    """C3-44: trial: 1 and trial: "true" are not the JSON bool; nothing under sealed/ is opened."""
+    fake = _fake_dll(tmp_path)
+    d = _s03_dir(tmp_path, trial=True, dll=str(fake))
+    _set_trial(d, trial_val)
+    spy = _OpenSpy(monkeypatch)
+    with pytest.raises(SystemExit, match='bool'):
+        _run_main(monkeypatch, tmp_path, d, 'trial', 'PID', True)
+    assert not spy.under(d / 'sealed')
+    assert not (tmp_path / 'out' / 'lock.yaml').exists()
+
+
+def test_c3_44_main_mode_trial_must_be_a_bool(tmp_path, monkeypatch):
+    fake = _fake_dll(tmp_path)
+    d = _s03_dir(tmp_path, _runs(), dll=str(fake))
+    _set_trial(d, '1')
+    with pytest.raises(SystemExit, match='bool'):
+        _run_main(monkeypatch, tmp_path, d, 'trial', 'PID', False)
+
+
+def test_c3_44_post_and_sens_after_trial_must_be_a_bool(tmp_path):
+    """post() and sens_after() go through check_s03_trial -> the same exact-bool rule on the lock's
+    S03 run."""
+    fake = _fake_dll(tmp_path)
+    d = _s03_dir(tmp_path, trial=True, dll=str(fake))
+    _set_trial(d, '1')
+    out = _lock_dir(tmp_path / 'r', tool_check=True, s03=d, unsealed=False)
+    for f in (lambda: s4.post(argparse.Namespace(out=str(out), dll=str(fake))),
+              lambda: s4.sens_after(argparse.Namespace(out=str(out), dll=str(fake), io_delay_ms=None))):
+        with pytest.raises(SystemExit, match='bool'):
+            f()
+
+
+_C3_LINK_FILES = ('sealed/levels_sangloc.csv', 'sealed/design.csv', 'sealed/sangloc/ket_qua.json',
+                  'sealed/sangloc_thu/so_dem.json', 'sealed/manifest.json')
+
+
+@pytest.mark.parametrize('rel', _C3_LINK_FILES)
+def test_c3_44_hard_link_alias_refused(tmp_path, monkeypatch, rel):
+    """C3-44: a sealed S03 file hard-linked to an outside file is refused before it is opened; the
+    outside file is never opened (identity of the opened descriptor, not the name)."""
+    fake = _fake_dll(tmp_path)
+    d = _s03_dir(tmp_path, trial=True, dll=str(fake))
+    target = d / 'sealed_test' / 'runs_test.csv'
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b'sealed test bytes')
+    p = d.joinpath(*rel.split('/'))
+    p.unlink()
+    os.link(target, p)
+    spy = _OpenSpy(monkeypatch)
+    with pytest.raises(SystemExit, match='one name'):
+        _run_main(monkeypatch, tmp_path, d, 'trial', 'PID', True)
+    assert not spy.opened(target)
+
+
+def test_c3_44_hard_link_on_runs_csv_refused(tmp_path, monkeypatch):
+    """sealed/runs.csv (the main-mode input) hard-linked to an outside file: refused, never opened."""
+    fake = _fake_dll(tmp_path)
+    d = _s03_dir(tmp_path, _runs(), dll=str(fake))
+    target = d / 'sealed_test' / 'runs_test.csv'
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b'sealed test bytes')
+    (d / 'sealed' / 'runs.csv').unlink()
+    os.link(target, d / 'sealed' / 'runs.csv')
+    spy = _OpenSpy(monkeypatch)
+    with pytest.raises(SystemExit, match='one name'):
+        _run_main(monkeypatch, tmp_path, d, 'trial', 'PID', False)
+    assert not spy.opened(target)
+
+
+def test_c3_44_junction_on_sangloc_thu_refused(tmp_path, monkeypatch):
+    """C3-44: sealed/sangloc_thu replaced by a junction to another folder is refused (realpath check);
+    the file behind the junction is never opened."""
+    import _winapi
+    if not hasattr(_winapi, 'CreateJunction'):
+        pytest.skip('junctions need Windows')
+    fake = _fake_dll(tmp_path)
+    d = _s03_dir(tmp_path, trial=True, dll=str(fake))
+    other = tmp_path / 'elsewhere' / 'sangloc_thu'
+    other.mkdir(parents=True)
+    (other / 'so_dem.json').write_text('{}')
+    import shutil
+    shutil.rmtree(d / 'sealed' / 'sangloc_thu')
+    _winapi.CreateJunction(str(other), str(d / 'sealed' / 'sangloc_thu'))
+    spy = _OpenSpy(monkeypatch)
+    with pytest.raises(SystemExit, match='link|resolves'):
+        _run_main(monkeypatch, tmp_path, d, 'trial', 'PID', True)
+    assert not spy.opened(other / 'so_dem.json')
+
+
+def test_c3_44_symlink_on_sangloc_thu_refused(tmp_path, monkeypatch):
+    """Same as the junction case with a directory symlink (skipped where os.symlink is not allowed)."""
+    fake = _fake_dll(tmp_path)
+    d = _s03_dir(tmp_path, trial=True, dll=str(fake))
+    other = tmp_path / 'elsewhere2' / 'sangloc_thu'
+    other.mkdir(parents=True)
+    (other / 'so_dem.json').write_text('{}')
+    import shutil
+    shutil.rmtree(d / 'sealed' / 'sangloc_thu')
+    try:
+        os.symlink(str(other), str(d / 'sealed' / 'sangloc_thu'), target_is_directory=True)
+    except OSError as e:
+        pytest.skip(f'os.symlink not permitted: {e}')
+    spy = _OpenSpy(monkeypatch)
+    with pytest.raises(SystemExit, match='link|resolves'):
+        _run_main(monkeypatch, tmp_path, d, 'trial', 'PID', True)
+    assert not spy.opened(other / 'so_dem.json')
+
+
+def test_c3_44_opened_file_identity_rechecked(tmp_path, monkeypatch):
+    """C3-44, the fstat branch: when the descriptor of the opened file is not the checked directory
+    entry (here a forced st_nlink = 2), s03_read refuses."""
+    fake = _fake_dll(tmp_path)
+    d = _s03_dir(tmp_path, trial=True, dll=str(fake))
+    real_fstat = os.fstat
+    want_ino = os.lstat(d / 'sealed' / 'design.csv').st_ino
+
+    def fake_fstat(fd):
+        st = real_fstat(fd)
+        if st.st_ino == want_ino:
+            seq = list(st)
+            seq[3] = 2                                    # st_nlink
+            st = os.stat_result(seq)
+        return st
+
+    monkeypatch.setattr(os, 'fstat', fake_fstat)
+    with pytest.raises(SystemExit, match='opened'):
+        s4.s03_read(str(d), 'sealed/design.csv')
+
+
+def test_c3_45_source_lock_covers_every_phase_source(tmp_path):
+    """C3-45: the fingerprint locks the union of the phase source lists (the screening script and
+    tools/mo_hinh_con.py at the first trial); SIM_SOURCES itself is unchanged."""
+    fake = _fake_dll(tmp_path)
+    d = _s03_dir(tmp_path, dll=str(fake))
+    fp = s4.fingerprint(str(fake), str(d))
+    assert set(fp['scripts']) == set(s4.LOCKED_SOURCES)
+    assert s4.S03_SCREEN_SCRIPT in fp['scripts'] and 'tools/mo_hinh_con.py' in fp['scripts']
+    assert list(s4.SIM_SOURCES) == list(s4.SOURCES) + [s4.S03_SCREEN_SCRIPT]
+
+
+@pytest.mark.parametrize('diff_file', ('tools/mo_hinh_con.py',))
+def test_c3_45_post_compares_the_changed_source(tmp_path, monkeypatch, diff_file):
+    """C3-45: a source that differs from the S03 script commit stops the post phase at the start
+    (a main lock), and only warns for a tool-check lock."""
+    real_blob = s4.blob_at
+    monkeypatch.setattr(s4, 'blob_at',
+                        lambda c, n: 'changed' if n == diff_file else real_blob(c, n))
+    with pytest.raises(SystemExit, match=f'not the sources of the S03 script commit: {diff_file}'):
+        _fake_post(tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize('diff_file', ('tools/mo_hinh_con.py',))
+def test_c3_45_tool_check_lock_only_warns(tmp_path, monkeypatch, capsys, diff_file):
+    real_blob = s4.blob_at
+    monkeypatch.setattr(s4, 'blob_at',
+                        lambda c, n: 'changed' if n == diff_file else real_blob(c, n))
+    rc, notes, *_ = _fake_post(tmp_path, monkeypatch, tool_check=True, levels=(0.5,))
+    assert rc == 0 and 'WARNING (--tool-check)' in capsys.readouterr().out
+
+
+def test_c3_45_post_compares_the_screening_script(tmp_path, monkeypatch):
+    real_blob = s4.blob_at
+    monkeypatch.setattr(s4, 'blob_at',
+                        lambda c, n: 'changed' if n == s4.S03_SCREEN_SCRIPT else real_blob(c, n))
+    with pytest.raises(SystemExit, match='not the sources of the S03 script commit: fwsim/s03_sangloc.py'):
+        _fake_post(tmp_path, monkeypatch)
+
+
+def test_c3_45_sens_after_compares_the_sources(tmp_path, monkeypatch):
+    """sens_after on a finished post folder runs the same source comparison."""
+    rc, notes, out, sel = _fake_post(tmp_path, monkeypatch)
+    assert rc == 0
+    real_blob = s4.blob_at
+    monkeypatch.setattr(s4, 'blob_at',
+                        lambda c, n: 'changed' if n == 'tools/mo_hinh_con.py' else real_blob(c, n))
+    with pytest.raises(SystemExit, match='not the sources of the S03 script commit: tools/mo_hinh_con.py'):
+        s4.sens_after(argparse.Namespace(out=str(out), dll=str(tmp_path / 'fake.dll'),
+                                         io_delay_ms=None))
+
+
+def test_c3_45_lock_fingerprint_difference_stops_post(tmp_path, monkeypatch):
+    """A lock whose fingerprint['scripts']['tools/mo_hinh_con.py'] differs is refused by
+    check_fingerprint before any check of the run data."""
+    rc, notes, out, sel = _fake_post(tmp_path, monkeypatch)
+    assert rc == 0
+    lock = json.loads((out / 'lock.yaml').read_text(encoding='utf-8'))
+    lock['common']['fingerprint']['scripts']['tools/mo_hinh_con.py'] = 'changed'
+    (out / 'lock.yaml').write_text(json.dumps(lock), encoding='utf-8')
+    import shutil
+    shutil.rmtree(out / 'post_checks')                     # post refuses a finished folder earlier
+    with pytest.raises(SystemExit, match='scripts'):
+        s4.post(argparse.Namespace(out=str(out), dll=str(tmp_path / 'fake.dll')))
+
+
+def test_c3_46_determinism_all_equal(tmp_path, monkeypatch):
+    """C3-46: identical digests in the GA evals rows and the new-process runs -> rc 0, no cho_liam."""
+    rc, notes, out, sel = _fake_post(tmp_path, monkeypatch)
+    assert rc == 0 and notes['cho_liam'] == []
+    assert notes['notes']['PID determinism']['all_equal'] is True
+    assert notes['notes']['PID determinism']['n_runs'] == 2
+    det = list(csv.DictReader(open(out / 'post_checks' / 'determinism.csv', encoding='utf-8')))
+    assert len(det) == 2 and all(r['equal'] == 'true' for r in det)
+
+
+def _c3_det_case(case):
+    """det_mod / evals_mod kwargs of _fake_post for one C3-46 counter-example."""
+    if case == 'drop_last':
+        return dict(det_mod=lambda j, r: r[:-1])
+    if case == 'extra':
+        return dict(det_mod=lambda j, r: r + [r[-1]])
+    if case == 'digest_none':
+        return dict(det_mod=lambda j, r: [dict(rr, digest=None) if i == 1 else rr
+                                          for i, rr in enumerate(r)])
+    if case == 'digest_diff':
+        return dict(det_mod=lambda j, r: [dict(rr, digest={'t': ['float64', [3], 'cd' * 32]})
+                                          if i == 1 else rr for i, rr in enumerate(r)])
+    if case == 'ga_missing':
+        return dict(evals_mod=lambda rows: rows[:-1])
+    if case == 'ga_hash_empty':
+        return dict(evals_mod=lambda rows: [dict(rr, log_sha256='') if i == 0 else rr
+                                            for i, rr in enumerate(rows)])
+    if case == 'ga_hash_bad':
+        return dict(evals_mod=lambda rows: [dict(rr, log_sha256='xyz') if i == 0 else rr
+                                            for i, rr in enumerate(rows)])
+    if case == 'ga_extra_key':
+        return dict(evals_mod=lambda rows: rows + [dict(rows[-1], v=9.9, mu=9.9)])
+    raise AssertionError(case)
+
+
+@pytest.mark.parametrize('case', ('drop_last', 'extra', 'digest_none', 'digest_diff', 'ga_missing',
+                                  'ga_hash_empty', 'ga_hash_bad', 'ga_extra_key'))
+def test_c3_46_determinism_mismatch_waits_for_liam(tmp_path, monkeypatch, case):
+    """C3-46: every mismatch between the GA attempt-1 rows and the new-process runs gives rc 2 with a
+    cho_liam determinism item; determinism.csv keeps one row per expected key, equal false for it."""
+    rc, notes, out, sel = _fake_post(tmp_path, monkeypatch, **_c3_det_case(case))
+    assert rc == 2 and notes['cho_liam'] and notes['cho_liam'][0]['check'] == 'determinism'
+    assert notes['notes']['PID determinism']['all_equal'] is False
+    assert notes['notes']['PID determinism']['reasons']
+    det = list(csv.DictReader(open(out / 'post_checks' / 'determinism.csv', encoding='utf-8')))
+    assert len(det) == 2
+    if case in ('drop_last', 'digest_none', 'digest_diff', 'ga_missing'):
+        assert det[1]['equal'] == 'false' and det[0]['equal'] == 'true'
+    elif case in ('extra', 'ga_extra_key'):
+        assert all(r['equal'] == 'true' for r in det)         # an extra row: the keys still match
+    else:
+        assert det[0]['equal'] == 'false'
+
+
+def test_c3_46_determinism_rows_unit(tmp_path):
+    """The (v, mu) counting of determinism_rows: a duplicated GA row and a result outside the runs are
+    reasons (the row-level duplicates are caught even earlier by check_eval_keys)."""
+    dig = s4.digest_sha(_DIG)
+    jobs = [('PID', {}, 0.2, 0.5)]
+    ga = [dict(controller='PID', v='0.2', mu='0.5', attempt='1', log_sha256=dig),
+          dict(controller='PID', v='0.2', mu='0.5', attempt='1', log_sha256=dig)]
+    rows, why = s4.determinism_rows('PID', False, jobs, [dict(digest=dict(_DIG))], ga)
+    assert len(rows) == 1 and rows[0]['equal'] is False and why and '2 GA evals rows' in why[0]
+    rows, why = s4.determinism_rows('PID', False, jobs, [dict(digest=dict(_DIG))],
+                                    [dict(controller='PID', v='9.9', mu='9.9', attempt='1',
+                                          log_sha256=dig)])
+    assert why and 'extra row' in why[0]
+    rows, why = s4.determinism_rows('PID', True, [], [dict(digest=dict(_DIG))],
+                                    [dict(controller='PID', v='1', mu='2', attempt='1',
+                                          log_sha256=dig)])
+    assert len(rows) == 0 and len(why) == 3           # count, extra GA row, extra result
+
+
+def _gs_stub(monkeypatch):
+    """gain_send with a fake ESP32 that answers the applied gains as float32 reprs."""
+    import gain_send as gs
+    calls = []
+
+    def exch(ip, port, make_packet, timeout, tries, log=print):
+        calls.append(make_packet(7))
+        return dict(ok='1', req_id='1', id='1', ctrl='PID', mac='aa', boot='1', sha='s', env='e',
+                    applied_n='0', **{n: repr(float(np.float32(v))) for n, v in G_PID.items()}), 1
+
+    monkeypatch.setattr(gs, 'exchange', exch)
+    return gs, calls
+
+
+def _gain_base():
+    gains = ','.join(f'{n}={v}' for n, v in G_PID.items())
+    return ['--ip', '127.0.0.1', '--port', '9', '--ctrl', 'PID', '--id', '1', '--gains', gains]
+
+
+def test_c3_47_post_notes_commit_selected_and_send(tmp_path, monkeypatch, capsys):
+    """C3-8: post writes post_trang_thai hoan_tat, selected_sha256 of the raw bytes and tool_check
+    false; gain_send --s04-run on that folder sends."""
+    rc, notes, out, sel = _fake_post(tmp_path / 'a', monkeypatch)
+    assert rc == 0
+    assert notes['post_trang_thai'] == 'hoan_tat'
+    assert notes['selected_sha256'] == hashlib.sha256(sel).hexdigest()
+    assert notes['selected_sha256_lf'] == hashlib.sha256(sel.replace(b'\r\n', b'\n')).hexdigest()
+    assert notes['tool_check'] is False
+    gs, calls = _gs_stub(monkeypatch)
+    assert gs.main(_gain_base() + ['--s04-run', str(out)]) == 0 and calls
+    txt = capsys.readouterr().out
+    assert '#ban_giao_s04,' in txt and 'selected_sha256=' in txt
+
+
+def test_c3_47_send_refused_when_selected_changed_after_post(tmp_path, monkeypatch, capsys):
+    """C3-8: selected.csv changed after the post checks hashed it -> refused (5), nothing sent;
+    the same content with CRLF line ends is accepted through selected_sha256_lf."""
+    rc, notes, out, sel = _fake_post(tmp_path / 'a', monkeypatch)
+    assert rc == 0
+    gs, calls = _gs_stub(monkeypatch)
+    base = _gain_base() + ['--s04-run', str(out)]
+    p = out / 'selected.csv'
+    p.write_bytes(sel + b'\n')
+    assert gs.main(base) == 5 and calls == []
+    assert capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=5')
+    p.write_bytes(sel)
+    assert gs.main(base) == 0 and len(calls) == 1
+    b2 = bytearray(sel)
+    i = b2.index(b'1')
+    b2[i:i + 1] = b'9' if b2[i:i + 1] != b'9' else b'8'
+    p.write_bytes(bytes(b2))
+    assert gs.main(base) == 5 and len(calls) == 1
+    p.write_bytes(sel.replace(b'\r\n', b'\n'))                      # same content, LF line ends
+    assert gs.main(base) == 0 and len(calls) == 2
+
+
+@pytest.mark.parametrize('bad', ([None], [{}], [{'controller': 'PID', 'check': 'x'}],
+                                 [{'controller': 'PID', 'check': 'x', 'reasons': 'r'}]))
+def test_c3_47_send_refused_for_broken_cho_liam(tmp_path, monkeypatch, capsys, bad):
+    """C3-47: a cho_liam item that is not {controller: str, check: str, reasons: list} is a broken
+    hand-over record: refused (5), and --liam-da-quyet cannot override it."""
+    rc, notes, out, sel = _fake_post(tmp_path / 'a', monkeypatch)
+    assert rc == 0
+    gs, calls = _gs_stub(monkeypatch)
+    p = out / 'post_checks' / 'notes.json'
+    n = json.loads(p.read_text(encoding='utf-8'))
+    n['cho_liam'] = bad
+    p.write_text(json.dumps(n), encoding='utf-8')
+    base = _gain_base() + ['--s04-run', str(out)]
+    assert gs.main(base) == 5 and calls == []
+    assert capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=5')
+    assert gs.main(base + ['--liam-da-quyet', 'x']) == 5 and calls == []
+
+
+@pytest.mark.parametrize('state', ('dang_chay', None))
+def test_c3_47_send_refused_when_post_not_done(tmp_path, monkeypatch, capsys, state):
+    """C3-8: post_trang_thai 'dang_chay' or absent -> the post phase did not run to its end: refused."""
+    rc, notes, out, sel = _fake_post(tmp_path / 'a', monkeypatch)
+    assert rc == 0
+    gs, calls = _gs_stub(monkeypatch)
+    p = out / 'post_checks' / 'notes.json'
+    n = json.loads(p.read_text(encoding='utf-8'))
+    if state is None:
+        del n['post_trang_thai']
+    else:
+        n['post_trang_thai'] = state
+    p.write_text(json.dumps(n), encoding='utf-8')
+    assert gs.main(_gain_base() + ['--s04-run', str(out)]) == 5 and calls == []
+    assert capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=5')
+
+
+def test_c3_47_tool_check_post_never_handed_over(tmp_path, monkeypatch, capsys):
+    """C3-47: a tool-check S04 run is never handed over to the HIL."""
+    rc, notes, out, sel = _fake_post(tmp_path / 'a', monkeypatch, tool_check=True, levels=(0.5,))
+    assert rc == 0 and notes['tool_check'] is True
+    gs, calls = _gs_stub(monkeypatch)
+    assert gs.main(_gain_base() + ['--s04-run', str(out)]) == 5 and calls == []
+    assert capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=5')
+
+
+def test_c3_47_determinism_difference_gates_the_send(tmp_path, monkeypatch, capsys):
+    """C3-46 + C3-47: a post with a determinism finding refuses the send; --liam-da-quyet sends."""
+    rc, notes, out, sel = _fake_post(tmp_path / 'a', monkeypatch,
+                                     det_mod=lambda j, r: r[:-1])
+    assert rc == 2 and notes['cho_liam'][0]['check'] == 'determinism'
+    gs, calls = _gs_stub(monkeypatch)
+    base = _gain_base() + ['--s04-run', str(out)]
+    assert gs.main(base) == 5 and calls == []
+    assert gs.main(base + ['--liam-da-quyet', 'Liam checked']) == 0 and len(calls) == 1
+
+
+def test_c3_47_gain_send_needs_a_declared_source(tmp_path, monkeypatch, capsys):
+    """C3-8: no --s04-run and no --nguon-gain-tay -> refused (5); a manual set names its source."""
+    gs, calls = _gs_stub(monkeypatch)
+    base = _gain_base()
+    assert gs.main(base) == 5 and calls == []
+    assert capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=5')
+    assert gs.main(base + ['--nguon-gain-tay', 'thu ban']) == 0 and len(calls) == 1
+    txt = capsys.readouterr().out
+    assert '#nguon_gain,loai=tay,mo_ta="thu ban"' in txt
+    assert gs.main(base + ['--nguon-gain-tay', 'x', '--s04-run', 'y']) == 1
+    assert gs.main(base + ['--nguon-gain-tay', '   ']) == 1
+
+
+@needs_dll
+def test_c3_48_kep_values_in_the_ga_evals(tmp_path):
+    """C3-48 (S03 v8.6 11.6): the DLL has the kep channel (asserted, never skipped); PID evals rows
+    hold three finite clamp fractions in [0, 1] and kep_note ''; ADRC rows are empty everywhere;
+    the CSV round-trip keeps both."""
+    fw = fwsim.FirmwareSim(_DLL)
+    assert getattr(fw, 'kep_cols', 0) != 0, 'fwsim.dll has no kep channel'
+    if not fw.pos_cols:
+        pytest.skip('DLL without pos_ctrl.c')
+    ev = s4.Evaluator(fw, _DLL, 'PID', [0.2], [0.436], str(tmp_path / 'p'))
+    ev.candidate(s3.defaults(fw, 'PID'), 1, 1, 0)
+    rows = [e for e in ev.evals if str(e['attempt']) == '1']
+    assert rows
+    for e in rows:
+        for k in s4.KEP_FRAC_COLS:
+            v = float(e[k])
+            assert math.isfinite(v) and 0.0 <= v <= 1.0
+        assert e['kep_note'] == ''
+    ev2 = s4.Evaluator(fw, _DLL, 'ADRC', [0.2], [0.436], str(tmp_path / 'a'))
+    ev2.candidate(s3.defaults(fw, 'ADRC'), 1, 1, 0)
+    rows_a = [e for e in ev2.evals if str(e['attempt']) == '1']
+    assert rows_a
+    for e in rows_a:
+        assert all(e[k] == '' for k in s4.KEP_FRAC_COLS + ['kep_note'])
+    p = tmp_path / 'evals.csv'
+    s4.write_rows(str(p), rows + rows_a, s4.EVAL_COLS)
+    back = {e['controller']: e for e in s4.read_csv(str(p))}
+    assert all(0.0 <= float(back['PID'][k]) <= 1.0 for k in s4.KEP_FRAC_COLS)
+    assert all(back['ADRC'][k] == '' for k in s4.KEP_FRAC_COLS + ['kep_note'])
+
+
+@needs_dll
+def test_c3_48_hash_compat_with_and_without_kep(tmp_path):
+    """C3-48: log_sha is on fwsim.BIT_EXACT_KEYS only, so a log with the kep channel and the same log
+    without it hash identically (old-DLL comparisons still work)."""
+    fw = fwsim.FirmwareSim(_DLL)
+    if not fw.pos_cols:
+        pytest.skip('DLL without pos_ctrl.c')
+    import o1_feasibility as o1
+    res, log = s4.run_gate(fw, o1.Path8(), 'PID', s3.defaults(fw, 'PID'), 0.2, 0.436)
+    assert 'kep' in log
+    assert s4.log_sha(log) == s4.log_sha({k: v for k, v in log.items() if k != 'kep'})
+
+
+@needs_dll
+def test_c3_48_same_dll_twice_bit_exact_including_kep(tmp_path):
+    """C3-48: the same PID run twice in this process and once in a new process give identical FULL
+    log_digest dicts, the 'kep' entry included (not only the kep-blind digest_sha)."""
+    fw = fwsim.FirmwareSim(_DLL)
+    if not fw.pos_cols:
+        pytest.skip('DLL without pos_ctrl.c')
+    import o1_feasibility as o1
+    path, g = o1.Path8(), s3.defaults(fw, 'PID')
+    res1, log1 = s4.run_gate(fw, path, 'PID', g, 0.2, 0.436)
+    res2, log2 = s4.run_gate(fw, path, 'PID', g, 0.2, 0.436)
+    d1, d2 = s3.log_digest(log1), s3.log_digest(log2)
+    assert d1 == d2 and 'kep' in d1
+    again = s3.run_in_new_process(_DLL, [('PID', g, 0.2, 0.436)], str(tmp_path / 'w'))[0]
+    assert again['digest'] == d1

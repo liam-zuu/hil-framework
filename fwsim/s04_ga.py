@@ -79,9 +79,11 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import math
 import os
+import re
 import stat
 import sys
 import time
@@ -173,6 +175,10 @@ PLANT_SENS_COLS = ['tool_check', 'controller', 'variant', 'baseline', 'v', 'mu',
 # S04 v6.7 section 9 item 6 / section 8: the sealed files of the S03 v8.5 screening the fingerprint locks
 S03_SEALED_LOCK = ('sealed/levels_sangloc.csv', 'sealed/design.csv', 'sealed/sangloc/ket_qua.json',
                    'sealed/sangloc_thu/so_dem.json')
+S03_PUBLIC_LOCK = ('meta.yaml', 'levels.csv', 'sweep.csv')   # the public S03 files the fingerprint locks
+S03_MANIFEST = 'sealed/manifest.json'      # raw-byte sha256 of every sealed file, written by S03 (C3-41)
+S03_KET_QUA = 'sealed/sangloc/ket_qua.json'   # the screening result/state per controller (C3-41)
+S03_DONE = 'hoan_tat'                      # trang_thai of a screening that ran to its end (C3-41)
 SO_GOC_META_KEY = 'sang_loc'   # S03 v8.5 section 8 condition 9: meta.yaml line of the S03 screening plan
 SO_GOC_FIELD = 'file_so'       # its record of the root number file (fwsim/s03_doe.py meta.yaml, D2a 13d0a76)
 S03_SCREEN_SCRIPT = 'fwsim/s03_sangloc.py'   # the S03 screening script (written in parallel), compared too
@@ -190,6 +196,72 @@ def meta_value(text, key):
             except ValueError:
                 return v.strip('"')
     raise KeyError(key)
+
+
+def s03_is_trial(meta_text, where):
+    """C3-44: exactly the JSON bool true -> True; exactly false, or no trial line -> False (as before);
+    any other value (1, 0, "true", null, ...) -> sys.exit (1 == True in Python: `in (True, 'true')` took
+    trial: 1)."""
+    try:
+        v = meta_value(meta_text, 'trial')
+    except KeyError:
+        return False
+    if v is True or v is False:
+        return v
+    sys.exit(f'{where}: meta.yaml trial is {v!r}; it must be the bool true or false (C3-44): nothing under '
+             f'sealed/ is read')
+
+
+def _s03_entry(s03_dir, rel):
+    """C3-44 (S04 v6.6, L56): the directory entry <s03_dir>/<rel>, checked BEFORE anything is opened:
+    a link, a junction, a path that resolves elsewhere, a non-regular file or a file with more than one
+    name is refused. Returns (path, lstat) or (None, None) when there is no entry."""
+    p = os.path.join(s03_dir, *rel.split('/'))
+    if not os.path.lexists(p):
+        return None, None
+    real = os.path.normcase(os.path.realpath(p))
+    if (os.path.islink(p) or getattr(os.path, 'isjunction', lambda q: False)(p)
+            or real != os.path.normcase(os.path.abspath(p))):
+        sys.exit(f'{p} is a link or resolves to {real}: refused (C3-44; S04 v6.6, L56)')
+    st = os.lstat(p)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+        sys.exit(f'{p}: not a plain file with one name ({st.st_nlink} links): refused (C3-44; S04 v6.6, L56)')
+    return p, st
+
+
+def s03_path(s03_dir, rel):
+    """The guarded path of an S03 run file (checked from its directory entries, BEFORE anything is
+    opened); None when there is no directory entry (C3-44)."""
+    return _s03_entry(s03_dir, rel)[0]
+
+
+def s03_read(s03_dir, rel):
+    """The bytes of an S03 run file, or None when there is no directory entry (C3-44). The OPENED
+    target is re-checked by fstat: still a regular file with exactly one name and the same identity
+    the path check saw."""
+    p, before = _s03_entry(s03_dir, rel)
+    if p is None:
+        return None
+    with open(p, 'rb') as f:
+        st = os.fstat(f.fileno())               # the OPENED target, not the name
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or not os.path.samestat(before, st):
+            sys.exit(f'{p}: the file opened is not the plain single-name file that was checked '
+                     f'({st.st_nlink} links): refused (C3-44, L56)')
+        return f.read()
+
+
+def s03_text(s03_dir, rel):
+    """utf-8 text of an S03 run file via s03_read, or None (C3-44)."""
+    raw = s03_read(s03_dir, rel)
+    return None if raw is None else raw.decode('utf-8')
+
+
+def s03_csv(s03_dir, rel):
+    """Rows (csv.DictReader) of an S03 run file via s03_read, or None (C3-44)."""
+    raw = s03_read(s03_dir, rel)
+    if raw is None:
+        return None
+    return list(csv.DictReader(io.StringIO(raw.decode('utf-8'), newline='')))
 
 
 def digest_sha(digest):
@@ -261,17 +333,32 @@ def hypervolume(points, ref):
 def _domain_rows(s03_dir, ctrl):
     """Levels rows of one controller from <s03>/sealed/levels_sangloc.csv (S04 v6.7 section 9 item 6: the
     sealed levels file of the S03 v8.5 screening, the columns of levels.csv plus nguon_mien and ly_do; the
-    public levels.csv is never read). sys.exit when the file is missing (an S03 run before v8.5 cannot be
-    used) or when nguon_mien of the controller's rows is not one identical value in ('sang_loc', 'du_phong')."""
+    public levels.csv is never read for the DOMAIN — C3-42 reads only its sweep levels, below). sys.exit
+    when the file is missing (an S03 run before v8.5 cannot be used), when nguon_mien of the controller's
+    rows is not one identical value in ('sang_loc', 'du_phong'), or when the controller does not have
+    exactly one row for each of its gains (C3-42: a missing factor, a factor twice, a row whose factor is
+    not a gain)."""
+    rel = 'sealed/levels_sangloc.csv'
     p = os.path.join(s03_dir, 'sealed', 'levels_sangloc.csv')
-    if not os.path.isfile(p):
+    rows = s03_csv(s03_dir, rel)                                    # C3-44: the guarded reader
+    if rows is None:
         sys.exit(f'{p} missing: no sealed/levels_sangloc.csv (the S03 v8.5 screening levels): an S03 run '
                  f'before v8.5 cannot be used (S04 v6.7 section 9 item 6)')
-    rows = [r for r in read_csv(p) if r['controller'] == ctrl]
+    rows = [r for r in rows if r['controller'] == ctrl]
     nguon = {(r.get('nguon_mien') or '') for r in rows}
     if len(nguon) != 1 or next(iter(nguon)) not in ('sang_loc', 'du_phong'):
         sys.exit(f'{p}: nguon_mien of every {ctrl} row must be the same value, one of (sang_loc, du_phong); '
                  f'got {sorted(nguon)} (S04 v6.7 section 9 item 6)')
+    have = [r['factor'] for r in rows]                              # C3-42: exactly one row per gain
+    want = list(s3.FACTORS[ctrl])
+    for n in want:
+        if n not in have:
+            sys.exit(f'{s03_dir}/sealed/levels_sangloc.csv has no level for {ctrl} {n}')
+    dup = sorted({n for n in have if have.count(n) > 1})
+    extra = sorted(set(have) - set(want))
+    if dup or extra:
+        sys.exit(f'{p}: {ctrl} needs exactly one row for each gain; twice {dup}, not a gain of {ctrl} '
+                 f'{extra} (C3-42)')
     return rows
 
 
@@ -303,13 +390,41 @@ def _du_phong_tran_exception(s03_dir, ctrl, name, row, H):
         return False
     if not (H == b_n == T and b <= T and math.isclose(b, T, rel_tol=s3.TRAN_RTOL)):
         return False
-    p = os.path.join(s03_dir, 'sweep.csv')
-    if not os.path.isfile(p):
+    sweep = s03_csv(s03_dir, 'sweep.csv')                           # C3-44: the guarded reader
+    if sweep is None:
         return False
-    hit = [r for r in read_csv(p)
+    hit = [r for r in sweep
            if r['controller'] == ctrl and r['factor'] == name and (r.get('value') or '') != ''
            and float(r['value']) == H]
     return bool(hit) and all((r.get('tran') or '') == 'true' for r in hit)
+
+
+def _level(row, key, ctrl, name):
+    """C3-42: one numeric column of a sealed levels row -> a finite float, else sys.exit."""
+    v = _finite(row.get(key))
+    if v is None:
+        sys.exit(f'{ctrl} {name}: {key} = {row.get(key)!r} in sealed/levels_sangloc.csv is not a finite '
+                 f'number (C3-42)')
+    return v
+
+
+def _sweep_levels(s03_dir, ctrl):
+    """C3-42: {factor: (L_q, H_q)} of the PUBLIC <s03>/levels.csv for one controller — the levels the
+    out-of-range check measured ('sweep levels'; this is the only thing the public file is used for).
+    A missing file gives {}; a row whose L or H is not finite is left out; a factor present twice is
+    left out."""
+    rows = s03_csv(s03_dir, 'levels.csv')                           # C3-44: the guarded reader
+    if rows is None:
+        return {}
+    rows = [r for r in rows if r['controller'] == ctrl]
+    have = [r['factor'] for r in rows]
+    out = {}
+    for r in rows:
+        L, H = _finite(r.get('L')), _finite(r.get('H'))
+        if L is None or H is None or have.count(r['factor']) > 1:
+            continue
+        out[r['factor']] = (L, H)
+    return out
 
 
 def read_domain(s03_dir, ctrl):
@@ -319,26 +434,46 @@ def read_domain(s03_dir, ctrl):
     by = {r['factor']: r for r in rows}
     nguon = rows[0]['nguon_mien']
     kiem = read_out_of_range(s03_dir, ctrl)
+    sweep = _sweep_levels(s03_dir, ctrl) if nguon == 'sang_loc' and kiem else {}   # C3-42
     out = []
     for n in s3.FACTORS[ctrl]:
-        if n not in by:
-            sys.exit(f'{s03_dir}/sealed/levels_sangloc.csv has no level for {ctrl} {n}')
-        L, H = float(by[n]['L']), float(by[n]['H'])
+        row = by[n]
+        L, H = _level(row, 'L', ctrl, n), _level(row, 'H', ctrl, n)              # C3-42
         if not L < H:
             sys.exit(f'{ctrl} {n}: L = {L} is not below H = {H} (S03 3.1 (ii))')
+        want = s3.scale_of(L, H)[0]
+        if row['scale'] != want:                                                # C3-42
+            sys.exit(f'{ctrl} {n}: scale {row["scale"]!r} is not {want!r}, the scale of S03 3.1 for '
+                     f'[{L}, {H}] (C3-42)')
+        if nguon == 'sang_loc':
+            # C3-42 (S03 v8.6 3.1b item 2): [L, H] inside the reference box W = [a, b_n], a > 0, binary64
+            a, b_n = _level(row, 'a', ctrl, n), _level(row, 'b_n', ctrl, n)
+            if not (0.0 < a <= L and H <= b_n):
+                sys.exit(f'{ctrl} {n}: [L, H] = [{L}, {H}] is not inside the reference box W = [a, b_n] = '
+                         f'[{a}, {b_n}] with a > 0 (S03 v8.6 3.1b item 2; C3-42)')
+            if n.startswith('omega_o') and H > s3.OMEGA_O_MAX:                    # C3-42 (S03 2.1)
+                sys.exit(f'{ctrl} {n}: H = {H} is above the omega_o cap {s3.OMEGA_O_MAX} (S03 2.1; C3-42)')
         # S04 v6.6: the GA domain is [L, H] of the ORIGINAL grid (S03 v8.4 3.1); levels of S03 v8.3 (set on
         # the extension) are refused. S04 v6.7 section 9 item 6: the refusal applies only to the 'du_phong'
         # source (for 'sang_loc' H may exceed b, up to b_n); the C3-7 / C3-26 exception accepts H = T.
         if nguon == 'du_phong' and (
-                (by[n].get('H_nguon') or '') == 'hết lưới nối'
-                or ((by[n].get('b') or '') != '' and H > float(by[n]['b'])
-                    and not _du_phong_tran_exception(s03_dir, ctrl, n, by[n], H))):
+                (row.get('H_nguon') or '') == 'hết lưới nối'
+                or ((row.get('b') or '') != '' and H > float(row['b'])
+                    and not _du_phong_tran_exception(s03_dir, ctrl, n, row, H))):
             sys.exit(f'{ctrl} {n}: H = {H} is set on the extension of the S03 grid (S03 v8.3 levels): S04 v6.6 needs '
                      f'the levels of S03 v8.4 (original grid only)')
         # S04 v6.4 (C14-2): the source of each level, from the S03 levels file ('' for an S03 run before v8.3);
-        # v6.6: with the result of the out-of-range check on each side (S03 v8.4 kiem_ngoai_mien.csv, '' without it)
-        out.append(dict(name=n, L=L, H=H, scale=by[n]['scale'], L_src=by[n].get('L_nguon') or '',
-                        H_src=by[n].get('H_nguon') or '', L_kiem=kiem.get((n, 'L'), ''), H_kiem=kiem.get((n, 'H'), '')))
+        # v6.6: with the result of the out-of-range check on each side (S03 v8.4 kiem_ngoai_mien.csv, '' without
+        # it). C3-42 ('same point only'): for sang_loc the check result of a side is attached only when the
+        # sealed bound equals the sweep level of that side (the check was measured there).
+        if nguon == 'sang_loc':
+            L_q, H_q = sweep.get(n, (None, None))
+            L_kiem = kiem.get((n, 'L'), '') if L_q == L else ''
+            H_kiem = kiem.get((n, 'H'), '') if H_q == H else ''
+        else:
+            L_kiem, H_kiem = kiem.get((n, 'L'), ''), kiem.get((n, 'H'), '')
+        out.append(dict(name=n, L=L, H=H, scale=row['scale'], L_src=row.get('L_nguon') or '',
+                        H_src=row.get('H_nguon') or '', L_kiem=L_kiem, H_kiem=H_kiem))
     return out
 
 
@@ -350,27 +485,17 @@ def kiem_file(s03_dir):
     hashed when it is a link or junction, resolves anywhere else (a link on its path), is not a plain file or has
     a second hard link: it must never alias a sealed file (L56; every caller of read_domain and fingerprint, the
     RSM script too, goes through here)."""
-    p = os.path.join(s03_dir, KIEM_FILE)
-    if not os.path.lexists(p):
-        return None
-    real = os.path.normcase(os.path.realpath(p))
-    if (os.path.islink(p) or getattr(os.path, 'isjunction', lambda q: False)(p)
-            or real != os.path.normcase(os.path.abspath(p))):
-        sys.exit(f'{p} is a link or resolves to {real}: refused (S04 v6.6, L56)')
-    st = os.lstat(p)
-    if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
-        sys.exit(f'{p}: not a plain file with one name ({st.st_nlink} links): refused (S04 v6.6, L56)')
-    return p
+    return s03_path(s03_dir, KIEM_FILE)
 
 
 def read_out_of_range(s03_dir, ctrl):
     """S04 v6.6 section 2: {(factor, 'L' | 'H'): summary} of the S03 v8.4 kiem_ngoai_mien.csv for one controller,
     e.g. '4 điểm: không cờ 4, chưa kết luận 0, cờ 0' (a side without points: '0 điểm'), with '(lượt kiểm: <total>)'
     when the total of the controller is not 'đã kiểm đủ'. {} when the S03 run has no such file (before v8.4)."""
-    p = kiem_file(s03_dir)
-    if p is None:
+    if s03_path(s03_dir, KIEM_FILE) is None:                        # C3-44: the guarded path first
         return {}
-    rows = [r for r in read_csv(p) if r['controller'] == ctrl]
+    rows = s03_csv(s03_dir, KIEM_FILE)
+    rows = [r for r in rows if r['controller'] == ctrl]
     tot = [r['ket_qua'] for r in rows if r['dong'] == 'tong']
     tail = '' if tot == ['đã kiểm đủ'] else f' (lượt kiểm: {" ".join(tot) or "không có dòng tổng"})'
     out = {}
@@ -484,10 +609,15 @@ def mu_rule(s03_dir, ctrl, gate, mu_levels):
     # S04 v6 section 9 item 4 (S03 v8 adds axial and test points): the mu rule uses only the
     # 257 points of the centre, outer and inner boxes, filtered by box in BOTH files before the
     # completeness and membership checks; the point_id list used is locked to 0..256
-    runs = [r for r in read_csv(os.path.join(s03_dir, 'sealed', 'runs.csv'))
-            if r['controller'] == ctrl and r['box'] in MU_RULE_BOXES]
+    all_runs = s03_csv(s03_dir, 'sealed/runs.csv')                  # C3-44: the guarded reader
+    if all_runs is None:
+        sys.exit(f'{s03_dir}/sealed/runs.csv missing: the mu rule needs the sealed S03 runs')
+    runs = [r for r in all_runs if r['controller'] == ctrl and r['box'] in MU_RULE_BOXES]
     # S04 v6.7 section 9 item 6: the design of the screening, sealed/design.csv (never the public one)
-    design = [(r['point_id'], r['box']) for r in read_csv(os.path.join(s03_dir, 'sealed', 'design.csv'))
+    all_design = s03_csv(s03_dir, 'sealed/design.csv')
+    if all_design is None:
+        sys.exit(f'{s03_dir}/sealed/design.csv missing: the mu rule needs the sealed S03 design')
+    design = [(r['point_id'], r['box']) for r in all_design
               if r['controller'] == ctrl and r['box'] in MU_RULE_BOXES]
     if not design or len(set(design)) != len(design):
         sys.exit(f'{s03_dir}/sealed/design.csv: no or duplicate design points for {ctrl} (S04 3, S4C-5)')
@@ -1125,14 +1255,76 @@ CHO_LIAM_NOTE = ('S04 section 6: cho_liam not empty = tell Liam before HIL (post
                  'kept, never chosen again here. It lists the pre-HIL check (range table, LADRC triangle: check '
                  'pre_hil), the spectral radius of the linear sub-model (check spectral_radius: rho >= 1, or rho '
                  'not computable although the gains are inside the table), the three-mu check (a run of the '
-                 'selected gains not passing G1-G5 at a mu level, gate state columns: check three_mu) and the '
-                 'b0 / R sensitivity result (check b0_factor / r_factor: judge() says sensitive)')
+                 'selected gains not passing G1-G5 at a mu level, gate state columns: check three_mu), the '
+                 'b0 / R sensitivity result (check b0_factor / r_factor: judge() says sensitive) and the '
+                 'determinism check (check determinism, C3-46: the run-again-in-a-new-process log SHA-256 '
+                 'against the GA evals.csv, key by key)')
+
+POST_DONE = 'hoan_tat'                      # post_trang_thai of notes.json when the post checks ran to the end
+POST_RUNNING = 'dang_chay'                  # while they run (a changed selected.csv keeps it, C3-8)
+SHA_RE = re.compile(r'[0-9a-f]{64}')
+
+
+def determinism_rows(ctrl, tc, jobs, res, ga_rows):
+    """C3-46 (S04 section 6): jobs = the (ctrl, g, v, mu) run again in a new process, res = what
+    s3.run_in_new_process returned (same order), ga_rows = the attempt-1 evals.csv rows of the selected
+    candidate. Returns (determinism.csv rows, reasons). A reason for: an expected key (controller, v, mu)
+    without exactly one GA row or without a new-process result; a GA row or a result beyond the expected
+    keys; a hash that is not 64 hex digits (a missing digest included); two valid hashes that differ.
+    equal is true only for two valid, equal hashes."""
+    why, rows = [], []
+    res = list(res) if isinstance(res, (list, tuple)) else []
+    if len(res) != len(jobs):
+        why.append(f'{ctrl}: the new process returned {len(res)} results for {len(jobs)} runs')
+    ga = {}
+    for e in ga_rows:
+        try:
+            ga.setdefault((float(e['v']), float(e['mu'])), []).append(e.get('log_sha256') or '')
+        except (KeyError, TypeError, ValueError):
+            why.append(f'{ctrl}: a GA evals row of the selected candidate has no numeric v, mu '
+                       f'({e.get("v")!r}, {e.get("mu")!r})')
+    want = [(float(v), float(mu)) for _, _, v, mu in jobs]
+    for k in sorted(set(ga) - set(want)):
+        why.append(f'{ctrl} v={k[0]} mu={k[1]}: a GA evals row of the selected candidate outside the runs of '
+                   f'the evaluation (extra row)')
+    for i, (_, _, v, mu) in enumerate(jobs):
+        tag, refs = f'{ctrl} v={v} mu={mu}', ga.get((float(v), float(mu)), [])
+        ref, got = (refs[0] if len(refs) == 1 else ''), ''
+        if len(refs) != 1:
+            why.append(f'{tag}: {len(refs)} GA evals rows (attempt 1) of the selected candidate, exactly one needed')
+        elif not SHA_RE.fullmatch(ref):
+            why.append(f'{tag}: the GA log_sha256 {ref!r} is not a SHA-256')
+        if i >= len(res):
+            why.append(f'{tag}: no new-process result (missing row)')
+        else:
+            dig = res[i].get('digest') if isinstance(res[i], dict) else None
+            try:
+                got = digest_sha(dig) if dig else ''
+            except (ValueError, TypeError, AttributeError) as exc:
+                why.append(f'{tag}: the new-process log digest cannot be hashed ({exc})')
+            else:
+                if not SHA_RE.fullmatch(got):
+                    why.append(f'{tag}: the new-process run has no log SHA-256 (no digest: the run failed)')
+        both = bool(SHA_RE.fullmatch(ref) and SHA_RE.fullmatch(got))
+        if both and ref != got:
+            why.append(f'{tag}: the log SHA-256 differ (GA {ref[:12]}, new process {got[:12]}): not the same '
+                       f'run bit for bit')
+        rows.append(dict(tool_check=tc, controller=ctrl, v=v, mu=mu, ga_log_sha256=ref,
+                         new_process_log_sha256=got, equal=both and ref == got))
+    for i in range(len(jobs), len(res)):
+        why.append(f'{ctrl}: new-process result {i + 1} beyond the {len(jobs)} runs asked (extra row)')
+    return rows, why
 
 
 def post(a):
     out = a.out
     lock = json.load(open(os.path.join(out, 'lock.yaml'), encoding='utf-8'))
-    sel = [r for r in read_csv(os.path.join(out, 'selected.csv')) if r['kind'] == 'send_to_HIL']
+    sel_p = os.path.join(out, 'selected.csv')
+    sel_raw = open(sel_p, 'rb').read()          # C3-8: hashed now and again at the end of the checks
+    sel = [r for r in csv.DictReader(io.StringIO(sel_raw.decode('utf-8'), newline=''))
+           if r['kind'] == 'send_to_HIL']
+    sel_sha = hashlib.sha256(sel_raw).hexdigest()
+    sel_sha_lf = hashlib.sha256(sel_raw.replace(b'\r\n', b'\n')).hexdigest()
     evals = read_csv(os.path.join(out, 'evals.csv'))
     pc = os.path.join(out, 'post_checks')
     if os.path.isdir(pc) and os.listdir(pc):
@@ -1145,8 +1337,9 @@ def post(a):
         require_classify()                    # C3-25: nothing is simulated without classify()
     except s3.S03Stop as e:
         sys.exit(str(e))
-    check_fingerprint(common, fingerprint(a.dll, common['s03_run'], unsealed=common.get('unsealed', False)),
-                      'post')                                                         # S4C-2
+    fp = fingerprint(a.dll, common['s03_run'], unsealed=common.get('unsealed', False))
+    check_fingerprint(common, fp, 'post')                                               # S4C-2
+    check_s03_source(s03_text(common['s03_run'], 'meta.yaml'), fp, a.dll, common['tool_check'])    # C3-45
     tc = common['tool_check']
     os.makedirs(pc, exist_ok=True)
     t0 = time.time()
@@ -1175,15 +1368,17 @@ def post(a):
                                  reasons=[f'spectral radius not computable although the gains are inside the '
                                           f'range table: {ph["spectral_radius_note"]}']))
         mus, speeds = L['eval_mu'], L['speeds']
-        key = (s['ga_seed'], s['gen'], s['cand_id'])
-        ref = {(float(e['v']), float(e['mu'])): e['log_sha256'] for e in evals
-               if e['controller'] == ctrl and (e['ga_seed'], e['gen'], e['cand_id']) == key and e['attempt'] == '1'}
         jobs = [(ctrl, g, v, mu) for mu in mus for v in speeds]
         res = s3.run_in_new_process(a.dll, jobs, os.path.join(pc, '_work'))
-        for (c, _, v, mu), r in zip(jobs, res):
-            got = digest_sha(r['digest']) if r['digest'] else ''
-            det.append(dict(tool_check=tc, controller=ctrl, v=v, mu=mu, ga_log_sha256=ref.get((v, mu), ''),
-                            new_process_log_sha256=got, equal=got != '' and got == ref.get((v, mu))))
+        key = (s['ga_seed'], s['gen'], s['cand_id'])
+        ga_rows = [e for e in evals
+                   if e['controller'] == ctrl and (e['ga_seed'], e['gen'], e['cand_id']) == key
+                   and e['attempt'] == '1']
+        rows_, why = determinism_rows(ctrl, tc, jobs, res, ga_rows)     # C3-46: key by key
+        det += rows_
+        notes[f'{ctrl} determinism'] = dict(all_equal=not why, n_runs=len(jobs), reasons=why)
+        if why:                             # C3-46: a determinism difference waits for Liam
+            cho_liam.append(dict(controller=ctrl, check='determinism', reasons=why))
         for kind, factors in (('b0_factor', B0_FACTORS if ctrl == 'ADRC' else ()), ('r_factor', R_FACTORS)):
             rows = []
             for mu in mus:
@@ -1236,17 +1431,28 @@ def post(a):
     work = os.path.join(pc, '_work')
     if os.path.isdir(work) and not os.listdir(work):
         os.rmdir(work)
-    with open(os.path.join(pc, 'notes.json'), 'w', encoding='utf-8') as f:
-        json.dump(dict(tool_check=tc, determinism_all_equal=all(d['equal'] for d in det) if det else None, notes=notes,
-                       cho_liam=cho_liam, cho_liam_note=CHO_LIAM_NOTE,
-                       script=s3.git_state(os.path.join(HERE, '..')), dll_sha256=s3.sha256_file(a.dll),
-                       criterion='B0_SENS/2026-11-05_run01: sensitive if completed changes, e_perp_max <= D changes, '
-                                 'a G3, G4 or G5 state changes (gate state columns, S04 v6.2), or e_perp_max changes '
-                                 'by more than 50 % of the factor-1.0 value; tv_duty change reported, not a criterion '
-                                 '(S04 6, B8b-21); rank after the change not reported',
-                       r_factors=R_FACTORS, b0_factors=B0_FACTORS), f, indent=1, default=str)
+    def write_notes(status):
+        # C3-8: post_trang_thai is 'dang_chay' while the checks run and 'hoan_tat' only after
+        # selected.csv is re-hashed unchanged (the file gain_send compares); gain_send refuses a
+        # notes.json that is not 'hoan_tat'
+        with open(os.path.join(pc, 'notes.json'), 'w', encoding='utf-8') as f:
+            json.dump(dict(tool_check=tc, post_trang_thai=status, selected_sha256=sel_sha,
+                           selected_sha256_lf=sel_sha_lf,
+                           determinism_all_equal=all(d['equal'] for d in det) if det else None, notes=notes,
+                           cho_liam=cho_liam, cho_liam_note=CHO_LIAM_NOTE,
+                           script=s3.git_state(os.path.join(HERE, '..')), dll_sha256=s3.sha256_file(a.dll),
+                           criterion='B0_SENS/2026-11-05_run01: sensitive if completed changes, e_perp_max <= D '
+                                     'changes, a G3, G4 or G5 state changes (gate state columns, S04 v6.2), or '
+                                     'e_perp_max changes by more than 50 % of the factor-1.0 value; tv_duty change '
+                                     'reported, not a criterion (S04 6, B8b-21); rank after the change not reported',
+                           r_factors=R_FACTORS, b0_factors=B0_FACTORS), f, indent=1, default=str)
+    write_notes(POST_RUNNING)
     log_phase(out, dict(phase='post', elapsed_s=round(time.time() - t0)))
     write_root_meta(out, a.dll, lock)
+    if s3.sha256_file(sel_p) != sel_sha:                    # C3-8: the file gain_send would read changed
+        sys.exit(f'{sel_p} changed while the post checks ran: post_checks/notes.json stays {POST_RUNNING!r}, '
+                 f'no hand-over (C3-8)')
+    write_notes(POST_DONE)                                  # C3-8: the LAST write of post
     print(f'post checks -> {pc}; tool_check {tc}; determinism equal: {all(d["equal"] for d in det) if det else None}')
     for k, v in notes.items():
         print(f'  {k}: {v}')
@@ -1262,6 +1468,9 @@ def post(a):
     if any(c['check'] in ('b0_factor', 'r_factor') for c in cho_liam):
         print('TELL LIAM before HIL: the b0 / R sensitivity check reports a sensitive factor '
               '(S04 v6.8 section 6; post_checks/notes.json cho_liam); no reselection')
+    if any(c['check'] == 'determinism' for c in cho_liam):
+        print('TELL LIAM before HIL: a run of the determinism check did not reproduce the GA log SHA-256 '
+              '(C3-46; post_checks/notes.json cho_liam); no reselection')
     return 2 if cho_liam else 0
 
 
@@ -1306,8 +1515,9 @@ def sens_after(a):
         require_classify()                    # C3-25: nothing is simulated without classify()
     except s3.S03Stop as e:
         sys.exit(str(e))
-    check_fingerprint(common, fingerprint(a.dll, common['s03_run'], unsealed=common.get('unsealed', False)),
-                      'sens_after')
+    fp = fingerprint(a.dll, common['s03_run'], unsealed=common.get('unsealed', False))
+    check_fingerprint(common, fp, 'sens_after')
+    check_s03_source(s03_text(common['s03_run'], 'meta.yaml'), fp, a.dll, common['tool_check'])    # C3-45
     measured = getattr(a, 'io_delay_ms', None)
     steps, rule = delay_steps(measured)
     tc = common['tool_check']
@@ -1419,11 +1629,10 @@ def main():
     if a.gen_base > a.gen_max or a.gen_base < 1:
         sys.exit('--gen-base must be in 1 .. --gen-max')
     ctrl = a.controller
-    s03_meta = open(os.path.join(a.s03, 'meta.yaml'), encoding='utf-8').read()
-    try:
-        s03_trial = meta_value(s03_meta, 'trial') in (True, 'true')
-    except KeyError:
-        s03_trial = False                            # a missing trial line counts as not trial
+    s03_meta = s03_text(a.s03, 'meta.yaml')                     # C3-44: the guarded reader
+    if s03_meta is None:
+        sys.exit(f'{a.s03}/meta.yaml missing')
+    s03_trial = s03_is_trial(s03_meta, a.s03)                   # C3-44: exactly the bool
     if a.tool_check and not s03_trial:               # S04 v6.7 9.6 (SL4-4): BEFORE anything under sealed/
         sys.exit(f'--tool-check takes an S03 --trial run; {a.s03} is not one (trial: true): nothing under '
                  f'sealed/ is read for a tool check')
@@ -1459,6 +1668,8 @@ def main():
 
     fp = fingerprint(a.dll, a.s03, unsealed=a.s03_unsealed and not a.tool_check)
     check_s03_sealed(fp, a.tool_check)            # S04 v6.7 section 8
+    check_s03_ket_qua(a.s03, [ctrl] if a.tool_check else list(s3.CONTROLLERS))   # C3-41 (main: both, S03 3.1b item 11)
+    check_s03_manifest(a.s03, fp)                                                # C3-41
     src_diff = check_s03_source(s03_meta, fp, a.dll, a.tool_check)   # S4C-2: the source the S03 run used
 
     if a.phase == 'trial':
@@ -1634,24 +1845,79 @@ def pymoo_file_hashes():
     return {n: s3.sha256_file(os.path.join(root, n)) for n in PYMOO_FILES}
 
 
+def s03_lock_names(unsealed=False):
+    """The S03 run files the fingerprint locks (the keys of fp['s03_files']): the public S03_PUBLIC_LOCK,
+    the sealed S03_SEALED_LOCK, sealed/runs.csv only when unsealed (L56), and the out-of-range check
+    file KIEM_FILE (S84-2: read_domain reads it)."""
+    return S03_PUBLIC_LOCK + S03_SEALED_LOCK + (('sealed/runs.csv',) if unsealed else ()) + (KIEM_FILE,)
+
+
 def fingerprint(dll, s03_dir, unsealed=False):
     """S4C-2: what must not change between the trial, the main runs and the post checks of one folder
     (S04 7): the DLL, the S03 files the domain and the mu rule come from (v6.6: kiem_ngoai_mien.csv too;
     v6.7 9.6: the four sealed files of S03_SEALED_LOCK and the root number file so_goc; sealed/runs.csv
-    only with --s03-unsealed, L56; the root design.csv is not hashed, the sealed one is), the plant source
-    blobs (L34), the Python sources the simulation and the scoring import (SOURCES), D, the library
+    only with --s03-unsealed, L56; the root design.csv is not hashed, the sealed one is; C3-44: every S03
+    file read through s03_read), the plant source blobs (L34), the Python sources the simulation, the
+    scoring and the pre-HIL check import (C3-45: LOCKED_SOURCES, one list over every phase, so
+    tools/mo_hinh_con.py and fwsim/s03_sangloc.py are locked at the first trial), D, the library
     versions and the pymoo files of PYMOO_CV."""
-    names = ('meta.yaml', 'levels.csv', 'sweep.csv') + S03_SEALED_LOCK + (('sealed/runs.csv',) if unsealed else ())
     s03_files = {}
-    for n in names:
-        p = os.path.join(s03_dir, n)
-        s03_files[n] = s3.sha256_file(p) if os.path.isfile(p) else None
-    kp = kiem_file(s03_dir)                     # S84-2: read_domain reads it (S04 v6.6), so it is locked too;
-    s03_files[KIEM_FILE] = s3.sha256_file(kp) if kp else None     # S84-3: checked before it is hashed
+    for n in s03_lock_names(unsealed):
+        raw = s03_read(s03_dir, n)              # C3-44: guarded read; the sha256 is of THESE bytes
+        s03_files[n] = None if raw is None else hashlib.sha256(raw).hexdigest()
     root = os.path.join(HERE, '..')
-    scripts = {n: s3.sha256_file(os.path.join(root, n)) for n in SOURCES}
+    scripts = {n: s3.sha256_file(os.path.join(root, n)) for n in LOCKED_SOURCES}
     return dict(dll_sha256=s3.sha256_file(dll), s03_files=s03_files, plant_src=fwsim.PLANT_SRC, scripts=scripts, D=D,
                 libraries=fwsim.lib_versions(), pymoo_files=pymoo_file_hashes(), so_goc=so_goc(s03_dir))
+
+
+def check_s03_ket_qua(s03_dir, ctrls):
+    """C3-41 (S03 v8.6 3.1b item 11): sealed/sangloc/ket_qua.json of the S03 run, before anything is
+    locked: the file must exist (a run without it was not screened by v8.5+), be a JSON object and hold
+    trang_thai 'hoan_tat' for every controller asked (a main run asks for both, a tool-check for its
+    own). sys.exit else; the guarded reader refuses link/hard-link aliases first."""
+    raw = s03_read(s03_dir, S03_KET_QUA)
+    where = f'{s03_dir}/{S03_KET_QUA}'
+    if raw is None:
+        sys.exit(f'{where} missing: S04 takes an S03 run only with this file (S03 v8.6 3.1b item 11; C3-41)')
+    try:
+        doc = json.loads(raw.decode('utf-8'))
+    except ValueError as e:
+        sys.exit(f'{where}: not JSON ({e}) (C3-41)')
+    if not isinstance(doc, dict):
+        sys.exit(f'{where}: not a JSON object (C3-41)')
+    for c in ctrls:
+        ent = doc.get(c)
+        st = ent.get('trang_thai') if isinstance(ent, dict) else None
+        if st != S03_DONE:
+            sys.exit(f"{where}: trang_thai of {c} is {st!r}, not '{S03_DONE}': the screening step of the S03 "
+                     f'run did not end for {c} (S03 v8.6 3.1b item 11; C3-41)')
+
+
+def check_s03_manifest(s03_dir, fp):
+    """C3-41: every sealed S03 file the fingerprint hashed is compared with the raw-byte sha256 that
+    S03 itself sealed in sealed/manifest.json (a file absent in both passes: None == None). The manifest
+    is not itself locked: it is written by S03 next to the files. sys.exit on a missing or malformed
+    manifest or on any difference."""
+    where = f'{s03_dir}/{S03_MANIFEST}'
+    raw = s03_read(s03_dir, S03_MANIFEST)
+    if raw is None:
+        sys.exit(f'{where} missing: the sealed S03 files cannot be checked against what S03 sealed (C3-41)')
+    try:
+        files = json.loads(raw.decode('utf-8')).get('files')
+    except (ValueError, AttributeError) as e:
+        sys.exit(f'{where}: not a JSON object ({e}) (C3-41)')
+    if not isinstance(files, dict):
+        sys.exit(f"{where}: no 'files' object (C3-41)")
+    bad = []
+    for n, got in fp['s03_files'].items():
+        if not n.startswith('sealed/'):
+            continue
+        want = files.get(n[len('sealed/'):])
+        if got != want:                          # None == None: absent in the run and in the manifest
+            bad.append(f'{n} (file {str(got)[:12]}, manifest {str(want)[:12]})')
+    if bad:
+        sys.exit(f'{where}: the sealed S03 files differ from the manifest of the S03 run: {"; ".join(bad)} (C3-41)')
 
 
 def so_goc(s03_dir):
@@ -1663,7 +1929,9 @@ def so_goc(s03_dir):
     root; a missing file -> sys.exit. The bytes and their CRLF->LF form are both hashed: accepted when
     rec['sha256'] equals either, or rec.get('sha256_lf') equals the LF hash; else sys.exit ("not the
     number file the S03 run recorded"). Returns dict(file=..., s03_sha256=..., sha256_lf=<LF hash>)."""
-    meta = open(os.path.join(s03_dir, 'meta.yaml'), encoding='utf-8').read()
+    meta = s03_text(s03_dir, 'meta.yaml')                       # C3-44: the guarded reader
+    if meta is None:
+        sys.exit(f'{s03_dir}/meta.yaml missing')
     try:
         plan = meta_value(meta, SO_GOC_META_KEY)
     except KeyError:
@@ -1706,11 +1974,10 @@ def check_s03_trial(common, phase):
     fingerprint() opens anything under sealed/. Reads the PUBLIC <common.s03_run>/meta.yaml only. A tool_check
     lock: the S03 run must be --trial (trial: true; a missing trial line counts as not trial). A main lock:
     the S03 run must not be trial and common.unsealed must be true. sys.exit else."""
-    meta = open(os.path.join(common['s03_run'], 'meta.yaml'), encoding='utf-8').read()
-    try:
-        trial = meta_value(meta, 'trial') in (True, 'true')
-    except KeyError:
-        trial = False                            # a missing trial line counts as not trial
+    meta = s03_text(common['s03_run'], 'meta.yaml')             # C3-44: the guarded reader
+    if meta is None:
+        sys.exit(f'{common["s03_run"]}/meta.yaml missing')
+    trial = s03_is_trial(meta, common['s03_run'])               # C3-44: exactly the bool
     if common['tool_check']:
         if not trial:
             sys.exit(f'{phase}: the lock is a --tool-check run but {common["s03_run"]} is not an S03 --trial '
@@ -1752,7 +2019,13 @@ def blob_at(commit, path):
 
 SIM_SOURCES = SOURCES + (S03_SCREEN_SCRIPT,)   # S4C-2 round 4 + S04 v6.7 9.6: this script and the screening
                                                # script are compared too; SOURCES itself stays unchanged
-                                               # (fingerprint 'scripts' is unchanged)
+POST_SOURCES = ('tools/mo_hinh_con.py',)   # C3-45: the linear sub-model of the pre-HIL check (post phase)
+# C3-45: one source list per phase; the fingerprint locks the union (a difference shows at the first
+# trial, not after the GA) and source_diff compares the same union against the S03 script commit
+PHASE_SOURCES = dict(trial=SIM_SOURCES, main=SIM_SOURCES, post=SIM_SOURCES + POST_SOURCES,
+                     sens_after=SIM_SOURCES)
+LOCKED_SOURCES = tuple(dict.fromkeys(n for ph in ('trial', 'main', 'post', 'sens_after')
+                                     for n in PHASE_SOURCES[ph]))
 
 
 def work_blob(rel):
@@ -1763,10 +2036,12 @@ def work_blob(rel):
 
 
 def source_diff(commit):
-    """The SIM_SOURCES whose working-tree blob is not the blob at <commit>: [(path, now, then)]; a path is
-    reported when then is None or now != then (a script missing at the S03 commit is reported)."""
+    """The LOCKED_SOURCES (C3-45: the union over every phase, so a difference of the pre-HIL sub-model
+    tools/mo_hinh_con.py shows at the first trial, not after the GA) whose working-tree blob is not the
+    blob at <commit>: [(path, now, then)]; a path is reported when then is None or now != then (a script
+    missing at the S03 commit is reported)."""
     out = []
-    for n in SIM_SOURCES:
+    for n in LOCKED_SOURCES:
         now, then = work_blob(n), blob_at(commit, n)
         if then is None or now != then:
             out.append((n, now, then))
@@ -1778,14 +2053,14 @@ def check_s03_source(s03_meta, fp, dll, tool_check=False):
     S03 meta.yaml at every trial and main start, so the first trial cannot lock a source S03 did not
     use (later phases compare with lock.yaml). By class, not file by file: the DLL
     (firmware.dll_sha256), the plant blobs (plant.src, L34), the run configuration S03 wrote (o1, imu)
-    and every module S04 imports for the simulation and the scoring, this script and the screening
-    script fwsim/s03_sangloc.py included (S04 v6.7 section 9 item 6;
-    SIM_SOURCES: the blob in this checkout against the blob at the S03 script commit, which must be
-    clean). A main run stops on any difference, so the S03 main run is run from the commit S04 runs
-    on (L34: one merged commit). --tool-check stops on the DLL, plant, configuration and commit, and
-    only warns about SIM_SOURCES; the differences are returned and written to lock.yaml and meta.yaml
-    (s03_source_diff). Not compared: the Python and library versions (S03 does not write them; S04
-    fixes them for its own folder in the fingerprint)."""
+    and every module S04 imports for the simulation, the scoring and the pre-HIL check, this script,
+    the screening script fwsim/s03_sangloc.py and tools/mo_hinh_con.py included (S04 v6.7 section 9
+    item 6; C3-45: LOCKED_SOURCES — the union over every phase — the blob in this checkout against the
+    blob at the S03 script commit, which must be clean). A main run stops on any difference, so the
+    S03 main run is run from the commit S04 runs on (L34: one merged commit). --tool-check stops on the
+    DLL, plant, configuration and commit, and only warns about LOCKED_SOURCES; the differences are
+    returned and written to lock.yaml and meta.yaml (s03_source_diff). Not compared: the Python and
+    library versions (S03 does not write them; S04 fixes them for its own folder in the fingerprint)."""
     if s03_dll_sha(s03_meta) != fp['dll_sha256']:
         sys.exit(f'{dll} (sha256 {fp["dll_sha256"][:12]}…) is not the DLL of the S03 run '
                  f'({str(s03_dll_sha(s03_meta))[:12]}…): S04 runs on the S03 firmware (S04 7)')
@@ -1951,7 +2226,13 @@ interpretations:   # of this script, not written in S04 v5; Liam or THESIS corre
   - "S04 v6.8 6: before HIL (post) the selected gains are checked against the range table and the triangle (post_checks/notes.json '<controller> pre_hil', copied to meta.yaml pre_hil; a failure is reported with exit code 2, no reselection); the same entry holds the spectral radius of the linear sub-model of one translation axis (tools/mo_hinh_con.ban_kinh_pho_va_trang_thai, with the kept and dropped states and the model parameters and file hash): report only, NOT a GA constraint, but rho >= 1 (or not computable although the set is inside the table) is a cho_liam item 'spectral_radius'; C3-8: a run of the three-mu check that does not pass G1-G5 (three mu levels, check done) is a cho_liam item 'three_mu'; a sensitive b0_factor / r_factor result of judge() is a cho_liam item under its own check name; cho_liam not empty -> post returns 2 (no reselection)"
   - "S04 v6.8 6 / v6.1 6 (RB-1): --phase sens_after (sensitivity check after selection, report only) runs the loop-delay variant (io_delay_ms; --io-delay-ms is the measured bench delay: not whole -> rounding down and up, within 1e-9 ms of a whole number -> that number; not given -> 1 and 2 ms) and the four plant variants of PLANT_VARIANTS (apply_plant_variant, ONE update_physical call per variant, the changed keys checked against the declared ones); one baseline run (io_delay_ms 0, no variant) per (controller, mu, v) serves both delay.csv and plant.csv; plant_params.json holds the before/after dumps and slip_nsub; output in sens_after/ only (phases.json, meta.yaml, post_checks/ not written); the GA, the trial and the post checks run with io_delay_ms = 0 and slip_omega_s = 0.1 (run_gate stops on another slip_omega_s)"
   - "S04 v6.7 9.6: the GA domain and the S03 design come from the SEALED files of the S03 v8.5 screening (sealed/levels_sangloc.csv with nguon_mien, ly_do; sealed/design.csv), never the public levels.csv / design.csv; the v6.6 original-grid refusal applies only to nguon_mien 'du_phong' ('sang_loc' may reach b_n); inside it, the C3-7 / C3-26 exception accepts H = T = b_n when the sweep.csv rows at H are all tran 'true' (S03 v8.6 3.1 rule (2)); lock.yaml holds nguon_mien / ly_do and the main phase stops when they differ; --tool-check still takes an S03 --trial run but now reads the two sealed files it needs (checked before anything under sealed/ is opened)"
-  - "S04 v6.7 8 / S03 v8.5 8 (9): the fingerprint locks meta.yaml, levels.csv, sweep.csv, the four files of S03_SEALED_LOCK (None when missing), sealed/runs.csv when unsealed and kiem_ngoai_mien.csv, plus so_goc: the root number file the S03 meta.yaml records under 'screen_u' (a dict file / sha256 / optional sha256_lf; key name and record shape are this script's choice, the screening script is written in parallel); its bytes or their CRLF->LF form must hash to the recorded sha256; check_s03_sealed needs all five sealed items for a main run, two for --tool-check; check_s03_source also compares the blobs of this script and of fwsim/s03_sangloc.py (a script missing at the S03 commit is reported)"
+  - "S04 v6.7 8 / S03 v8.5 8 (9): the fingerprint locks meta.yaml, levels.csv, sweep.csv, the four files of S03_SEALED_LOCK (None when missing), sealed/runs.csv when unsealed and kiem_ngoai_mien.csv, plus so_goc: the root number file the S03 meta.yaml records in field file_so of the sang_loc line (a dict file / sha256 / optional sha256_lf, as fwsim/s03_doe.py writes it); its bytes or their CRLF->LF form must hash to the recorded sha256; check_s03_sealed needs all five sealed items for a main run, two for --tool-check; check_s03_source also compares the blobs of this script and of fwsim/s03_sangloc.py (a script missing at the S03 commit is reported)"
+  - "C3-41 (S03 v8.6 3.1b item 11): before anything is locked, sealed/sangloc/ket_qua.json must exist, be a JSON object and hold trang_thai 'hoan_tat' for the controller (a main run for both), and every sealed S03 file the fingerprint hashed must equal the raw-byte sha256 the S03 run itself sealed in sealed/manifest.json (a file absent in both passes); the manifest itself is not locked"
+  - "C3-42: the domain checks of read_domain: exactly one sealed levels row per gain of the controller (a factor twice or a factor that is not a gain refuses); L, H and, for nguon_mien sang_loc, a and b_n finite; scale the scale of S03 3.1 for [L, H]; sang_loc [L, H] inside the reference box W = [a, b_n] with a > 0 (exact binary64, bounds inclusive, no tolerance) and omega_o H <= 48; the out-of-range check result of a sang_loc side is attached only when the sealed bound equals the public levels.csv sweep level of that side (the only use of the public file)"
+  - "C3-44: every file of the S03 run (public and sealed) is opened through s03_read: the directory entry is refused before opening when it is a link, a junction, resolves elsewhere, is not a regular file or has more than one name, and the opened target is re-checked by fstat (same identity, one name); meta.yaml trial must be exactly the JSON bool true or false (any other value stops)"
+  - "C3-45: one source list per phase (PHASE_SOURCES); the fingerprint locks LOCKED_SOURCES, the union over trial / main / post / sens_after — tools/mo_hinh_con.py (the pre-HIL sub-model) and fwsim/s03_sangloc.py locked and compared at the first trial already; post and sens_after run check_s03_source again like the starts"
+  - "C3-46: the post determinism check compares the GA evals.csv log_sha256 of the selected candidate with the log SHA-256 of the same runs again in a new process, key by key (controller, v, mu): a missing, extra, duplicated or malformed entry on either side, a hash that is not 64 hex digits (a missing digest included) or two valid hashes that differ is a cho_liam item 'determinism'"
+  - "C3-8: post reads selected.csv once as bytes at the start, writes post_checks/notes.json with post_trang_thai 'dang_chay', the completion state, and selected_sha256 (+ selected_sha256_lf, the CRLF->LF form) of those bytes, re-hashes selected.csv at the end (a change stops, notes.json stays 'dang_chay') and only then writes 'hoan_tat' as the last write; tools/gain_send.py refuses a notes.json that is not 'hoan_tat' or whose selected_sha256 does not match the file it would send"
   - "S03 v8.6 11.6: the PID integral clamp indicator (fwsim.kep_indicator) is report only: evals.csv adds kep_frac_vx, kep_frac_vy, kep_frac_wz, kep_note (ADRC rows '' / ''); a kep_indicator ValueError only fills kep_note (status and score unchanged); a PID run on a DLL without the kep channel (fwsim_kep_cols = 0) stops in main() before the GA; log_sha hashes only fwsim.BIT_EXACT_KEYS (digest_sha), so a log with and without the 'kep' array gives the same value"
 """)
 
