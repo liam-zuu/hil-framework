@@ -2292,7 +2292,7 @@ def test_tinh_psi_chuan_k_from_ref_12b_without_f6(tmp_path, monkeypatch):
         assert 'thieu psi_chuan_k (F6)' not in r['ly_do']
         assert r['phi_hat_chuan_k_deg'] == pytest.approx(math.degrees(ca.wrap(math.radians(
             r['psi_chuan_k_deg'] - r['a_k_deg']))))
-        assert r['u_phi_hat_chuan_k_deg'] == r['u_a_k_deg']
+        assert r['u_phi_hat_chuan_k_deg'] == r['u_a_noi_bo_deg']          # CODE 23/11 F7 thu 2 (option A)
     assert r1['psi_chuan_k_deg'] - r0['psi_chuan_k_deg'] == pytest.approx(math.degrees(0.3), abs=1e-6)
     assert r1['phi_hat_chuan_k_deg'] == pytest.approx(r0['phi_hat_chuan_k_deg'], abs=1e-6)
     rb = f7('rb', chuoi='chan_doan')                                         # chain not locked: no camera psi
@@ -2449,3 +2449,70 @@ def test_hcl1_13_rv_repeat_across_block_edge():
     assert ca.rv_lap_khi_quay(np.full(12, 0.05), rv_n, yaw) == []        # wheels not turning: not a repeat
     yaw3 = np.array([1.0] * 3 + [1.01] * 3 + [1.02] * 3 + [1.03] * 3)
     assert ca.rv_lap_khi_quay(rate, rv_n, yaw3) == []
+
+
+# ------------------------------------------------------------------ F7 thu 2 (CODE 23/11): u_a_noi_bo_deg, dau_doan
+def test_f7_thu2_noi_bo_and_dau_doan(tmp_path, monkeypatch):
+    """u_a_noi_bo_deg = u_a without u_psi_cuc (null when another term is missing); option A: u_phi_hat =
+    u_a_noi_bo; dau_doan: one record per valid long leg of the issued attempt (no C8B bound function), its frame ids
+    = the frames psi' of the leg-start window is averaged on, frames path + sha."""
+    d, f2, a6, f8, run2 = _f8_setup(tmp_path, monkeypatch)
+    rc, f5 = run2(f8('ll', [_rec('C8_1', 'K2', 'L0', 'HC_K2_1')]), 'r2')
+    dp = str(tmp_path / 'r2' / 'doan_12b_v1.json')
+    f9 = write_json(str(tmp_path / 'f9.json'), dict(doan_12b_sha256=f5['sha256'], trang_thai='dat',
+                                                    doan=[dict(i=x['i'], e_hieu_m=0.0) for x in f5['doan']]))
+    out = str(tmp_path / 'f7.json')
+    c8b = write_json(str(tmp_path / 'c8b.json'), dict(u_psi_cuc_rad=0.004, u_psi_hai_dau_rad=0.001))
+    assert ca.main(tinh_args(d, 'K2', '--a6', a6, '--xoay', str(tmp_path / 'xoay.json'), '--e-hieu', f9,
+                             '--doan', dp, '--can-c8b', c8b, '--out', out)) in (0, 1)
+    r = json.load(open(out, encoding='utf-8'))
+    h = r['u_hang_deg']
+    assert h['u_psi_cuc'] == pytest.approx(math.degrees(0.004)) and not r['u_hang_thieu']
+    assert r['u_a_noi_bo_deg'] == pytest.approx(r['u_a_k_deg'] - h['u_psi_cuc'])
+    assert r['u_a_noi_bo_deg'] == pytest.approx(sum(v for k, v in h.items() if k != 'u_psi_cuc' and v is not None))
+    assert r['u_phi_hat_chuan_k_deg'] == r['u_a_noi_bo_deg']
+    dd = r['dau_doan']
+    fr = os.path.join(d, 'frames.csv')
+    assert [x['doan_i'] for x in dd] == [0, 1, 2, 3] and all(x['thu_id'] == 'HC_K2_1' for x in dd)
+    assert all(x['frames_duong_dan'] == os.path.abspath(fr) and x['frames_sha256'] == ca.sha256(fr) for x in dd)
+    F = ca.frames_basic(fr, os.path.join(d, 'track.json'))
+    pos = {int(v): k for k, v in enumerate(F['idx'])}
+    F['tx'], F['ty'] = F.get('tx', F['x']), F.get('ty', F['y'])          # frames_basic: x, y are the tag centre
+    for x in dd:
+        assert x['ids'] and len(set(x['ids'])) == len(x['ids'])
+        ps = np.array([F['psi'][pos[i]] for i in x['ids']])
+        assert x['psi_deg'] == pytest.approx(math.degrees(ca.mean_unwrapped(ps)), abs=1e-9)
+        assert x['p_tag_m'] == pytest.approx([float(np.mean([F['tx'][pos[i]] for i in x['ids']])),
+                                              float(np.mean([F['ty'][pos[i]] for i in x['ids']]))], abs=1e-12)
+
+
+def test_f7_noi_bo_null_when_other_term_missing(tmp_path):
+    """u_a_noi_bo_deg is null when a term other than u_psi_cuc is missing (here u_map: no F9); an attempt without
+    analysis gives no dau_doan record."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    c8b = write_json(str(tmp_path / 'c8b.json'), dict(u_psi_cuc_rad=0.004, u_psi_hai_dau_rad=0.001))
+    out = str(tmp_path / 'f7.json')
+    assert ca.main(tinh_args(d, 'K2', '--can-c8b', c8b, '--out', out)) in (0, 1)
+    r = json.load(open(out, encoding='utf-8'))
+    assert 'u_map' in r['u_hang_thieu'] and r['u_a_noi_bo_deg'] is None
+    assert ca.dau_doan([('x', None, [])], {}, {}, 'x') == []
+
+
+def test_dau_doan_every_attempt_or_issued_only(tmp_path):
+    """dau_doan: valid long legs only; every=True (C8B bound function) -> every attempt, else the issued one; ids =
+    F idx under the window mask."""
+    fr = write_json(str(tmp_path / 'fr.json'), dict(x=1))
+    F = dict(idx=np.array([10, 11, 12, 13]))
+
+    def an(tag):
+        legs = [dict(i=0, dai=True, trang_thai='hop_le', a=0, p_tag_a=np.array([0.1, 0.2]), R_a=0.5),
+                dict(i=1, dai=True, trang_thai='thieu', a=1, p_tag_a=np.array([0.0, 0.0]), R_a=0.0),
+                dict(i=4, dai=False, trang_thai='hop_le', a=1, p_tag_a=np.array([0.0, 0.0]), R_a=0.0)]
+        return dict(legs=legs, windows=[dict(mask=np.array([False, True, True, False])), dict(mask=np.ones(4, bool))])
+    att = [('cap', an('c'), []), ('them', an('t'), [])]
+    src = {'cap': (fr, F), 'them': (fr, F)}
+    allr = ca.dau_doan(att, src, {'cap': 's1', 'them': 's2'}, 'cap', every=True)
+    assert [(x['thu_id'], x['doan_i'], x['ids']) for x in allr] == [('cap', 0, [11, 12]), ('them', 0, [11, 12])]
+    assert allr[1]['session_sha256'] == 's2' and allr[0]['psi_deg'] == pytest.approx(math.degrees(0.5))
+    one = ca.dau_doan(att, src, {}, 'cap', every=False)
+    assert [x['thu_id'] for x in one] == ['cap']

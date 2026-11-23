@@ -1361,7 +1361,11 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
         rong = sorted(set(rong) | {'u_khung_giua_session'})
     for k in rong:
         hang[k] = None
+    # CODE 23/11 (F7 thu 2): u_a without u_psi_cuc (the part inside one floor map); null when another term is missing
+    thieu_khac = (set(thieu_hang) | set(rong)) - {'u_psi_cuc'}
+    u_noi_bo = None if thieu_khac else math.degrees(u_a - u_cuc)
     out = dict(res, a_k_deg=math.degrees(a), u_a_k_deg=None if rong else math.degrees(u_a),
+               u_a_noi_bo_deg=u_noi_bo,
                do_tan_deg=math.degrees(spread), do_tan_tho_deg=math.degrees(spread_tho),
                truot_cheo=dict(tc, cach='HCB4: sigma = (tb ti_le_tho doan lui - tb ti_le_tho doan toi)/2 tren bon doan dai; '
                                         'E bu = E + sigma*|E_x|*(-1, +1) (duong cheo FL-RR); a_k = tb vong a_l_tho; '
@@ -1384,7 +1388,8 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     elif psi_k_cam is not None:     # no camera term added here: it goes to u_beta_cam (C8B), psi' cancels in phi
         out['psi_chuan_k_deg'], out['psi_chuan_k_nguon'] = math.degrees(psi_k_cam), PSI_K_NGUON_CAM
         out['phi_hat_chuan_k_deg'] = math.degrees(wrap(psi_k_cam - a))
-        out['u_phi_hat_chuan_k_deg'] = out['u_a_k_deg']
+        # CODE 23/11 (F7 thu 2): option A, C8B bounds the camera from each leg start straight to W -> without u_psi_cuc
+        out['u_phi_hat_chuan_k_deg'] = out['u_a_noi_bo_deg']
     return out
 
 
@@ -2028,6 +2033,28 @@ def read_can_c8b(path, cho):
     return vals[0], None if hd is None else vals[1], bool(b.get('chot', False))
 
 
+def dau_doan(attempts, att_src, att_ses, cap_id, every=True):
+    """CODE 23/11, format of C8B (F7 thu 2): one record per leg-start window whose psi' a_k takes, over the legs
+    of u_psi_cuc (legs_u: every valid long leg of every attempt of the place with the C8B bound function, else the
+    issued attempt only): thu_id, doan_i, frames_duong_dan, frames_sha256, ids (frame ids of the window: the frames
+    through the gate, A6 and q of the chain, the set psi' of the window is averaged on), plus cua_so, p_tag_m,
+    psi_deg (the values here) and session_sha256."""
+    out = []
+    for tid, an, _ in attempts:
+        if an is None or (not every and tid != cap_id) or tid not in att_src:
+            continue
+        frames, F = att_src[tid]
+        for lg in an['legs']:
+            if not (lg['dai'] and lg['trang_thai'] == 'hop_le'):
+                continue
+            w = an['windows'][lg['a']]
+            ids = [int(v) for v in np.asarray(F['idx'])[np.asarray(w['mask'], bool)]]
+            out.append(dict(thu_id=tid, doan_i=lg['i'], cua_so=lg['a'], frames_duong_dan=os.path.abspath(frames),
+                            frames_sha256=sha256(frames), ids=ids, p_tag_m=[float(v) for v in lg['p_tag_a']],
+                            psi_deg=math.degrees(lg['R_a']), session_sha256=att_ses.get(tid)))
+    return out
+
+
 def _same_num(x, y, tol=1e-12):
     """Equal numbers or equal-length number lists within tol; None only equals None."""
     if x is None or y is None:
@@ -2177,7 +2204,7 @@ def cmd_tinh(a):
     ses_given = {sha256(p) for p in ses_files}
     nguon += [dict(vai_tro='session', duong_dan=os.path.abspath(p), sha256=sha256(p)) for p in ses_files]
     khung_files = read_khung_giua_session(getattr(a, 'khung_giua_session', None))
-    att_ses = {}
+    att_ses, att_src = {}, {}
     # option A (CODE 22/11): the mounting of the issued attempt from its F5 (run 2 of cua_so), read before the chain
     q_tu, ll_cap_q, q_cung_cap, sha_cap_q = getattr(a, 'q_tu', None), None, None, None
     if a.xoay and q_tu:
@@ -2227,6 +2254,7 @@ def cmd_tinh(a):
             attempts.append((A['thu_id'], None, failed + [str(exc)]))
             continue
         attempts.append((A['thu_id'], an, failed))
+        att_src[A['thu_id']] = (frames, F)                # dau_doan (F7 thu 2): frame ids of the leg-start windows
         if is_cap:
             check_cap_sources(d, frames, track, A['log_path'], a.a6, a.xoay, need=bool(a.neo or a.e_hieu),
                               doan=a.doan)
@@ -2342,6 +2370,7 @@ def cmd_tinh(a):
                      can_hai_dau=can_fn, p_ref_tag=p_ref_tag, khung=kg)
     for x in r['luot_thu']:
         x['session_sha256'] = att_ses.get(x['thu_id'])
+    r['dau_doan'] = dau_doan(attempts, att_src, att_ses, cap_id, every=can_fn is not None)
     if x_why:                                            # why the xoay_v1 file gave no q for this place
         r['ly_do'].append(f'xoay: {x_why}')
         if r['trang_thai'] == 'khoa':
