@@ -2664,7 +2664,7 @@ def test_e_hieu_iii_refuses_other_dets(tmp_path, scene):
 
 
 # ---------------------------------------------------------------- P_neo / A_neo (CODE 23/11 T12, S7-14.5 v1 hai dau)
-NEO_KT = dict(w_s=3.0, n_min=2, frac_min=0.0, bien_s=0.1)
+NEO_KT = dict(w_s=3.0, n_min=10, frac_min=0.0, p_dung_m=0.003, psi_dung_deg=0.3, bien_s=0.1, dau_cuoi_s=0.25)
 
 
 def _neo_files(tmp_path, scene, drop_b=(), tape_off=None, windows=('pre', 'post'), lid='C8-P-F02-1', tag_more=None,
@@ -2876,8 +2876,9 @@ def test_neo_luot_scale_neighbours_failing_only_2b_stay(tmp_path, scene, monkeyp
 
 
 def test_neo_luot_w_failure_is_per_frame(tmp_path, scene, monkeypatch):
-    """KCP4V2-2: a W frame whose refit on R_t fails is left out of W alone (per frame, its id recorded), the other W
-    frames still give the mean (n_min 2); the one-sided gate of CAM is the gate of W."""
+    """KCP4V2-2, KCP4V3-2, KCP4V3-6: a W frame whose refit on R_t fails is recorded per frame (id + reason) and, the
+    reference being exactly the W of F2, R_t is not usable: the frames on it are not valid, nothing after W: the run
+    is not concluded (no mean over a subset of W)."""
     csp, sp, *_ = _neo_files(tmp_path, scene)
     real = kc.FramePoses.full_rms
 
@@ -2889,8 +2890,9 @@ def test_neo_luot_w_failure_is_per_frame(tmp_path, scene, monkeypatch):
     rc, o = _neo_run(tmp_path, csp, sp)
     r = o['luot']['C8-P-F02-1']
     wq = list(r['info']['W_qua_cong'].values())
-    assert rc == 0 and r['trang_thai'] == 'dat' and wq and all(v['loi_khung'] == [2] and v['n'] == 2 for v in wq)
-    assert any(x['khung'] == 2 for x in r['info']['khong_hop_le'])
+    assert rc == 0 and r['trang_thai'] == 'chua_ket_luan' and wq
+    assert all([x['khung'] for x in v['loi_khung']] == [2] and v['w_khong_qua'] == [2] and v['n'] == 2
+               and v['ly_do'].startswith('W tren tap chung') for v in wq)
 
 
 def test_circ_mean_is_the_cam_mean_and_refuses_no_branch():
@@ -2900,6 +2902,69 @@ def test_circ_mean_is_the_cam_mean_and_refuses_no_branch():
     assert kc.circ_mean(a) == pytest.approx(ck.trung_binh_go_vong(a), abs=1e-12)
     assert kc.circ_mean(a[::-1]) == pytest.approx(kc.circ_mean(a), abs=1e-12)
     assert math.isnan(kc.circ_mean([0.0, math.pi]))
+
+
+def test_neo_luot_w_is_the_f2_window_without_time_recheck(tmp_path, scene):
+    """KCP4V3-3: the W ids are those of F2 (khung_ma_hop_le, chosen by F2 with its own times); with the edge just after
+    frame 3 (its capture end 4/60 is after t_ref) the replay does not drop it again: all 3 W frames are used."""
+    csp, sp, *_ = _neo_files(tmp_path, scene, t_canh=3 / 60 + 1e-6)
+    rc, o = _neo_run(tmp_path, csp, sp)
+    r = o['luot']['C8-P-F02-1']
+    wq = list(r['info']['W_qua_cong'].values())
+    assert rc == 0 and r['trang_thai'] == 'dat' and all(v['n'] == 3 and v['ly_do'] is None for v in wq)
+
+
+def test_neo_luot_w_not_still_on_r_t_is_not_usable(tmp_path, scene, monkeypatch):
+    """KCP4V3-2: W replayed on R_t must be still (c7_tuong_doi._stillness with the F2 thresholds) else R_t is not
+    usable and the run is not concluded."""
+    import c7_tuong_doi as td
+    csp, sp, *_ = _neo_files(tmp_path, scene)
+    monkeypatch.setattr(td, '_stillness', lambda t, x, y, psi, kt: (False, dict(n=len(t))))
+    rc, o = _neo_run(tmp_path, csp, sp)
+    r = o['luot']['C8-P-F02-1']
+    assert rc == 0 and r['trang_thai'] == 'chua_ket_luan'
+    assert all('khong dung yen' in x['ly_do'] for x in r['info']['khong_hop_le'])
+
+
+def test_neo_luot_refuses_bad_f2_thresholds(tmp_path, scene):
+    """KCP4V3-5: t_canh_s not a finite number, or w_s outside the CAM ranges: code 2."""
+    for key, val in (('t_canh_s', '26'), ('nguong', dict(NEO_KT, w_s=0.1))):
+        csp, sp, *_ = _neo_files(tmp_path, scene)
+        _neo_rewrite(csp, lambda x, k=key, v=val: dict(x, **{k: v}))
+        rc, o = _neo_run(tmp_path, csp, sp)
+        assert rc == 2 and o is None
+
+
+@pytest.mark.parametrize('case', ['moi', 'cu_trong', 'cu_ngoai'])
+def test_e_hieu_failing_pair_of_i_is_not_dat(tmp_path, scene, case):
+    """KCP4V3-1: a failing pair of the (i) maximum (trong_vung_hong, or for results written before it a failing P1
+    pair of the region with both marks in it) makes the leg chan_doan; a failing pair with a mark outside the region
+    does not."""
+    kcp, dop, *_ = _f5_iii(tmp_path, scene)
+    k = json.loads(kcp.read_text(encoding='utf-8'))
+    tv = k['P1_tuong_doi']['theo_vung']['goc']
+    tv['moc_vung'] = [25, 26, 27, 28]
+    if case == 'moi':
+        tv['trong_vung_hong'] = [dict(clip='H_a', s=25, j=26)]
+    else:
+        k['P1_tuong_doi']['cap_hong'] = [dict(clip='H_a', vung='goc', s=25, j=26 if case == 'cu_trong' else 9,
+                                              ly_do='x')]
+    kcp.write_text(json.dumps(k), encoding='utf-8')
+    out = tmp_path / 'e.json'
+    assert kc.main(['e_hieu', '--kiem-cheo', str(kcp), '--doan', str(dop), '--out', str(out)]) == 0
+    leg = json.loads(out.read_text(encoding='utf-8'))['doan'][0]
+    if case == 'cu_ngoai':
+        assert leg['trang_thai'] == 'dat' and 'e_hieu_m' in leg
+    else:
+        assert leg['trang_thai'] == 'chan_doan' and any('cap trong vung hong' in w for w in leg['ly_do'])
+
+
+def test_circ_mean_branch_at_pi_is_the_cam_one():
+    """KCP4V3-4: [0, 0, 180 deg] (resultant 1/3): the CAM mean (+60 deg), not -60 deg."""
+    import c7_chuoi_khung as ck
+    a = [0.0, 0.0, math.pi]
+    assert kc.circ_mean(a) == pytest.approx(ck.trung_binh_go_vong(a), abs=1e-12)
+    assert kc.circ_mean(a) == pytest.approx(math.radians(60.0), abs=1e-9)
 
 
 def test_circ_mean_across_pi():
