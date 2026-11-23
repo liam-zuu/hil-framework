@@ -671,7 +671,9 @@ def test_u_phi_dau_doan_no_double_count(monkeypatch):
         return (2e-4 if ref.get('doan_i') == 1 else 1e-4), [[8, 1e-4]]
     monkeypatch.setattr(K, 'a6_hieu_replay', rep)
     monkeypatch.setattr(a6m, '_a3_rad', lambda kc, p, pl: (0.002, '', 'goc'))
-    f7 = dict(_f7(uphi=0.95, uak=0.95), u_a_noi_bo_deg=0.36, dau_doan=[dict(thu_id='HC_goc_2', doan_i=0)])
+    # HIEUCHUAN under cach A writes u_phi_hat_chuan_k_deg = u_a_noi_bo_deg (CODE 23/11): the scorer formula then
+    # gives the u_phi of the lock
+    f7 = dict(_f7(uphi=0.36, uak=0.95), u_a_noi_bo_deg=0.36, dau_doan=[dict(thu_id='HC_goc_2', doan_i=0)])
     dd = [dict(_win(0.35, 0.36, 0.8, tan=3e-4, doan='doan1'), luot_id='HC_goc_2', doan_i=0),
           dict(_win(-0.33, -0.36, 0.8, tan=5e-4, doan='doan1'), luot_id='HC_goc_2', doan_i=1)]
     W = [_win(0.0, 0.0, 0.8, doan='doan2', psi_tan_rad=1e-3, frames='r1')]
@@ -688,6 +690,11 @@ def test_u_phi_dau_doan_no_double_count(monkeypatch):
     assert m['hang_dong_thanh_phan']['u_phi_cach'] == 'u_a_noi_bo + dau_doan'
     assert m['hang_dong']['u_phi_rad'] == pytest.approx(1.25 * math.radians(0.36 + K.U_BETA_LECH_TAM_DEG)
                                                         + math.radians(ub), rel=1e-12)
+    # the scorer reads u_phi_hat_chuan_k_deg: an F7 where it is not u_a_noi_bo_deg would score with another u_phi
+    # than the lock carries -> refused (CODE 23/11)
+    for uphi in (0.95, None):
+        with pytest.raises(K.KhoaError, match='bo cham'):
+            K.build({'O1-F05': _tb('O1-F05')}, dau_chan=dc, **dict(kw, truc_xe=dict(f7, u_phi_hat_chuan_k_deg=uphi)))
     # only the ref_12b window: u_a_noi_bo would leave the leg-start camera error out -> null with the reason
     k2 = K.build({'O1-F05': _tb('O1-F05')}, dau_chan=dict(goc=dict(ref=dc['goc']['ref'], W=W)), **kw)
     assert k2['muc']['O1-F05']['hang_dong']['u_phi_rad'] is None

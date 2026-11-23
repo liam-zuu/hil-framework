@@ -822,6 +822,15 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
             hd['u_phi_rad'] = None
         else:
             u_phi_le = LE * hd['u_phi_rad'] + math.radians(ub[CHO_MUC])
+            # CODE 23/11 (after 82d5881): the scorer (c7_score) takes 1.25 (u_phi_hat_chuan_k_deg of F7 + u_beta) +
+            # u_beta_cam_deg[k] of this lock; the lock must carry exactly that u_phi (under cach A with dau_doan
+            # HIEUCHUAN writes u_phi_hat_chuan_k_deg = u_a_noi_bo_deg); a difference -> refused
+            uph = _num(truc_xe.get('u_phi_hat_chuan_k_deg')) if isinstance(truc_xe, dict) else None
+            cham = None if uph is None else math.radians(LE * (uph + U_BETA_LECH_TAM_DEG) + ub[CHO_MUC])
+            if cham is None or abs(cham - u_phi_le) > 1e-12 * max(1.0, abs(u_phi_le)):
+                raise KhoaError(f'u_phi_rad cua khoa {u_phi_le!r} khac cong thuc bo cham tu F7 {CHO_MUC} '
+                                f'(u_phi_hat_chuan_k_deg {uph!r}) + u_beta_cam_deg cua khoa: {cham!r}; F7 cach A phai co '
+                                'u_phi_hat_chuan_k_deg = u_a_noi_bo_deg')
     for lv in LEVELS:
         tb = tbs.get(lv)
         cq = can_quay(tb, lv)
