@@ -344,12 +344,40 @@ def _f8null():
     return _f8([dict(luot_id='r1', cho='goc', lan_lap_id=None), dict(luot_id='r2', cho='K1', lan_lap_id=None)])
 
 
-def test_cach_a_u_beta_cam_and_p6_i():
-    """CODE 23/11 chot T12 muc 4, cach A (Liam at CODE 'Cach A (Recommended)'): F8 all null -> u_beta_cam 0 dat with the
-    assumption label, P6 rieng (i) 0; an F8 with ids keeps the beta_cam_replay rule."""
-    ub, st, why, gd = K.u_beta_cam(_f8null())
-    assert st == 'dat' and ub == dict(goc=0.0, K1=0.0, K2=0.0) and gd['nhan'] == K.LL_E_NULL and not why
-    ub, st, _, gd = K.u_beta_cam(_f8())
+def _kc3(a3=dict(goc=0.2, K1=0.08, K2=0.19), flag=None):
+    k = _kc()
+    k['A3_tuong_doi'] = dict(A3_xp_deg=dict(a3), ngoai_suy={c: c == flag for c in K.CHO},
+                             mot_phuong={c: False for c in K.CHO}, cap_hong={c: False for c in K.CHO})
+    return k
+
+
+def _tc(tan):
+    return dict(schema='tham_chieu_v1', psi_tan_rad=tan)
+
+
+def test_cach_a_u_beta_cam_and_p6_i(monkeypatch):
+    """CODE 23/11 chot T12 muc 4, cach A (Liam at CODE 'Cach A (Recommended)'), correction 77991725: F8 all null ->
+    u_beta_cam[k] = LE (2 A3_xp[k] + 2 A6du + largest psi_tan of the W at k), NOT 0; a missing part -> null at k,
+    thieu; P6 rieng (i) 0; an F8 with ids keeps the beta_cam_replay rule."""
+    import c8b_a6 as a6m
+    monkeypatch.setattr(a6m, 'a6du_rad', lambda a6, rho: 0.001)
+    s = _src()
+    kcs = [_kc3(), _kc3(a3=dict(goc=0.25, K1=0.07, K2=0.1))]
+    tcs = dict(goc=[_tc(0.002), _tc(0.003)], K1=[_tc(0.001)], K2=[_tc(0.0025)])
+    ub, st, why, gd, stc = K.u_beta_cam(_f8null(), kcs, s['a6'], 0.1445, tcs)
+    assert st == 'dat' and not why and gd['nhan'] == K.LL_E_NULL and stc == dict(goc='dat', K1='dat', K2='dat')
+    assert ub['goc'] == pytest.approx(1.25 * math.degrees(2 * math.radians(0.25) + 2 * 0.001 + 0.003), rel=1e-12)
+    assert ub['K1'] == pytest.approx(1.25 * math.degrees(2 * math.radians(0.08) + 2 * 0.001 + 0.001), rel=1e-12)
+    assert all(v > 0 for v in ub.values())                                   # not 0 any more
+    ub, st, why, _, stc = K.u_beta_cam(_f8null(), kcs, s['a6'], 0.1445, dict(goc=tcs['goc']))
+    assert st == 'thieu' and ub['K1'] is None and stc['goc'] == 'dat' and any('K1' in w for w in why)
+    ub, _, why, _, stc = K.u_beta_cam(_f8null(), [_kc3(flag='K1')], s['a6'], 0.1445, tcs)
+    assert ub['K1'] is None and ub['goc'] is not None and any('ngoai_suy' in w for w in why)
+    ub, _, _, _, _ = K.u_beta_cam(_f8null(), kcs, s['a6'], 0.1445, dict(tcs, goc=[_tc(None)]))
+    assert ub['goc'] is None
+    ub, _, _, _, _ = K.u_beta_cam(_f8null(), kcs, None, 0.1445, tcs)
+    assert all(v is None for v in ub.values())
+    ub, st, _, gd, _ = K.u_beta_cam(_f8())
     assert st == 'thieu' and gd is None
     _, why, part, _ = K.hang_dong_tinh(_src(lan_lap=_f8null()), 0.1445)
     assert part['P6_rieng_i_m'] == 0.0 and not any('P6 rieng dau (i)' in w for w in why['hang_m'])
@@ -389,11 +417,119 @@ def test_full_hang_m_hang_rad_u_phi_and_lever(monkeypatch):
     v4, _, _, _ = K.hang_dong_tinh(_src(**dict(full, lan_lap=_f8())), 0.1445)
     assert v4['u_phi_rad'] is None                                       # cach A only when F8 all null
     s = _src(**full)
-    k = K.build({'O1-F05': _tb('O1-F05')}, lan_lap=s['lan_lap'], a_m=0.1445, kiem_cheo=s['kiem_cheo'], a6=s['a6'],
-                xoay=s['xoay'], u_h=s['u_h'], cam=s['cam'], truc_xe=s['truc_xe'], neo=s['neo'], u_moc=s['u_moc'])
+    kw = dict(lan_lap=s['lan_lap'], a_m=0.1445, kiem_cheo=s['kiem_cheo'], a6=s['a6'], xoay=s['xoay'], u_h=s['u_h'],
+              cam=s['cam'], truc_xe=s['truc_xe'], neo=s['neo'], u_moc=s['u_moc'])
+    k0 = K.build({'O1-F05': _tb('O1-F05')}, **kw)                        # no W of goc: u_beta_cam goc thieu
+    assert k0['muc']['O1-F05']['hang_dong']['u_phi_rad'] is None
+    assert 'u_beta_cam goc' in k0['muc']['O1-F05']['hang_dong_ly_do']['u_phi_rad']
+    tcs = dict(goc=[_tc(0.002)], K1=[_tc(0.001)], K2=[_tc(0.001)])
+    k = K.build({'O1-F05': _tb('O1-F05')}, tham_chieu=tcs, **kw)
     m = k['muc']['O1-F05']
-    assert m['hang_dong']['u_phi_rad'] == pytest.approx(K.LE * math.radians(0.5 + K.U_BETA_LECH_TAM_DEG))
+    ubg = k['u_beta_cam_deg']['goc']
+    assert ubg == pytest.approx(1.25 * math.degrees(2 * a3 + 2 * 0.0078 + 0.002), rel=1e-12)
+    assert m['hang_dong']['u_phi_rad'] == pytest.approx(K.LE * math.radians(0.5 + K.U_BETA_LECH_TAM_DEG)
+                                                        + math.radians(ubg), rel=1e-12)
     b = m['hang_theo_u'][0]
     assert b['P4_tay_don_m'] == pytest.approx(m['P4_tay_don']['L_m'] * math.radians(b['A4_deg']))
     assert b['P4_m'] == pytest.approx(m['can_quay']['p_m'] + b['P4_tay_don_m'], rel=1e-12)
-    assert k['u_beta_cam_trang_thai'] == 'dat' and k['u_beta_cam_gia_dinh']['nhan'] == K.LL_E_NULL
+    assert k['u_beta_cam_trang_thai_cho']['goc'] == 'dat' and k['u_beta_cam_gia_dinh']['nhan'] == K.LL_E_NULL
+    assert k['u_beta_cam_trang_thai'] == 'thieu'           # _kc carries the A3 flags of goc only: K1, K2 thieu
+
+
+def test_cli_tham_chieu_one_a6_and_place(tmp_path, capsys):
+    """--tham-chieu CHO=path: a tham_chieu_v1 of another A6 than --a6 is refused (one A6 for the lock); a bad place
+    or schema is refused; a good one is anchored in khoa_truoc.nguon."""
+    tb = tmp_path / 'tb.json'
+    tb.write_text(json.dumps(_tb('O1-F05')), encoding='utf-8')
+    a6 = tmp_path / 'a6.json'
+    a6.write_text(json.dumps(_src()['a6']), encoding='utf-8')
+    import c8_u_imu as cu
+    good = tmp_path / 'tc.json'
+    good.write_text(json.dumps(dict(_tc(0.002), a6_sha256=cu.sha256(str(a6)))), encoding='utf-8')
+    bad = tmp_path / 'tc_bad.json'
+    bad.write_text(json.dumps(dict(_tc(0.002), a6_sha256='ab' * 32)), encoding='utf-8')
+    base = ['--tb', f'O1-F05={tb}', '--a6', str(a6)]
+    for i, extra in enumerate([['--tham-chieu', f'goc={bad}'], ['--tham-chieu', f'K3={good}'],
+                               ['--tham-chieu', f'goc={good}', '--a6', str(a6)][:2] + ['--tham-chieu', f'K1={tb}']]):
+        assert K.main(base + extra + ['--out', str(tmp_path / f'x{i}.json')]) == 2
+        assert not (tmp_path / f'x{i}.json').exists()
+    assert K.main(base + ['--tham-chieu', f'goc={good}', '--out', str(tmp_path / 'o.json')]) == 0
+    k = json.loads((tmp_path / 'o.json').read_text(encoding='utf-8'))
+    assert any(n['vai'] == 'tham_chieu goc' and n['sha256'] == cu.sha256(str(good)) for n in k['khoa_truoc']['nguon'])
+
+
+def test_u_beta_cam_flag_missing_is_thieu(monkeypatch):
+    """An A3 flag of the place absent (not False) counts as not checked: thieu at that place (design v7 section 1)."""
+    import c8b_a6 as a6m
+    monkeypatch.setattr(a6m, 'a6du_rad', lambda a6, rho: 0.001)
+    k = _kc3()
+    del k['A3_tuong_doi']['cap_hong']['K2']
+    ub, _, why, _, stc = K.u_beta_cam(_f8null(), [k], _src()['a6'], 0.1445,
+                                      dict(goc=[_tc(0.001)], K1=[_tc(0.001)], K2=[_tc(0.001)]))
+    assert ub['K2'] is None and stc['K2'] == 'thieu' and ub['K1'] is not None and any('cap_hong' in w for w in why)
+
+
+def _frames(path, rows):
+    cols = 'idx,t_s,valid,tag_x,tag_y'
+    path.write_text(cols + '\n' + '\n'.join(f'{i},{i / 60},{v},{x},{y}' for i, v, x, y in rows) + '\n',
+                    encoding='utf-8')
+
+
+def test_u_beta_cam_footprints(monkeypatch):
+    """Cach A, 'hieu A6 du giua hai dau chan' (CODE 23/11, 77991725): A6du at the ref_12b footprint + A6du at the
+    largest W footprint of the place, not 2 A6du at the edge of the domain; without footprints the domain bound."""
+    import c8b_a6 as a6m
+    monkeypatch.setattr(a6m, 'a6du_rad', lambda a6, rho: None if rho is None or rho > 1.55 else 0.001 * rho)
+    kcs = [_kc3()]
+    tcs = dict(goc=[_tc(0.002)], K1=[_tc(0.001)], K2=[_tc(0.001)])
+    dc = dict(goc=dict(rho_12b_m=0.5, rho_W_m=0.6), K1=dict(rho_12b_m=1.6, rho_W_m=1.4))
+    ub, _, why, gd, stc = K.u_beta_cam(_f8null(), kcs, _src()['a6'], 0.1445, tcs, dc)
+    assert ub['goc'] == pytest.approx(1.25 * math.degrees(2 * math.radians(0.2) + 0.0011 + 0.002), rel=1e-12)
+    assert ub['K1'] is None and stc['K1'] == 'thieu'                       # a footprint outside the domain
+    rmax = 1.615 - 0.1445 / math.sqrt(2)
+    assert ub['K2'] == pytest.approx(1.25 * math.degrees(2 * math.radians(0.19) + 2 * 0.001 * rmax + 0.001), rel=1e-12)
+    assert gd['a6du_cach'] == dict(goc='dau_chan', K1='dau_chan', K2='rho_max (khong co dau chan; can tren)')
+
+
+def test_rho_khung(tmp_path):
+    import c8_u_imu as cu
+    f = tmp_path / 'frames.csv'
+    _frames(f, [(1, 1, 0.3, 0.4), (2, 1, 0.6, 0.8), (3, 0, 9.0, 9.0), (4, 1, 0.0, 0.1)])
+    sha = cu.sha256(str(f))
+    assert K.rho_khung(str(f), [1, 2], sha, [0.0, 0.0]) == pytest.approx(1.0)
+    assert K.rho_khung(str(f), [1, 4], sha, [0.0, 0.1]) == pytest.approx(math.hypot(0.3, 0.3))
+    for ids, s in (([1, 3], sha), ([1, 5], sha), ([1], 'ab' * 32), ([], sha)):
+        with pytest.raises(K.KhoaError):
+            K.rho_khung(str(f), ids, s, [0.0, 0.0])
+
+
+def test_cli_dau_chan(tmp_path, monkeypatch):
+    """--cua-so F2 + --khung-12b CHO=frames.csv: the F2 ref_12b window of that place on those frames and the W ids of
+    the --tham-chieu frames give u_beta_cam_dau_chan; a frames file with no F2 window is refused."""
+    import c8_u_imu as cu
+    tb = tmp_path / 'tb.json'
+    tb.write_text(json.dumps(_tb('O1-F05')), encoding='utf-8')
+    a6 = tmp_path / 'a6.json'
+    a6.write_text(json.dumps(dict(_src()['a6'], plumb_xy_m=[0.0, 0.0])), encoding='utf-8')
+    f12, fW = tmp_path / 'f12.csv', tmp_path / 'fW.csv'
+    _frames(f12, [(10, 1, 0.3, 0.4), (11, 1, 0.3, 0.41), (12, 1, 5.0, 5.0)])
+    _frames(fW, [(7, 1, 0.6, 0.0), (8, 1, 0.61, 0.0)])
+    f2 = tmp_path / 'cua_so.jsonl'
+    f2.write_text('\n'.join(json.dumps(r) for r in (
+        dict(loai='ref_12b', cho='goc', luot_id='HC_goc_2', frames_sha256=cu.sha256(str(f12)),
+             khung=[dict(id=10), dict(id=11)]),
+        dict(loai='ref_12b', cho='K1', luot_id='HC_K1_2', frames_sha256=cu.sha256(str(f12)),
+             khung=[dict(id=12)]))) + '\n', encoding='utf-8')
+    tc = tmp_path / 'tc.json'
+    tc.write_text(json.dumps(dict(_tc(0.002), a6_sha256=cu.sha256(str(a6)), ids=[7, 8],
+                                  frames_sha256=cu.sha256(str(fW)),
+                                  nguon=[dict(vai_tro='frames', duong_dan=str(fW), sha256=cu.sha256(str(fW)))])),
+                  encoding='utf-8')
+    base = ['--tb', f'O1-F05={tb}', '--a6', str(a6), '--tham-chieu', f'goc={tc}', '--cua-so', str(f2)]
+    assert K.main(base + ['--khung-12b', f'goc={f12}', '--out', str(tmp_path / 'o.json')]) == 0
+    k = json.loads((tmp_path / 'o.json').read_text(encoding='utf-8'))
+    d = k['u_beta_cam_dau_chan']['goc']
+    assert d['rho_12b_m'] == pytest.approx(math.hypot(0.3, 0.41)) and d['rho_W_m'] == pytest.approx(0.61)
+    assert d['luot_12b'] == ['HC_goc_2'] and any(n['vai'] == 'khung_12b goc' for n in k['khoa_truoc']['nguon'])
+    assert K.main(base + ['--khung-12b', f'K2={f12}', '--out', str(tmp_path / 'x.json')]) == 2   # no K2 window
+    assert K.main(['--tb', f'O1-F05={tb}', '--khung-12b', f'goc={f12}', '--out', str(tmp_path / 'y.json')]) == 2

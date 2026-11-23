@@ -23,6 +23,9 @@ Per level (O1-F02, O1-F05, O1-F08; the K tasks take the F05 3b numbers only for 
   u_beta_cam_deg {goc, K1, K2}: LE x the largest change of beta under the map noise at the two tape footprints,
                 from NHACTAM lan_lap beta_cam_replay (data contract F15 b, F16): max_abs_dbeta_rad per place; missing ->
                 null and u_beta_cam_trang_thai thieu (CAM: u_phi not finite, the lever-arm terms not concluded).
+                F8 all null, cach A (CODE 23/11 chot T12 muc 4, correction 77991725): LE x (2 A3_xp[k] + 2 A6du +
+                largest psi_tan_rad of the W at k, --tham-chieu); u_beta_cam_trang_thai_cho per place.
+                u_phi_rad (hang_dong) = LE (u_phi_hat + u_beta) + u_beta_cam[goc] (design v7 6c).
   khac          the other terms of design section 1 (A6, P1/A3, P5, P6, U_thang, W, U_p_tc_san, delta_q): null with the
                 reason 'chua co nguon' until their sessions deliver (KIEMCHEO, NHACTAM, HIEUCHUAN, CAM).
   hang_theo_u   M5b (names CODE 19/11, GATE 8705918 GC6-5): [{u_lo_m_s, u_hi_m_s, P4_m, A4_deg, trang_thai}] of the
@@ -106,7 +109,7 @@ CHO_THIEU = dict(           # sources not delivered yet (CODE 23/11 muc 5): the 
     U_moc='U_moc_hieu_xy_m, U_moc_hieu_psi_rad: CAM chua xuat (hop dong muc G (6))',
     W='W (dao dong W, W-canh): CAM T11 tham_chieu_v1 chua chay',
     u_theta='u_theta cua delta_q: u_a_k_deg cua F7 (HIEUCHUAN tinh) chua co',
-    u_phi='u_phi_hat (F7 truc_xe_v1 goc) va u_beta, u_beta_cam (muc 4, cho Liam) chua co')
+    u_phi='u_phi_hat (F7 truc_xe_v1 goc khoa) chua co, hay F8 khong rong (cach A chi khi F8 rong)')
 
 
 class KhoaError(Exception):
@@ -192,12 +195,7 @@ def hang_dong_tinh(src, side):
         for k in ('hang_m', 'hang_rad', 'he_so_r'):
             why[k].append('khong co A6 (--a6)')
     else:
-        import c8b_a6 as a6m
-        rho_in = float((a6.get('mien') or {}).get('rho_max_m', a6m.RHO_MAX_M)) - float(side) / math.sqrt(2.0)
-        try:
-            du = a6m.a6du_rad(a6, rho_in)
-        except (KeyError, TypeError, ValueError):
-            du = None
+        du, rho_in = _a6du_of(a6, side)
         if du is None:
             why['hang_m'].append('A6du khong tinh duoc (A6 khong dat hay ngoai mien)')
             why['hang_rad'].append('A6du khong tinh duoc')
@@ -256,7 +254,7 @@ def hang_dong_tinh(src, side):
     if not why['hang_rad'] and all(k in part for k in ('A3_rad', 'A6du_rad', 'A5_rad')):
         val['hang_rad'] = 2 * part['A3_rad'] + 2 * part['A6du_rad'] + part['A5_rad']
     if not why['u_phi_rad']:
-        val['u_phi_rad'] = part['u_phi_rad']                 # margin once in build (1.25 (u_phi_hat + u_beta))
+        val['u_phi_rad'] = part['u_phi_rad']   # u_phi_hat + u_beta only; build: 1.25 x this + u_beta_cam (has margin)
     lever = None
     if all(k in part for k in ('q_hat_m', 'dq_khong_u_theta_m', 'u_theta_rad')):
         dq0 = part['dq_khong_u_theta_m']
@@ -480,12 +478,99 @@ def man_trap(tb):
                 ly_do=sh.get('why') or 'no 3b shutter fit')
 
 
-def u_beta_cam(lan_lap):
-    """u_beta_cam_deg {goc, K1, K2} after the margin from NHACTAM beta_cam_replay (F15 b); missing -> null."""
+def _a6du_of(a6, side):
+    """A6du (rad) at the largest valid centre rho (rho_max - side / sqrt 2), with that rho; (None, rho or None)."""
+    if not isinstance(a6, dict) or side is None:
+        return None, None
+    import c8b_a6 as a6m
+    rho_in = float((a6.get('mien') or {}).get('rho_max_m', a6m.RHO_MAX_M)) - float(side) / math.sqrt(2.0)
+    try:
+        return a6m.a6du_rad(a6, rho_in), rho_in
+    except (KeyError, TypeError, ValueError):
+        return None, rho_in
+
+
+def _a3_hai_dau_rad(kcs, cho):
+    """2 A3_xp (two ends, A3_tuong_doi.max_deg = 2 A3_xp) at cho, the largest over the segments; (None, reason)."""
+    if not kcs:
+        return None, 'khong co kiem_cheo.json (--kiem-cheo)'
+    vals = []
+    for k in kcs:
+        at = k.get('A3_tuong_doi') or {}
+        bad = [f for f in ('ngoai_suy', 'mot_phuong', 'cap_hong') if (at.get(f) or {}).get(cho) is not False]
+        v = _num((at.get('A3_xp_deg') or {}).get(cho))
+        if bad:
+            return None, f'A3 {cho} co {bad} (thiet ke v7 muc 1: cap do thieu)'
+        if v is None:
+            return None, f'kiem_cheo thieu A3_xp_deg {cho}'
+        vals.append(v)
+    return 2.0 * math.radians(max(vals)), None
+
+
+def rho_khung(path, ids, sha, plumb):
+    """Largest tag centre distance (tag_x, tag_y; valid 1) to the plumb point over the frames idx in ids of one
+    frames.csv whose SHA-256 must be sha; every id must be a valid frame (KhoaError otherwise)."""
+    import csv
+    if cu.sha256(path) != sha:
+        raise KhoaError(f'{path}: SHA-256 is not {sha} (frames of the window)')
+    want, got = {int(i) for i in ids}, {}
+    with open(path, newline='', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            try:
+                i = int(row['idx'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if i in want and row.get('valid') == '1':
+                x, y = _num(row.get('tag_x')), _num(row.get('tag_y'))
+                if x is not None and y is not None:
+                    got[i] = (x, y)
+    if not want or set(got) != want:
+        raise KhoaError(f'{path}: {len(want - set(got))} window frames without a valid tag centre')
+    C = [float(v) for v in plumb]
+    return max(math.hypot(x - C[0], y - C[1]) for x, y in got.values())
+
+
+def u_beta_cam(lan_lap, kiem_cheo=None, a6=None, side=None, tham_chieu=None, dau_chan=None):
+    """u_beta_cam_deg {goc, K1, K2} after the margin; returns (values, trang_thai, reasons, gia_dinh, per-place
+    trang_thai). F8 with ids: from NHACTAM beta_cam_replay (F15 b). F8 all null, cach A (CODE 23/11 chot T12 muc 4,
+    correction 77991725: the body turns with the tag, beta = wrap(psi'_tc - psi'_chuan,k) from the tag yaw, so the
+    camera error of that yaw difference between the ref_12b window and W is NOT 0):
+      u_beta_cam_deg[k] = LE x (2 A3_xp[k] (kiem_cheo luot1, two ends) + A6 dư of the two footprints + the largest
+                        psi_tan_rad of the tham_chieu_v1 W of the runs at k)
+    A6 dư of the two footprints = A6du(rho of the ref_12b window of the provider run at k) + A6du(largest rho of the W
+    windows of the runs at k), rho = the largest tag centre distance to the plumb over the window frames (dau_chan
+    {k: {rho_12b_m, rho_W_m}}); without dau_chan[k]: 2 A6du at the largest valid rho (an upper bound, labelled).
+    A missing part (no W of k yet, an A3 flag) -> null at k, thieu."""
     if f8_rong(lan_lap):
-        # cach A (CODE 23/11 chot T12 muc 4): beta not measured, so no map noise of a beta measurement: 0, dat
-        return ({c: 0.0 for c in CHO}, 'dat', [], dict(nhan=LL_E_NULL, gia_dinh=LL_E_NULL_CAN_CU +
-                                                        '; cach A: beta = 0, u_beta_cam = 0'))
+        kcs = [k for k in (kiem_cheo or []) if isinstance(k, dict)]
+        du, _ = _a6du_of(a6, side)
+        out, st, why, cach = {}, {}, [], {}
+        for c in CHO:
+            a3, w3 = _a3_hai_dau_rad(kcs, c)
+            tcs = [t for t in ((tham_chieu or {}).get(c) or []) if isinstance(t, dict)]
+            tan = [_num(t.get('psi_tan_rad')) for t in tcs]
+            dc = (dau_chan or {}).get(c)
+            if isinstance(dc, dict) and isinstance(a6, dict):
+                import c8b_a6 as a6m
+                d12, dW = a6m.a6du_rad(a6, dc.get('rho_12b_m')), a6m.a6du_rad(a6, dc.get('rho_W_m'))
+                a6p = None if d12 is None or dW is None else d12 + dW
+                cach[c] = 'dau_chan'
+            else:
+                a6p = None if du is None else 2.0 * du
+                cach[c] = 'rho_max (khong co dau chan; can tren)'
+            miss = ([w3] if w3 else []) + ([] if a6p is not None else
+                                           ['A6du khong tinh duoc (--a6, --canh-ma-m, dau chan ngoai mien)']) \
+                + (['W (T11 tham_chieu_v1) cua cho chua co (--tham-chieu)'] if not tcs else []) \
+                + (['tham_chieu_v1 thieu psi_tan_rad'] if tcs and any(x is None for x in tan) else [])
+            if miss:
+                out[c], st[c] = None, 'thieu'
+                why.append(f'{c}: ' + '; '.join(miss))
+            else:
+                out[c], st[c] = LE * math.degrees(a3 + a6p + max(tan)), 'dat'
+        gd = dict(nhan=LL_E_NULL, gia_dinh=LL_E_NULL_CAN_CU + '; cach A: beta = wrap(psi\'_tc - psi\'_chuan,k) tu yaw '
+                  'ma, u_beta = 0,234 do, u_beta_cam = 1,25 (2 A3_xp + A6du hai dau chan + psi_tan W) (CODE 23/11, '
+                  '77991725)', a6du_cach=cach)
+        return out, ('dat' if not why else 'thieu'), why, gd, st
     rep = (lan_lap or {}).get('beta_cam_replay') if isinstance(lan_lap, dict) else None
     out, why = {}, []
     for c in CHO:
@@ -496,12 +581,13 @@ def u_beta_cam(lan_lap):
             why.append(f'{c}: beta_cam_replay missing or not dat ({st!r})')
         else:
             out[c] = LE * math.degrees(v)
-    return out, ('dat' if not why else 'thieu'), why, None
+    return out, ('dat' if not why else 'thieu'), why, None, {c: ('dat' if out[c] is not None else 'thieu')
+                                                             for c in CHO}
 
 
 def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None, muc_kha_thi=LEVELS, nguong=None,
           a6=None, ses=None, cam=None, commit_hil=None, kiem_cheo=None, xoay=None, u_h=None, truc_xe=None,
-          neo=None, u_moc=None):
+          neo=None, u_moc=None, tham_chieu=None, dau_chan=None):
     muc = {}
     side = a_m
     hd, hd_why, hd_part, lever = (hang_dong_tinh(dict(kiem_cheo=kiem_cheo, a6=a6, xoay=xoay, u_h=u_h,
@@ -510,6 +596,16 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
                                                   side)
                                   if side is not None else (dict(hang_m=None, he_so_r=None, hang_rad=None,
                                                                  u_phi_rad=None), {}, {}, None))
+    ub, ust, uwhy, ugd, ust_cho = u_beta_cam(lan_lap, kiem_cheo, a6, side, tham_chieu, dau_chan)
+    # design v7 6c: u_phi = 1.25 (u_phi_hat + u_beta) + u_beta_cam (u_beta_cam already has the margin), at goc
+    hd = dict(hd)
+    u_phi_le = None
+    if hd['u_phi_rad'] is not None:
+        if ub.get(CHO_MUC) is None:
+            hd_why = dict(hd_why, u_phi_rad=[f'u_beta_cam {CHO_MUC} thieu ({"; ".join(uwhy) or ust})'])
+            hd['u_phi_rad'] = None
+        else:
+            u_phi_le = LE * hd['u_phi_rad'] + math.radians(ub[CHO_MUC])
     for lv in LEVELS:
         tb = tbs.get(lv)
         cq = can_quay(tb, lv)
@@ -523,7 +619,7 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
                        chi_bao_cao=['g5'] if lv == 'O1-F08' else [],
                        hang_theo_u=bands, hang_theo_u_ly_do=bwhy,
                        hang_dong=dict(a_m=a_m, **{k: (None if hd[k] is None else LE * hd[k])
-                                                  for k in ('hang_m', 'he_so_r', 'u_phi_rad', 'hang_rad')}),
+                                                  for k in ('hang_m', 'he_so_r', 'hang_rad')}, u_phi_rad=u_phi_le),
                        hang_dong_truoc_le=dict(hd), hang_dong_thanh_phan=dict(hd_part),
                        P4_tay_don=dict(L_m=lever, ly_do=None if lever is not None else
                                        '(|q_hat| + dq) A4(u) them vao P4_m khi co dq day du (u_theta F7); '
@@ -533,7 +629,6 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
                            **{k: ('; '.join(hd_why[k]) if k in hd_why else None)
                               for k in ('hang_m', 'he_so_r', 'u_phi_rad', 'hang_rad')}),
                        khac={k: dict(gia_tri=None, trang_thai='thieu', ly_do='chua co nguon') for k in KHAC})
-    ub, ust, uwhy, ugd = u_beta_cam(lan_lap)
     # F17 bo_cham.bang_man_trap: each level and K one branch; alpha needs the 3b source; K (0.5 m/s, F05 speeds)
     # takes the branch of the F05 3b (J v6 J4-13)
     src = {n['vai'][3:]: n for n in (nguon or []) if n.get('vai', '').startswith('3b ')}
@@ -548,7 +643,7 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
             bang[key]['nguon_3b'] = dict(duong_dan=n.get('duong_dan', n['file']), sha256=n['sha256'])
     eh, ehw = eps_h_of(nguong)
     lle, lle_st, lle_why = lan_lap_E(a6, lan_lap)
-    out = dict(lan_lap_E=lle, lan_lap_E_trang_thai=lle_st, lan_lap_E_ly_do=lle_why, version=VERSION, le=LE, muc=muc, bang_man_trap=bang, u_beta_cam_deg=ub, u_beta_cam_trang_thai=ust, u_beta_cam_gia_dinh=ugd,
+    out = dict(lan_lap_E=lle, lan_lap_E_trang_thai=lle_st, lan_lap_E_ly_do=lle_why, version=VERSION, le=LE, muc=muc, bang_man_trap=bang, u_beta_cam_deg=ub, u_beta_cam_trang_thai=ust, u_beta_cam_trang_thai_cho=ust_cho, u_beta_cam_dau_chan=dau_chan or {}, u_beta_cam_gia_dinh=ugd,
                u_beta_cam_ly_do=uwhy, nhanh_tick=nhanh_tick, commit_hil=commit_hil, muc_kha_thi=list(muc_kha_thi),
                eps_H=eh, eps_H_ly_do=ehw, mien_car_pose=mien_car_pose(a6, ses, cam),
                khoa_truoc=dict(nguon=nguon or [], script=script, commit_hil=commit_hil,
@@ -579,6 +674,44 @@ def _clean(o):
     return o
 
 
+def dau_chan_of(a, extra, nguon):
+    """{cho: {rho_12b_m, rho_W_m, ...}} of the two footprints of beta (cach A): the ref_12b window of --khung-12b in
+    the F2 --cua-so (same cho, frames_sha256) and the W windows (ids, frames of nguon) of the --tham-chieu at cho."""
+    a6 = extra.get('a6')
+    if not isinstance(a6, dict) or not isinstance(a6.get('plumb_xy_m'), list) or not a.cua_so:
+        raise KhoaError('--khung-12b needs --a6 (plumb_xy_m) and --cua-so (F2)')
+    rows = []
+    with open(a.cua_so, encoding='utf-8') as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+    nguon.append(dict(vai='cua_so F2', file=os.path.basename(a.cua_so), duong_dan=os.path.abspath(a.cua_so),
+                      sha256=cu.sha256(a.cua_so)))
+    out = {}
+    for s in a.khung_12b:
+        cho, sep, pth = s.partition('=')
+        if not sep or cho not in CHO or cho in out:
+            raise KhoaError(f'--khung-12b {s!r}: CHO=frames.csv, CHO in {CHO}, once each')
+        sha = cu.sha256(pth)
+        win = [r for r in rows if r.get('loai') == 'ref_12b' and r.get('cho') == cho and r.get('frames_sha256') == sha]
+        if not win:
+            raise KhoaError(f'--khung-12b {s!r}: no F2 ref_12b window of {cho} on these frames')
+        r12 = max(rho_khung(pth, [k['id'] for k in w['khung']], sha, a6['plumb_xy_m']) for w in win)
+        tcs = (extra.get('tham_chieu') or {}).get(cho) or []
+        rW = []
+        for t in tcs:
+            fr = [n for n in t.get('nguon') or [] if n.get('vai_tro') == 'frames']
+            if len(fr) != 1 or fr[0].get('sha256') != t.get('frames_sha256') or not isinstance(t.get('ids'), list):
+                raise KhoaError(f'tham_chieu_v1 at {cho}: frames source / ids not usable for the W footprint')
+            rW.append(rho_khung(fr[0]['duong_dan'], t['ids'], t['frames_sha256'], a6['plumb_xy_m']))
+        nguon.append(dict(vai=f'khung_12b {cho}', file=os.path.basename(pth), duong_dan=os.path.abspath(pth),
+                          sha256=sha))
+        if rW:
+            out[cho] = dict(rho_12b_m=r12, rho_W_m=max(rW), luot_12b=sorted({w.get('luot_id') for w in win}),
+                            n_W=len(rW), quy_tac='max |tam ma - diem doi| tren khung cua so (ref_12b F2; W tham_chieu)')
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--tb', action='append', required=True, help='LEVEL=c8b_3b json')
@@ -603,6 +736,13 @@ def main(argv=None):
     ap.add_argument('--neo', default=None, help='KIEMCHEO neo_luot.json (c7_neo_luot_v1, theo_cho.goc)')
     ap.add_argument('--u-moc', action='append', default=None,
                     help='CAM U_moc file with U_moc_hieu_xy_m, U_moc_hieu_psi_rad; repeat (largest used)')
+    ap.add_argument('--tham-chieu', action='append', default=None,
+                    help='CHO=CAM T11 tham_chieu_v1 of one run at CHO (goc, K1, K2); repeat for every run (cach A: '
+                         'u_beta_cam takes the largest psi_tan_rad at the place); a6_sha256 must be the --a6 file')
+    ap.add_argument('--cua-so', default=None, help='HIEUCHUAN F2 cua_so_v1.jsonl (ref_12b windows, for --khung-12b)')
+    ap.add_argument('--khung-12b', action='append', default=None,
+                    help='CHO=frames.csv of the ref_12b provider run at CHO (J v6 line 59): its F2 ref_12b window '
+                         '(same cho, frames_sha256) gives the footprint rho of u_beta_cam (cach A)')
     ap.add_argument('--commit-hil', default=None,
                     help='40-hex hil commit that will score the runs; required with bo_tick (O1 v11.34 Q4)')
     ap.add_argument('--out', required=True)
@@ -665,6 +805,23 @@ def main(argv=None):
                     extra[key] = d
                 nguon.append(dict(vai=vai, file=os.path.basename(pth), duong_dan=os.path.abspath(pth),
                                   sha256=cu.sha256(pth)))
+        a6_sha = cu.sha256(a.a6) if a.a6 else None
+        for s in a.tham_chieu or []:
+            cho, sep, pth = s.partition('=')
+            if not sep or cho not in CHO:
+                raise KhoaError(f'--tham-chieu {s!r}: CHO=path, CHO in {CHO}')
+            with open(pth, encoding='utf-8') as f:
+                d = json.load(f)
+            if not isinstance(d, dict) or d.get('schema') != 'tham_chieu_v1':
+                raise KhoaError(f'--tham-chieu {pth}: not a tham_chieu_v1 file')
+            if a6_sha is None or d.get('a6_sha256') != a6_sha:
+                raise KhoaError(f'--tham-chieu {pth}: a6_sha256 {d.get("a6_sha256")!r} is not the --a6 file '
+                                f'{a6_sha!r} (one A6 for the lock)')
+            extra.setdefault('tham_chieu', {}).setdefault(cho, []).append(d)
+            nguon.append(dict(vai=f'tham_chieu {cho}', file=os.path.basename(pth), duong_dan=os.path.abspath(pth),
+                              sha256=cu.sha256(pth)))
+        if a.khung_12b:
+            extra['dau_chan'] = dau_chan_of(a, extra, nguon)
         out = build(tbs, ll, nguon, script_state(), a.canh_ma_m, nt, mk, commit_hil=a.commit_hil, **extra)
         with open(a.out, 'x', encoding='utf-8') as f:
             f.write(json.dumps(_clean(out), indent=1, ensure_ascii=False, allow_nan=False))
