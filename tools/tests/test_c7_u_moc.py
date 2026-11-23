@@ -300,6 +300,7 @@ def test_manifest_numbers_domain_and_source_follow_the_design(run, tmp_path, mon
     S = np.mean([2 * math.sin((5e-4 + 1e-6 * idx[i]) / 2) for i in range(5)])
     assert m['U_moc_tham_psi_rad'] == pytest.approx(math.asin(S / R), rel=1e-12)
     assert m['U_moc_hieu_xy_m'] == pytest.approx(m['U_moc_dong_xy_m'] + m['U_moc_tham_xy_m'])
+    assert m['U_moc_hieu_psi_rad'] == pytest.approx(m['U_moc_dong_psi_rad'] + m['U_moc_tham_psi_rad'])  # G (6)
     assert m['a6_sha256'] == ck.sha256(str(tmp_path / 'a6.json')) and m['kiem_a6']['cung_file'] is True
 
 
@@ -406,3 +407,84 @@ def test_c7_score_khung_nhieu_only_with_tuong_doi(capsys):
     for extra in (['--khung-nhieu', 'k', '--khung-nhieu-loai', 'xy'], ['--tuong-doi', '--khung-nhieu', 'k']):
         assert c7_score.main(base + extra) == 2
         assert '--khung-nhieu and --khung-nhieu-loai go together' in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- step 'luot' (CODE 23/11, chot T12 muc 5, before T13)
+def _luot_world(tmp_path, rows, W=range(0, 5), q=(0.003, -0.004), u_q=0.0012, a6_xoay='same', tc_extra=None):
+    w = _world(tmp_path, rows, W=W)
+    head = json.loads(open(w['khung'], encoding='utf-8').readline())
+    a6s = head['nguon']['a6']['sha256']
+    ids = [int(rows[i]['idx']) for i in W]
+    tc = dict(schema=ctd.THAM_CHIEU_SCHEMA, ids=ids, ids_sha256=ctd.ids_sha(ids),
+              frames_sha256=head['nguon']['frames']['sha256'], a6_sha256=a6s)
+    tc.update(tc_extra or {})
+    _w(tmp_path / 'tc_luot.json', tc)
+    xa = a6s if a6_xoay == 'same' else a6_xoay
+    _w(tmp_path / 'xoay.json', dict(version='xoay_v1', a6_sha256=xa,
+                                    cho={'goc': dict(q_tag_m=list(q), u_q_m=u_q, trang_thai='dat'),
+                                         'K1': dict(q_tag_m=[0.001, 0.0], u_q_m=0.002, trang_thai='dat')}))
+    return w, str(tmp_path / 'tc_luot.json'), str(tmp_path / 'xoay.json')
+
+
+def _luot(w, tcp, xp, out, cho='goc', extra=()):
+    code = um.main(['luot', '--khung', w['khung'], '--tham-chieu', tcp, '--xoay', xp, '--cho', cho,
+                    '--out', str(out)] + list(extra))
+    return code, (_rd(out) if out.exists() else None)
+
+
+def test_luot_six_fields_over_the_whole_khung_file(run, tmp_path):
+    rows = run[1]
+    w, tcp, xp = _luot_world(tmp_path, rows)
+    code, d = _luot(w, tcp, xp, tmp_path / 'l.json', extra=['--u-them-m', '0.00057', '--u-them-nguon', 'F8 rong'])
+    assert code == 0 and d['ok'] is True and d['format'] == um.FORMAT_LUOT and d['truoc_le'] is True
+    aq = math.hypot(0.003, -0.004) + 0.0012 + 0.00057                 # |q_hat| + u_q + plate bound: upper bound
+    assert d['q']['abs_q_can_m'] == pytest.approx(aq, rel=1e-12)
+    idx = [int(r['idx']) for r in rows]
+
+    def uxy(i):
+        return max(0.001 + 1e-5 * i + 2 * aq * 1e-4, 5e-4 + 2 * aq * math.sin(1e-4))
+    assert d['U_moc_dong_xy_m'] == pytest.approx(max(uxy(i) for i in idx), rel=1e-12)       # every frame of the file
+    assert d['U_moc_dong_psi_rad'] == pytest.approx(max(5e-4 + 1e-6 * i for i in idx), rel=1e-12)
+    assert d['U_moc_tham_xy_m'] == pytest.approx(np.mean([uxy(idx[i]) for i in range(5)]), rel=1e-12)
+    psi = [float(ck._f(rows[i]['tag_psi'])) - 0.001 for i in range(5)]
+    R = abs(np.mean(np.exp(1j * np.array(psi))))
+    S = np.mean([2 * math.sin((5e-4 + 1e-6 * idx[i]) / 2) for i in range(5)])
+    assert d['U_moc_tham_psi_rad'] == pytest.approx(math.asin(S / R), rel=1e-12)
+    assert d['U_moc_hieu_xy_m'] == pytest.approx(d['U_moc_dong_xy_m'] + d['U_moc_tham_xy_m'], rel=1e-12)
+    assert d['U_moc_hieu_psi_rad'] == pytest.approx(d['U_moc_dong_psi_rad'] + d['U_moc_tham_psi_rad'], rel=1e-12)
+    assert d['mien']['n_khung'] == len(rows) and d['mien']['n_W'] == 5
+    assert d['phu_thuoc'].startswith('chua_kiem_truoc_T13')
+
+
+def test_luot_k2_takes_q_of_the_place_named(run, tmp_path):
+    rows = run[1]
+    w, tcp, xp = _luot_world(tmp_path, rows)
+    code, d = _luot(w, tcp, xp, tmp_path / 'k2.json', cho='K2', extra=['--q-tu', 'K1'])
+    assert code == 0 and d['q']['cho_q'] == 'K1' and d['q']['abs_q_can_m'] == pytest.approx(0.001 + 0.002)
+    code, d = _luot(w, tcp, xp, tmp_path / 'k2b.json', cho='K2')       # K2 has no block of its own
+    assert code == 3 and not d['ok'] and any('xoay_v1 cho K2' in x for x in d['ly_do'])
+
+
+@pytest.mark.parametrize('mod, frag', [
+    (dict(tc_extra=dict(frames_sha256='0' * 64)), 'frames_sha256'),
+    (dict(tc_extra=dict(a6_sha256='0' * 64)), 'a6_sha256 khac A6'),
+    (dict(a6_xoay='0' * 64), 'xoay_v1 a6_sha256'),
+    (dict(tc_extra=dict(ids_sha256='0' * 64)), 'ids_sha256'),
+])
+def test_luot_not_ok_on_a_source_mismatch(run, tmp_path, mod, frag):
+    w, tcp, xp = _luot_world(tmp_path, run[1], **mod)
+    code, d = _luot(w, tcp, xp, tmp_path / 'x.json')
+    assert code == 3 and not d['ok'] and any(frag in x for x in d['ly_do']), d['ly_do']
+    assert d['U_moc_hieu_xy_m'] is None and d['U_moc_hieu_psi_rad'] is None
+
+
+def test_luot_not_ok_on_a_khung_error_or_a_missing_w_frame(run, tmp_path):
+    rows = run[1]
+    w, tcp, xp = _luot_world(tmp_path, rows)
+    _edit_khung(w, _set_rec(len(rows) - 1, loi='khop_nhieu_khong_tin'))   # outside W, inside the file
+    code, d = _luot(w, tcp, xp, tmp_path / 'e.json')
+    assert code == 3 and any(x.startswith('khung_loi') for x in d['ly_do'])
+    w, tcp, xp = _luot_world(_sub(tmp_path, 'b'), rows)
+    _edit_khung(w, lambda lines: lines.pop(1 + 2))                  # frame 2 of W gone from the khung file
+    code, d = _luot(w, tcp, xp, tmp_path / 'b' / 'm.json')
+    assert code == 3 and any(x.startswith('thieu_khung_W') for x in d['ly_do'])

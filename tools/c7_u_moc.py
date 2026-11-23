@@ -587,7 +587,7 @@ def run_manifest(a):
         kiem_a6.update(n_khung=sum(1 for i in recs if not recs[i].get('loi')), cung_file=True)
     # the bound
     U = dict.fromkeys(U_KEYS)
-    U['U_moc_hieu_xy_m'] = None
+    U['U_moc_hieu_xy_m'] = U['U_moc_hieu_psi_rad'] = None      # contract G (6): six fields, hieu = dong + tham
     if q is not None and not thieu and not loi:
         aq = math.hypot(q[0], q[1])
         ud = [u_khung(recs[i], aq) for i in sorted(dom)]
@@ -599,8 +599,10 @@ def run_manifest(a):
         U['U_moc_tham_psi_rad'] = ut
         if ut is None:
             bad.append(f'tham_psi_S_khong_nho_hon_R: S {S} R {R}')
+        else:
+            U['U_moc_hieu_psi_rad'] = U['U_moc_dong_psi_rad'] + ut
         U['U_moc_hieu_xy_m'] = U['U_moc_dong_xy_m'] + U['U_moc_tham_xy_m']
-    if not all(isinstance(U[k], float) and math.isfinite(U[k]) and U[k] >= 0.0 for k in U_KEYS) and not bad:
+    if not all(isinstance(U[k], float) and math.isfinite(U[k]) and U[k] >= 0.0 for k in U) and not bad:
         bad.append('U_khong_huu_han')
     nhieu = dict(x.split('=', 1) for x in (a.nhieu or []))
     pt, bad_pt = phu_thuoc(kept, luoi, nhieu, khung_sha, dt, goc)
@@ -645,6 +647,92 @@ def run_manifest(a):
     return 0 if man['ok'] else 3
 
 
+# ---------------------------------------------------------------- step 'luot'
+FORMAT_LUOT = 'u_moc_luot_v1'
+
+
+def run_luot(a):
+    """The six U_moc fields of ONE run before any scoring (CODE 23/11, Chot_T12_khoa_C8B_v1 muc 5, row "Moc dich":
+    the C8B lock T12 needs them before T13; contract G (6)). Same per-frame bound and the same three reductions as
+    'manifest' (u_khung, u_tham_psi), with the domain = EVERY frame of the khung file (it covers [t0 - 7 s, end of
+    the scored domain + 0.5 s], README of step khung, so it holds the domain of any scoring of the run: a larger
+    max, on the safe side); W = the ids of tham_chieu_v1 (T11). Arm |q|: |q_hat| of the xoay_v1 block of the place
+    (--q-tu for a place without E, K2) + u_q (+ --u-them-m, the F8 rong plate bound), an upper bound of the |q| the
+    chain uses (CODE 23/11 chot T12 muc 4). Not checked here (the manifest does it once a scoring exists): the
+    dependence on the moved frames (TC3-12) and the nodes the scoring keeps; the file says so (phu_thuoc
+    'chua_kiem_truoc_T13'). ok false: a frame of the khung file with an error, a W id missing from it, sources
+    that do not match (luot_id, frames sha, A6 sha of the khung file vs tham_chieu_v1 and xoay_v1)."""
+    import c7_tuong_doi as ctd
+    t_start = time.time()
+    head, recs = doc_khung(a.khung)
+    tc = _json(a.tham_chieu)
+    bad = []
+    if tc.get('schema') != ctd.THAM_CHIEU_SCHEMA:
+        raise ValueError(f'tham_chieu_v1: schema {tc.get("schema")!r}')
+    ng = head.get('nguon') or {}
+    if tc.get('frames_sha256') != (ng.get('frames') or {}).get('sha256'):
+        bad.append('tham_chieu_v1 frames_sha256 khac frames cua file khung')
+    a6_k = (ng.get('a6') or {}).get('sha256')
+    if not a6_k or tc.get('a6_sha256') != a6_k:
+        bad.append('tham_chieu_v1 a6_sha256 khac A6 cua file khung')
+    xo = ck.doc_xoay(a.xoay, a.q_tu or a.cho)
+    if not xo['ok'] or xo['q'] is None or xo.get('u_q') is None:
+        bad.append(f'xoay_v1 cho {a.q_tu or a.cho}: {xo["ly_do"]}')
+    elif xo.get('a6_sha256') != a6_k:
+        bad.append('xoay_v1 a6_sha256 khac A6 cua file khung')
+    loi = sorted(i for i, r in recs.items() if r.get('loi'))
+    if loi:
+        bad.append(f'khung_loi: {len(loi)} khung (dau {loi[:5]})')
+    W = [int(i) for i in (tc.get('ids') or [])]
+    if not W or ctd.ids_sha(W) != tc.get('ids_sha256'):
+        bad.append('tham_chieu_v1: khong co ids, hay ids_sha256 khong cua ids')
+    thieu = [i for i in W if i not in recs or recs[i].get('loi')]
+    if thieu:
+        bad.append(f'thieu_khung_W: {len(thieu)} id cua W khong co (hay loi) trong file khung (dau {thieu[:5]})')
+    U = dict.fromkeys(U_KEYS)
+    U['U_moc_hieu_xy_m'] = U['U_moc_hieu_psi_rad'] = None
+    aq = None
+    if not bad:
+        aq = math.hypot(*xo['q']) + float(xo['u_q']) + float(a.u_them_m or 0.0)
+        ud = [u_khung(recs[i], aq) for i in sorted(recs)]
+        uw = [u_khung(recs[i], aq) for i in W]
+        U['U_moc_dong_xy_m'] = max(x for x, _ in ud)
+        U['U_moc_dong_psi_rad'] = max(p for _, p in ud)
+        U['U_moc_tham_xy_m'] = float(np.mean([x for x, _ in uw]))
+        ut, R, S = u_tham_psi([recs[i]['psi_p'] for i in W], [p for _, p in uw])
+        U['U_moc_tham_psi_rad'] = ut
+        if ut is None:
+            bad.append(f'tham_psi_S_khong_nho_hon_R: S {S} R {R}')
+        else:
+            U['U_moc_hieu_psi_rad'] = U['U_moc_dong_psi_rad'] + ut
+        U['U_moc_hieu_xy_m'] = U['U_moc_dong_xy_m'] + U['U_moc_tham_xy_m']
+    if not bad and not all(isinstance(U[k], float) and math.isfinite(U[k]) and U[k] >= 0.0 for k in U):
+        bad.append('U_khong_huu_han')
+    ts = [recs[i]['t_s'] for i in sorted(recs)]
+    gh = ['mien = moi khung cua file khung (bao mien cham bat ky cua luot), khong phai mien cua lan cham: lon hon '
+          'hay bang so cua manifest',
+          'tay don |q| = |q_hat| + u_q' + (' + u_them' if a.u_them_m else '') + ': can tren cua |q| cua chuoi',
+          'can thuc nghiem (lon nhat quan sat duoc tren 8 huong va 200 to hop), khong phai can chung minh (v3 2)']
+    out = dict(format=FORMAT_LUOT, ok=not bad, ly_do=bad, luot_id=head.get('luot_id'), cho=a.cho, **U,
+               truoc_le=True,
+               q=dict(q_hat_m=None if bad and aq is None else xo['q'], u_q_m=xo.get('u_q'),
+                      u_them_m=a.u_them_m, u_them_nguon=a.u_them_nguon, cho_q=a.q_tu or a.cho, abs_q_can_m=aq),
+               mien=dict(n_khung=len(recs), n_W=len(W), tu_s=min(ts) if ts else None, den_s=max(ts) if ts else None,
+                         cach='moi khung cua file khung'),
+               phu_thuoc='chua_kiem_truoc_T13 (manifest kiem khi co lan cham)', gioi_han=gh,
+               a6_sha256=a6_k,
+               dau_vao=dict(khung=_ref(a.khung), tham_chieu_v1=_ref(a.tham_chieu), xoay_v1=_ref(a.xoay)),
+               script=cm.script_state(('tools/c7_u_moc.py', 'tools/c7_chuoi_khung.py', 'tools/c7_tuong_doi.py')),
+               giay=round(time.time() - t_start, 1))
+    text = json.dumps(cm._json(out), ensure_ascii=False, indent=1, allow_nan=False)
+    with open(a.out, 'x', encoding='utf-8') as f:
+        f.write(text + '\n')
+    print(f"{head.get('luot_id')}: ok {out['ok']}, U dong/tham/hieu xy {U['U_moc_dong_xy_m']} / "
+          f"{U['U_moc_tham_xy_m']} / {U['U_moc_hieu_xy_m']} m, psi {U['U_moc_dong_psi_rad']} / "
+          f"{U['U_moc_tham_psi_rad']} / {U['U_moc_hieu_psi_rad']} rad" + ('' if not bad else '; ' + '; '.join(bad[:4])))
+    return 0 if out['ok'] else 3
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[1])
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -671,10 +759,22 @@ def main(argv=None):
     m.add_argument('--goc', default=None, help='folder the relative paths of the score files are relative to '
                                                '(default: the folder of --luoi)')
     m.add_argument('--out', required=True)
+    lu = sub.add_parser('luot', help='u_moc_luot_v1: the six U_moc fields of one run before scoring (run_luot)')
+    lu.add_argument('--khung', required=True, help='u_moc_khung.jsonl of the run (step khung)')
+    lu.add_argument('--tham-chieu', dest='tham_chieu', required=True, help='tham_chieu_v1 of the run (T11)')
+    lu.add_argument('--xoay', required=True, help='xoay_v1 (per place)')
+    lu.add_argument('--cho', required=True, choices=('goc', 'K1', 'K2'))
+    lu.add_argument('--q-tu', dest='q_tu', default=None, help='place whose xoay block gives q (K2: K1)')
+    lu.add_argument('--u-them-m', dest='u_them_m', type=float, default=None,
+                    help='added to u_q (F8 rong: 0.00057, the plate bound of session 1)')
+    lu.add_argument('--u-them-nguon', dest='u_them_nguon', default=None)
+    lu.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
         if a.cmd == 'manifest':
             return run_manifest(a)
+        if a.cmd == 'luot':
+            return run_luot(a)
         return run_khung(a)
     except (OSError, ValueError, KeyError) as e:
         print(f'c7_u_moc: {e}', file=sys.stderr)
