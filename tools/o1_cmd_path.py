@@ -49,6 +49,18 @@ Anchors (O1 3.5): received data lines sorted by log_seq.
             read as -1 (Liam 23/11 CODE_CAM local_f3c5357d; Codex C3N1-1, C3N2-1, C3N2-2). The window is mapped
             from the edge (Liam 15/11): schedule packets lost at the start make the edge late, and neither (3)
             nor (4) is sure to see it (Codex C3N2-4): a known limit (Liam 23/11 "Ghi gioi han").
+            LIMITS of the run-before rule (Codex Sol round 3, C3N3-1..4, DEFERRED: Liam 23/11 CODE local_be52def9
+            box "Dieu (3)": "Chot + gioi han + t_mono (Recommended)"; no further Codex round). pre_stream_bound_ms
+            holds only under four assumptions the ESP32 log cannot prove: (i) traj_age_ms is the age at t_a (it is
+            read later in the tick, by up to L_a, C3N3-1); (ii) the Pi sends the zero tail on time (a late tail is
+            longer than O1_TAIL_S x (1 + E_MAX), C3N3-2); (iii) the Pi wall clock does not step back within a run
+            (the sending window from the #test_start / #test_end epochs, C3N3-3); (iv) the send-to-receive latency
+            is at most PRE_STREAM_SLACK_MS = 1 s, an estimate near what C8 session 2 showed (C3N3-4). C8 session 2:
+            the 8 start anchors read as -1 are 76 s or more past the bound (76.7-253.1 s), far beyond what (i)-(iv)
+            can move.
+            From the sender after hil f45b337 (feat/sender-t-mono), '#test_start' carries t_mono_ns (grid origin,
+            CLOCK_MONOTONIC, same clock as agv_logger t_mono_ns on the Pi): a later reader can drop (iii); this
+            script does not read it yet.
   (2), (4): the value of a run is the largest of the deviation ON the anchor lines and of the pair
   bound below over the pairs that HIDE ticks (a lost line, or a tick difference other than 1):
   every control tick pushes one data line (tick + 1 on every consecutive pair, 1030/1030 on
@@ -444,7 +456,8 @@ def _packet_before_stream(start, t0, t_w1):
     zero tail) is received no earlier than its stream began, and the edge t0 comes within TRAJ_TIMEOUT_MS of a stream
     packet (run_active needs a fresh packet), so t0 - r0 is at most the stream length (sending window + tail, clock
     rate bound E_MAX) + TRAJ_TIMEOUT_MS + the transit latency of the edge packet (slack PRE_STREAM_SLACK_MS). Above
-    pre_stream_bound_ms: not a packet of this stream. Age -1 or empty: False (handled before, or no evidence)."""
+    pre_stream_bound_ms: not a packet of this stream. Age -1 or empty: False (handled before, or no evidence).
+    Assumptions (i)-(iv) of the module docstring, (3) LIMITS (C3N3-1..4, DEFERRED, Liam 23/11)."""
     age = start['_age']
     if age is None or age < 0:
         return False
