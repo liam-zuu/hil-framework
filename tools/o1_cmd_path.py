@@ -44,7 +44,23 @@ Anchors (O1 3.5): received data lines sorted by log_seq.
             after t_w1. run_active falls and rises again before the end anchor: no evidence.
   (3)       start anchor: last line with t + L <= t_w0 in the same motor-on stretch; end anchor:
             first line at or after t_w1; a line b is used as a LATER anchor only when the line
-            b+1 (next log_seq, motor on) exists: L = t_(b+1) - t_b.
+            b+1 (next log_seq, motor on) exists: L = t_(b+1) - t_b. A start anchor age of a packet received
+            before this run's stream began (age + (t_w0 - t_a) above pre_stream_bound_ms: the run before) is
+            read as -1 (Liam 23/11 CODE_CAM local_f3c5357d; Codex C3N1-1, C3N2-1, C3N2-2). The window is mapped
+            from the edge (Liam 15/11): schedule packets lost at the start make the edge late, and neither (3)
+            nor (4) is sure to see it (Codex C3N2-4): a known limit (Liam 23/11 "Ghi gioi han").
+            LIMITS of the run-before rule (Codex Sol round 3, C3N3-1..4, DEFERRED: Liam 23/11 CODE local_be52def9
+            box "Dieu (3)": "Chot + gioi han + t_mono (Recommended)"; no further Codex round). pre_stream_bound_ms
+            holds only under four assumptions the ESP32 log cannot prove: (i) traj_age_ms is the age at t_a (it is
+            read later in the tick, by up to L_a, C3N3-1); (ii) the Pi sends the zero tail on time (a late tail is
+            longer than O1_TAIL_S x (1 + E_MAX), C3N3-2); (iii) the Pi wall clock does not step back within a run
+            (the sending window from the #test_start / #test_end epochs, C3N3-3); (iv) the send-to-receive latency
+            is at most PRE_STREAM_SLACK_MS = 1 s, an estimate near what C8 session 2 showed (C3N3-4). C8 session 2:
+            the 8 start anchors read as -1 are 76 s or more past the bound (76.7-253.1 s), far beyond what (i)-(iv)
+            can move.
+            From the sender after hil f45b337 (feat/sender-t-mono), '#test_start' carries t_mono_ns (grid origin,
+            CLOCK_MONOTONIC, same clock as agv_logger t_mono_ns on the Pi): a later reader can drop (iii); this
+            script does not read it yet.
   (2), (4): the value of a run is the largest of the deviation ON the anchor lines and of the pair
   bound below over the pairs that HIDE ticks (a lost line, or a tick difference other than 1):
   every control tick pushes one data line (tick + 1 on every consecutive pair, 1030/1030 on
@@ -422,6 +438,32 @@ def read_sender_complete(path, task_id):
     return True, ''
 
 
+PRE_STREAM_SLACK_MS = 1000.0     # transit-latency slack of the rule below [ms]; an estimate, not measured (C8 session 2:
+                                 # the 8 packets it reads are 63 s or more past the bound)
+
+
+def pre_stream_bound_ms(t0, t_w1):
+    """Bound [ms] of _packet_before_stream: the sending window (t_w1 - t0) + the zero tail O1_TAIL_S x (1 + E_MAX)
+    + TRAJ_TIMEOUT_MS + PRE_STREAM_SLACK_MS."""
+    return (t_w1 - t0) / 1e3 + o1_tasks.O1_TAIL_S * 1e3 * (1.0 + E_MAX) + TRAJ_TIMEOUT_MS + PRE_STREAM_SLACK_MS
+
+
+def _packet_before_stream(start, t0, t_w1):
+    """(3) start anchor (Liam 23/11 CODE_CAM local_f3c5357d, after Codex Sol rounds 1, 2: C3N1-1, C3N2-1, C3N2-2; box
+    "Sua + Codex vong 3"): True when its traj_age_ms is that of a packet received before the sender's stream of this
+    run began, read from the age alone (no assumption on the log): the packet was received at
+    r0 <= t_a - traj_age_ms, so t0 - r0 >= traj_age_ms + (t0 - t_a). A packet of this run's stream (schedule and
+    zero tail) is received no earlier than its stream began, and the edge t0 comes within TRAJ_TIMEOUT_MS of a stream
+    packet (run_active needs a fresh packet), so t0 - r0 is at most the stream length (sending window + tail, clock
+    rate bound E_MAX) + TRAJ_TIMEOUT_MS + the transit latency of the edge packet (slack PRE_STREAM_SLACK_MS). Above
+    pre_stream_bound_ms: not a packet of this stream. Age -1 or empty: False (handled before, or no evidence).
+    Assumptions (i)-(iv) of the module docstring, (3) LIMITS (C3N3-1..4, DEFERRED, Liam 23/11)."""
+    age = start['_age']
+    if age is None or age < 0:
+        return False
+    return age + (t0 - start['_t']) / 1e3 > pre_stream_bound_ms(t0, t_w1)
+
+
 def analyse(rows, task, events=(), has_age_col=True, sched=None, bao_s=None, sender_ok=None):
     """sched: (sched_first_s, sched_last_s) of the sender (B81c-1); bao_s: #test_start -> #test_end epoch
     span of the sender (K-1), used when sched is None; sender_ok: (ok, why) of read_sender_complete."""
@@ -671,7 +713,7 @@ def analyse(rows, task, events=(), has_age_col=True, sched=None, bao_s=None, sen
         else:
             chain = [start] + [r for r in mo_rows
                                if start['_seq'] < r['_seq'] <= fin['_seq'] and L_of(r) is not None]
-            worst, at, neg = -math.inf, None, 0
+            worst, at, neg, stale = -math.inf, None, 0, None
             for pa, pb in zip(chain[:-1], chain[1:]):
                 age = pa['_age']
                 if age is None:                 # empty cell: no evidence for this pair (CP1-2)
@@ -681,11 +723,21 @@ def analyse(rows, task, events=(), has_age_col=True, sched=None, bao_s=None, sen
                 if age < 0:                     # -1: no packet since boot; any later packet came after t_a
                     neg += 1
                     age = 0
+                elif pa is start and _packet_before_stream(start, t0, t_w1):
+                    # Liam 23/11 CODE_CAM local_f3c5357d, box "Dieu (3)": "Sua (Recommended)", then after Codex Sol
+                    # round 2 "Sua + Codex vong 3": the start anchor age is that of a packet received before this
+                    # run's stream began (_packet_before_stream), not of this schedule ("from the first packet", O1
+                    # 3.5 (3)): as -1, any packet of the schedule came after t_a, so the pair bound counts from t_a
+                    # (an upper bound over the window from the edge). Lost first packets of the schedule (a late
+                    # edge) are a known limit (Liam 23/11 box "Mat goi dau": "Ghi gioi han"; Codex C3N2-4).
+                    stale = age
+                    age = 0
                 b3 = age + 1.0 + (pb['_t'] - pa['_t']) / 1e3 + L_of(pb) / 1e3
                 if b3 > worst:
                     worst, at = b3, [pa['_seq'], pb['_seq']]
             res['cond3'] = dict(value_ms=worst if at else None, at_seq=at, start_anchor_seq=start['_seq'],
-                                end_anchor_seq=fin['_seq'], n_pairs=len(chain) - 1, age_minus1_as_0=neg)
+                                end_anchor_seq=fin['_seq'], n_pairs=len(chain) - 1, age_minus1_as_0=neg,
+                                start_age_run_before_ms=stale)
     res['decided'] = True
     return res
 

@@ -437,6 +437,71 @@ def test_CP2_3_negative_age_on_a_run_active_line_is_a_flag(tmp_path):
     assert any(f.startswith('ra_age_negative') for f in res['flags'])
 
 
+def _pre_edge(rows, age_of):
+    """rows with the age of every line before the first packet (age -1 in make_log) set to age_of(i, row)."""
+    return [dict(r, traj_age_ms=age_of(i, r)) if r['traj_age_ms'] == -1 else r for i, r in enumerate(rows)]
+
+
+def _start_gap(tmp_path, rows):
+    """(bound - (t_w0 - t_a)) [ms] of the start anchor of rows: the start anchor age above it is the run before."""
+    res = run(tmp_path, rows)
+    ta = next(r['timestamp_us'] for r in rows if r['log_seq'] == res['cond3']['start_anchor_seq'])
+    return cp.pre_stream_bound_ms(res['t_w0_us'], res['t_w1_us']) - (res['t_w0_us'] - ta) / 1e3
+
+
+def test_start_anchor_age_of_the_run_before_reads_as_no_packet(tmp_path):
+    """Liam 23/11 CODE_CAM local_f3c5357d ("Sua (Recommended)", then "Sua + Codex vong 3"; C8 session 2, 8/17 runs:
+    e.g. C8-L-F05-2 log_seq 22886 traj_age_ms 94110 before the edge, 9 at the edge, sending window 13.7 s): a start
+    anchor packet older than the whole stream (window + tail + 200 ms + slack) is of the run before; (3) counts as
+    with -1. One ms at or below the bound keeps the number (the bound uses the window and the tail, C3N1-4)."""
+    rows = make_log()
+    for d in 'abcde':
+        (tmp_path / d).mkdir()
+    base = run(tmp_path / 'a', rows)['cond3']
+    assert base['age_minus1_as_0'] == 1 and base['start_age_run_before_ms'] is None
+    c3 = run(tmp_path / 'b', _pre_edge(rows, lambda i, r: 94000 + i))['cond3']
+    assert c3['value_ms'] == pytest.approx(base['value_ms']) and c3['value_ms'] < 100
+    assert c3['start_age_run_before_ms'] >= 94000 and c3['age_minus1_as_0'] == 0 and c3['at_seq'] == base['at_seq']
+    gap = _start_gap(tmp_path / 'c', rows)
+    assert gap > cp.TRAJ_TIMEOUT_MS + 1000.0                         # window + tail + 200 ms + slack
+    over = run(tmp_path / 'd', _pre_edge(rows, lambda i, r: int(math.floor(gap)) + 1))['cond3']
+    assert over['start_age_run_before_ms'] == int(math.floor(gap)) + 1
+    assert over['value_ms'] == pytest.approx(base['value_ms'])
+    at = run(tmp_path / 'e', _pre_edge(rows, lambda i, r: int(math.floor(gap))))['cond3']
+    assert at['start_age_run_before_ms'] is None and at['value_ms'] > gap
+
+
+def test_pre_stream_bound_is_the_stream_length_plus_the_margins():
+    """The bound holds every part of the stream: sending window, zero tail at the clock-rate bound, TRAJ_TIMEOUT_MS
+    (the edge within that of a stream packet), the transit slack (numbers written out, not from the module)."""
+    tail_ms = cp.o1_tasks.O1_TAIL_S * 1000.0 * (1.0 + 2002e-6)
+    assert cp.pre_stream_bound_ms(0, 13_687_000) == pytest.approx(13687.0 + tail_ms + 200.0 + 1000.0)
+    assert cp.PRE_STREAM_SLACK_MS == 1000.0 and cp.TRAJ_TIMEOUT_MS == 200 and cp.E_MAX == 2002e-6
+
+
+def test_start_anchor_old_age_kept_when_the_packet_may_be_of_the_schedule(tmp_path):
+    """Codex C3N1-1, C3N2-1, C3N2-2: an old start anchor age shorter than the stream may be a packet of this schedule
+    (MANUAL while it arrived, lines lost at the log start or between two lines of consecutive log_seq): kept as a
+    number, whatever the log shows before it (here every line before the edge at 219 ms or 5 s, consecutive)."""
+    for d in 'ab':
+        (tmp_path / d).mkdir()
+    for d, age in (('a', 219), ('b', 5000)):
+        c3 = run(tmp_path / d, _pre_edge(make_log(), lambda i, r: age))['cond3']
+        assert c3['start_age_run_before_ms'] is None and c3['value_ms'] > age
+
+
+def test_old_age_on_a_later_anchor_stays_a_number(tmp_path):
+    """Codex C3N1-5, C3N2-3: only the START anchor is read as -1; an old age on a later anchor (even one older than the
+    stream: the rule applied per anchor would hide it) is kept."""
+    rows = make_log()
+    edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
+    mid = [r['log_seq'] for r in rows if r['log_seq'] > edge + 200 and r['run_active'] == 1][:3]
+    rows = _pre_edge(rows, lambda i, r: 94000 + i)
+    rows = [dict(r, traj_age_ms=95000 + k) if r['log_seq'] in mid else r for k, r in enumerate(rows)]
+    c3 = run(tmp_path, rows)['cond3']
+    assert c3['start_age_run_before_ms'] >= 94000 and c3['value_ms'] > 95000
+
+
 def test_CP2_4_empty_age_before_the_edge(tmp_path):
     rows = make_log()
     edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
