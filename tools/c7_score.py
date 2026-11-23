@@ -2733,9 +2733,10 @@ def main_rel(argv):
     return 0
 
 
-def load_rel(a, frames, track, fsha, esha, task, hs):
+def load_rel(a, frames, track, fsha, esha, task, hs, nhieu=False):
     """The relative-frame inputs of a scoring run (--tuong-doi), every file bound to the frames and log scored and
-    to each other by sha256; the reference recomputed from them must equal tham_chieu_v1."""
+    to each other by sha256; the reference recomputed from them must equal tham_chieu_v1 (nhieu: frames moved by
+    --khung-nhieu, the reference is the recomputed one, its change is what c7_u_moc manifest compares)."""
     cua = ctd.read_jsonl(a.cua_so)
     pre = _pre_of(cua, a.luot_id)
     if pre.get('frames_sha256') != fsha or pre.get('esp32_sha256') != esha:
@@ -2762,11 +2763,11 @@ def load_rel(a, frames, track, fsha, esha, task, hs):
                               {k: tcf.get(k) for k in ('cua_so_v1_sha256', 'frames_sha256', 'a6_sha256', 'xoay_sha256')},
                               f8_rong_ok=f8_ok)
     for k in ('ids_sha256', 'tap', 'trang_thai', 'p_ok', 'psi_ok'):
-        if tc[k] != tcf.get(k):
+        if tc[k] != tcf.get(k) and not nhieu:
             raise ValueError(f'tham_chieu_v1 {k} {tcf.get(k)!r} != recomputed {tc[k]!r}')
     for k in ('p_tc_m', 'psi_tc_rad'):
         x, y = tc[k], tcf.get(k)
-        if (x is None) != (y is None) or (x is not None and np.max(np.abs(np.subtract(x, y))) > 1e-12):
+        if ((x is None) != (y is None) or (x is not None and np.max(np.abs(np.subtract(x, y))) > 1e-12)) and not nhieu:
             raise ValueError(f'tham_chieu_v1 {k} differs from the recomputed value')
     ubc = None
     if a.c8b_khoa:
@@ -2812,8 +2813,14 @@ def main(argv=None):
     ap.add_argument('--tuong-doi', action='store_true', help='relative frame (J v6; CAM v5)')
     for k in ('--cua-so', '--tham-chieu', '--truc-xe', '--lan-lap', '--a6', '--xoay', '--c8b-khoa', '--luot-id'):
         ap.add_argument(k, default=None)
+    ap.add_argument('--khung-nhieu', default=None,
+                    help='u_moc_khung.jsonl: score the frames moved to their worst refit (c7_u_moc manifest, '
+                         'dependence check; never a scoring of the run: write it outside the C8 folder)')
+    ap.add_argument('--khung-nhieu-loai', default=None, choices=('xy', 'psi'))
     a = ap.parse_args(argv)
     try:
+        if (a.khung_nhieu or a.khung_nhieu_loai) and not (a.khung_nhieu and a.khung_nhieu_loai and a.tuong_doi):
+            raise ValueError('--khung-nhieu and --khung-nhieu-loai go together, with --tuong-doi')
         for p in (a.out, a.rows):
             if p and os.path.exists(p):
                 raise ValueError(f'{p} exists: use a new file')
@@ -2844,6 +2851,10 @@ def main(argv=None):
         evp = a.events or (a.esp32 + '.events.txt')
         evp = evp if os.path.exists(evp) else None
         frames = cm.read_frames(a.frames)
+        nhieu = None
+        if a.khung_nhieu:
+            import c7_u_moc                                   # CAM: the dependence check of u_moc_manifest_v1
+            frames, nhieu = c7_u_moc.khung_nhieu(frames, a.khung_nhieu, a.khung_nhieu_loai, fsha)
         rel = None
         if a.tuong_doi and out_op is None:
             if not (a.out and a.rows):
@@ -2852,7 +2863,7 @@ def main(argv=None):
             try:
                 if not (a.cua_so and a.tham_chieu):
                     raise ValueError('--tuong-doi needs --cua-so and --tham-chieu')
-                rel = load_rel(a, frames, track_info, fsha, cm.sha256(a.esp32), a.task, hs)
+                rel = load_rel(a, frames, track_info, fsha, cm.sha256(a.esp32), a.task, hs, nhieu=nhieu is not None)
             except (ValueError, OSError) as exc:
                 # Codex CT3-4: a run with operator evidence (no edge, so no cua_so_v1, ...) is recorded as that loss;
                 # a window file never written (FileNotFoundError) too (round 4)
@@ -2872,6 +2883,8 @@ def main(argv=None):
                    sender_file=os.path.basename(a.sender) if a.sender else None,
                    sender_sha256=cm.sha256(a.sender) if a.sender and os.path.exists(a.sender) else None,
                    events_file=os.path.basename(evp) if evp else None, events_sha256=cm.sha256(evp) if evp else None)
+        if nhieu is not None:
+            out['khung_nhieu'] = nhieu
     except Exception as exc:            # CS1-6: any error ends with exit 2, never a traceback without a verdict
         print(f'c7_score: {type(exc).__name__}: {exc}', file=sys.stderr)
         print('#ket_qua,ma=2')
