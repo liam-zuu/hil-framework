@@ -724,10 +724,12 @@ def build_c8(tmp_path, levels=LEVELS, u_t=0.014, two=False, sub=''):
     d['bo_cham']['phien_ban'] = 'tools/c8b_khoa_v5.py@' + 'c' * 40
     kv5 = _jw(goc, 'c8b_khoa_v5.json', dict(
         version=GC.KHOA_FORMAT, trang_thai='khoa', nhanh_tick=d['u_t_branch'], bang_man_trap=d['bo_cham']['bang_man_trap'],
+        commit_hil='5' * 40,                                          # CODE 23/11: the scoring commit (bo_tick)
         muc_kha_thi=list(levels), mien_car_pose=d['camera']['c8b']['mien_car_pose'], eps_H=d['camera']['c8b']['eps_H'],
         khoa_truoc=dict(nguon=[dict(vai='ke_hoach_c8', file='ke_hoach_c8.json', sha256=kh['sha256']),
                                dict(vai='a6', file='a6.json', sha256=a6['sha256'])],
-                        script=dict(file='tools/c8b_khoa_v5.py', commit='c' * 40, dirty=False), luc=LUC_KHOA_C8B),
+                        script=dict(file='tools/c8b_khoa_v5.py', commit='c' * 40, dirty=False), luc=LUC_KHOA_C8B,
+                        commit_hil='5' * 40),
         muc={lv: dict(chi_bao_cao=['g5'] if lv == 'O1-F08' else [],
                       hang_dong=dict(a_m=pl[lv]['a_m'], hang_m=pl[lv]['u_p']['hang_m'],
                                      he_so_r=pl[lv]['u_p']['he_so_r'], u_phi_rad=pl[lv]['u_p']['u_phi_rad'],
@@ -2822,3 +2824,25 @@ def test_code_23_11_one_a6_for_the_lock_and_the_f_files(tmp_path):
         _rewrite_khoa(goc, d, lambda k: k['khoa_truoc'].update(nguon=nguon_edit(k['khoa_truoc']['nguon'])))
         with pytest.raises(GC.GateFileError, match='A6 file'):
             GC.check_nguon(d, goc)
+
+
+# ── CODE 23/11 (chot T12 section 3, O1 Q4): bo_tick needs the scoring commit in the lock, every grid made by it ─────
+
+def test_code_23_11_bo_tick_needs_the_scoring_commit_of_the_lock(tmp_path):
+    d, goc = build_c8(tmp_path / 'a')                                  # bo_tick, commit_hil = the scorer: accepted
+    assert d['u_t_branch'] == 'bo_tick'
+    cases = ((lambda k: k.pop('commit_hil'), 'with commit_hil None'),
+             (lambda k: k.update(commit_hil='5' * 39), 'with commit_hil'),
+             (lambda k: k.update(commit_hil='6' * 40) or k['khoa_truoc'].update(commit_hil='6' * 40),
+              'is not commit_hil 666666'),
+             (lambda k: k['khoa_truoc'].update(commit_hil='6' * 40), 'khoa_truoc.commit_hil'))
+    for i, (edit, msg) in enumerate(cases):
+        d, goc = build_c8(tmp_path / f'b{i}')
+        _rewrite_khoa(goc, d, edit)
+        with pytest.raises(GC.GateFileError, match=msg):
+            GC.check_nguon(d, goc)
+    # giu_tick: the tick part kept, no commit asked
+    d, goc = build_c8(tmp_path / 'c')
+    _rewrite_khoa(goc, d, lambda k: k.update(nhanh_tick='giu_tick', commit_hil=None))
+    d['u_t_branch'] = 'giu_tick'
+    GC._check_commit_hil(json.load(open(os.path.join(goc, d['khoa_c8b']['duong_dan']), encoding='utf-8')), {'7' * 40})

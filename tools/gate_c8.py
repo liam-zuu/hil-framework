@@ -2187,6 +2187,27 @@ def _check_a6(d: dict, goc: str, khoa: dict) -> str:
     return want
 
 
+def _check_commit_hil(khoa: dict, scorers: set) -> None:
+    """CODE 23/11 (chot T12 khoa C8B section 3; O1 v11.34 Q4, Liam 17/11 "Code qua Codex, SHA ghi truoc"): the tick
+    part is dropped (nhanh_tick bo_tick) only with the commit of the time and grid scoring written in the C8b lock
+    before the scoring: commit_hil (40 hex) at the top of the lock (and the same in khoa_truoc when it states one);
+    every scored luoi.json was made by that commit (scorer.commit). giu_tick: nothing to check."""
+    if khoa.get('nhanh_tick') != 'bo_tick':
+        return
+    ch = khoa.get('commit_hil')
+    if not isinstance(ch, str) or not re.fullmatch(r'[0-9a-f]{40}', ch):
+        raise GateFileError(f'khoa_c8b: nhanh_tick bo_tick with commit_hil {ch!r}; the tick part is dropped only with the '
+                            'scoring commit (40 hex) written in the lock before the scoring (O1 Q4; CODE 23/11): C8 is '
+                            'not locked')
+    kt = khoa.get('khoa_truoc') if isinstance(khoa.get('khoa_truoc'), dict) else {}
+    if 'commit_hil' in kt and kt['commit_hil'] != ch:
+        raise GateFileError(f'khoa_c8b: khoa_truoc.commit_hil {kt["commit_hil"]!r} differs from commit_hil {ch!r}')
+    bad = sorted(str(c) for c in scorers if c != ch)
+    if bad:
+        raise GateFileError(f'luoi.json scorer commit {bad} is not commit_hil {ch[:12]}... of the C8b lock (bo_tick: '
+                            'every grid scored by the commit written before the scoring; O1 Q4, CODE 23/11)')
+
+
 def _check_bang_chung(d: dict, goc: str, scorers: set) -> None:
     """The four evidence files of the U standard (CODE_C8B design v7 section 0, D1-D4; signature agreed with C8B
     19/11): D1 (locked before the held-out part) and D4 (rule 2b masks only G2, G3, G5 at 8) are the C8b lock itself
@@ -2305,6 +2326,7 @@ def check_nguon(d: dict, goc: str) -> dict:
         raise GateFileError(f'chuan_u.ho_so_c8: bang_chung {bc!r} must list exactly the four evidence SHAs {want!r}')
     if hs.get('ke_hoach_c8_sha256') != d['ke_hoach_c8']['sha256'] or hs.get('khoa_c8b_sha256') != d['khoa_c8b']['sha256']:
         raise GateFileError('chuan_u.ho_so_c8: ke_hoach_c8_sha256 / khoa_c8b_sha256 are not the plan / C8b lock of the gate')
+    _check_commit_hil(khoa, scorers)
     _check_bang_chung(d, goc, scorers)
     cl = hs.get('cham_luc')                       # F17, GC6-1: the time of the first scoring of every C8 run
     if not isinstance(cl, dict) or set(cl) != set(cham_luc) \
