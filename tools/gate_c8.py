@@ -140,6 +140,15 @@ class GateFileError(ValueError):
     pass
 
 
+class CanLiamChon(GateFileError):
+    """CAN LIAM QUYET at a bien_nguong Uhat (J section 0b): ghep stops; .phieu is the decision sheet (phieu_chon_v1)
+    with both choices of every open case, written by main beside --out (CODE 24/11)."""
+
+    def __init__(self, msg: str, phieu: dict):
+        super().__init__(msg)
+        self.phieu = phieu
+
+
 # ── small readers ──────────────────────────────────────────────────────────────────────────────────────────────
 
 def _num(x, what: str, positive: bool = False) -> float:
@@ -682,16 +691,22 @@ def _level_terms(e: dict, w: str) -> dict:
     return dict(a_m=a_m, u_p=u_p, u_psi=u_psi)
 
 
-def level_block(level: str, a_m: float, u_p: dict, u_psi: dict, runs: list, quyet: Optional[dict] = None) -> dict:
-    """The dieu_2b.per_level block of a gate level for the writer (C8b script): a_m (m), u_p {hang_m, he_so_r,
-    u_phi_rad, hang_theo_u}, u_psi {hang_rad, hang_theo_u} (null for a term without a checked bound), runs the
-    eligible C8 runs of the level (runs_c8 entries, u_t_s each); U_t,C8, Uhat and the mask computed here."""
-    e = dict(a_m=a_m, u_p=u_p, u_psi=u_psi)
-    t = _level_terms(e, level)
+def level_uhat(level: str, a_m: float, u_p: dict, u_psi: dict, runs: list) -> Tuple[float, Dict[str, dict]]:
+    """(U_t,C8, Uhat of G2, G3, G5) of a gate level from its terms and its eligible C8 runs (level_block)."""
+    t = _level_terms(dict(a_m=a_m, u_p=u_p, u_psi=u_psi), level)
     if not runs:
         raise GateFileError(f'{level}: no eligible C8 run')
     u_t = max(_num(r['u_t_s'], f'{level} u_t_s', positive=True) for r in runs)
-    uh = uhat_level(level, t, u_t)
+    return u_t, uhat_level(level, t, u_t)
+
+
+def level_block(level: str, a_m: float, u_p: dict, u_psi: dict, runs: list, quyet: Optional[dict] = None,
+                uh: Optional[Tuple[float, Dict[str, dict]]] = None) -> dict:
+    """The dieu_2b.per_level block of a gate level for the writer (C8b script): a_m (m), u_p {hang_m, he_so_r,
+    u_phi_rad, hang_theo_u}, u_psi {hang_rad, hang_theo_u} (null for a term without a checked bound), runs the
+    eligible C8 runs of the level (runs_c8 entries, u_t_s each); U_t,C8, Uhat and the mask computed here (uh: the
+    result of level_uhat on the same inputs, not computed again)."""
+    u_t, uh = uh if uh is not None else level_uhat(level, a_m, u_p, u_psi, runs)
     sd, why = so_do_of(level, uh, quyet)
     return dict(a_m=a_m, u_p=u_p, u_psi=u_psi, u_t_c8_s=u_t, uhat=uh, so_do=list(sd), ly_do_so_do=why)
 
@@ -2912,6 +2927,54 @@ def _man_trap_rel(goc: str, v):
     return v
 
 
+def _terms_plain(x):
+    """u_p / u_psi of a level for the decision sheet (no parsed bands)."""
+    return {k: v for k, v in x.items() if not k.startswith('_')}
+
+
+def _json_plain(o):
+    """NaN / inf as null for a JSON file."""
+    if isinstance(o, dict):
+        return {k: _json_plain(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_json_plain(v) for v in o]
+    if isinstance(o, float) and not math.isfinite(o):
+        return None
+    return o
+
+
+def phieu_chon(open_cases: list) -> dict:
+    """The decision sheet (phieu_chon_v1, CODE 24/11: Liam chooses once, never the tool) of the bien_nguong cases:
+    per case the level, the condition, its inputs (a_m, u_p, u_psi, U_t,C8 and the u_t_s of the eligible runs), the
+    Uhat block (uhat null: not told within the budget; uhat_duoi the lower bound), the threshold and its half with the
+    strict comparison of rule 2b, and both choices with the so_do of the level each gives."""
+    ca = []
+    for x in open_cases:
+        lv, c, uh = x['muc'], x['dieu_kien'], x['uhat']
+        thr = o1_gate.THRESHOLDS[c]
+        opts = {}
+        for chon in ('so_do', 'quyet'):
+            q = dict(x['quyet_khac'])
+            q[c] = dict(chon=chon)
+            for o in x['mo_khac']:                     # the other open cases of the level: taken as 'quyet' here
+                q.setdefault(o, dict(chon='quyet'))
+            opts[chon] = dict(so_do_muc=list(so_do_of(lv, uh, q)[0]),
+                              nghia=('quyết bằng số đo q, chưa cộng U (khong_dat khi q > ngưỡng)' if chon == 'so_do'
+                                     else 'ba nhánh có U (đạt khi cận trên ≤ ngưỡng, không đạt khi cận dưới > ngưỡng, '
+                                          'còn lại chưa kết luận)'))
+        ca.append(dict(muc=lv, dieu_kien=c, nguong=thr, nua_nguong=0.5 * thr,
+                       so_sanh='Û > ½ ngưỡng (chặt) → so_do; Û ≤ ½ ngưỡng → quyet (thiết kế v6_C8 mục 4, 5)',
+                       uhat=uh[c], u_t_c8_s=x['u_t'],
+                       dau_vao=dict(a_m=x['a_m'], u_p=_terms_plain(x['u_p']), u_psi=_terms_plain(x['u_psi']),
+                                    luot=[dict(run_id=r.get('run_id'), u_t_s=r['u_t_s']) for r in x['runs']]),
+                       mo_khac_cung_muc=x['mo_khac'], lua_chon=opts))
+    return dict(format='phieu_chon_v1', ly_do=('Û không tách được khỏi ½ ngưỡng trong ngân sách tính (bien_nguong): '
+                                               'J v6 không quyết mặt nạ, C8 chưa khóa; CAN LIAM QUYET (J mục 0b)'),
+                cach_ghi=('file --liam của ghep: quyet_liam.<muc>.<dieu_kien> = {chon: so_do | quyet, ngay, phien, '
+                          'nguyen_van}, rồi chạy lại ghep'),
+                ca=ca)
+
+
 def ghep_va_ghi(out: str, goc: str, *args, **kw) -> str:
     """ghep then write_gate; the dossier ghep wrote in this call is taken back when the gate is refused (GC9-8)."""
     p = os.path.join(goc, args[6] if len(args) > 6 else kw['ho_so'])
@@ -3104,7 +3167,7 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
     loai = {k: evidence_of(runs[k])['loai'] for k in kt}
     levels = [k for k in kt if not loai[k] and k not in bo]
     muc = khoa.get('muc') or {}
-    per = {}
+    per, terms = {}, {}
     for lv in levels:
         hd, bands = (muc.get(lv) or {}).get('hang_dong'), (muc.get(lv) or {}).get('hang_theo_u')
         if not isinstance(hd, dict) or any(hd.get(q) is None for q in ('a_m', 'hang_m', 'he_so_r', 'u_phi_rad',
@@ -3114,7 +3177,25 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
         u_p = dict(hang_m=hd['hang_m'], he_so_r=hd['he_so_r'], u_phi_rad=hd['u_phi_rad'],
                    hang_theo_u=_band_list(bands, 'P4_m', float))
         u_psi = dict(hang_rad=hd['hang_rad'], hang_theo_u=_band_list(bands, 'A4_deg', math.radians))
-        per[lv] = level_block(lv, hd['a_m'], u_p, u_psi, runs[lv], ql.get(lv))
+        terms[lv] = (hd['a_m'], u_p, u_psi, level_uhat(lv, hd['a_m'], u_p, u_psi, runs[lv]))
+    # CODE 24/11: every bien_nguong without Liam's choice, of every level, on one decision sheet (both choices); no
+    # choice is made here
+    open_cases = []
+    for lv in levels:
+        a_m, u_p, u_psi, (u_t, uh) = terms[lv]
+        mo = [c for c in MASKABLE if uh[c]['trang_thai'] == 'bien_nguong' and not (lv == G5_F08 and c == 'g5')
+              and (ql.get(lv) or {}).get(c) is None]
+        for c in mo:
+            open_cases.append(dict(muc=lv, dieu_kien=c, uhat=uh, u_t=u_t, a_m=a_m, u_p=u_p, u_psi=u_psi,
+                                   runs=runs[lv], quyet_khac=dict(ql.get(lv) or {}),
+                                   mo_khac=[o for o in mo if o != c]))
+    if open_cases:
+        raise CanLiamChon(f'ghep: {len(open_cases)} Uhat cannot be told from half the threshold within the budget '
+                          f'({", ".join(x["muc"] + " " + x["dieu_kien"] for x in open_cases)}): C8 is not locked; CAN '
+                          'LIAM QUYET (J section 0b); both choices on the decision sheet', phieu_chon(open_cases))
+    for lv in levels:
+        a_m, u_p, u_psi, uhu = terms[lv]
+        per[lv] = level_block(lv, a_m, u_p, u_psi, runs[lv], ql.get(lv), uh=uhu)
     # the U standard and its dossier
     bc_refs = {k: kho.ref(p) for k, p in bang_chung.items()}
     rec = kcj.get('khoa_s7') if isinstance(kcj.get('khoa_s7'), dict) else {}
@@ -3256,8 +3337,18 @@ def main(argv=None) -> int:
             keys = ('muc_bo_theo_liam', 'quyet_liam', 'o_hong_theo_liam')
             if not isinstance(liam, dict) or not set(liam) <= set(keys):
                 raise GateFileError(f'--liam {a.liam}: a JSON object with keys among {list(keys)}')
-        sha = ghep_va_ghi(a.out, a.goc, a.ke_hoach, a.thu_tu_clip, a.khoa_c8b, a.tien_de, a.kiem_cheo, bc, a.ho_so,
-                          liam.get('muc_bo_theo_liam'), liam.get('quyet_liam'), liam.get('o_hong_theo_liam'))
+        try:
+            sha = ghep_va_ghi(a.out, a.goc, a.ke_hoach, a.thu_tu_clip, a.khoa_c8b, a.tien_de, a.kiem_cheo, bc,
+                              a.ho_so, liam.get('muc_bo_theo_liam'), liam.get('quyet_liam'),
+                              liam.get('o_hong_theo_liam'))
+        except CanLiamChon as exc:
+            # CODE 24/11: the decision sheet beside --out (never replaced), no gate file; exit 3
+            sp = os.path.splitext(a.out)[0] + '_phieu_chon.json'
+            with open(sp, 'x', encoding='utf-8', newline='\n') as f:
+                f.write(json.dumps(_json_plain(exc.phieu), indent=1, ensure_ascii=False) + '\n')
+            print(f'gate_c8: {exc}', file=sys.stderr)
+            print('phieu_chon', sp, sha256_file(sp))
+            return 3
         print('gate_c8_v2', a.out, sha)
     except (OSError, ValueError, GateFileError) as exc:
         print(f'gate_c8: {exc}', file=sys.stderr)

@@ -2979,3 +2979,41 @@ def test_code_23_11_grid_so_do_state_from_its_numbers(tmp_path):
         with pytest.raises(GC.GateFileError, match=msg):
             GC.check_nguon(d, goc)
     assert cell['muc'] == 'O1-F08'
+
+
+def test_code_24_11_ghep_writes_both_choices_of_a_boundary_case(tmp_path, monkeypatch):
+    """CODE 24/11: a bien_nguong Uhat without Liam's choice (here G5 at F02): ghep stops, no gate file; the decision
+    sheet beside --out holds both choices (inputs, Uhat, U_t,C8, half the threshold, the strict '>') and the so_do of
+    the level each gives; with Liam's choice in --liam the gate is written with it."""
+    real = GC.uhat_level
+
+    def edge(level, blk, u_t, budget=GC.BUDGET):
+        out = real(level, blk, u_t, budget)
+        if level == 'O1-F02':
+            out['g5'] = dict(uhat=None, uhat_duoi=3.6, delta_cuoi_s=GC.DELTA0_S, so_lan_tinh=7, trang_thai='bien_nguong')
+        return out
+    d, goc = build_c8(tmp_path)
+    monkeypatch.setattr(GC, 'uhat_level', edge)                      # after the fixture: only ghep and its check
+    out = str(tmp_path / 'gate.json')
+    args = ['ghep', '--goc', goc, '--ke-hoach', 'ke_hoach_c8.json', '--thu-tu-clip', 'thu_tu_clip.csv',
+            '--khoa-c8b', 'c8b_khoa_v5.json', '--tien-de', 'tien_de_c8.json', '--kiem-cheo', 'kiem_cheo.json',
+            '--ho-so', 'chuan_u/ho_so_cli.json', '--out', out] + \
+        sum((['--bang-chung', f'{k}={p}'] for k, p in BANG_CHUNG.items()), [])
+    assert GC.main(args) == 3
+    assert not os.path.exists(out) and not os.path.exists(os.path.join(goc, 'chuan_u/ho_so_cli.json'))
+    ph = json.load(open(str(tmp_path / 'gate_phieu_chon.json'), encoding='utf-8'))
+    assert ph['format'] == 'phieu_chon_v1' and len(ph['ca']) == 1
+    ca = ph['ca'][0]
+    assert (ca['muc'], ca['dieu_kien'], ca['nguong'], ca['nua_nguong']) == ('O1-F02', 'g5', 7.5, 3.75)
+    assert ca['uhat']['trang_thai'] == 'bien_nguong' and ca['uhat']['uhat_duoi'] == 3.6 and 'chặt' in ca['so_sanh']
+    assert ca['u_t_c8_s'] > 0 and ca['dau_vao']['luot'] and set(ca['dau_vao']) == {'a_m', 'u_p', 'u_psi', 'luot'}
+    sd, q = ca['lua_chon']['so_do']['so_do_muc'], ca['lua_chon']['quyet']['so_do_muc']
+    assert 'g5' in sd and 'g5' not in q and set(sd) - {'g5'} == set(q)
+    assert GC.main(args) == 1                                         # the sheet is never replaced
+    os.remove(str(tmp_path / 'gate_phieu_chon.json'))
+    lp = str(tmp_path / 'liam.json')
+    json.dump(dict(quyet_liam={'O1-F02': {'g5': dict(chon='so_do', ngay='2026-11-24', phien='local_x',
+                                                     nguyen_van='FAKE')}}), open(lp, 'w', encoding='utf-8'))
+    assert GC.main(args + ['--liam', lp]) == 0
+    gf = GC.read_gate_c8(out)
+    assert 'g5' in gf.so_do('O1-F02') and gf.data['dieu_2b']['per_level']['O1-F02']['ly_do_so_do']['g5'] == ['quyet_liam']
