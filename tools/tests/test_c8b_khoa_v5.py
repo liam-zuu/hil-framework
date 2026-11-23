@@ -686,6 +686,9 @@ def test_u_phi_dau_doan_no_double_count(monkeypatch):
     ub = k['u_beta_cam_deg']['goc']
     assert ub == pytest.approx(1.25 * math.degrees(0.004 + 2e-4 + 1e-3 + 5e-4), rel=1e-12)
     assert k['u_beta_cam_gia_dinh']['a6du_cach']['goc']['loai_ref'] == 'dau_doan'
+    # one rule for every place: K1, K2 have no leg-start windows here -> no number (no fallback to the old bounds)
+    assert k['u_beta_cam_deg']['K1'] is None and k['u_beta_cam_deg']['K2'] is None
+    assert sum('luat dau_doan' in w for w in k['u_beta_cam_ly_do']) == 2
     m = k['muc']['O1-F05']
     assert m['hang_dong_thanh_phan']['u_phi_cach'] == 'u_a_noi_bo + dau_doan'
     assert m['hang_dong']['u_phi_rad'] == pytest.approx(1.25 * math.radians(0.36 + K.U_BETA_LECH_TAM_DEG)

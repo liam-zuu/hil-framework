@@ -785,11 +785,17 @@ def u_beta_cam(lan_lap, kiem_cheo=None, a6=None, side=None, tham_chieu=None, dau
         kcs = [k for k in (kiem_cheo or []) if isinstance(k, dict)]
         du, _ = _a6du_of(a6, side)
         out, st, why, cach = {}, {}, [], {}
+        # one rule for every place: once a place is taken on the leg-start windows of F7 (dau_doan), a place without
+        # them (no F7 given, or F7 without dau_doan) has no number; the bounds of the earlier rule (reference window,
+        # edge of the domain) do not bound the leg-start quantity
+        moi = any(isinstance(d, dict) and d.get('dau_doan') for d in (dau_chan or {}).values())
         for c in CHO:
             a3, w3 = _a3_hai_dau_rad(kcs, c)
             tcs = [t for t in ((tham_chieu or {}).get(c) or []) if isinstance(t, dict)]
             tan = [_num(t.get('psi_tan_rad')) for t in tcs]
             dc = (dau_chan or {}).get(c)
+            if moi and not (isinstance(dc, dict) and (dc.get('dau_doan') or dc.get('thieu'))):
+                dc = dict(thieu='khong co F7 khoa voi dau_doan cho cho nay (luat dau_doan dang dung o cho khac)')
             if isinstance(dc, dict) and dc.get('thieu'):
                 # HIEUCHUAN HCL2-6/7 (23/11): an F7 that is not 'khoa' gives no usable dau_doan / u_a_noi_bo, and
                 # the bounds of the earlier rule are no bound of the leg-start quantity: no number at this place
