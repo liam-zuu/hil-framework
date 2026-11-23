@@ -2187,11 +2187,13 @@ def _check_a6(d: dict, goc: str, khoa: dict) -> str:
     return want
 
 
-def _check_commit_hil(khoa: dict, scorers: set) -> None:
-    """CODE 23/11 (chot T12 khoa C8B section 3; O1 v11.34 Q4, Liam 17/11 "Code qua Codex, SHA ghi truoc"): the tick
-    part is dropped (nhanh_tick bo_tick) only with the commit of the time and grid scoring written in the C8b lock
-    before the scoring: commit_hil (40 hex) at the top of the lock (and the same in khoa_truoc when it states one);
-    every scored luoi.json was made by that commit (scorer.commit). giu_tick: nothing to check."""
+def _check_commit_hil(d: dict, goc: str, khoa: dict, scorers: set) -> None:
+    """CODE 23/11 (chot T12 khoa C8B section 3; O1 v11.34 Q4, Liam 17/11 "Code qua Codex, SHA ghi truoc": the script
+    of the time match and the grid scoring, c8b_gio and c8b_luoi): the tick part is dropped (nhanh_tick bo_tick) only
+    with the commit written in the C8b lock before the scoring: commit_hil (40 hex) at the top of the lock (and the
+    same in khoa_truoc when it states one). Every luoi.json of C8 (cells and K runs) has scorer.commit (c7_score) and
+    script {commit, dirty false} (c8b_luoi) = commit_hil, and so has the final time file of every scoring (c8b_gio,
+    the one luoi.json names by gio_sha256; the preliminary T5 file is not asked). giu_tick: nothing to check."""
     if khoa.get('nhanh_tick') != 'bo_tick':
         return
     ch = khoa.get('commit_hil')
@@ -2206,6 +2208,43 @@ def _check_commit_hil(khoa: dict, scorers: set) -> None:
     if bad:
         raise GateFileError(f'luoi.json scorer commit {bad} is not commit_hil {ch[:12]}... of the C8b lock (bo_tick: '
                             'every grid scored by the commit written before the scoring; O1 Q4, CODE 23/11)')
+    grids, gios, want_gio = [], [], set()
+    for c in d['o_c8']:
+        for x in c['chuoi']:
+            grids += [(f'cell {c["o"]} run {x["run_id"]}: {k}', x[k]) for k in ('file_cham', 'file_cham_h1') if x[k]]
+            gios += [(f'cell {c["o"]} run {x["run_id"]}: {k}', x[k]) for k in ('file_gio', 'file_gio_h1') if x[k]]
+    for x in d['luot_k']:
+        for k in ('file_cham', 'file_cham_h1'):
+            if x[k]:
+                grids.append((f'K run {x["run_id"]}: {k}', x[k]))
+                g = _open_ref(goc, x[k], f'K run {x["run_id"]}: {k}').get('gio_sha256')
+                if g is not None:
+                    want_gio.add(g)
+    found = {}
+    if want_gio:                                         # the time files of the K runs, found by sha256 (c8b_gio_v1)
+        base = os.path.realpath(goc)
+        for f in sorted({_folder_of(t) for t in d['thu_tu_clip']}):
+            for root, dirs, names in os.walk(os.path.join(base, f)):
+                dirs[:] = sorted(dirs)
+                for n in sorted(names):
+                    q = os.path.join(root, n)
+                    if not n.lower().endswith('.json') or os.path.getsize(q) > INDEX_MAX_BYTES:
+                        continue
+                    h = sha256_file(q)
+                    if h in want_gio and h not in found:
+                        found[h] = dict(duong_dan=os.path.relpath(q, base).replace(os.sep, '/'), sha256=h)
+        miss = sorted(want_gio - set(found))
+        if miss:
+            raise GateFileError(f'the time file(s) {[m[:12] for m in miss]} the K runs\' luoi.json name (gio_sha256) are in '
+                                'no C8 session folder: their commit cannot be checked (bo_tick; CODE 23/11)')
+        gios += [(f'K run time file {h[:12]}...', r) for h, r in sorted(found.items())]
+    for tag, files in (('luoi.json script (c8b_luoi)', grids), ('time file script (c8b_gio)', gios)):
+        for w, ref in files:
+            sc = _open_ref(goc, ref, w).get('script')
+            if not isinstance(sc, dict) or sc.get('commit') != ch or sc.get('dirty') is not False:
+                raise GateFileError(f'{w}: {tag} {sc!r} is not commit_hil {ch[:12]}... with dirty false (bo_tick: the '
+                                    'time match and the grid scoring of the commit written before the scoring; O1 Q4, '
+                                    'CODE 23/11)')
 
 
 def _check_bang_chung(d: dict, goc: str, scorers: set) -> None:
@@ -2326,7 +2365,7 @@ def check_nguon(d: dict, goc: str) -> dict:
         raise GateFileError(f'chuan_u.ho_so_c8: bang_chung {bc!r} must list exactly the four evidence SHAs {want!r}')
     if hs.get('ke_hoach_c8_sha256') != d['ke_hoach_c8']['sha256'] or hs.get('khoa_c8b_sha256') != d['khoa_c8b']['sha256']:
         raise GateFileError('chuan_u.ho_so_c8: ke_hoach_c8_sha256 / khoa_c8b_sha256 are not the plan / C8b lock of the gate')
-    _check_commit_hil(khoa, scorers)
+    _check_commit_hil(d, goc, khoa, scorers)
     _check_bang_chung(d, goc, scorers)
     cl = hs.get('cham_luc')                       # F17, GC6-1: the time of the first scoring of every C8 run
     if not isinstance(cl, dict) or set(cl) != set(cham_luc) \

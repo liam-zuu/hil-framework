@@ -545,7 +545,8 @@ def _gio(rid, cell, h_s, tt_ref=None, ops=(), **kw):
              dem_truot_kiem_gio=False, h_s=h_s, sha256=dict(esp32=esp, frames=_h('frames ' + rid)),
              nguon=[dict(file='frames.csv', sha256=_h('frames ' + rid)), dict(file=rid.split('#')[0] + '.csv', sha256=esp)],
              thao_tac_nguon=None if tt_ref is None else dict(file='score_tt.json', sha256=tt_ref['sha256']),
-             nodes_s=[0.0, 0.001], cua_so_ghep_log_s=[1.0, 4.0])
+             nodes_s=[0.0, 0.001], cua_so_ghep_log_s=[1.0, 4.0],
+             script=dict(commit='5' * 40, dirty=False, luc_chay=LUC_CHAM))      # CODE 23/11: c8b_gio of commit_hil
     g.update(kw)
     return g
 
@@ -583,7 +584,7 @@ def _luoi(goc, rid, cell, fg, u_max, outcome='dat', clip=None, fg_obj=None, ops=
     x = dict(trang_thai_luot='hong_he_do' if lost else 'cham', outcome=outcome, task=cell['muc'],
              gio_sha256=None if fg is None else fg['sha256'], u_max_s=u_max, nodes_s=[0.0, 0.001], nguon_nut=nn,
              hong_nut=[lost, lost], clip=dict(ten=clip, clip_sha256=_h('clip ' + clip)),
-             script=dict(commit='c' * 40, dirty=False, luc_chay=LUC_CHAM), nodes_ok=[not lost, not lost],
+             script=dict(commit='5' * 40, dirty=False, luc_chay=LUC_CHAM), nodes_ok=[not lost, not lost],
              scorer=None if lost else dict(commit='5' * 40, dirty=False,
                                            nut=[dict(commit='5' * 40, dirty=False, luc_chay=LUC_CHAM)] * 2),
              u_t_nodes=[None, None] if lost else [u_max, u_max], report_only=['g5'] if cell['muc'] == 'O1-F08' else [],
@@ -2303,7 +2304,7 @@ def _add_k(goc, d, run_id='C8-P-K1-1', luc=LUC_CHAM):
     cell = dict(muc='O1-' + run_id.split('-')[2], controller='PID')
     rid = run_id.replace('-', '_')
     fk, _ = _luoi(goc, 'K_' + rid, cell, None, 0.005, clip='IMG_' + rid,
-                  script=dict(commit='c' * 40, dirty=False, luc_chay=luc))
+                  script=dict(commit='5' * 40, dirty=False, luc_chay=luc))
     d['luot_k'].append(dict(run_id=run_id, clip='IMG_' + rid, file_cham=fk, file_cham_h1=None))
     _write_csv(goc, d)
     runs = [x['run_id'] for c in d['o_c8'] for x in c['chuoi']] + [x['run_id'] for x in d['luot_k']]
@@ -2841,8 +2842,46 @@ def test_code_23_11_bo_tick_needs_the_scoring_commit_of_the_lock(tmp_path):
         _rewrite_khoa(goc, d, edit)
         with pytest.raises(GC.GateFileError, match=msg):
             GC.check_nguon(d, goc)
+    # the c8b_luoi and the final c8b_gio script of every scoring (CODE 23/11), clean
+    x0 = None
+    for key, edit, msg in (('file_cham', lambda y: y['script'].update(commit='6' * 40), 'luoi.json script'),
+                           ('file_cham', lambda y: y['script'].update(dirty=True), 'luoi.json script'),
+                           ('file_gio', lambda y: y['script'].update(commit='6' * 40), 'time file script'),
+                           ('file_gio', lambda y: y.pop('script'), 'time file script')):
+        d, goc = build_c8(tmp_path / f'e{len(os.listdir(tmp_path))}')
+        x0 = d['o_c8'][0]['chuoi'][0]
+        prev = x0['file_cham']['sha256']
+        _rewrite(goc, x0[key], edit)
+        _relink(goc, d, x0, old=prev)
+        with pytest.raises(GC.GateFileError, match=msg):
+            GC.check_nguon(d, goc)
+    # a K run: its final time file found by the sha256 its luoi.json names, its script checked too
+    d, goc = build_c8(tmp_path / 'k')
+    _add_k(goc, d)
+    GC.check_nguon(d, goc)
+    raw = open(os.path.join(goc, d['luot_k'][0]['file_cham']['duong_dan']), 'rb').read()
+    sha = d['luot_k'][0]['file_cham']['sha256']
+    _rewrite(goc, d['luot_k'][0]['file_cham'], lambda y: y['script'].update(commit='6' * 40))
+    with pytest.raises(GC.GateFileError, match='K run C8-P-K1-1: file_cham: luoi.json script'):
+        GC.check_nguon(d, goc)
+    with open(os.path.join(goc, d['luot_k'][0]['file_cham']['duong_dan']), 'wb') as f:
+        f.write(raw)
+    d['luot_k'][0]['file_cham']['sha256'] = sha
+    kcell = dict(muc='O1-K1', controller='PID')
+    for commit, msg in (('6' * 40, 'K run time file'), ('5' * 40, None)):
+        gk = _jw(goc, f'luot/K/gio_{commit[0]}.json', _gio('K_x', kcell, 0.005, script=dict(commit=commit, dirty=False)))
+        _rewrite(goc, d['luot_k'][0]['file_cham'], lambda y: y.update(gio_sha256=gk['sha256']))
+        if msg:
+            with pytest.raises(GC.GateFileError, match=msg):
+                GC.check_nguon(d, goc)
+        else:
+            GC.check_nguon(d, goc)
+    os.remove(os.path.join(goc, gk['duong_dan']))
+    with pytest.raises(GC.GateFileError, match='in no C8 session folder'):
+        GC.check_nguon(d, goc)
     # giu_tick: the tick part kept, no commit asked
     d, goc = build_c8(tmp_path / 'c')
     _rewrite_khoa(goc, d, lambda k: k.update(nhanh_tick='giu_tick', commit_hil=None))
     d['u_t_branch'] = 'giu_tick'
-    GC._check_commit_hil(json.load(open(os.path.join(goc, d['khoa_c8b']['duong_dan']), encoding='utf-8')), {'7' * 40})
+    GC._check_commit_hil(d, goc, json.load(open(os.path.join(goc, d['khoa_c8b']['duong_dan']), encoding='utf-8')),
+                         {'7' * 40})
