@@ -129,7 +129,17 @@ def doc_xoay(src, cho=None):
     return out
 
 
-def doc_xoay_cung_lan_lap(src, cho, cho_q=None, ll_id=None, ll_id_q=None):
+# F8 rong (CODE 23/11, 03_CODE/docs/2026-11-23_Chot_T12_khoa_C8B_v1.md muc 4, goc 934301af; Chot F8 rong muc 1; Liam 23/11
+# at CODE "Dung mot lan lap (Recommended)", "Cach A (Recommended)"): an F8 that passed its identity checks
+# (c7_tuong_doi.f8_rong) but gives no run a lan_lap_id -> q of xoay_v1 of the place (K2, no E turn: the place of
+# F8_RONG_Q_TU, the one c8_hc_a of HIEUCHUAN borrows from, --q-tu F5 HC_K1_1 in chay_T9b.sh of 97823b4), u_q raised by
+# the plate shift bound of session 1 (lift, put back: position 0.57 mm, P3; CAM f126d362), labelled F8_RONG_NHAN.
+F8_RONG_NHAN = 'can_lech_tam_buoi1_chua_xac_minh_lan_lap'
+U_LECH_TAM_BUOI1_M = 0.00057
+F8_RONG_Q_TU = {'K2': 'K1'}
+
+
+def doc_xoay_cung_lan_lap(src, cho, cho_q=None, ll_id=None, ll_id_q=None, f8_rong=False):
     """doc_xoay of the place cho; a place WITHOUT its own block in a per-place xoay_v1 (K2: no E turn there) takes,
     CODE 22/11 option (A) (contract C8 section 3, "F4 cho K2"), the block of the place cho_q WITH E on the SAME
     mounting of the plate: q is the tag centre seen from the turning centre, fixed while the plate is not taken off.
@@ -137,7 +147,9 @@ def doc_xoay_cung_lan_lap(src, cho, cho_q=None, ll_id=None, ll_id_q=None):
     from F8 run 1, non-empty strings. Another mounting, an id missing (not verified) or no cho_q: no q (ok False,
     ly_do says why), so u_q is missing and the place is chua_ket_luan. A place WITH its own block always uses it
     (cho_q ignored). Returns the doc_xoay dict plus nguon_q {cho, lan_lap_id, cach} when a q is taken; cho_q = cho:
-    ValueError."""
+    ValueError. f8_rong (F8 rong, the caller checked c7_tuong_doi.f8_rong): the mounting is not compared by ids (the
+    F8 gives none) but taken as one mounting (F8_RONG_NHAN); two non-empty ids that differ are still refused; u_q is
+    raised by q_luot, not here."""
     xo = doc_xoay(src, cho)
     raw = xo.get('raw')
     per_place = isinstance(raw, dict) and isinstance(raw.get('cho'), dict)
@@ -149,17 +161,20 @@ def doc_xoay_cung_lan_lap(src, cho, cho_q=None, ll_id=None, ll_id_q=None):
         return xo                                              # xoay_thieu_cho_<cho>, as before
     if cho_q == cho:
         raise ValueError(f'cho_q {cho_q!r} is the place itself')
-    if not (isinstance(ll_id, str) and ll_id and isinstance(ll_id_q, str) and ll_id_q):
-        xo['ly_do'] = f'chua_xac_minh_cung_lan_lap_{cho_q} (lan_lap_id {cho} {ll_id!r}, {cho_q} {ll_id_q!r})'
-        return xo
-    if ll_id != ll_id_q:
+    s = lambda v: isinstance(v, str) and bool(v)                  # noqa: E731
+    if s(ll_id) and s(ll_id_q) and ll_id != ll_id_q:
         xo['ly_do'] = f'khac_lan_lap_{cho_q} (lan_lap_id {cho} {ll_id!r}, {cho_q} {ll_id_q!r})'
+        return xo
+    if not f8_rong and not (s(ll_id) and s(ll_id_q)):
+        xo['ly_do'] = f'chua_xac_minh_cung_lan_lap_{cho_q} (lan_lap_id {cho} {ll_id!r}, {cho_q} {ll_id_q!r})'
         return xo
     xq = doc_xoay(src, cho_q)
     if xq['q'] is None or not xq['ok']:
         xo['ly_do'] = f'cho_{cho_q}_cung_lan_lap:{xq["ly_do"]}'
         return xo
-    xq['nguon_q'] = dict(cho=cho_q, lan_lap_id=ll_id, cach='khoi F4 cua cho co E cung lan lap tam (CODE 22/11 A)')
+    xq['nguon_q'] = (dict(cho=cho_q, lan_lap_id=None, nhan=F8_RONG_NHAN,
+                          cach='khoi F4 cua cho co E, F8 rong: mot lan lap (CODE 23/11 chot T12 muc 4)') if f8_rong
+                     else dict(cho=cho_q, lan_lap_id=ll_id, cach='khoi F4 cua cho co E cung lan lap tam (CODE 22/11 A)'))
     return xq
 
 
@@ -190,9 +205,12 @@ def doc_lan_lap(src, luot_id=None):
         for k in LAN_LAP_FILE_KEYS:
             if k not in rec and k in d:
                 rec[k] = d[k]
+        # F8 rong (CODE 23/11, Chot_T12 muc 4 cach A; Chot_F8_rong muc 1b): no run of the FILE has a lan_lap_id
+        rec['_moi_lan_lap_id_null'] = bool(runs) and all(r.get('lan_lap_id') is None for r in runs)
         d = rec
     else:
         d = dict(d)
+        d['_moi_lan_lap_id_null'] = d.get('lan_lap_id') is None
     d['_path'], d['_sha256'] = path, sha
     return d
 
@@ -202,14 +220,16 @@ def _trang_thai(d, key):
     return tt.get(key) if isinstance(tt, dict) else None
 
 
-def q_luot(xoay, lan_lap, cho=None, a6_sha256=None, truc_xe=None, u_psi_w_rad=None):
+def q_luot(xoay, lan_lap, cho=None, a6_sha256=None, truc_xe=None, u_psi_w_rad=None, f8_rong_ok=False):
     """(q [x, y] or None, u_q [m] or None, ly_do) of the run. Same mounting as the E clip (lan_lap absent: the
     calibration clips of the same session, 12b / E; or cung_lan_lap true): q of xoay_v1. Another mounting: the q
     composed by CODE_C8B, c8b_xoay.ghep_q(lan_lap, cho, xoay_v1, truc_xe, u_psi_w_rad) -> {q_m, u_q_m, trang_thai,
     ly_do} (contract F16, signature of hil 6866824: q_m = R(-theta_luot) (R(theta_chuan) q_tag + delta_c_B), before
     the margin; u_psi_w_rad: noise of the mean tag heading over the run window, given by the caller); not 'dat', not importable or no place: no q (the
     position through q is not concluded). a6_sha256 (the A6 file used for psi'): q was fitted on psi' after ONE A6
-    (xoay_v1 a6_sha256, contract F4); missing there or another A6: no q (Codex CT1-3)."""
+    (xoay_v1 a6_sha256, contract F4); missing there or another A6: no q (Codex CT1-3). f8_rong_ok (F8 rong, checked by
+    the caller with c7_tuong_doi.f8_rong): q of xoay_v1 as for one mounting, u_q + U_LECH_TAM_BUOI1_M, reason
+    F8_RONG_NHAN (CODE 23/11 chot T12 muc 4)."""
     if not xoay['ok']:
         return None, None, xoay['ly_do']
     if a6_sha256 is not None:
@@ -219,6 +239,8 @@ def q_luot(xoay, lan_lap, cho=None, a6_sha256=None, truc_xe=None, u_psi_w_rad=No
             return None, None, 'xoay_a6_khac_a6_dang_dung'
     if lan_lap is None or lan_lap.get('cung_lan_lap') is True:
         return list(xoay['q']), float(xoay['u_q']), ('khong_kiem_lan_lap' if lan_lap is None else '')
+    if f8_rong_ok:
+        return list(xoay['q']), float(xoay['u_q']) + U_LECH_TAM_BUOI1_M, F8_RONG_NHAN
     if _trang_thai(lan_lap, 'delta_c_B') != 'dat':
         return None, None, 'thieu_delta_c_B'
     if cho is None:
@@ -296,16 +318,21 @@ def tam_cua_luot(lan_lap, tam_id=None):
 
 
 def chuoi_khung(frames_csv, a6, xoay, lan_lap=None, plumb=PLUMB_16_11, zc=ZC_16_11, track=None, cho=None,
-                truc_xe=None, u_psi_w_rad=None, tam_id=None, cho_q=None, ll_id=None, ll_id_q=None):
+                truc_xe=None, u_psi_w_rad=None, tam_id=None, cho_q=None, ll_id=None, ll_id_q=None, f8_rong_ok=False):
     """Rows (dicts with ROW_KEYS) of every frame of frames.csv (module docstring). a6: doc_a6(...) or None; xoay: path,
     dict or doc_xoay(...) result; lan_lap: path, dict or doc_lan_lap(...) result, or None (calibration clips of the
     session of E: same mounting); cho: place k of the run (goc, K1, K2) for the C8B q composition of another
     mounting; truc_xe (truc_xe_v1 dict) and u_psi_w_rad: passed to the C8B q composition of another mounting; tam_id:
     the plate on the car, used for the A6 plate check when lan_lap is None or has no tam_id (tam_cua_luot); cho_q,
     ll_id, ll_id_q: a place without its own F4 block (K2) takes the block of cho_q on the same mounting
-    (doc_xoay_cung_lan_lap, CODE 22/11 option A). Angles in rad, positions in m."""
+    (doc_xoay_cung_lan_lap, CODE 22/11 option A). f8_rong_ok (F8 rong, the caller checked c7_tuong_doi.f8_rong; CODE
+    23/11 chot T12 muc 4): q as for one mounting with u_q + U_LECH_TAM_BUOI1_M (q_luot); K2 without cho_q borrows from
+    F8_RONG_Q_TU. Angles in rad, positions in m."""
     rows, fpath = _frames(frames_csv)
-    xo = xoay if (isinstance(xoay, dict) and 'ok' in xoay and 'q' in xoay) else         doc_xoay_cung_lan_lap(xoay, cho, cho_q, ll_id, ll_id_q)     # cho_q None: doc_xoay(xoay, cho) as before
+    if f8_rong_ok and cho_q is None:
+        cho_q = F8_RONG_Q_TU.get(cho)
+    xo = xoay if (isinstance(xoay, dict) and 'ok' in xoay and 'q' in xoay) else \
+        doc_xoay_cung_lan_lap(xoay, cho, cho_q, ll_id, ll_id_q, f8_rong=f8_rong_ok)   # cho_q None: doc_xoay as before
     ll = lan_lap if (lan_lap is None or '_sha256' in lan_lap) else doc_lan_lap(lan_lap)
     src = _tag_heading_source(rows, fpath, track)
     n = len(rows)
@@ -340,7 +367,7 @@ def chuoi_khung(frames_csv, a6, xoay, lan_lap=None, plumb=PLUMB_16_11, zc=ZC_16_
                     if not a6ok[k]:
                         why_a6[k] = f'a6_khung:{why[j]}'
     psi_p = np.where(a6ok, tp - np.nan_to_num(dps), np.nan)
-    q, uq, why_q = q_luot(xo, ll, cho, None if a6 is None else a6['sha256'], truc_xe, u_psi_w_rad)
+    q, uq, why_q = q_luot(xo, ll, cho, None if a6 is None else a6['sha256'], truc_xe, u_psi_w_rad, f8_rong_ok)
     if q is not None:
         c, s = np.cos(psi_p), np.sin(psi_p)
         px = tx - (c * q[0] - s * q[1])

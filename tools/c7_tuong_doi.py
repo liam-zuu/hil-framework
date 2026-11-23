@@ -502,9 +502,53 @@ def rang_buoc_12b(truc_xe, lan_lap, k):
     return why
 
 
-def phi_beta(task, truc_xe, lan_lap, tc, u_beta_cam_deg=None):
+# F8 rong (Liam 23/11, phien CODE local_483c9ce2, hop chon "phi buoi 2", nguyen van: "Cach A (Recommended)"; CODE
+# 03_CODE/docs/2026-11-23_Chot_T12_khoa_C8B_v1.md muc 4, goc 5a7d428b): an F8 that passed its identity checks but gives
+# no lan_lap_id to any run (NHACTAM stopped the beta path for session 2) -> beta = 0, u_beta = the plate heading shift
+# bound of session 1 (lift and put back, A2: 05_DATA/results/C8/2026-11-18_run01/C2/do_05b994c/c8_phan_nhac_tam.json
+# goc_deg), plate unchanged in the run (one mounting assumed: Liam 23/11 at CODE "Chua thao, con nguyen"); labelled
+# F8_RONG_NHAN. beta: CODE erratum 23/11 (goc 77991725), not 0: the body turn from the 12b window to W, = the tag turn
+# (phi_beta). u_beta_cam is still read from the C8B lock (C8B computes it: camera bound of the tag-yaw difference).
+F8_RONG_NHAN = ck.F8_RONG_NHAN
+U_BETA_F8_RONG_DEG = 0.234
+F8_RONG_GIA_DINH = ('mot lan lap tam (khong thao tam giua cac luot): beta = wrap(psi_tc - psi_chuan_k) (than xoay bang '
+                    'ma xoay), u_beta = can lech tam buoi 1 (A2)')
+
+
+def f8_rong(lan_lap, a6_sha256, co_ref_12b, truc_xe=None):
+    """(True, []) when lan_lap (doc_lan_lap of THIS run, bound to the window file by c7_score.bind_lan_lap) is the
+    F8 rong case of cach A, else (False, reasons). Same identity checks as the F5 gate HCC2-7 of CODE 23/11 (Chot F8
+    rong muc 1b): schema (doc_lan_lap), tam_id given, a6.sha256 = the A6 used (a6_sha256), the window file has a
+    ref_12b window of this place (co_ref_12b), and no run of the file has a lan_lap_id (doc_lan_lap
+    _moi_lan_lap_id_null). truc_xe_v1, when given, must not name a mounting either (its lan_lap_id null; its
+    lan_lap_v1_sha256, when written, this F8 file)."""
+    if lan_lap is None:
+        return False, ['thieu_lan_lap_v1']
+    why = []
+    if lan_lap.get('_moi_lan_lap_id_null') is not True or lan_lap.get('lan_lap_id') is not None:
+        why.append('F8 co lan_lap_id (khong phai F8 rong)')
+    if not (isinstance(lan_lap.get('tam_id'), str) and lan_lap['tam_id']):
+        why.append('F8 thieu tam_id')
+    a6 = lan_lap.get('a6') if isinstance(lan_lap.get('a6'), dict) else {}
+    if not a6_sha256 or a6.get('sha256') != a6_sha256:
+        why.append('F8 a6.sha256 khac A6 dang dung')
+    if co_ref_12b is not True:
+        why.append('cua_so_v1 khong co cua so ref_12b cua cho nay')
+    if truc_xe is not None:
+        m = truc_xe.get('mien_hieu_luc') if isinstance(truc_xe.get('mien_hieu_luc'), dict) else {}
+        if m.get('lan_lap_id', truc_xe.get('lan_lap_id')) is not None:
+            why.append('truc_xe_v1 co lan_lap_id ma F8 khong co')
+        t_sha = m.get('lan_lap_v1_sha256', truc_xe.get('lan_lap_v1_sha256'))
+        if t_sha is not None and t_sha != lan_lap.get('_sha256'):
+            why.append('truc_xe_v1 lan_lap_v1_sha256 khac F8 dang dung')
+    return not why, why
+
+
+def phi_beta(task, truc_xe, lan_lap, tc, u_beta_cam_deg=None, f8_rong_ok=False):
     """(phi [rad] or None, u_phi [rad] (inf when a part is missing), ok, reasons). Same session and same placement
-    only (rang_buoc_12b); no Delta-a path."""
+    only (rang_buoc_12b); no Delta-a path. f8_rong_ok (f8_rong(...)[0] of the caller, cach A): beta = wrap(psi_tc_rad
+    of tc - psi_chuan_k_deg of truc_xe_v1), u_beta = U_BETA_F8_RONG_DEG, no 12b binding through lan_lap_v1 (it names
+    none) and no trang_thai.beta 'dat'; the anchor-set rule (tc tap 'giao', J 2) and the truc_xe_v1 checks are kept."""
     why = []
     k = cho_of(task)
     if truc_xe is None:
@@ -522,14 +566,32 @@ def phi_beta(task, truc_xe, lan_lap, tc, u_beta_cam_deg=None):
         ph = uph = None
     if lan_lap is None:
         return None, math.inf, False, why + ['thieu_lan_lap_v1 (beta)']
-    why += rang_buoc_12b(truc_xe, lan_lap, k)
-    tt = lan_lap.get('trang_thai')
-    if not (isinstance(tt, dict) and tt.get('beta') == 'dat'):
-        why.append(f'beta khong hop le (trang_thai.beta {tt.get("beta") if isinstance(tt, dict) else tt!r})')
-    b, ub = lan_lap.get('beta_deg'), lan_lap.get('u_beta_deg')
-    if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (b, ub)):
-        why.append('lan_lap_v1 thieu beta_deg / u_beta_deg')
-        b = ub = None
+    if lan_lap.get('cho') not in (None, k):
+        raise ValueError(f'lan_lap_v1 of place {lan_lap.get("cho")!r}, the task needs {k!r}')
+    if f8_rong_ok:
+        # cach A, CODE erratum 23/11 (chot T12 muc 4, goc 77991725; design lan lap v4 3: beta = wrap(alpha_dich -
+        # alpha_chuan,k), the turn of the BODY from the 12b window to W): the plate does not turn on the car, so the body
+        # turns as the tag: beta = wrap(psi'_tc of the run - psi_chuan_k of truc_xe_v1 (F7, same place, same session));
+        # the run's beta_deg of NHACTAM is not used
+        pc, pt = truc_xe.get('psi_chuan_k_deg'), tc.get('psi_tc_rad')
+        if not (isinstance(pc, (int, float)) and math.isfinite(pc)):
+            why.append('truc_xe_v1 thieu psi_chuan_k_deg (beta cach A)')
+            b = None
+        elif not (tc.get('psi_ok', True) and isinstance(pt, (int, float)) and math.isfinite(pt)):
+            why.append('tham chieu thieu psi_tc_rad (beta cach A)')
+            b = None
+        else:
+            b = math.degrees(ck.wrap(pt - math.radians(pc)))
+        ub = U_BETA_F8_RONG_DEG
+    else:
+        why += rang_buoc_12b(truc_xe, lan_lap, k)
+        tt = lan_lap.get('trang_thai')
+        if not (isinstance(tt, dict) and tt.get('beta') == 'dat'):
+            why.append(f'beta khong hop le (trang_thai.beta {tt.get("beta") if isinstance(tt, dict) else tt!r})')
+        b, ub = lan_lap.get('beta_deg'), lan_lap.get('u_beta_deg')
+        if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (b, ub)):
+            why.append('lan_lap_v1 thieu beta_deg / u_beta_deg')
+            b = ub = None
     if tc['tap'] != 'giao':
         why.append('mat_neo: beta khong do duoc tren neo (J 2)')
     if why or ph is None or b is None:

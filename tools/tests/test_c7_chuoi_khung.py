@@ -345,3 +345,57 @@ def test_tam_id_and_lan_lap(fake_a6, tmp_path):
     ll2 = dict(schema='lan_lap_v1', cung_lan_lap=True, trang_thai={'delta_c_B': 'dat'})          # no tam_id
     out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), xoay_file(tmp_path), lan_lap=ll2, track=TRACK0, tam_id='T1')
     assert all(r['trang_thai'] == 'khoa' for r in out)
+
+
+# ---------------------------------------------------------------- F8 rong (CODE 23/11 chot T12 muc 4, goc 934301af)
+def _ll_rong(**over):
+    d = dict(schema='lan_lap_v1', luot_id='r1', cho='goc', tam_id='T1', lan_lap_id=None, cung_lan_lap=None,
+             trang_thai={'delta_c_B': 'chua_ket_luan'}, _moi_lan_lap_id_null=True, _sha256='f' * 64, _path='ll.json')
+    d.update(over)
+    return d
+
+
+def test_f8_rong_q_of_the_place_with_the_plate_bound(fake_a6, tmp_path):
+    """F8 rong (the caller checked c7_tuong_doi.f8_rong): q of xoay_v1 as for one mounting, u_q + 0.57 mm, labelled;
+    without the flag the same F8 gives no q (thieu_delta_c_B), as before."""
+    a6p, _ = fake_a6
+    xp = _xoay_goc_k1(tmp_path, a6p)
+    out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), xp, _ll_rong(), track=TRACK0, cho='goc', f8_rong_ok=True)
+    assert all(r['q_ok'] and r['trang_thai'] == 'khoa' for r in out)
+    assert all(abs(r['u_q_m'] - (0.0005 + ck.U_LECH_TAM_BUOI1_M)) < 1e-15 for r in out)
+    assert all(ck.F8_RONG_NHAN in r['ly_do'] for r in out)
+    px, py = np.array([r['p_x'] for r in out]), np.array([r['p_y'] for r in out])
+    assert np.max(np.hypot(px - 0.4, py + 0.2)) < 1e-6
+    out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), xp, _ll_rong(), track=TRACK0, cho='goc')
+    assert all(not r['q_ok'] and 'thieu_delta_c_B' in r['ly_do'] for r in out)
+
+
+def test_f8_rong_k2_borrows_the_block_of_k1(fake_a6, tmp_path):
+    """K2 (no E turn) borrows the K1 block (F8_RONG_Q_TU, the place c8_hc_a of HIEUCHUAN borrows from) without ids,
+    u_q + 0.57 mm; two ids that differ are still refused."""
+    a6p, _ = fake_a6
+    assert ck.F8_RONG_Q_TU == {'K2': 'K1'} and ck.U_LECH_TAM_BUOI1_M == 0.00057
+    xp = _xoay_goc_k1(tmp_path, a6p)
+    out = ck.chuoi_khung(spin_rows(q=(0.02, 0.01)), ck.doc_a6(a6p), xp, _ll_rong(cho='K2'), track=TRACK0, cho='K2',
+                         f8_rong_ok=True)
+    assert all(r['q_ok'] for r in out)
+    assert all(abs(r['u_q_m'] - (0.0004 + ck.U_LECH_TAM_BUOI1_M)) < 1e-15 for r in out)
+    px, py = np.array([r['p_x'] for r in out]), np.array([r['p_y'] for r in out])
+    assert np.max(np.hypot(px - 0.4, py + 0.2)) < 1e-6                 # the K1 q, not the goc q
+    xo = ck.doc_xoay_cung_lan_lap(xp, 'K2', 'K1', None, None, f8_rong=True)
+    assert xo['ok'] and xo['nguon_q']['cho'] == 'K1' and xo['nguon_q']['nhan'] == ck.F8_RONG_NHAN
+    xo = ck.doc_xoay_cung_lan_lap(xp, 'K2', 'K1', 'LL_1', 'LL_2', f8_rong=True)
+    assert not xo['ok'] and 'khac_lan_lap_K1' in xo['ly_do']
+    assert not ck.doc_xoay_cung_lan_lap(xp, 'K2', 'K1', None, None)['ok']    # without the flag: unverified, no q
+    out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), xp, _ll_rong(cho='K2'), track=TRACK0, cho='K2')
+    assert all(not r['q_ok'] for r in out)
+
+
+def test_f8_rong_q_keeps_the_a6_and_xoay_checks(fake_a6, tmp_path):
+    a6p, _ = fake_a6
+    other = xoay_file(tmp_path, a6_sha='b' * 64)                         # q fitted on another A6
+    out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), other, _ll_rong(), track=TRACK0, f8_rong_ok=True)
+    assert all(not r['q_ok'] and 'xoay_a6_khac_a6_dang_dung' in r['ly_do'] for r in out)
+    nd = xoay_file(tmp_path, st='chua_ket_luan')
+    out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), nd, _ll_rong(), track=TRACK0, f8_rong_ok=True)
+    assert all(not r['q_ok'] for r in out)
