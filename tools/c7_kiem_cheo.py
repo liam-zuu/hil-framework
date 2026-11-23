@@ -232,6 +232,9 @@ def fit_without(img, marks, train, model, w, h, zc):
     obj = np.vstack([cp.mark_corners_floor(*marks[i]) for i in train])
     im = np.vstack([img[i] for i in train])
     cam, _ = cm.fit_two_pass(model, obj, im, w, h, zc)
+    fi = getattr(cam, 'fit_info', None)               # KCP4-7: a camera whose fit did not converge is not used
+    if isinstance(fi, dict) and fi.get('ok') is False:
+        raise KCError(f'camera fit without {sorted(set(marks) - set(train))[:8]} did not converge ({fi})')
     return cam
 
 
@@ -1005,6 +1008,13 @@ def p1_rel_clip(clip, pc, marks, regions, tag, kappa, plumb, l_max=L_MAX_M, phis
             for j in pc.ids:
                 if j == s:
                     continue
+                # KCP4V3-1: whether the pair belongs to the (i) maximum (both marks of the region, L <= l_max) is
+                # known from the tape before any fit, so a failing pair of (i) is recorded as such
+                if s in marks and j in marks:           # KCP4V4-6: a clip without the mark keeps the pair as broken
+                    L0 = float(np.linalg.norm(np.array(marks[j][:2]) - np.array(marks[s][:2])))
+                    tv0 = j in reg['moc'] and L0 <= l_max
+                else:
+                    L0, tv0 = None, j in reg['moc']      # length unknown: counted in the region (conservative)
                 try:                                        # KS7-7, KCJ1-13: the WHOLE pair, listed when it fails
                     cam = pc((s, j))
                     xs, xj = np.array(marks[s][:2]), np.array(marks[j][:2])
@@ -1031,7 +1041,7 @@ def p1_rel_clip(clip, pc, marks, regions, tag, kappa, plumb, l_max=L_MAX_M, phis
                     if not all(math.isfinite(pr[x]) for x in ('d_m', 'dh_m', 'chuyen_m', 'chuyen_psi_deg')):
                         raise KCError('non-finite result')
                 except Exception as e:
-                    hong.append(dict(clip=clip, vung=k, s=s, j=j, ly_do=str(e)[:200]))
+                    hong.append(dict(clip=clip, vung=k, s=s, j=j, L_m=L0, trong_vung=tv0, ly_do=str(e)[:200]))
                     continue
                 rows += rr
                 pairs.append(pr)
@@ -1155,6 +1165,8 @@ def s7_summary(rel, a3rel, cover, regions, a3_hong=None):
                      chuyen_psi_max_deg=mx(p['chuyen_psi_deg'] for p in pk),
                      trong_vung_max_m=max([max(p['d_m'], p['dh_m']) for p in pin], default=None),
                      trong_vung_n_cap=len(pin), moc_vung=reg['moc'], n_cap=len(pk), vung_mo_rong=reg['vung_mo_rong'],
+                     trong_vung_hong=[dict(clip=h['clip'], s=h['s'], j=h['j']) for h in hong_p1          # KCP4V3-1
+                                      if h['vung'] == k and h.get('trong_vung')],
                      ngoai_suy=any(cover[c][k]['ngoai_suy'] for c in cover),
                      mot_phuong=any(cover[c][k]['mot_phuong'] for c in cover),
                      ly_do={c: cover[c][k]['ly_do'] for c in cover if cover[c][k]['ly_do']})
@@ -1605,8 +1617,9 @@ def tung_khung(a):
                         ('frames_sha256', sha256_file(fp)), ('kiem_cheo_khung_sha256', sha256_file(kp))):
             if tr.get(k) != want:
                 raise KCError(f'{rid}: track {k} {tr.get(k)!r} is not {want!r} (KC1-10, KCC1-8, KCC1-9)')
-        if tr.get('moc_loai') and tr.get('cham_lai') != 2:
-            raise KCError(f'{rid}: marks excluded but the track was not rescored (cham_lai 2)')
+        tp_ = track_final_problems(tr)               # KCP4-4 (C33-12): every track, not only with marks excluded
+        if tp_:
+            raise KCError(f'{rid}: not a final track: {tp_}')
         frows = _read_csv(fp)
         r = run_frame_check(frows, _read_csv(kp), tr, groups, chains)
         tp = os.path.join(d, 'track.json')
@@ -1631,6 +1644,7 @@ def tung_khung(a):
                luot_chua_co=thieu_luot, luot_thieu_neo=thieu_neo, mau_thuan=mau,
                moc_vuot_sau=[dict(moc=i, clip=c) for i in sorted(over) for c in over[i]],
                hoan_tat=not thieu_luot and not mau and not thieu_neo and e_all is not None,
+               ke_hoach_van_de=plan_order_problems(ev, vai_tro(kc)),    # KCP4-10: information; tien_de grades it
                c33_12=False,                      # design v6 S8-3: refusal of trial tracks etc. after the CAM merge
                luat=dict(max_thieu=COVER_MAX_MISS, max_gap_s=COVER_MAX_GAP_S))
     write_new(a.out, out)
@@ -1695,10 +1709,26 @@ class FramePoses:
         anchors = sorted(anchors)
         if not set(anchors) <= set(d):
             raise KCError(f'{what}: anchors {sorted(set(anchors) - set(d))} not detected in the frame')
-        cam, rms, ok, ly, cond = self.ctx.pose(cm.CHAIN_XE, anchors, d)
+        try:
+            cam, rms, ok, ly, cond = self.ctx.pose(cm.CHAIN_XE, anchors, d)
+        except (ValueError, ArithmeticError, np.linalg.LinAlgError) as e:   # KCP4V3-6
+            raise KCError(f'{what}: scoring pose refit failed ({type(e).__name__}: {str(e)[:80]})')
         if not ok:
             raise KCError(f'{what}: scoring pose refit not trusted ({ly}, cond {cond:.3g})')
         return cam
+
+    def full_rms(self, anchors, d, what=''):
+        """The scoring camera on `anchors` with the rms [px] of its refit (gate (1) of the replayed chain, KCP4-1)."""
+        anchors = sorted(anchors)
+        if not set(anchors) <= set(d):
+            raise KCError(f'{what}: anchors {sorted(set(anchors) - set(d))} not detected in the frame')
+        try:
+            cam, rms, ok, ly, cond = self.ctx.pose(cm.CHAIN_XE, anchors, d)
+        except (ValueError, ArithmeticError, np.linalg.LinAlgError) as e:   # KCP4V3-6: a numeric failure of one frame
+            raise KCError(f'{what}: scoring pose refit failed ({type(e).__name__}: {str(e)[:80]})')
+        if not ok:
+            raise KCError(f'{what}: scoring pose refit not trusted ({ly}, cond {cond:.3g})')
+        return cam, float(rms)
 
     def held(self, rm, anchors, d, what=''):
         use = [i for i in sorted(anchors) if i not in set(rm)]
@@ -1934,6 +1964,7 @@ def meo_E(a):
     fp_ = FramePoses(s, pc)
     rx = R_XP_M if a.r_xp is None else a.r_xp
     per, dev = [], 0.0
+    body = cm.car_corners_body(side)
     for fid, t, x, y, anc in poses:
         if fid not in dets or cm.CAR_ID not in dets[fid][1]:
             raise KCError(f'E frame {fid}: valid with a tag in frames.csv but not in dets.npz with the car tag')
@@ -1945,18 +1976,23 @@ def meo_E(a):
             raise KCError(f'E frame {fid}: the replayed scoring pose differs from frames.csv by {dev:.3g} m '
                           f'(> {TOL_REPLAY_M}: another session, detections or anchors)')
         uv = np.asarray(d[cm.CAR_ID], float)
-        per.append((fid, t, anc, d, uv, lift(cam.pix2floor(uv, 0.0), kappa, C)))
-    foot = np.vstack([unlift(P, kappa, C) for *_r, P in per])             # KCF1-4: floor footprint, not lifted
+        # KCP4-9 (CODE 23/11): du_m at the 4 VIRTUAL tag corners (centre, heading, side of the scoring pose, ArUco
+        # order), brought to pixels through the scoring camera; goc_m stays the real corners (A6 fits g from them)
+        c_, s_ = math.cos(r['tag_psi']), math.sin(r['tag_psi'])
+        V = np.array([r['tag_x'], r['tag_y']]) + body @ np.array([[c_, s_], [-s_, c_]])
+        uv_v = cam.project(np.column_stack([unlift(V, kappa, C), np.zeros(4)]))
+        per.append((fid, t, anc, d, uv, lift(cam.pix2floor(uv, 0.0), kappa, C), uv_v, V))
+    foot = np.vstack([unlift(P, kappa, C) for *_r, P, _uv_v, _V in per])             # KCF1-4: floor footprint, not lifted
     hid = h32_ids(mk, foot, rx)
     cases = held_cases(pc, hid)
     a3_ca = {n: a3_held_case(n, pc.img, mk, full, cam, ids_, (side, float(s['tag_h_m'])), l_max)
              for n, ids_, cam in cases}
     khung = []
-    for fid, t, anc, d, uv, P in per:
+    for fid, t, anc, d, uv, P, uv_v, V in per:
         du = {}
         for n, ids_, _ in cases:
             ch = fp_.held(ids_, anc, d, f'E frame {fid}')
-            res = lift(ch.pix2floor(uv, 0.0), kappa, C) - P
+            res = lift(ch.pix2floor(uv_v, 0.0), kappa, C) - V                       # KCP4-9: virtual corners
             if not np.all(np.isfinite(res)):
                 raise KCError(f'E frame {fid}, case {n}: non-finite residual (KCF1-5)')
             du[n] = [[float(v) for v in xx] for xx in res]
@@ -1964,7 +2000,8 @@ def meo_E(a):
     out = _with_sha(dict(
         schema=MEO_E_SCHEMA, cho=a.cho, trang_thai=MEO_TRANG_THAI, ly_do=[], chieu='held_minus_full',
         bo_H32=True, truoc_le=True,
-        thu_tu_goc='ArUco 0..3 (goc anh that cua ma noc trong dets.npz, thu tu ArUco)',
+        thu_tu_goc='ArUco 0..3 (goc_m: goc anh that cua ma noc trong dets.npz; du_m: tai 4 goc ma ao cung thu tu)',
+        tham_so=dict(L_max_m=l_max, R_XP_M=rx, mac_dinh=dict(L_max_m=l_max == L_MAX_M, R_XP_M=rx == R_XP_M)),
         clip_sha256=clip, nguon=[dict(vai_tro='track', duong_dan=os.path.abspath(tp), sha256=tr_sha),
                                  dict(vai_tro='frames', duong_dan=os.path.abspath(fp), sha256=fr_sha),
                                  dict(vai_tro='dets', duong_dan=os.path.abspath(dp_), sha256=dets_sha),
@@ -1981,7 +2018,11 @@ def meo_E(a):
         gioi_han=['chi so thuc nghiem truoc le; truong du ban do giua camera bo moc H32 va camera cham, trong ho mo hinh',
                   'camera tung khung: camera cham phat lai dung chuoi xe cua track (moc_dung, cam_H[xe]), lech so voi '
                   'frames.csv <= TOL_REPLAY_M; camera bo ca khop lai tren cung khung, cung neo tru ca; goc_m = 4 goc '
-                  'anh that cua ma noc qua camera cham, nang car_pose',
+                  'anh that cua ma noc qua camera cham, nang car_pose (A6 khop g tu chinh cac goc nay); du_m = du ban '
+                  'do tai 4 goc MA AO (tam, huong, canh cua tu the cham) theo hop dong F15 (a) (KCP4-9, CODE 23/11); '
+                  'ban buoi 2 (meo_E_F2, A6 5f6a1fdd) tinh du_m tai goc that: lech U_meo_E 5,9 % goc / 42 % K1, '
+                  's_E <= 0,03 %, CODE giu',
+                  'tham_so L_max_m, R_XP_M ngoai khoa_s7 (KCP4-13): ghi trong tham_so; mac dinh = hang S7',
                   'ban_do.ca[*].A3 (CODE 20/11): moi cap moc trong tap bo cua ca, L <= L_max, do tren anh session qua '
                   'camera cua ca (khop khong co ca tap bo), gap qua a3_tag_gap voi camera cham session.camera; '
                   'quy_deg = |dtheta| + gap_deg nhu a3_clip; quy_max_deg = max cac cap (null khi khong co cap)']))
@@ -2660,8 +2701,16 @@ def tien_de_eval(kc, us, tk, sha_kc, sha_us, sha_tk):
     for n in roles:
         if n not in sess:
             bad('thieu_du_lieu', f'thieu_clip:{n}')
-    if not any(n in sess for n in ('H_m', 'H_z')):                  # camera segment without an end clip
+    for n in sorted(set(sess) - set(roles)):                       # KCP4-10: a clip H of a role the segment lacks
+        bad('thieu_du_lieu', f'vai_ngoai_doan:{n}')
+    dn = kc.get('doan')
+    if dn and (set(dn.get('vai_tro_co') or ()) & set(dn.get('vai_tro_vang') or ())
+               or set(dn.get('vai_tro_co') or ()) | set(dn.get('vai_tro_vang') or ()) != set(CLIPS_REQUIRED)):
+        bad('thieu_du_lieu', 'doan_vai_tro_khong_nhat_quan')
+    if not any(n in roles and n in sess for n in ('H_m', 'H_z')):  # camera segment without an end clip
         bad('thieu_du_lieu', 'khong_co_clip_kiem_troi')
+    if tk is not None and tk.get('luot') and 'H_z' not in roles:   # KCP4-10: a segment with runs needs its H_z
+        bad('thieu_du_lieu', 'doan_co_luot_khong_co_H_z')
     for n, r in (kc.get('kiem_h') or {}).items():
         v = r.get('ti_le_cung_luc')                 # KCJ1-2: NaN, inf, missing or not a number fails too
         if not _fin01(v) or not v >= KIEM_H_MIN:
@@ -2825,14 +2874,17 @@ def iii_leg(fp_, rows, dets, ids_a, ids_b, side, kappa, plumb, to):
             tx, ty = rows[f].get('tag_x'), rows[f].get('tag_y')
             if tx not in ('', None) and ty not in ('', None):
                 dev = max(dev, abs(pS['tag_x'] - float(tx)), abs(pS['tag_y'] - float(ty)))
-            e[f] = np.array([pS['x'] - pR['x'], pS['y'] - pR['y'], float(cm.cp_wrap(pS['psi'] - pR['psi']))])
+            e[f] = np.array([pS['tag_x'] - pR['tag_x'], pS['tag_y'] - pR['tag_y'],          # KCP4V2-10: the tag
+                             float(cm.cp_wrap(pS['tag_psi'] - pR['tag_psi']))])
     except KCError as ex:
         return None, None, str(ex)[:200], None
     if not dev <= TOL_REPLAY_M:
         raise KCError(f'(iii): the replayed scoring pose differs from frames.csv by {dev:.3g} m (another session, '
                       'detections or anchors)')
-    ea = np.mean([e[f] for f in ids_a], axis=0)
-    eb = np.mean([e[f] for f in ids_b], axis=0)
+    def mean_e(ids):                              # KCP4-11: heading by the unwrapped mean
+        return np.array([np.mean([e[f][0] for f in ids]), np.mean([e[f][1] for f in ids]),
+                         circ_mean([e[f][2] for f in ids])])
+    ea, eb = mean_e(ids_a), mean_e(ids_b)
     dd = eb - ea
     if not np.all(np.isfinite(dd)):
         return None, None, 'khong huu han', None
@@ -2858,6 +2910,27 @@ def e_hieu(a):
     if tv is None:
         raise KCError('kiem_cheo result without P1_tuong_doi for this place')
     part_i = tv.get('trong_vung_max_m')
+    # KCP4-7 (S7-13 KS7B-1): (i) is not usable when the start region is extrapolated / one-direction / a pair failed
+    # cap_hong of the region also counts pairs outside the (i) maximum (out of the disc, longer than L_MAX_M, A3), so
+    # it is not a reason here (KCP4V2-7; the in-region pairs are counted by trong_vung_n_cap); NaN never enters a max
+    why_i = [f'(i) {k}' for k in ('ngoai_suy', 'mot_phuong') if tv.get(k) is not False]
+    n_i = tv.get('trong_vung_n_cap')
+    if not _fin_ge0(part_i) or not (isinstance(n_i, int) and not isinstance(n_i, bool) and n_i > 0):
+        why_i.append('(i) khong co cap trong vung (hay so khong huu han)')
+        part_i = None
+    # KCP4V3-1: a failing pair of the (i) maximum: (i) is an observed maximum over a partial set, not dat. Results
+    # written before trong_vung_hong existed: any failing P1 pair of the region with both marks in it counts
+    # (its length is not recorded there, so the pair may lie outside L_MAX_M: conservative)
+    if isinstance(tv.get('trong_vung_hong'), list):                    # KCP4V4-5: null / not a list -> the
+        hong_i = list(tv['trong_vung_hong'])                             # conservative path from cap_hong
+    else:
+        mv = set(tv.get('moc_vung') or [])
+        hong_i = [h for h in ((kc.get('P1_tuong_doi') or {}).get('cap_hong') or [])
+                  if h.get('vung') == cho and h.get('s') in mv and h.get('j') in mv]
+    if hong_i:
+        why_i.append(f'(i) {len(hong_i)} cap trong vung hong: {hong_i[:3]}')
+    if d.get('trang_thai') not in ('khoa', 'chan_doan'):          # KCP4-6: the root states c8_hc_a writes
+        raise KCError(f'{a.doan}: trang_thai {d.get("trang_thai")!r} is not khoa / chan_doan')
     cfg = d.get('car_pose_cfg') or {}
     side, h_m = cfg.get('side_m'), cfg.get('h_m')
     to = cfg.get('tag_offset') or (0.0, 0.0, 0.0)
@@ -2895,6 +2968,11 @@ def e_hieu(a):
             raise KCError('F5: track file changed (sha256, KCJ1-8)')
         if tr.get('session_sha256') != d.get('session_sha256') or tr.get('frames_sha256') != d.get('frames_sha256'):
             raise KCError('F5: the track was not made from this session / these frames (KCJ1-8)')
+        # KCP4-6: the clip and the detections of F5 are those of the track
+        if d.get('clip_sha256') is not None and d.get('clip_sha256') != tr.get('video_sha256'):
+            raise KCError('F5: clip_sha256 is not the video of the track (KCP4-6)')
+        if d.get('dets_sha256') is not None and tr.get('dets_sha256') is not None                 and d['dets_sha256'] != tr['dets_sha256']:
+            raise KCError('F5: dets_sha256 is not the dets.npz of the track (KCP4-6)')
         s, s_sha = load_json_sha(ses['duong_dan'])
         if s_sha != d.get('session_sha256'):
             raise KCError('F5: session file changed (sha256, KCJ1-8)')
@@ -2938,6 +3016,7 @@ def e_hieu(a):
             why.append(f"doan F5 {g.get('trang_thai')}")
         if d.get('trang_thai') == 'chan_doan':
             why.append('F5 chan_doan')
+        why += why_i                                      # KCP4-7: (i) not usable -> the leg is not dat
         ca, cb = g.get('cua_so_a') or {}, g.get('cua_so_b') or {}
         ii_m = ii_psi = None
         if why_ii:
@@ -2951,17 +3030,21 @@ def e_hieu(a):
                                                     float(side), float(h_m), kappa, plumb, tuple(to)):
                     ii_m, ii_psi = max(ii_m, math.hypot(dx, dy)), max(ii_psi, abs(dpsi))
         iii_m = iii_psi = iii_info = None
+        bad_v = [f for f in list(ca.get('khung_id') or []) + list(cb.get('khung_id') or [])
+                 if rows_iii is not None and (f not in rows_iii or not _true(rows_iii[f].get('valid')))]
         if fp_iii is None:
             why += why_iii or ['(iii) khong tinh: chuoi session / track / frames cua F5 chua dung (xem ly do (ii))']
+        elif bad_v:                                       # KCP4-6: a window frame not valid in frames.csv
+            why.append(f'(iii) khung cua so khong hop le trong frames.csv: {bad_v[:5]}')
         else:
             iii_m, iii_psi, w3, iii_info = iii_leg(fp_iii, rows_iii, dets_iii, list(ca.get('khung_id') or []),
                                                    list(cb.get('khung_id') or []), float(s['car_side_m']), *set_iii)
             if w3:
                 why.append(f'(iii) {w3}')
-        vals = [v for v in (part_i, ii_m, iii_m) if v is not None]
+        vals = [v for v in (part_i, ii_m, iii_m) if v is not None and math.isfinite(v)]       # KCP4V2-7
         if not vals:
             raise KCError('e_hieu_m: a leg with neither (i) nor (ii) (start region without in-region pairs)')
-        psis = [v for v in (ii_psi, iii_psi) if v is not None]
+        psis = [v for v in (ii_psi, iii_psi) if v is not None and math.isfinite(v)]
         rec = dict(i=g.get('i'), e_hieu_psi_rad=max(psis) if psis else None, phan_i_m=part_i, phan_ii_m=ii_m,
                    phan_iii_m=iii_m, phan_iii_psi_rad=iii_psi, phan_iii=iii_info)
         # KCJ1-7: a diagnostic number is NOT written under e_hieu_m (the key the reader turns into a usable value);
@@ -2991,6 +3074,441 @@ def e_hieu(a):
     top = max(x.get('e_hieu_m', x.get('e_hieu_m_chan_doan')) for x in legs)
     _say(f"e_hieu {cho}: {len(legs)} doan, max {top * 1000:.2f} mm, "
          f"{sum(x['trang_thai'] == 'dat' for x in legs)} doan dat; trang_thai {out['trang_thai']}")
+
+
+NEO_LUOT_SCHEMA = 'c7_neo_luot_v1'            # P_neo / A_neo (S7-13 KS7B-3, S7-14.5; CODE 23/11 T12 chot section 5)
+GATE_KEYS = ('min_marks', 'rms_extra_px', 'car_res_sim_m', 'scale_rel', 'scale_win_s', 'scale_min')
+RATIO_WHY = ('ti_le', 'ti_le_it_lan_can')      # (2b) verdicts of c7_measure.apply_gates: a frame failing only these is
+                                               # still a neighbour of the scale gate (KCP4V2-1)
+W_PRE_SPAN_S = 1.0                             # c7_tuong_doi.mot_phia: the one-sided reference spans w_s + 1 s
+
+
+def circ_mean(a):
+    """Mean of angles [rad] as c7_chuoi_khung.trung_binh_go_vong (each unwrapped around the circular mean, contract
+    'trung_binh_go_vong'; KCP4-11, KCP4V2-8); NaN when the circular mean is undefined (resultant below 1e-9: no branch
+    can be chosen) or no finite angle."""
+    g = np.asarray(a, float).ravel()
+    g = g[np.isfinite(g)]
+    if not len(g) or math.hypot(float(np.mean(np.sin(g))), float(np.mean(np.cos(g)))) < 1e-9:
+        return float('nan')
+    import c7_chuoi_khung as ck_                  # KCP4V3-4: the very function of CAM (branch at +pi included)
+    return float(ck_.trung_binh_go_vong(g))
+
+
+def _gate_row(f, t, pose, n, rms):
+    return dict(idx=f, t_s=t, n_marks=n, rms_px=rms, khop_ok=True, car_seen=True, res_sim_m=pose['res_sim_m'],
+                scale=pose['scale'], x=pose['x'], y=pose['y'], psi=pose['psi'])
+
+
+def _fail_row(f, t, n):
+    """A replayed frame whose refit failed: gate (1) / khop fails it and it is no neighbour of (2b)."""
+    return dict(idx=f, t_s=t, n_marks=n, rms_px=float('inf'), khop_ok=False, car_seen=True, res_sim_m=float('inf'),
+                scale=float('nan'), x=float('nan'), y=float('nan'), psi=float('nan'))
+
+
+def _gate12(r, gates, rms_h):
+    """The (1) and (2a) verdicts of c7_measure.apply_gates for one replayed row (its why list without (2b))."""
+    why = []
+    if r['n_marks'] < gates['min_marks']:
+        why.append('moc_it')
+    elif not (r['rms_px'] <= rms_h + gates['rms_extra_px']):
+        why.append('moc_du_thua')
+    if r.get('khop_ok') is False:
+        why.append('khop')
+    if not (r['res_sim_m'] <= gates['car_res_sim_m']):
+        why.append('xe_meo')
+    return why
+
+
+def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms_h, t_ref=None, kt=None):
+    """P_neo / A_neo of one C8 run (S7-14.5; CODE 23/11: the bound of hang_m covers EVERY frame t of the run). W = pre.
+    For every valid frame t of the run (frames.csv valid with a tag pose, from the first W frame to the last post
+    frame), R_t = (anchors common to every W frame) & S_t; the replay deviation of a frame f on R_t is e_f = TAG pose
+    (tag_x, tag_y, tag_psi; KCP4V2-10) on its own anchors S_f - tag pose on R_t (scoring chain, as iii_leg);
+    value_t = |e_t - mean over W of e_f| (heading by trung_binh_go_vong, KCP4V2-8).
+    Gates of the reference chain (S7-14.5 'replay changing valid -> frame not valid'; KCP4-1, KCP4V2-1): every frame
+    the TRACK let into its scale neighbours (car seen, tag in dets, frames.csv why only (2b) or none) within
+    scale_win_s of the run is replayed on its R_t, times from dets.npz (checked increasing), and the chain goes through
+    c7_measure.apply_gates with the gates of the track; a run frame failing is left out and counted with the reason.
+    W on R_t (KCP4V2-2, KCP4V3-2, KCP4V3-3, KCP4V4-3): the frames of [t_ref - W_S - 1 s, t_ref) (frames.csv times,
+    those of F2) the track let in are replayed on R_t, failures per frame, gated by the ONE-SIDED scale gate of CAM
+    (c7_tuong_doi.mot_phia); R_t is usable only when EVERY W id of F2 replays, passes and the replayed W is still
+    (c7_tuong_doi._stillness, F2 thresholds). The caller requires the F2 pre conclusion du_mau and dat (KCP4V4-1).
+    A valid frame whose R_t is not usable makes the run not concluded (KCP4V4-2, diagnostic max kept). KCP4-2: at
+    least one valid replayed frame AFTER the last W frame. Returns (dict, reason)."""
+    import c7_tuong_doi as td                      # CAM: one-sided gate of the reference window
+    if not ids_w or not ids_post:
+        return None, 'cua so khong co khung'
+    for f in list(ids_w) + list(ids_post):
+        if f not in rows:
+            return None, f'khung {f} cua cua so khong co trong frames.csv'
+    if not (isinstance(t_ref, (int, float)) and not isinstance(t_ref, bool) and math.isfinite(t_ref)):
+        raise KCError(f'neo: F2 pre t_canh_s {t_ref!r} is not a finite number')
+    if not isinstance(kt, dict):                                         # KCP4V4-4
+        raise KCError(f'neo: F2 pre nguong {kt!r} is not an object')
+    if kt.get('w_s') != td.W_S:                                          # KCP4V4-4: check_khung_tc of CAM: w_s = W_S
+        raise KCError(f'neo: F2 pre nguong.w_s {kt.get("w_s")!r} is not the reference window {td.W_S} s')
+    for k in ('w_s', 'p_dung_m', 'psi_dung_deg', 'dau_cuoi_s'):          # KCP4V3-5: the ranges of CAM
+        v, (lo_, hi_) = kt.get(k), td.KTC_RANGES[k]
+        if not (isinstance(v, (int, float)) and not isinstance(v, bool) and lo_ <= v <= hi_):
+            raise KCError(f'neo: F2 pre nguong.{k} {v!r} outside {td.KTC_RANGES[k]}')
+    S = {}
+
+    def anchors(f):
+        if f not in S:
+            S[f] = _ids_of(rows[f].get('moc_dung'))
+        return S[f]
+
+    for f in ids_w:
+        if f not in dets or cm.CAR_ID not in dets[f][1]:
+            return None, f'khung W {f} khong co trong dets.npz (hay khong thay ma noc)'
+    W = set.intersection(*[set(anchors(f)) for f in ids_w])
+    t_of = {f: float(dets[f][0]) for f in dets}
+    order = sorted(t_of)
+    if not all(math.isfinite(v) for v in t_of.values()) or any(t_of[b] <= t_of[a_] for a_, b in zip(order, order[1:])):
+        raise KCError('neo: dets.npz times not finite or not increasing with the frame ids (KCP4V3-5)')
+
+    def eligible(f):                               # a neighbour of the TRACK's scale gate
+        r = rows.get(f)
+        return (r is not None and f in dets and cm.CAR_ID in dets[f][1]
+                and all(w in RATIO_WHY for w in (r.get('why') or '').split('|') if w))   # c7_measure writes '|'
+
+    def replay(f, ref):
+        d = dets[f][1]
+        pS = cm.car_pose(fp_.full(anchors(f), d, f'khung {f}'), d[cm.CAR_ID], side, kappa, plumb, to)
+        camR, rmsR = fp_.full_rms(ref, d, f'khung {f} (tap chung)')
+        pR = cm.car_pose(camR, d[cm.CAR_ID], side, kappa, plumb, to)
+        return pS, pR, rmsR
+
+    def dev(pS, pR):                               # KCP4V2-10: the tag centre and tag heading (not the wheel centre)
+        return np.array([pS['tag_x'] - pR['tag_x'], pS['tag_y'] - pR['tag_y'],
+                         float(cm.cp_wrap(pS['tag_psi'] - pR['tag_psi']))])
+
+    lo, hi, wmax = min(ids_w), max(ids_post), max(ids_w)
+    run = [f for f in sorted(rows) if lo <= f <= hi and _true(rows[f].get('valid'))
+           and rows[f].get('tag_x') not in ('', None)]
+    t_lo, t_hi = t_of.get(lo, -math.inf), t_of.get(hi, math.inf)
+    ctx = [f for f in order if t_lo - gates['scale_win_s'] - 1e-9 <= t_of[f] <= t_hi + gates['scale_win_s'] + 1e-9
+           and eligible(f)]
+    run_set = set(run)
+    cache, bad, rep_dev = {}, {}, 0.0
+    ref_rows, e_t = [], {}
+    for t in ctx:                                   # pass 1: the reference chain over the run and its scale neighbours
+        ref = tuple(sorted(W & set(anchors(t))))
+        if len(ref) < MIN_TRAIN:
+            ref_rows.append(_fail_row(t, t_of[t], len(ref)))
+            if t in run_set:
+                bad[t] = f'moc_it: tap tham chieu {len(ref)} moc (< {gates["min_marks"]})'
+            continue
+        try:
+            pS, pR, rmsR = replay(t, list(ref))
+        except KCError as ex:
+            ref_rows.append(_fail_row(t, t_of[t], len(ref)))
+            if t in run_set:
+                bad[t] = f'khop: {str(ex)[:150]}'
+            continue
+        if t in run_set:
+            rep_dev = max(rep_dev, abs(pS['tag_x'] - float(rows[t]['tag_x'])),
+                          abs(pS['tag_y'] - float(rows[t]['tag_y'])))
+            e_t[t] = (ref, dev(pS, pR))
+        ref_rows.append(_gate_row(t, t_of[t], pR, len(ref), rmsR))
+    if not rep_dev <= TOL_REPLAY_M:
+        raise KCError(f'neo: the replayed scoring pose differs from frames.csv by {rep_dev:.3g} m (another session, '
+                      'detections or anchors)')
+    for t in run:
+        if t not in bad and t not in e_t:
+            bad[t] = 'khong co dets / ma noc hay frames.csv khong cho lam lan can'
+    cm.apply_gates(ref_rows, rms_h, gates)          # KCP4-1, KCP4V2-1: the chain with the track's neighbours
+    for r in ref_rows:
+        if not r['valid'] and r['idx'] in e_t:
+            bad[r['idx']] = 'cong: ' + ','.join(r['why'])
+            e_t.pop(r['idx'], None)
+    # KCP4V4-3: the one-sided span and the stillness of W in the TIMES OF F2 (frames.csv t_s, the times c7_tuong_doi
+    # used to choose W); the dets times stay for the two-sided (2b) chain of the track
+    t_csv = {}
+    for f in order:
+        try:
+            t_csv[f] = float(rows[f]['t_s']) if f in rows else float('nan')
+        except (TypeError, ValueError, KeyError):
+            t_csv[f] = float('nan')
+    a_w = t_ref - td.W_S
+    w_ctx = [f for f in order if math.isfinite(t_csv[f]) and a_w - W_PRE_SPAN_S - 1e-12 <= t_csv[f] < t_ref
+             and eligible(f)]
+    if any(not math.isfinite(t_csv.get(f, float('nan'))) for f in ids_w):
+        raise KCError('neo: a W frame without a finite frames.csv t_s (KCP4V4-3)')
+    W_ids = set(ids_w)
+    best_p, best_a, f_p, f_a, n_ok, n_sau = 0.0, 0.0, None, None, 0, 0
+    mat_w = []                                      # KCP4V4-2: frames that passed the chain gates but lost W on R_t
+    for t in sorted(e_t):
+        ref, et = e_t[t]
+        if ref not in cache:
+            # W on R_t (KCP4V2-2, KCP4V3-2, KCP4V3-3, KCP4V3-6): the frames of the one-sided span replayed on R_t, a
+            # failure kept per frame (id + reason); the one-sided scale gate of CAM; R_t is usable only when EVERY
+            # W id of F2 (khung_ma_hop_le, chosen by F2 with its own times) replays, passes the gates and the W
+            # replayed on R_t is still (c7_tuong_doi._stillness, thresholds of F2): the reference is then exactly
+            # the W of F2 (no subset, no time re-check of the window edge)
+            fr_, ch_, wd, loi = [], [], {}, []
+            for f in w_ctx:
+                try:
+                    pS, pR, rmsR = replay(f, list(ref))
+                    gr = _gate_row(f, t_of[f], pR, len(ref), rmsR)
+                    fr_.append(dict(t_s=t_csv[f], scale=pR['scale'], car_seen=True, why=_gate12(gr, gates, rms_h)))
+                    ch_.append(dict(tag_x=pR['tag_x'], tag_y=pR['tag_y'], tag_psi=pR['tag_psi']))
+                    wd[f] = dev(pS, pR)
+                except KCError as ex:
+                    loi.append(dict(khung=f, ly_do=str(ex)[:120]))
+                    fr_.append(dict(t_s=t_csv[f], scale=float('nan'), car_seen=True, why=['khop']))
+                    ch_.append(dict(tag_x=float('nan'), tag_y=float('nan'), tag_psi=float('nan')))
+            okm = td.mot_phia(fr_, ch_, gates, t_ref) if fr_ else np.zeros(0, bool)
+            passed = {f for f, o in zip(w_ctx, okm) if o}
+            miss = sorted(W_ids - passed)
+            rec_w = dict(n=len(W_ids & passed), loi_khung=loi, w_khong_qua=miss[:50], n_w_khong_qua=len(miss))
+            if miss:
+                cache[ref] = (f'W tren tap chung: {len(miss)}/{len(W_ids)} khung W cua F2 khong phat lai / khong qua '
+                              f'cong mot phia (dau {miss[:5]})', rec_w)
+            else:
+                ok = sorted(W_ids)
+                still, num = td._stillness(np.array([t_csv[f] for f in ok]),
+                                           np.array([ch_[w_ctx.index(f)]['tag_x'] for f in ok]),
+                                           np.array([ch_[w_ctx.index(f)]['tag_y'] for f in ok]),
+                                           np.array([ch_[w_ctx.index(f)]['tag_psi'] for f in ok]), kt)
+                rec_w['dung_yen'] = num
+                m = np.array([np.mean([wd[f][0] for f in ok]), np.mean([wd[f][1] for f in ok]),
+                              circ_mean([wd[f][2] for f in ok])])
+                if not still:
+                    cache[ref] = ('W tren tap chung khong dung yen (do tan / dich vuot nguong F2)', rec_w)
+                elif not np.all(np.isfinite(m)):
+                    cache[ref] = ('W: goc khong xac dinh nhanh (trung_binh_go_vong)', rec_w)
+                else:
+                    cache[ref] = (m, rec_w)
+        m, _rec = cache[ref]
+        if isinstance(m, str):
+            bad[t] = m
+            mat_w.append(t)
+            continue
+        dd = et - m
+        p, ang = float(math.hypot(dd[0], dd[1])), abs(float(cm.cp_wrap(dd[2])))
+        n_ok += 1
+        n_sau += t > wmax
+        if f_p is None or p > best_p:
+            best_p, f_p = p, t
+        if f_a is None or ang > best_a:
+            best_a, f_a = ang, t
+    info = dict(n_khung=len(run), n_khung_hop_le=n_ok, n_khung_sau_W=n_sau, n_khung_khong_hop_le=len(bad),
+                khong_hop_le=[dict(khung=k, ly_do=v) for k, v in sorted(bad.items())], n_khung_lan_can=len(ctx),
+                n_tap_chung=len(cache), tap_W=sorted(W), lech_phat_lai_max_m=rep_dev,
+                W_qua_cong={','.join(map(str, k)): dict(v[1], ly_do=v[0] if isinstance(v[0], str) else None)
+                            for k, v in cache.items()},
+                doi_tap=any(set(anchors(t)) != W for t in e_t))
+    if mat_w:                                       # KCP4V4-2: a valid frame without its W reference: the maximum may
+        info.update(P_neo_m_chan_doan=best_p if f_p is not None else None,       # be among them (diagnostic only)
+                    A_neo_rad_chan_doan=best_a if f_a is not None else None, khung_mat_W=mat_w[:50])
+        return dict(info=info), (f'{len(mat_w)} khung qua cong chuoi doi chung mat doi chung W tren R_t '
+                                 f'(dau {mat_w[:5]}): cuc dai khong bao het khung hop le')
+    if not n_sau:                                   # KCP4-2: nothing replayed after the reference window
+        return dict(info=info), f'khong khung nao sau W phat lai duoc ({len(bad)} khung khong hop le)'
+    info.update(khung_max_P=f_p, khung_max_A=f_a)
+    return dict(P_neo_m=best_p, A_neo_rad=best_a, info=info), ''
+
+
+def _window_ids(r, lid, nm):
+    """KCP4-3: the frame ids the scorer averages (khung_ma_hop_le, ints of c7_score cua-so), increasing, inside khung;
+    None when missing or empty (the run is then not concluded); a malformed list: KCError."""
+    kh = r.get('khung')
+    kh_ids = [x.get('id') if isinstance(x, dict) else x for x in kh] if isinstance(kh, list) else None
+    v = r.get('khung_ma_hop_le')
+    if v is None or (isinstance(v, list) and not v):
+        return None
+    if not isinstance(v, list) or not all(isinstance(x, int) and not isinstance(x, bool) for x in v) \
+            or any(b <= a_ for a_, b in zip(v, v[1:])):
+        raise KCError(f'cua_so_v1 {lid} {nm}: khung_ma_hop_le malformed, repeated or out of order')
+    if kh_ids is None or not set(v) <= set(kh_ids):
+        raise KCError(f'cua_so_v1 {lid} {nm}: khung_ma_hop_le not inside khung')
+    return v
+
+
+def track_final_problems(tr):
+    """KCP4-4 (C33-12): a track the main path may use: thu False, cham_lai 2, ket_luan 'ket_luan'. Returns reasons."""
+    p = []
+    if tr.get('thu') is not False:
+        p.append(f'track thu {tr.get("thu")!r} (can false)')
+    if tr.get('cham_lai') != 2:
+        p.append(f'track cham_lai {tr.get("cham_lai")!r} (can 2)')
+    if tr.get('ket_luan') != 'ket_luan':
+        p.append(f'track ket_luan {tr.get("ket_luan")!r}')
+    return p
+
+
+def neo_luot(a):
+    """P_neo / A_neo (S7-13 KS7B-3, S7-14.5; CODE 23/11 T12: names c7_neo_luot_v1, the bound over EVERY frame of the
+    run): for every C8 run of the merged F2 (cua_so_v1.jsonl and its manifest <file>.nguon.json, cua_so_ghep_v1:
+    the runs and the runs left out (bo), KCP4-3), replay of the anchor sets REALLY used by each frame (frames.csv
+    moc_dung) through the scoring chain of the final track (thu false, cham_lai 2, ket_luan, KCP4-4), neo_run:
+    P_neo_m / A_neo_rad = max over the valid frames t of the run of |replay deviation at t - mean replay deviation
+    over W = pre| (position / heading), before margin; info.hai_dau keeps post - pre (iii_leg). A run whose replay
+    cannot be made: chua_ket_luan + reason (the other runs kept). theo_cho: max over the runs of each place; not dat
+    when a run of the place is not."""
+    with open(a.cua_so, 'rb') as f:
+        cb = f.read()
+    cs_sha = hashlib.sha256(cb).hexdigest()                     # KCF1-7: hash of the bytes parsed
+    try:
+        rows_cs = [json.loads(x) for x in cb.decode('utf-8').splitlines() if x.strip()]
+    except ValueError as e:
+        raise KCError(f'cua_so_v1: {e}')
+    mp = a.cua_so + '.nguon.json'                                # KCP4-3: the manifest of the merge after T6
+    man, man_sha = load_json_sha(mp)
+    if man.get('schema') != 'cua_so_ghep_v1' or (man.get('ra') or {}).get('sha256') != cs_sha:
+        raise KCError(f'{mp}: not the cua_so_ghep_v1 manifest of this F2 (ra.sha256 is not the sha of the file)')
+    bo = {x.get('khoa'): x.get('ly_do') for x in man.get('bo') or [] if isinstance(x, dict)}
+    plan = sorted({x.get('luot_id') for x in man.get('nguon') or [] if isinstance(x, dict)
+                   and isinstance(x.get('luot_id'), str) and x['luot_id'].startswith('C8-')} - set(bo))
+    win = {}
+    for r in rows_cs:
+        if isinstance(r, dict) and r.get('loai') in ('pre', 'post'):
+            lid = r.get('luot_id')
+            if not isinstance(lid, str) or not lid:
+                raise KCError('cua_so_v1: a pre/post window without luot_id')
+            if r.get('schema') != 'cua_so_v1':
+                raise KCError(f'cua_so_v1 {lid}: schema {r.get("schema")!r}')
+            if r['loai'] in win.setdefault(lid, {}):
+                raise KCError(f'cua_so_v1: two {r["loai"]} windows of {lid}')
+            win[lid][r['loai']] = r
+    extra = sorted(set(win) - set(plan))
+    if extra:
+        raise KCError(f'cua_so_v1: windows of runs not in the manifest (or left out): {extra}')
+    tracks = {}                                                  # frames sha -> (dir, track, track sha)
+    for d in a.track:
+        tr, tr_sha = load_json_sha(os.path.join(d, 'track.json'))
+        fs = _hex(tr.get('frames_sha256'), f'{d} track.frames_sha256')
+        if sha256_file(os.path.join(d, 'frames.csv')) != fs:
+            raise KCError(f'{d}: frames.csv is not the one of track.json')
+        if fs in tracks:
+            raise KCError(f'--track {d}: same frames.csv as {tracks[fs][0]}')
+        tracks[fs] = (d, tr, tr_sha)
+    sessions = {}
+    for sp_ in a.session:
+        s_, sha_ = load_json_sha(sp_)
+        if sha_ in sessions:
+            raise KCError(f'--session {sp_} given twice')
+        sessions[sha_] = sp_
+    out_l = {}
+    for lid in plan:                                             # KCP4-3: every run of the merged F2, missing too
+        w = win.get(lid, {})
+        rec = dict(cho=(next(iter(w.values())).get('cho') if w else None), P_neo_m=None, A_neo_rad=None, n_pre=None,
+                   n_post=None, info=None)
+        why = []
+        if set(w) != {'pre', 'post'}:
+            why.append(f'thieu cua so {sorted({"pre", "post"} - set(w))}')
+        else:
+            pre, post = w['pre'], w['post']
+            for k in ('cho', 'clip_sha256', 'session_sha256', 'frames_sha256'):
+                if pre.get(k) != post.get(k):
+                    raise KCError(f'cua_so_v1 {lid}: pre and post with another {k}')
+            ids = dict(pre=_window_ids(pre, lid, 'pre'), post=_window_ids(post, lid, 'post'))
+            rec.update(n_pre=len(ids['pre'] or []), n_post=len(ids['post'] or []))
+            fs = pre.get('frames_sha256')
+            if ids['pre'] is None or ids['post'] is None:
+                why.append(f'cua so khong co khung ma hop le: {[k for k, v in ids.items() if v is None]}')
+            elif not max(ids['pre']) < min(ids['post']):
+                why.append('pre khong ket thuc truoc post')
+            elif not (isinstance(pre.get('ket_luan'), dict) and pre['ket_luan'].get('du_mau') is True
+                      and pre['ket_luan'].get('dat') is True):                   # KCP4V4-1: W of F2 usable
+                kl = pre.get('ket_luan') if isinstance(pre.get('ket_luan'), dict) else {}
+                why.append(f"F2 pre khong dat (du_mau {kl.get('du_mau')!r}, dat {kl.get('dat')!r}): "
+                           f"{kl.get('ly_do')}")
+            elif fs not in tracks:
+                why.append('khong co --track co frames.csv cua cua so')
+            elif pre.get('session_sha256') not in sessions:
+                why.append('khong co --session cua cua so')
+            else:
+                d, tr, tr_sha = tracks[fs]
+                if tr.get('session_sha256') != pre['session_sha256'] or tr.get('video_sha256') != pre['clip_sha256']:
+                    raise KCError(f'{lid}: the track of the window was made from another session / clip')
+                tp_ = track_final_problems(tr)
+                if tp_:
+                    why += tp_
+                else:
+                    s, ses_sha, mk, pc, full, kappa, C = _session_ctx(sessions[pre['session_sha256']],
+                                                                      tr.get('session_sha256'), a.model)
+                    dp_ = tr.get('dets_file') or os.path.join(d, 'dets.npz')
+                    dets, dets_sha, _ = load_dets_checked(dp_, _hex(tr.get('dets_sha256'),
+                                                                    f'{lid} track.dets_sha256'),
+                                                          None, tr.get('video_sha256'), f'{lid} dets.npz')
+                    rows = {int(r_['idx']): r_ for r_ in _read_csv(os.path.join(d, 'frames.csv'))}
+                    to = tuple(tr.get('tag_offset') or s.get('tag_offset') or (0.0, 0.0, 0.0))
+                    cfg = (float(s['car_side_m']), float(s['kappa']), np.asarray(s['plumb_xy_m'], float), to)
+                    g_tr = tr.get('gates') or {}
+                    if not all(isinstance(g_tr.get(k), (int, float)) for k in GATE_KEYS):
+                        raise KCError(f'{lid}: track.json without the gates {GATE_KEYS}')
+                    gates = cm.check_gates({k: g_tr[k] for k in GATE_KEYS})
+                    fp_ = FramePoses(s, pc)
+                    res, w3 = neo_run(fp_, rows, dets, ids['pre'], ids['post'], *cfg, gates, float(s['rms_px_H']),
+                                      t_ref=pre.get('t_canh_s'), kt=pre.get('nguong'))
+                    if w3:
+                        why.append(w3)
+                        rec['info'] = (res or {}).get('info')
+                    else:
+                        # kept in info (CODE 23/11): the two-end number post - pre, as e_hieu (iii)
+                        m2, psi2, w2, i2 = iii_leg(fp_, rows, dets, ids['pre'], ids['post'], *cfg)
+                        res['info']['hai_dau'] = dict(P_m=m2, A_rad=psi2, ly_do=w2 or None,
+                                                      tap_chung=(i2 or {}).get('tap_chung'))
+                        rec.update(P_neo_m=res['P_neo_m'], A_neo_rad=res['A_neo_rad'], info=res['info'])
+                    rec['nguon'] = dict(track=dict(duong_dan=os.path.abspath(os.path.join(d, 'track.json')),
+                                                   sha256=tr_sha),
+                                        frames=dict(duong_dan=os.path.abspath(os.path.join(d, 'frames.csv')),
+                                                    sha256=fs),
+                                        dets=dict(duong_dan=os.path.abspath(dp_), sha256=dets_sha),
+                                        session=dict(duong_dan=os.path.abspath(sessions[ses_sha]), sha256=ses_sha))
+        rec.update(trang_thai='dat' if not why else 'chua_ket_luan', ly_do=why)
+        out_l[lid] = rec
+    theo_cho = {}                     # CODE 23/11: {P_neo_m, A_neo_rad, n_luot, trang_thai, ly_do}; C8B reads goc
+    for lid, r in sorted(out_l.items()):
+        c = theo_cho.setdefault(r['cho'], dict(P_neo_m=None, A_neo_rad=None, n_luot=0, luot_max_P=None,
+                                               luot_max_A=None, ly_do=[]))
+        if r['trang_thai'] != 'dat':
+            c['ly_do'].append(f'{lid} chua_ket_luan')
+            continue
+        if c['P_neo_m'] is None or r['P_neo_m'] > c['P_neo_m']:
+            c.update(P_neo_m=r['P_neo_m'], luot_max_P=lid)
+        if c['A_neo_rad'] is None or r['A_neo_rad'] > c['A_neo_rad']:
+            c.update(A_neo_rad=r['A_neo_rad'], luot_max_A=lid)
+        c['n_luot'] += 1
+    unknown = theo_cho.pop(None, None)                # a run without any window: its place is unknown, so no place
+    for c in theo_cho.values():                       # can be dat (conservative, KCP4-3)
+        if unknown:
+            c['ly_do'] += [f'{x} (khong ro cho)' for x in unknown['ly_do']]
+        c['trang_thai'] = 'dat' if not c['ly_do'] and c['n_luot'] else 'chua_ket_luan'
+    out = dict(schema=NEO_LUOT_SCHEMA, model=a.model, luot=out_l, theo_cho=theo_cho,
+               luot_chua_ket_luan=sorted(k for k, v in out_l.items() if v['trang_thai'] != 'dat'),
+               luot_khong_ro_cho=sorted(k for k, v in out_l.items() if v['cho'] is None),
+               luot_bo=[dict(luot_id=k, ly_do=v) for k, v in sorted(bo.items())],
+               nguon=dict(cua_so=dict(duong_dan=os.path.abspath(a.cua_so), sha256=cs_sha),
+                          cua_so_nguon=dict(duong_dan=os.path.abspath(mp), sha256=man_sha)),
+               loai='chi so thuc nghiem truoc le (S7-13 KS7B-3, S7-14.5): max tren moi khung hop le cua luot '
+                    '|lech phat lai khung t - trung binh lech phat lai tren W (pre)|',
+               gioi_han=['phat lai tap neo that tung khung (frames.csv moc_dung) tren khung that (dets.npz) qua chuoi '
+                         'cham, so voi tap tham chieu R_t = (neo chung moi khung W) giao S_t (doi chung dinh nghia o '
+                         'neo_run); chi thay phan do doi tap neo, khong thay sai chung cua ca tap',
+                         'khung luot: hop le trong frames.csv, co tu the ma, tu khung W dau toi khung post cuoi; chuoi '
+                         'doi chung gom ca lan can cong ti le cua track (khung chi truot (2b), +- scale_win_s), gio tu '
+                         'dets.npz, qua cung cong cua track (apply_gates); khung truot cong hay phat lai khong duoc thi '
+                         'khong hop le, ghi ID va ly do (KCP4V2-1)',
+                         'W tren R_t: phai tai lap DUNG TOAN BO W cua F2 (moi ID khung_ma_hop_le phat lai duoc, qua cong '
+                         'ti le MOT PHIA cua CAM c7_tuong_doi.mot_phia, va dung yen theo _stillness voi nguong F2); khong '
+                         'thi R_t khong dung duoc, ghi ID (KCP4V2-2, KCP4V3-2, KCP4V3-3, than trong hon quy tac mau cua '
+                         'tham_chieu)',
+                         'P_neo la hieu tam ma tho (tag_x, tag_y; tag_psi), chua qua A6 / q; phan quay q do C8B cong '
+                         '((|q|+dq)*A_neo vao hang_m, CODE 23/11, KCP4-5, KCP4V2-10)',
+                         'dem trung mot phan voi P7 / A5 (lech khung theo thoi gian): phia than trong (CODE 23/11)',
+                         'info.hai_dau: so hai dau post - pre nhu e_hieu (iii), chi de doi chieu'],
+               commit_hil=commit_hil())
+    write_new(a.out, out)
+    _say(f"neo_luot: {len(out_l)} luot, {sum(v['trang_thai'] == 'dat' for v in out_l.values())} dat; theo_cho "
+         + ', '.join(f"{c} {v['trang_thai']}: P "
+                     f"{'-' if v['P_neo_m'] is None else round(v['P_neo_m'] * 1000, 3)} mm, A "
+                     f"{'-' if v['A_neo_rad'] is None else round(math.degrees(v['A_neo_rad']), 4)} deg"
+                     for c, v in sorted(theo_cho.items()))
+         + f"; chua ket luan {out['luot_chua_ket_luan']}; bo {sorted(bo)}")
 
 
 def xuat(a):
@@ -3121,10 +3639,17 @@ def main(argv=None):
     b.add_argument('--dets', action='append', required=True,
                    help='dets.npz of every clip of the anchor frames (run ends, calibration windows), repeated')
     b.add_argument('--out', required=True)
+    n = sub.add_parser('neo_luot', help='P_neo / A_neo of every C8 run (pre -> post anchor-set replay)')
+    n.add_argument('--model', required=True)
+    n.add_argument('--cua-so', dest='cua_so', required=True, help='merged F2 cua_so_v1.jsonl with pre/post windows')
+    n.add_argument('--track', action='append', required=True,
+                   help='final track dir of a run (track.json, frames.csv; dets_file of track.json), repeated')
+    n.add_argument('--session', action='append', required=True, help='scoring session(s) of the windows, repeated')
+    n.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
         {'phan_tich': phan_tich, 'xuat': xuat, 'kiem_h': kiem_h_cli, 'tung_khung': tung_khung, 'tien_de': tien_de,
-         'e_hieu': e_hieu, 'meo_E': meo_E, 'meo_bang': meo_bang}[a.cmd](a)
+         'e_hieu': e_hieu, 'meo_E': meo_E, 'meo_bang': meo_bang, 'neo_luot': neo_luot}[a.cmd](a)
     except (KCError, OSError, ValueError, KeyError) as e:
         print(f'loi: {e}')
         print('#ket_qua,ma=2')

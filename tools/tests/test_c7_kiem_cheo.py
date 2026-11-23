@@ -634,7 +634,7 @@ def _tk_setup(tmp_path, bad=None, theo=None):
     _write_csv(d / 'frames.csv', _frames())
     _write_csv(d / 'kiem_cheo_khung.csv', _khung(big=(40, 5, 0.004)))
     tr = dict(u_so_sha256=kc.sha256_file(str(us)), session_sha256='1' * 64, model_khoa='B1', nhom=GR,
-              moc_loai=[], cham_lai=1, hang_so_sha256='4' * 64,
+              moc_loai=[], cham_lai=2, thu=False, ket_luan='ket_luan', hang_so_sha256='4' * 64,
               nguong_dung={c: dict(nguong_m=0.0013, nguong_tho_m=0.0015) for c in kc.comparators(GR)},
               frames_sha256=kc.sha256_file(str(d / 'frames.csv')),
               kiem_cheo_khung_sha256=kc.sha256_file(str(d / 'kiem_cheo_khung.csv')))
@@ -647,7 +647,13 @@ def _tk_setup(tmp_path, bad=None, theo=None):
     elif bad == 'nhom':
         tr['nhom'] = [[1, 2], [3, 4], [5, 6], [7, 8]]
     elif bad == 'not_rescored':
-        tr['moc_loai'] = [dict(chuoi='xe', id=5, t_bd=1.0)]
+        tr.update(moc_loai=[dict(chuoi='xe', id=5, t_bd=1.0)], cham_lai=1)
+    elif bad == 'not_rescored_no_moc':               # KCP4-4: a track not rescored is refused even without exclusions
+        tr['cham_lai'] = 1
+    elif bad == 'track_thu':
+        tr['thu'] = True
+    elif bad == 'track_chua_ket_luan':
+        tr['ket_luan'] = 'chua_ket_luan'
     elif bad == 'nguong':
         tr['nguong_dung']['2']['nguong_m'] = 0.0012
     elif bad == 'hang_so':
@@ -663,7 +669,8 @@ def _tk_setup(tmp_path, bad=None, theo=None):
     return args, out
 
 
-@pytest.mark.parametrize('bad', [None, 'u_so', 'session', 'model', 'nhom', 'not_rescored', 'thu', 'nguong', 'hang_so',
+@pytest.mark.parametrize('bad', [None, 'u_so', 'session', 'model', 'nhom', 'not_rescored', 'not_rescored_no_moc',
+                                 'track_thu', 'track_chua_ket_luan', 'thu', 'nguong', 'hang_so',
                                  'frames_swapped', 'khung_swapped'])
 def test_tung_khung_cli_checks_the_track(tmp_path, bad):
     """KC1-10, KCC1-8, KCC1-9: the track must name the u_so.json, H_a session, model, groups, constants file and the
@@ -1122,7 +1129,7 @@ def _tk_two(tmp_path, r2_frames=None, r1_loai=None, same_dir=False, theo=None):
     d2.mkdir()
     _write_csv(d2 / 'frames.csv', r2_frames if r2_frames is not None else _frames(invalid={7}))
     _write_csv(d2 / 'kiem_cheo_khung.csv', _khung())
-    tr2 = dict(tr, moc_loai=[], cham_lai=1, frames_sha256=kc.sha256_file(str(d2 / 'frames.csv')),
+    tr2 = dict(tr, moc_loai=[], cham_lai=2, frames_sha256=kc.sha256_file(str(d2 / 'frames.csv')),
                kiem_cheo_khung_sha256=kc.sha256_file(str(d2 / 'kiem_cheo_khung.csv')))
     (d2 / 'track.json').write_text(json.dumps(tr2), encoding='utf-8')
     args += ['--luot', f'r2={d1 if same_dir else d2}']
@@ -1450,7 +1457,8 @@ def test_e_hieu_reads_f5_and_writes_f9(tmp_path, scene):
                    encoding='utf-8')
     kcr = dict(version=kc.VERSION, thu=False, model='B1',
                hang_so_s7=dict(xuat_phat=dict(goc=[0.0, 0.0]), R_XP_M=0.6, L_MAX_M=1.05, plumb=[0.03, -0.02], **_HS_DUONG),
-               P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007))),
+               P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007, trong_vung_n_cap=6, ngoai_suy=False,
+                                                             mot_phuong=False, cap_hong=False))),
                sessions=dict(H_a=dict(sha256=kc.sha256_file(str(sp)))))
     kcp = tmp_path / 'kc.json'
     kcp.write_text(json.dumps(kcr), encoding='utf-8')
@@ -1779,7 +1787,8 @@ def test_e_hieu_refuses_f5_without_legs_and_unchained_track(tmp_path, scene):
                    encoding='utf-8')
     kcr = dict(version=kc.VERSION, thu=False, model='B1',
                hang_so_s7=dict(xuat_phat=dict(goc=[0.0, 0.0]), R_XP_M=0.6, L_MAX_M=1.05, plumb=[0.03, -0.02], **_HS_DUONG),
-               P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007))),
+               P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007, trong_vung_n_cap=6, ngoai_suy=False,
+                                                             mot_phuong=False, cap_hong=False))),
                sessions=dict(H_a=dict(sha256=kc.sha256_file(str(sp)))))
     kcp = tmp_path / 'kc.json'
     kcp.write_text(json.dumps(kcr), encoding='utf-8')
@@ -1988,7 +1997,7 @@ def _f15_session(tmp_path, scene):
              tag_h_m=0.119, kappa=F15_KAP, plumb_xy_m=list(F15_C), camera=cmeas.cam_to_dict(cam),
              fit_ids=sorted(img), marks={str(i): list(m) for i, m in marks.items()},
              ref_corners_px={str(i): c.tolist() for i, c in img.items()},
-             zc_fit_m=float(abs(cam.centre[2])), tag_offset=[0.0, 0.0, 0.0],
+             zc_fit_m=float(abs(cam.centre[2])), tag_offset=[0.0, 0.0, 0.0], rms_px_H=0.3,
              kiem_cheo=dict(nhom=kc.make_groups(sorted(img)), cam_H={'xe': cmeas.cam_to_dict(cam)}, nen={},
                             cond_max=1e4))
     sp = tmp_path / 'ses.json'
@@ -2033,7 +2042,14 @@ def _e_corners(k, offset=(0.0, 0.0, 0.2)):
     return body @ R.T + np.array([0.05 + 0.01 * k, -0.02])
 
 
-def _e_files(tmp_path, sp, offset=(0.0, 0.0, 0.2), track_over=None, rows_extra=(), scene=None):
+def _shrunk(P, f):
+    """The detected tag shrunk by f about its centre (KCP4-9: a detection that passes the gates but is not the
+    nominal square)."""
+    c = np.mean(P, axis=0)
+    return c + f * (np.asarray(P, float) - c)
+
+
+def _e_files(tmp_path, sp, offset=(0.0, 0.0, 0.2), track_over=None, rows_extra=(), scene=None, shrink=1.0):
     import c7_measure as cmeas
     td = tmp_path / 'E'
     td.mkdir(exist_ok=True)
@@ -2044,7 +2060,7 @@ def _e_files(tmp_path, sp, offset=(0.0, 0.0, 0.2), track_over=None, rows_extra=(
         {int(i): np.asarray(c, float) for i, c in ses['ref_corners_px'].items()})
     drop = lambda k: {1 + k % 3}                                         # noqa: E731 (anchors change per frame)
     dp = _dets_file(td / 'dets.npz', sc, [(k, k / 60) for k in range(12)], 'a' * 64, drop,
-                    lambda k: _tag_px(cam, _e_corners(k, offset)))
+                    lambda k: _tag_px(cam, _shrunk(_e_corners(k, offset), shrink)))
     dets = {k: d for k, _, d in cmeas.load_dets(str(dp))[0]}
     ctx = cmeas.ChainCtx(ses)
     rows = ['idx,t_s,valid,psi,tag_x,tag_y,moc_dung']
@@ -2094,6 +2110,28 @@ def test_meo_E_corners_order_and_lift(tmp_path, scene, monkeypatch):
     assert r['h_bar']['da_kiem'] is False
     a3 = r['ban_do']['ca'][0]['A3']                                      # CODE 20/11: A3 per H32 case
     assert a3['cam_full'] == 'session.camera' and a3['L_max_m'] == kc.L_MAX_M and a3['n_cap'] == len(a3['cap'])
+
+
+def test_meo_E_du_at_the_virtual_corners(tmp_path, scene, monkeypatch):
+    """KCP4-9 (CODE 23/11, F15 (a) 'four virtual tag corners'): the detected tag shrunk 1 % about its centre: goc_m
+    stays the real (shrunk) corners, du_m is the field at the VIRTUAL corners (nominal square, same centre and
+    heading), not at the detected ones."""
+    sp = _f15_session(tmp_path, scene)
+    td, cs = _e_files(tmp_path, sp, shrink=0.99)
+    _field_cases(monkeypatch, scene)
+    out = tmp_path / 'e.json'
+    assert kc.main(['meo_E', '--model', 'B1', '--cho', 'goc', '--session', str(sp), '--track', str(td), '--cua-so',
+                    str(cs), '--out', str(out)]) == 0
+    r = json.loads(out.read_text(encoding='utf-8'))
+    for k in r['khung']:
+        V = _e_corners(k['frame_id'])
+        P = _shrunk(V, 0.99)
+        assert np.allclose(k['goc_m'], P, atol=1e-9)
+        want = (1 - F15_KAP) * _FieldCam.f((V - F15_KAP * F15_C) / (1 - F15_KAP))
+        real = (1 - F15_KAP) * _FieldCam.f((P - F15_KAP * F15_C) / (1 - F15_KAP))
+        assert np.allclose(k['du_m']['bo_vung'], want, atol=1e-9)
+        assert np.max(np.abs(want - real)) > 1e-7
+    assert r['tham_so'] == dict(L_max_m=kc.L_MAX_M, R_XP_M=kc.R_XP_M, mac_dinh=dict(L_max_m=True, R_XP_M=True))
 
 
 @pytest.mark.parametrize('bad', ['K2', 'no_track_sha', 'dup_dau', 'session', 'a6_other_h', 'a6_nan', 'a6_schema',
@@ -2451,12 +2489,17 @@ def test_meo_E_per_frame_held_camera_independent(tmp_path, scene):
         d, anc = dets[fid], kc._ids_of(rows[fid]['moc_dung'])
         full = refit(cam_h, anc, d)
         Pf = kc.lift(full.pix2floor(d[0], 0.0), kap, C)
-        assert np.allclose(k['goc_m'], Pf, atol=1e-12)
+        assert np.allclose(k['goc_m'], Pf, atol=1e-12)                 # goc_m: the real corners (A6 fits g on them)
+        # KCP4V2-12: du_m oracle at the VIRTUAL square (tag centre, tag heading, nominal side of the scoring fit)
+        tp = cmeas.car_pose(full, d[0], 0.1445, kap, C)
+        cc, ss = math.cos(tp['tag_psi']), math.sin(tp['tag_psi'])
+        V = np.array([tp['tag_x'], tp['tag_y']]) + cmeas.car_corners_body(0.1445) @ np.array([[cc, ss], [-ss, cc]])
+        uv_v = full.project(np.column_stack([kc.unlift(V, kap, C), np.zeros(4)]))
         for ca in r['ban_do']['ca']:
             rm = ca['bo_ids']
             c0 = kc.fit_without(img, mk, [i for i in sorted(img) if i not in rm], 'B1', W, H, ZC)
             held = refit(c0, [i for i in anc if i not in rm], d)
-            want = kc.lift(held.pix2floor(d[0], 0.0), kap, C) - Pf
+            want = kc.lift(held.pix2floor(uv_v, 0.0), kap, C) - V
             assert np.allclose(k['du_m'][ca['ten']], want, atol=1e-10)
             if 30 in rm:
                 big = max(big, float(np.max(np.abs(want))))
@@ -2504,7 +2547,10 @@ def test_meo_bang_needs_the_dets_of_every_clip(tmp_path, scene, monkeypatch):
 
 
 # ---------------------------------------------------------------- F9 (iii): replay of the real anchor sets (CODE 20/11)
-def _f5_iii(tmp_path, scene, drop_b=(), tape_off=None):
+NEO_GATES = dict(min_marks=8, rms_extra_px=5.0, car_res_sim_m=0.01, scale_rel=0.05, scale_win_s=0.25, scale_min=2)
+
+
+def _f5_iii(tmp_path, scene, drop_b=(), tape_off=None, tag_more=None, drop_more=None, valid0=None):
     """A 12b clip of 12 frames (car tag standing at window a = frames 1-3, at window b = frames 8-10), dets.npz with
     the marks of the scene minus drop_b in window b, frames.csv by the scoring chain, F5 with dets + fingerprint, and a
     kiem_cheo result with (i) and the 12b corridor. tape_off = (id, dx): the session tape of that mark off by dx."""
@@ -2518,14 +2564,18 @@ def _f5_iii(tmp_path, scene, drop_b=(), tape_off=None):
     ses['video_sha256'] = 'b' * 64
     sp.write_text(json.dumps(ses), encoding='utf-8')
     Pa, Pb = _e_corners(0, (0, 0, 0)) + [-0.15, 0.0], _e_corners(0, (0, 0, 0)) + [0.30, 0.10]
-    win = {k: Pa for k in (1, 2, 3)} | {k: Pb for k in (8, 9, 10)}
+    win = {k: Pa for k in (1, 2, 3)} | {k: Pb for k in (8, 9, 10)} | {k: _e_corners(0, (0, 0, 0)) + np.asarray(v)
+                                                                       for k, v in (tag_more or {}).items()}
+    dm = drop_more or {}
     dp = _dets_file(tmp_path / 'dets.npz', scene, [(k, k / 60) for k in range(12)], 'b' * 64,
-                    lambda k: set(drop_b) if k in (8, 9, 10) else set(), lambda k: _tag_px(cam, win[k]) if k in win else None)
+                    lambda k: set(drop_b) if k in (8, 9, 10) else set(dm.get(k, ())),
+                    lambda k: _tag_px(cam, win[k]) if k in win else None)
     fr = cmeas.load_dets(str(dp))[0]
     dets = {k: d for k, _, d in fr}
     ctx = cmeas.ChainCtx(ses)
-    rows = ['idx,t_s,valid,psi,tag_x,tag_y,moc_dung']
+    rows = ['idx,t_s,valid,why,psi,tag_x,tag_y,moc_dung']
     pose = {}
+    v0 = valid0 or {}                                    # frame -> why of a frame the track set valid=0
     for k in range(12):
         anc = sorted(i for i in dets[k] if i != 0)
         tx = ty = ps = ''
@@ -2533,16 +2583,19 @@ def _f5_iii(tmp_path, scene, drop_b=(), tape_off=None):
             r = cmeas.car_pose(ctx.pose('xe', anc, dets[k])[0], dets[k][0], 0.1445, ses['kappa'], ses['plumb_xy_m'])
             tx, ty, ps = repr(r['tag_x']), repr(r['tag_y']), repr(r['psi'])
             pose[k] = r
-        rows.append(f"{k},{k / 60!r},1,{ps},{tx},{ty},{';'.join(str(i) for i in anc)}")
+        rows.append(f"{k},{k / 60!r},{0 if k in v0 else 1},{v0.get(k, '')},{ps},{tx},{ty},"
+                    f"{';'.join(str(i) for i in anc)}")
     frp = tmp_path / 'frames.csv'
     frp.write_text('\n'.join(rows) + '\n', encoding='utf-8')
     trp = tmp_path / 'track.json'
     trp.write_text(json.dumps(dict(session_sha256=kc.sha256_file(str(sp)), frames_sha256=kc.sha256_file(str(frp)),
-                                   video_sha256='b' * 64, dets_sha256=kc.sha256_file(str(dp)), tag_offset=[0, 0, 0])),
+                                   video_sha256='b' * 64, dets_sha256=kc.sha256_file(str(dp)), tag_offset=[0, 0, 0],
+                                   thu=False, cham_lai=2, ket_luan='ket_luan', gates=NEO_GATES)),
                    encoding='utf-8')
     kcr = dict(version=kc.VERSION, thu=False, model='B1',
                hang_so_s7=dict(xuat_phat=dict(goc=[0.0, 0.0]), R_XP_M=0.6, L_MAX_M=1.05, plumb=list(F15_C), **_HS_DUONG),
-               P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007))),
+               P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007, trong_vung_n_cap=6, ngoai_suy=False,
+                                                             mot_phuong=False, cap_hong=False))),
                sessions=dict(H_a=dict(sha256=kc.sha256_file(str(sp)))))
     kcp = tmp_path / 'kc.json'
     kcp.write_text(json.dumps(kcr), encoding='utf-8')
@@ -2610,6 +2663,362 @@ def test_e_hieu_iii_refuses_other_dets(tmp_path, scene):
     assert kc.main(['e_hieu', '--kiem-cheo', str(kcp), '--doan', str(dop), '--out', str(tmp_path / 'e.json')]) == 2
 
 
+# ---------------------------------------------------------------- P_neo / A_neo (CODE 23/11 T12, S7-14.5 v1 hai dau)
+NEO_KT = dict(w_s=3.0, n_min=10, frac_min=0.0, p_dung_m=0.003, psi_dung_deg=0.3, bien_s=0.1, dau_cuoi_s=0.25)
+
+
+def _neo_files(tmp_path, scene, drop_b=(), tape_off=None, windows=('pre', 'post'), lid='C8-P-F02-1', tag_more=None,
+               drop_more=None, ids=None, valid0=None, t_canh=4 / 60 + 1e-6):
+    """The 12b scene of _f5_iii seen as one C8 run: pre window = frames 1-3, post window = frames 8-10, in a merged F2
+    (cua_so_v1.jsonl, khung_ma_hop_le) naming the session, frames and clip of the track, with its manifest."""
+    kcp, dop, ses, dets, frp = _f5_iii(tmp_path, scene, drop_b=drop_b, tape_off=tape_off, tag_more=tag_more,
+                                       drop_more=drop_more, valid0=valid0)
+    src = {x['vai_tro']: x for x in json.loads(dop.read_text(encoding='utf-8'))['nguon']}
+    sp, ids = src['session']['duong_dan'], ids or dict(pre=(1, 2, 3), post=(8, 9, 10))
+    lines = [json.dumps(dict(schema='cua_so_v1', luot_id=lid, cho='goc', loai=w, clip_sha256='b' * 64,
+                             session_sha256=src['session']['sha256'], frames_sha256=src['frames']['sha256'],
+                             khung=[dict(id=k, pts_s=k / 60) for k in ids[w]],
+                             khung_ma_hop_le=list(ids[w]), t_canh_s=t_canh, nguong=NEO_KT,
+                             ket_luan=dict(du_mau=True, dat=True, ly_do=[])))
+             for w in windows]                         # ints, as c7_score writes; the F2 edge time and thresholds
+    csp = tmp_path / 'cua_so_v1.jsonl'
+    csp.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    _neo_manifest(csp, [lid])
+    return csp, sp, ses, dets, frp, dop
+
+
+def _neo_manifest(csp, runs, bo=()):
+    """<F2>.nguon.json (cua_so_ghep_v1) naming the runs and the runs left out (KCP4-3), written after every change of
+    the F2 bytes (its ra.sha256)."""
+    with open(str(csp) + '.nguon.json', 'w', encoding='utf-8') as f:
+        json.dump(dict(schema='cua_so_ghep_v1', nguon=[dict(luot_id=r) for r in runs],
+                       bo=[dict(khoa=b, ly_do='x') for b in bo],
+                       ra=dict(duong_dan=str(csp), sha256=kc.sha256_file(str(csp)))), f)
+
+
+def _neo_rewrite(csp, fn, runs=('C8-P-F02-1',), bo=()):
+    lines = [fn(json.loads(x)) for x in csp.read_text(encoding='utf-8').splitlines()]
+    csp.write_text('\n'.join(json.dumps(x) for x in lines if x is not None) + '\n', encoding='utf-8')
+    _neo_manifest(csp, list(runs), bo)
+
+
+def _neo_run(tmp_path, csp, sp, track_dir=None):
+    out = tmp_path / 'neo.json'
+    if out.exists():
+        out.unlink()
+    rc = kc.main(['neo_luot', '--model', 'B1', '--cua-so', str(csp), '--track', str(track_dir or tmp_path),
+                  '--session', str(sp), '--out', str(out)])
+    return rc, (json.loads(out.read_text(encoding='utf-8')) if out.exists() else None)
+
+
+def _neo_oracle(ses, dets, frp, frames, W_ids=(1, 2, 3)):
+    """Independent P / A (c7_measure): max over frames of |e_t - mean over W of e_f| on R_t = W & S_t."""
+    import c7_measure as cmeas
+    ctx = cmeas.ChainCtx(ses)
+    rows = {int(x['idx']): x for x in kc._read_csv(str(frp))}
+    S = {k: kc._ids_of(rows[k]['moc_dung']) for k in frames}
+    W = set.intersection(*(set(S[k]) for k in W_ids))
+
+    def e(k, ref):
+        a = cmeas.car_pose(ctx.pose('xe', S[k], dets[k])[0], dets[k][0], 0.1445, ses['kappa'], ses['plumb_xy_m'])
+        b = cmeas.car_pose(ctx.pose('xe', ref, dets[k])[0], dets[k][0], 0.1445, ses['kappa'], ses['plumb_xy_m'])
+        return np.array([a['x'] - b['x'], a['y'] - b['y'], cmeas.cp_wrap(a['psi'] - b['psi'])])
+    best = {}
+    for t in frames:
+        ref = sorted(W & set(S[t]))
+        m = np.mean([e(f, ref) for f in W_ids], axis=0)
+        d = e(t, ref) - m
+        best[t] = (float(np.hypot(d[0], d[1])), abs(float(d[2])))
+    return best
+
+
+def test_neo_luot_zero_without_anchor_change(tmp_path, scene):
+    csp, sp, *_ = _neo_files(tmp_path, scene)
+    rc, o = _neo_run(tmp_path, csp, sp)
+    r = o['luot']['C8-P-F02-1']
+    assert rc == 0 and o['schema'] == kc.NEO_LUOT_SCHEMA and r['trang_thai'] == 'dat'
+    assert r['P_neo_m'] == 0.0 and r['A_neo_rad'] == 0.0 and r['info']['doi_tap'] is False
+    assert r['n_pre'] == 3 and r['n_post'] == 3 and r['info']['n_khung'] == 6 and r['info']['n_khung_hop_le'] == 6
+    assert r['info']['n_khung_sau_W'] == 3 and r['info']['khong_hop_le'] == []
+    c = o['theo_cho']['goc']
+    assert c['n_luot'] == 1 and c['trang_thai'] == 'dat' and c['ly_do'] == [] and c['P_neo_m'] == 0.0
+    assert any('KCP4-5' in g for g in o['gioi_han'])
+
+
+def test_neo_luot_max_over_every_frame_independent(tmp_path, scene):
+    """Mark 25 taped 3 mm off and lost in the post window: P_neo, A_neo = max over the valid run frames, recomputed
+    independently; >= the two-end number of info.hai_dau, which equals e_hieu (iii) on the same windows."""
+    csp, sp, ses, dets, frp, dop = _neo_files(tmp_path, scene, drop_b=(25,), tape_off=(25, 0.003))
+    rc, o = _neo_run(tmp_path, csp, sp)
+    assert rc == 0
+    r = o['luot']['C8-P-F02-1']
+    want = _neo_oracle(ses, dets, frp, (1, 2, 3, 8, 9, 10))
+    assert r['P_neo_m'] == pytest.approx(max(v[0] for v in want.values()), abs=1e-12) and r['P_neo_m'] > 1e-5
+    assert r['A_neo_rad'] == pytest.approx(max(v[1] for v in want.values()), abs=1e-12) and r['A_neo_rad'] > 0
+    assert r['info']['doi_tap'] is True and r['info']['n_tap_chung'] == 2 and r['info']['khung_max_P'] in (8, 9, 10)
+    e_ = tmp_path / 'e.json'
+    assert kc.main(['e_hieu', '--kiem-cheo', str(tmp_path / 'kc.json'), '--doan', str(dop), '--out', str(e_)]) == 0
+    leg = json.loads(e_.read_text(encoding='utf-8'))['doan'][0]
+    assert r['info']['hai_dau']['P_m'] == leg['phan_iii_m'] and r['P_neo_m'] >= leg['phan_iii_m'] - 1e-15
+    assert o['theo_cho']['goc']['P_neo_m'] == r['P_neo_m'] and o['theo_cho']['goc']['luot_max_P'] == 'C8-P-F02-1'
+
+
+def test_neo_luot_sees_an_isolated_peak_between_the_windows(tmp_path, scene):
+    """KCP4 test (Codex): a frame in the MIDDLE of the run (5, tag seen) loses the taped-off mark 25, the windows do
+    not: the two-end number is 0 but P_neo, A_neo are the replay at frame 5 (independent oracle), so an implementation
+    that replays only the windows fails."""
+    csp, sp, ses, dets, frp, dop = _neo_files(tmp_path, scene, tape_off=(25, 0.003), tag_more={5: (0.05, 0.02)},
+                                              drop_more={5: (25,)})
+    rc, o = _neo_run(tmp_path, csp, sp)
+    r = o['luot']['C8-P-F02-1']
+    want = _neo_oracle(ses, dets, frp, (1, 2, 3, 5, 8, 9, 10))
+    assert rc == 0 and r['trang_thai'] == 'dat' and r['info']['khung_max_P'] == 5 and r['info']['khung_max_A'] == 5
+    assert r['P_neo_m'] == pytest.approx(want[5][0], abs=1e-12) and want[5][0] > 1e-5
+    assert r['A_neo_rad'] == pytest.approx(want[5][1], abs=1e-12) and want[5][1] > 0
+    assert r['info']['hai_dau']['P_m'] == 0.0 and r['info']['n_khung'] == 7
+
+
+def test_neo_luot_reference_set_below_the_gate_is_not_valid(tmp_path, scene):
+    """KCP4-1, KCP4-2: post frames keep only 7 marks: R_t has 7 < min_marks 8 of the track gates, the frames are not
+    valid (counted with the reason), nothing after W is replayed: the run is not concluded, the place not dat."""
+    import c7_measure as cmeas
+    marks = scene[0]
+    keep = sorted(marks)[:7]
+    drop = [i for i in marks if i not in keep and i != cmeas.CAR_ID]
+    csp, sp, *_ = _neo_files(tmp_path, scene, drop_b=drop)
+    rc, o = _neo_run(tmp_path, csp, sp)
+    r = o['luot']['C8-P-F02-1']
+    assert rc == 0 and r['trang_thai'] == 'chua_ket_luan' and r['P_neo_m'] is None
+    assert 'khong khung nao sau W' in r['ly_do'][0] and o['theo_cho']['goc']['trang_thai'] == 'chua_ket_luan'
+    bad = {x['khung']: x['ly_do'] for x in r['info']['khong_hop_le']}
+    assert set(bad) == {8, 9, 10} and all('moc_it' in v for v in bad.values())
+
+
+@pytest.mark.parametrize('case', ['missing_post', 'empty_post', 'overlap', 'no_track', 'track_thu', 'bo'])
+def test_neo_luot_run_not_concluded_keeps_the_file(tmp_path, scene, case):
+    """KCP4-2, KCP4-3, KCP4-4: a run of the manifest without a window, an empty window, pre not before post, no
+    track, a trial track: that run is chua_ket_luan with its reason, the place not dat, code 0 (other runs kept); a
+    run left out (bo) is listed and not counted."""
+    csp, sp, *_ = _neo_files(tmp_path, scene)
+    if case == 'missing_post':
+        _neo_rewrite(csp, lambda x: None if x['loai'] == 'post' else x)
+    elif case == 'empty_post':
+        _neo_rewrite(csp, lambda x: dict(x, khung_ma_hop_le=[]) if x['loai'] == 'post' else x)
+    elif case == 'overlap':
+        _neo_rewrite(csp, lambda x: dict(x, khung=[dict(id=k, pts_s=k / 60) for k in (2, 3, 8)],
+                                         khung_ma_hop_le=[2, 3, 8]) if x['loai'] == 'post' else x)
+    elif case == 'no_track':
+        _neo_rewrite(csp, lambda x: dict(x, frames_sha256='c' * 64))
+    elif case == 'track_thu':
+        tp = tmp_path / 'track.json'
+        tp.write_text(json.dumps(dict(json.loads(tp.read_text(encoding='utf-8')), thu=True)), encoding='utf-8')
+    elif case == 'bo':
+        _neo_rewrite(csp, lambda x: dict(x, luot_id='C8-P-F02-2'), runs=('C8-P-F02-1', 'C8-P-F02-2'),
+                     bo=('C8-P-F02-2',))
+        # the bo run's windows are refused: windows of a run left out
+        rc, o = _neo_run(tmp_path, csp, sp)
+        assert rc == 2 and o is None
+        _neo_rewrite(csp, lambda x: None, runs=('C8-P-F02-1',), bo=('C8-P-F02-2',))
+    rc, o = _neo_run(tmp_path, csp, sp)
+    r = o['luot']['C8-P-F02-1']
+    assert rc == 0 and r['trang_thai'] == 'chua_ket_luan' and r['ly_do'] and r['P_neo_m'] is None
+    assert o['luot_chua_ket_luan'] == ['C8-P-F02-1']
+    want = dict(missing_post='thieu cua so', empty_post='khong co khung ma hop le', overlap='pre khong ket thuc',
+                no_track='khong co --track', track_thu='track thu', bo='thieu cua so')[case]
+    assert want in r['ly_do'][0]
+    if case == 'bo':
+        assert o['luot_bo'] == [dict(luot_id='C8-P-F02-2', ly_do='x')] and 'C8-P-F02-2' not in o['luot']
+    if r['cho'] is None:                            # no window at all: no place is reported, none can be dat
+        assert o['theo_cho'] == {} and o['luot_khong_ro_cho'] == ['C8-P-F02-1']
+    else:
+        c = o['theo_cho']['goc']
+        assert c['trang_thai'] == 'chua_ket_luan' and c['P_neo_m'] is None
+
+
+def test_neo_luot_two_runs_one_place_not_dat_when_one_is_not_concluded(tmp_path, scene):
+    """Two runs at goc, the second without a track: the place keeps the first run's numbers but is chua_ket_luan
+    (C8B: hang thieu)."""
+    csp, sp, *_ = _neo_files(tmp_path, scene)
+    lines = [json.loads(x) for x in csp.read_text(encoding='utf-8').splitlines()]
+    lines += [dict(x, luot_id='C8-P-F05-1', frames_sha256='c' * 64) for x in lines]
+    csp.write_text('\n'.join(json.dumps(x) for x in lines) + '\n', encoding='utf-8')
+    _neo_manifest(csp, ['C8-P-F02-1', 'C8-P-F05-1'])
+    rc, o = _neo_run(tmp_path, csp, sp)
+    c = o['theo_cho']['goc']
+    assert rc == 0 and o['luot']['C8-P-F02-1']['trang_thai'] == 'dat'
+    assert c['trang_thai'] == 'chua_ket_luan' and c['n_luot'] == 1 and c['P_neo_m'] == 0.0
+    assert c['ly_do'] == ['C8-P-F05-1 chua_ket_luan']
+
+
+def test_neo_luot_refuses_a_track_of_another_clip_or_a_foreign_manifest(tmp_path, scene):
+    csp, sp, *_ = _neo_files(tmp_path, scene)
+    _neo_rewrite(csp, lambda x: dict(x, clip_sha256='d' * 64))
+    rc, o = _neo_run(tmp_path, csp, sp)
+    assert rc == 2 and o is None
+    (tmp_path / 'b').mkdir()
+    csp2, sp2, *_ = _neo_files(tmp_path / 'b', scene)
+    with open(str(csp2), 'a', encoding='utf-8') as f:            # F2 bytes changed after the manifest: refused
+        f.write('\n')
+    rc, o = _neo_run(tmp_path / 'b', csp2, sp2)
+    assert rc == 2 and o is None
+
+
+def test_neo_luot_scale_neighbours_failing_only_2b_stay(tmp_path, scene, monkeypatch):
+    """KCP4V2-1: frames 8, 9 failed ONLY the track's scale gate (valid=0, why ti_le) but stay neighbours of (2b), as in
+    c7_measure.apply_gates: with scale_min 5, frame 10 has 5 neighbours (1, 2, 3, 8, 9) and stays valid on the
+    reference chain; an implementation dropping 8, 9 from the neighbours leaves 3 and loses the run."""
+    monkeypatch.setitem(NEO_GATES, 'scale_min', 5)
+    csp, sp, *_ = _neo_files(tmp_path, scene, valid0={8: 'ti_le', 9: 'ti_le_it_lan_can'},
+                             ids=dict(pre=(1, 2, 3), post=(10,)), t_canh=11 / 60 + 1e-6)   # W span: 5 eligible
+    rc, o = _neo_run(tmp_path, csp, sp)
+    r = o['luot']['C8-P-F02-1']
+    assert rc == 0 and r['trang_thai'] == 'dat' and r['info']['n_khung'] == 4 and r['info']['n_khung_hop_le'] == 4
+    assert r['info']['n_khung_lan_can'] == 6 and r['info']['khong_hop_le'] == []
+
+
+def test_neo_luot_w_failure_is_per_frame(tmp_path, scene, monkeypatch):
+    """KCP4V2-2, KCP4V3-2, KCP4V3-6: a W frame whose refit on R_t fails is recorded per frame (id + reason) and, the
+    reference being exactly the W of F2, R_t is not usable: the frames on it are not valid, nothing after W: the run
+    is not concluded (no mean over a subset of W)."""
+    csp, sp, *_ = _neo_files(tmp_path, scene)
+    real = kc.FramePoses.full_rms
+
+    def fake(self, anchors, d, what=''):
+        if what.startswith('khung 2 '):
+            raise kc.KCError('khung 2: thu loi khop')
+        return real(self, anchors, d, what)
+    monkeypatch.setattr(kc.FramePoses, 'full_rms', fake)
+    rc, o = _neo_run(tmp_path, csp, sp)
+    r = o['luot']['C8-P-F02-1']
+    wq = list(r['info']['W_qua_cong'].values())
+    assert rc == 0 and r['trang_thai'] == 'chua_ket_luan' and wq
+    assert all([x['khung'] for x in v['loi_khung']] == [2] and v['w_khong_qua'] == [2] and v['n'] == 2
+               and v['ly_do'].startswith('W tren tap chung') for v in wq)
+
+
+def test_circ_mean_is_the_cam_mean_and_refuses_no_branch():
+    """KCP4V2-8: the mean is c7_chuoi_khung.trung_binh_go_vong (order free); [0, 180 deg] has no branch: NaN."""
+    import c7_chuoi_khung as ck
+    a = [0.0, math.radians(160.0), math.radians(-170.0)]
+    assert kc.circ_mean(a) == pytest.approx(ck.trung_binh_go_vong(a), abs=1e-12)
+    assert kc.circ_mean(a[::-1]) == pytest.approx(kc.circ_mean(a), abs=1e-12)
+    assert math.isnan(kc.circ_mean([0.0, math.pi]))
+
+
+def test_neo_luot_w_is_the_f2_window_without_time_recheck(tmp_path, scene):
+    """KCP4V3-3: the W ids are those of F2 (khung_ma_hop_le, chosen by F2 with its own times); with the edge just after
+    frame 3 (its capture end 4/60 is after t_ref) the replay does not drop it again: all 3 W frames are used."""
+    csp, sp, *_ = _neo_files(tmp_path, scene, t_canh=3 / 60 + 1e-6)
+    rc, o = _neo_run(tmp_path, csp, sp)
+    r = o['luot']['C8-P-F02-1']
+    wq = list(r['info']['W_qua_cong'].values())
+    assert rc == 0 and r['trang_thai'] == 'dat' and all(v['n'] == 3 and v['ly_do'] is None for v in wq)
+
+
+def test_neo_luot_w_not_still_on_r_t_is_not_usable(tmp_path, scene, monkeypatch):
+    """KCP4V3-2: W replayed on R_t must be still (c7_tuong_doi._stillness with the F2 thresholds) else R_t is not
+    usable and the run is not concluded."""
+    import c7_tuong_doi as td
+    csp, sp, *_ = _neo_files(tmp_path, scene)
+    monkeypatch.setattr(td, '_stillness', lambda t, x, y, psi, kt: (False, dict(n=len(t))))
+    rc, o = _neo_run(tmp_path, csp, sp)
+    r = o['luot']['C8-P-F02-1']
+    assert rc == 0 and r['trang_thai'] == 'chua_ket_luan'
+    assert all('khong dung yen' in x['ly_do'] for x in r['info']['khong_hop_le'])
+
+
+def test_neo_luot_refuses_bad_f2_thresholds(tmp_path, scene):
+    """KCP4V3-5: t_canh_s not a finite number, or w_s outside the CAM ranges: code 2."""
+    for key, val in (('t_canh_s', '26'), ('nguong', dict(NEO_KT, w_s=0.1)), ('nguong', dict(NEO_KT, w_s=2.0)),
+                     ('nguong', [3])):                                   # KCP4V4-4: w_s = W_S, an object
+        csp, sp, *_ = _neo_files(tmp_path, scene)
+        _neo_rewrite(csp, lambda x, k=key, v=val: dict(x, **{k: v}))
+        rc, o = _neo_run(tmp_path, csp, sp)
+        assert rc == 2 and o is None
+
+
+@pytest.mark.parametrize('case', ['moi', 'cu_trong', 'cu_ngoai', 'null_trong'])
+def test_e_hieu_failing_pair_of_i_is_not_dat(tmp_path, scene, case):
+    """KCP4V3-1: a failing pair of the (i) maximum (trong_vung_hong, or for results written before it a failing P1
+    pair of the region with both marks in it) makes the leg chan_doan; a failing pair with a mark outside the region
+    does not."""
+    kcp, dop, *_ = _f5_iii(tmp_path, scene)
+    k = json.loads(kcp.read_text(encoding='utf-8'))
+    tv = k['P1_tuong_doi']['theo_vung']['goc']
+    tv['moc_vung'] = [25, 26, 27, 28]
+    if case == 'moi':
+        tv['trong_vung_hong'] = [dict(clip='H_a', s=25, j=26)]
+    elif case == 'null_trong':                    # KCP4V4-5: null is not an empty list: the cap_hong path decides
+        tv['trong_vung_hong'] = None
+        k['P1_tuong_doi']['cap_hong'] = [dict(clip='H_a', vung='goc', s=25, j=26, trong_vung=True, ly_do='x')]
+    else:
+        k['P1_tuong_doi']['cap_hong'] = [dict(clip='H_a', vung='goc', s=25, j=26 if case == 'cu_trong' else 9,
+                                              ly_do='x')]
+    kcp.write_text(json.dumps(k), encoding='utf-8')
+    out = tmp_path / 'e.json'
+    assert kc.main(['e_hieu', '--kiem-cheo', str(kcp), '--doan', str(dop), '--out', str(out)]) == 0
+    leg = json.loads(out.read_text(encoding='utf-8'))['doan'][0]
+    if case == 'cu_ngoai':
+        assert leg['trang_thai'] == 'dat' and 'e_hieu_m' in leg
+    else:
+        assert leg['trang_thai'] == 'chan_doan' and any('cap trong vung hong' in w for w in leg['ly_do'])
+
+
+def test_circ_mean_branch_at_pi_is_the_cam_one():
+    """KCP4V3-4: [0, 0, 180 deg] (resultant 1/3): the CAM mean (+60 deg), not -60 deg."""
+    import c7_chuoi_khung as ck
+    a = [0.0, 0.0, math.pi]
+    assert kc.circ_mean(a) == pytest.approx(ck.trung_binh_go_vong(a), abs=1e-12)
+    assert kc.circ_mean(a) == pytest.approx(math.radians(60.0), abs=1e-9)
+
+
+def test_neo_luot_f2_pre_not_concluded_is_not_used(tmp_path, scene):
+    """KCP4V4-1: F2 says its pre window lacks samples (ket_luan du_mau false): the run is not concluded even though
+    every W id replays."""
+    csp, sp, *_ = _neo_files(tmp_path, scene)
+    _neo_rewrite(csp, lambda x: dict(x, ket_luan=dict(du_mau=False, dat=False, ly_do=['90 khung < n_min 120'])))
+    rc, o = _neo_run(tmp_path, csp, sp)
+    r = o['luot']['C8-P-F02-1']
+    assert rc == 0 and r['trang_thai'] == 'chua_ket_luan' and r['ly_do'][0].startswith('F2 pre khong dat')
+
+
+def test_neo_luot_lost_w_of_the_peak_frame_is_not_concluded(tmp_path, scene, monkeypatch):
+    """KCP4V4-2: the peak frame 5 (R_5 = W without 25) loses its W reference (W frame 2 fails on that R_t only); the
+    other frames (R = W) still give 0 after W: the run must not be dat at 0, it is not concluded with the
+    diagnostic maximum kept."""
+    csp, sp, *_ = _neo_files(tmp_path, scene, tape_off=(25, 0.003), tag_more={5: (0.05, 0.02)}, drop_more={5: (25,)})
+    real = kc.FramePoses.full_rms
+
+    def fake(self, anchors, d, what=''):
+        if what.startswith('khung 2 ') and 25 not in anchors:
+            raise kc.KCError('khung 2: thu loi khop tren R_5')
+        return real(self, anchors, d, what)
+    monkeypatch.setattr(kc.FramePoses, 'full_rms', fake)
+    rc, o = _neo_run(tmp_path, csp, sp)
+    r = o['luot']['C8-P-F02-1']
+    assert rc == 0 and r['trang_thai'] == 'chua_ket_luan' and 'mat doi chung W' in r['ly_do'][0]
+    assert r['info']['khung_mat_W'] == [5] and r['info']['P_neo_m_chan_doan'] == 0.0
+
+
+def test_p1_rel_clip_region_mark_missing_from_the_clip(scene):
+    """KCP4V4-6: a region mark absent from the clip marks (a trial clip H_b with fewer marks) gives broken pairs, no
+    KeyError; their in-region flag is conservative (length unknown)."""
+    marks, cam, img = scene
+    mk = {i: m for i, m in marks.items() if i != 25}
+    pc = kc.PairCams(img, marks, 'B1', W, H, ZC)
+    rows, pairs, hong = kc.p1_rel_clip('H_b', pc, mk, {'goc': dict(moc=[25, 26])}, (0.1445, 0.119), 0.04,
+                                       np.array(F15_C), l_max=1.05, phis=(0.0,))
+    h25 = [h for h in hong if 25 in (h['s'], h['j'])]
+    assert h25 and all(h['L_m'] is None or h['s'] != 25 for h in h25)
+    assert any(h['s'] == 25 and h['j'] == 26 and h['trong_vung'] is True for h in h25)
+
+
+def test_circ_mean_across_pi():
+    """KCP4-11: [+179 deg, -179 deg] averages to 180 deg (wrapped), not 0."""
+    m = kc.circ_mean([math.radians(179.0), math.radians(-179.0)])
+    assert abs(abs(kc.cm.cp_wrap(m)) - math.pi) < 1e-12
+
+
 # ---------------------------------------------------------------- camera segments (Liam 20/11 "Theo doan, bo H giua")
 def _doan(k, u, t, cuoi=True):
     """Make the tien_de fixture a camera segment: no H_m (session, kiem_h, plan); without cuoi no H_z either."""
@@ -2647,6 +3056,48 @@ def test_segment_without_end_clip_is_missing_data(monkeypatch):
     r = _td_full(lambda k, u, t: _doan(k, u, t, cuoi=False))
     assert r['ket_qua'] == 'thieu_du_lieu' and 'khong_co_clip_kiem_troi' in r['ly_do']
     assert kc.DOAN_KHONG_CUOI in r['gioi_han'] and set(r['vai_tro_clip_h']) == {'H_a', 'H_b'}
+
+
+def test_segment_extra_role_or_runs_without_H_z_is_missing_data(monkeypatch):
+    """KCP4-10: a clip H of a role the segment says it lacks (left-over H_m with full comparisons) does not count: the
+    premise is missing data; a segment with runs but without H_z is missing data; roles co / vang must cover the four
+    exactly once."""
+    monkeypatch.setattr(kc, 'ID_KHOA', tuple(ALL8))                     # the 8-mark fixture
+
+    def keep_Hm(k, u, t):
+        hm = (k['sessions']['H_m'], k['kiem_h']['H_m'])
+        _doan(k, u, t)
+        k['sessions']['H_m'], k['kiem_h']['H_m'] = hm
+    r = _td_full(keep_Hm)
+    assert r['ket_qua'] == 'thieu_du_lieu' and 'vai_ngoai_doan:H_m' in r['ly_do']
+    r = _td_full(lambda k, u, t: (_doan(k, u, t, cuoi=False), t['ke_hoach']['su_kien'].__setitem__(slice(None),
+                                                                                              ['H_a', 'H_b', 'R1', 'R2'])))
+    assert r['ket_qua'] == 'thieu_du_lieu' and 'doan_co_luot_khong_co_H_z' in r['ly_do']
+    r = _td_full(lambda k, u, t: (_doan(k, u, t), k['doan']['vai_tro_vang'].append('H_a')))
+    assert r['ket_qua'] == 'thieu_du_lieu' and 'doan_vai_tro_khong_nhat_quan' in r['ly_do']
+
+
+def test_e_hieu_not_dat_when_i_is_extrapolated_and_refuses_foreign_f5(tmp_path, scene):
+    """KCP4-7: the start region of (i) extrapolated -> the leg is chan_doan, no e_hieu_m key; KCP4-6: F5 naming
+    another clip, or an unknown root state: code 2."""
+    kcp, dop, *_ = _f5_iii(tmp_path, scene)
+    k = json.loads(kcp.read_text(encoding='utf-8'))
+    k['P1_tuong_doi']['theo_vung']['goc']['ngoai_suy'] = True
+    kcp.write_text(json.dumps(k), encoding='utf-8')
+    out = tmp_path / 'e.json'
+    assert kc.main(['e_hieu', '--kiem-cheo', str(kcp), '--doan', str(dop), '--out', str(out)]) == 0
+    leg = json.loads(out.read_text(encoding='utf-8'))['doan'][0]
+    assert leg['trang_thai'] == 'chan_doan' and '(i) ngoai_suy' in leg['ly_do'] and 'e_hieu_m' not in leg
+    for key, val in (('clip_sha256', 'e' * 64), ('trang_thai', 'la')):
+        d = json.loads(dop.read_text(encoding='utf-8'))
+        d[key] = val
+        d['sha256'] = kc.doan_body_sha(d)
+        dop.write_text(json.dumps(d), encoding='utf-8')
+        o2 = tmp_path / f'e_{key}.json'
+        assert kc.main(['e_hieu', '--kiem-cheo', str(kcp), '--doan', str(dop), '--out', str(o2)]) == 2
+        d[key] = dict(clip_sha256='b' * 64, trang_thai='khoa')[key]
+        d['sha256'] = kc.doan_body_sha(d)
+        dop.write_text(json.dumps(d), encoding='utf-8')
 
 
 def test_phan_tich_segment_clips(tmp_path, scene, monkeypatch):
