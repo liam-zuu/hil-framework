@@ -92,6 +92,7 @@ from o1_feasibility import Path8                                         # noqa:
 from o1_tasks import FIG8, FINAL_SET                                     # noqa: E402
 
 EPS_MM = 2.0           # eps_H [DE XUAT], locked at C8 (design Q1; O1 v11.28 4)
+DRIFT_VERSION = 'c7_calib_drift_v2'    # CAM v4 section 3 TC3-10: position and heading, a state per quantity (gate_c8)
 MARK_PX = 2.0          # own corner residual growth of one mark that names it [DE XUAT]
 STEP_M = 0.05          # spacing of the lane samples (arc length)
 MIN_MARKS = 6          # common floor marks needed for the pose refit (calibrate needs 6 too)
@@ -288,30 +289,46 @@ def one_way(sa, sb, poses, tag_offset=(0.0, 0.0, 0.0)):
     ka, h, side = float(sa['kappa']), float(sa['tag_h_m']), float(sa['car_side_m'])
     plumb = [float(v) for v in sa['plumb_xy_m']]
     cents, dC = physical_centres(sa, cam_a, cam_b)
-    errs = {}
+    errs, errs_psi = {}, {}
     for name, C in cents.items():
         if not C[2] > h:
             raise ValueError(f'lens height {C[2]:.3f} m ({name}) not above the tag height {h} m')
         e = np.zeros((len(poses), 2))
+        ep = np.zeros(len(poses))
         for k, (x, y, psi) in enumerate(poses):
             q = tag_corners(x, y, psi, side, tag_offset)
             floor = C[:2] + (q - C[:2]) * (C[2] / (C[2] - h))
             px = cam_b.project(np.column_stack([floor, np.zeros(4)]))
             r = cm.car_pose(a_ref, px, side, ka, plumb, tag_offset)
             e[k] = (r['x'] - x, r['y'] - y)
+            ep[k] = math.atan2(math.sin(r['psi'] - psi), math.cos(r['psi'] - psi))     # heading, v2 (TC3-10)
         errs[name] = e
+        errs_psi[name] = ep
     return errs, dict(ids=ids, rms_px=rms, camera_shift_m=dC.tolist(),
-                      lens_z_m={k: float(v[2]) for k, v in cents.items()})
+                      lens_z_m={k: float(v[2]) for k, v in cents.items()}, psi_rad=errs_psi)
 
 
-def compare(s0, s1, tasks, k_start=None, eps_mm=EPS_MM, d_lap_mm=None, mark_px=MARK_PX, tag_offset=None):
+def compare(s0, s1, tasks, k_start=None, eps_mm=EPS_MM, d_lap_mm=None, mark_px=MARK_PX, tag_offset=None,
+            eps_huong_deg=None, d_lap_huong_deg=None):
     """drift dict of design section 2 (s1 None: clip H at the end missing). tag_offset (dx, dy, dpsi
-    rad): the one the runs are tracked with; None: the tag_offset of session H0 (CD3-2)."""
+    rad): the one the runs are tracked with; None: the tag_offset of session H0 (CD3-2).
+    Version c7_calib_drift_v2 (CAM v4 section 3 TC3-10; gate_c8 DRIFT_VERSION): D_H_vi_tri_mm (= D_H_mm) and
+    D_H_huong_deg = the largest |wrap(psi reported - psi true)| of car_pose over the same lane poses, both ways, both
+    lens hypotheses; trang_thai_vi_tri / trang_thai_huong 'so' (both measured here) or 'thieu' (no clip H at the
+    end, vang_H1); cach 'tuyet_doi' (session against session, every lane pose; the relative way per run is
+    'tuong_doi'). eps_H_huong_deg = max(eps_huong_deg, 2 x d_lap_huong_deg); no eps_huong_deg (not locked yet):
+    vuot from the position only and eps_H_huong_deg null (the gate recomputes vuot with its own eps_H, GC9-3)."""
     eps_mm = _finite(eps_mm, '--eps-mm', 0.0, strict=True)
     mark_px = _finite(mark_px, '--mark-px', 0.0, strict=True)
     if d_lap_mm is not None:
         d_lap_mm = _finite(d_lap_mm, '--d-lap-mm', 0.0)
     eps = max(eps_mm, 2.0 * d_lap_mm) if d_lap_mm is not None else eps_mm
+    if eps_huong_deg is not None:
+        eps_huong_deg = _finite(eps_huong_deg, '--eps-huong-deg', 0.0, strict=True)
+    if d_lap_huong_deg is not None:
+        d_lap_huong_deg = _finite(d_lap_huong_deg, '--d-lap-huong-deg', 0.0)
+    eps_psi = None if eps_huong_deg is None else (
+        max(eps_huong_deg, 2.0 * d_lap_huong_deg) if d_lap_huong_deg is not None else eps_huong_deg)
     poses, names = lane_poses(tasks, k_start)                        # also checks --k-start for K1/K2
     off = _triple(s0.get('tag_offset') if tag_offset is None else list(tag_offset), 'tag offset')
     pts = poses[:, :2]
@@ -320,9 +337,13 @@ def compare(s0, s1, tasks, k_start=None, eps_mm=EPS_MM, d_lap_mm=None, mark_px=M
                 tasks=list(tasks), lanes=names, n_points=int(len(pts)), step_m=STEP_M,
                 k_start=None if k_start is None else list(k_start), tag_offset=off,
                 eps_H_mm=eps, eps_mm=eps_mm, d_lap_mm=d_lap_mm, mark_px=mark_px,
+                eps_H_huong_deg=eps_psi, eps_huong_deg=eps_huong_deg, d_lap_huong_deg=d_lap_huong_deg,
+                version=DRIFT_VERSION, cach='tuyet_doi',
                 status='eps_H, mark_px: DE XUAT, khoa o C8')
     if s1 is None:
         return dict(base, thieu_H1=True, vuot=True, D_H_mm=None, s1_session_sha256=None,
+                    D_H_vi_tri_mm=None, D_H_huong_deg=None, trang_thai_vi_tri='thieu', trang_thai_huong='thieu',
+                    vang_H1=True, vuot_do_thieu=True,
                     note='thieu clip H cuoi: cac luot tu clip H dang dung toi cuoi buoi chua ket luan (Q2)')
     check_same(s0, s1)
     check_camera(s0, 'session H0')
@@ -337,6 +358,10 @@ def compare(s0, s1, tasks, k_start=None, eps_mm=EPS_MM, d_lap_mm=None, mark_px=M
             by[(way, hyp)] = (float(n[k]), float(np.median(n)), k)
     (w_way, w_hyp), (d_h, _, w_k) = max(by.items(), key=lambda kv: kv[1][0])
     worst = pts[w_k]
+    by_psi = {(way, hyp): math.degrees(float(np.max(np.abs(e))))
+              for way, dd in (('h0_to_h1', d01), ('h1_to_h0', d10)) for hyp, e in dd['psi_rad'].items()}
+    d_psi = max(by_psi.values())
+    vuot = bool(d_h > eps) or (eps_psi is not None and d_psi > eps_psi)
     ref0 = {int(i): np.array(v, float) for i, v in s0['ref_centres_px'].items()}
     ref1 = {int(i): np.array(v, float) for i, v in s1['ref_centres_px'].items()}
     fl = set(cm.session_floor_ids(s0)) & set(cm.session_floor_ids(s1))
@@ -354,9 +379,12 @@ def compare(s0, s1, tasks, k_start=None, eps_mm=EPS_MM, d_lap_mm=None, mark_px=M
     c0, c1 = s0['camera'], s1['camera']
     return dict(base, thieu_H1=False, s1_session_sha256=s1['_sha256'],
                 h1_video=s1.get('video'), h1_video_sha256=s1.get('video_sha256'),
-                D_H_mm=d_h, vuot=bool(d_h > eps),
+                D_H_mm=d_h, vuot=vuot,
+                D_H_vi_tri_mm=d_h, D_H_huong_deg=d_psi, trang_thai_vi_tri='so', trang_thai_huong='so',
+                vang_H1=False, vuot_do_thieu=False,
                 D_mm={way: {hyp: dict(max=by[(way, hyp)][0], median=by[(way, hyp)][1]) for hyp in e01}
                       for way in ('h0_to_h1', 'h1_to_h0')},
+                D_huong_deg={way: {hyp: by_psi[(way, hyp)] for hyp in e01} for way in ('h0_to_h1', 'h1_to_h0')},
                 worst=dict(direction=w_way, hypothesis=w_hyp),
                 worst_xy_m=[float(worst[0]), float(worst[1])],
                 camera_shift_m=d10['camera_shift_m'], lens_z_m=dict(h0_to_h1=d01['lens_z_m'], h1_to_h0=d10['lens_z_m']),
@@ -423,8 +451,20 @@ def check_drift(d):
     else:
         dh = _finite(d['D_H_mm'], 'drift.json D_H_mm', 0.0)
         _sha(d['s1_session_sha256'], 'drift.json s1_session_sha256')
-        if d['vuot'] != (dh > eps):
-            raise ValueError(f'drift.json: vuot {d["vuot"]} does not match D_H {dh} / eps_H {eps}')
+        want = dh > eps
+        if d.get('version') == DRIFT_VERSION:              # v2: the heading too, when its threshold is given
+            dpsi = _finite(d.get('D_H_huong_deg'), 'drift.json D_H_huong_deg', 0.0)
+            if d.get('D_H_vi_tri_mm') != dh or d.get('trang_thai_vi_tri') != 'so' \
+                    or d.get('trang_thai_huong') != 'so' or d.get('vuot_do_thieu') is not False:
+                raise ValueError('drift.json v2: D_H_vi_tri_mm = D_H_mm, both quantities measured (so), '
+                                 'vuot_do_thieu false')
+            ep = d.get('eps_H_huong_deg')
+            if ep is not None:
+                want = want or dpsi > _finite(ep, 'drift.json eps_H_huong_deg', 0.0, strict=True)
+        if d['vuot'] != want:
+            raise ValueError(f'drift.json: vuot {d["vuot"]} does not match D_H {dh} / eps_H {eps}'
+                             + (f', heading {d.get("D_H_huong_deg")} / {d.get("eps_H_huong_deg")}'
+                                if d.get('version') == DRIFT_VERSION else ''))
 
 
 def check_score(sc, tr, frames_sha, session_sha, drift, name):
@@ -577,6 +617,10 @@ def main(argv=None):
     a1.add_argument('--k-start', default=None, help='X,Y,HEAD_DEG nominal start pose of K1/K2 (C8, final test)')
     a1.add_argument('--eps-mm', type=float, default=EPS_MM)
     a1.add_argument('--d-lap-mm', type=float, default=None, help='D_H of the two back-to-back clips H of C8 (Q4)')
+    a1.add_argument('--eps-huong-deg', type=float, default=None,
+                    help='heading threshold eps_H.huong_deg (locked at C8); none: vuot from the position only')
+    a1.add_argument('--d-lap-huong-deg', type=float, default=None,
+                    help='D_H_huong_deg of the two back-to-back clips H (eps = max(--eps-huong-deg, 2 x this))')
     a1.add_argument('--mark-px', type=float, default=MARK_PX)
     a1.add_argument('--tag-offset', default=None,
                     help='DX,DY,DPSI_DEG the runs are tracked with (track --tag-offset); default: tag_offset of --s0')
@@ -603,12 +647,12 @@ def main(argv=None):
                 dx, dy, dp = cm._pair(a.tag_offset, 3, '--tag-offset')
                 off = (_finite(dx, '--tag-offset dx'), _finite(dy, '--tag-offset dy'),
                        math.radians(_finite(dp, '--tag-offset deg')))
-            d = compare(s0, s1, tasks, ks, a.eps_mm, a.d_lap_mm, a.mark_px, off)
+            d = compare(s0, s1, tasks, ks, a.eps_mm, a.d_lap_mm, a.mark_px, off, a.eps_huong_deg, a.d_lap_huong_deg)
             _write(a.out, d)
             if d['thieu_H1']:
                 print('THIEU clip H cuoi: cac luot chua ket luan (Q2)')
             else:
-                print(f"D_H {d['D_H_mm']:.2f} mm (eps_H {d['eps_H_mm']:.2f}): {'VUOT, cham lai hai lan' if d['vuot'] else 'trong nguong'}; "
+                print(f"D_H {d['D_H_mm']:.2f} mm, huong {d['D_H_huong_deg']:.5f} deg (eps_H {d['eps_H_mm']:.2f} mm, {d['eps_H_huong_deg']} deg): {'VUOT, cham lai hai lan' if d['vuot'] else 'trong nguong'}; "
                       f"dich tam moc trung vi {d['shift_px']['median']:.2f} px, lon nhat {d['shift_px']['max']:.2f} px "
                       f"(ID {d['shift_px']['max_id']}); moc du tang: {[m['id'] for m in d['marks_grown']] or 'khong'}")
             print(f"#ket_qua,ma=0,vuot={int(d['vuot'])}")
