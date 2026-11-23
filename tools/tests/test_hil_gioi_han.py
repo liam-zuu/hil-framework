@@ -8,6 +8,7 @@ exactly 0 or +-1000 (PWM_TIMEOUT), restarts the 50 ms at every pin change, and f
 MISO -> censored. All data synthetic under tmp_path. Run: python -m pytest <this file>"""
 import base64
 import binascii
+import copy
 import csv
 import hashlib
 import json
@@ -629,9 +630,6 @@ def test_c3_15_censored_by_log_end(tmp_path):
 
 # ---- C3-17: band count on the completion window of the scorer ----
 
-BLOB = '0123456789abcdef0123456789abcdef01234567'
-
-
 def _sha256(path):
     with open(path, 'rb') as f:
         return hashlib.sha256(f.read()).hexdigest()
@@ -641,7 +639,7 @@ def _lock(npz, task='O1-F08', **kw):
     """The 'e2_khoa_cham' block (C3-28) as --cham writes it, for a hand-made scorer JSON."""
     d = dict(frame_log=os.path.basename(npz), frame_log_sha256=_sha256(npz), task=task,
              allow_final_set=True, allow_pre_b81_15=True, esp_log=None, esp_log_sha256=None,
-             scorer={'hil_o1_score': BLOB})
+             scorer={m: _git_blob(sys.modules[m].__file__) for m in SCORER_MODULES})
     d.update(kw)
     return d
 
@@ -842,7 +840,7 @@ def test_c3_31_gaps_in_bounds():
 # ---- C3-28: the scorer result is locked to the NPZ (SHA-256) and the task; real scorer ----
 
 SCORER_MODULES = ('hil_o1_score', 'o1_gate_eval', 'o1_gate', 'o1_feasibility', 'o1_lanes',
-                  'o1_tasks', 'hil_edge_map')
+                  'o1_tasks', 'hil_edge_map', 'protocol', 'gate_c8')
 
 
 def _git_blob(path):
@@ -930,6 +928,8 @@ def test_c3_28_batch_real_scorer(real_cham):
         assert lk['allow_final_set'] is True and lk['allow_pre_b81_15'] is True
         assert lk['esp_log'] is None and lk['esp_log_sha256'] is None
         assert set(lk['scorer']) == set(SCORER_MODULES) and lk['scorer']['hil_o1_score'] == blob
+        for m in ('protocol', 'gate_c8'):
+            assert lk['scorer'][m] == _git_blob(sys.modules[m].__file__)
         assert row['win_ht_src'] == (f"hil_o1_score:lifecycle_RUN:completed={js['completed']}"
                                      f':allow_final_set=1:allow_pre_b81_15=1:scorer_blob={blob}')
         assert float(row['t_ht0_s']) == pytest.approx(js['T_cmd'], abs=1e-6)
@@ -999,5 +999,108 @@ def test_c3_28_score_json_fields(tmp_path):
         assert hg.main(['--frame-log', npz, '--task', 'O1-F08', '--score-json', str(sj),
                         '--out', str(tmp_path / f'o{i}')]) == code, i
     row = read_one(tmp_path / 'o0' / 'o_gioi_han.csv')
+    blob = _git_blob(sys.modules['hil_o1_score'].__file__)
     assert row['win_ht_src'] == ('hil_o1_score:lifecycle_RUN:completed=true:allow_final_set=1:'
-                                 f'allow_pre_b81_15=1:scorer_blob={BLOB}')
+                                 f'allow_pre_b81_15=1:scorer_blob={blob}')
+
+
+def test_c3_28_same_npz_other_scoring_config(real_cham, tmp_path):
+    """Codex C3-28 counterexample: same NPZ and task, another scoring configuration (another
+    ESP32 log, other flags, another scorer source) used to pass; now refused."""
+    npz_a = real_cham['npz']['runA']
+    esp = {}
+    for name, pwm in (('x', 0), ('y', 100)):
+        p = tmp_path / f'{name}.csv'
+        with open(p, 'w', newline='', encoding='utf-8') as f:
+            w = csv.writer(f)
+            w.writerow(ESP_COLS)
+            w.writerow([E0_US, 1000, pwm, 0, 0, 0])
+        esp[name] = str(p)
+    sha_x = _sha256(esp['x'])
+    bogus = 'f' * 40                              # a valid 40-hex blob, not the running one
+    sc0 = real_cham['js']['runA']                 # lock: esp None, real 9-module scorer blobs
+    cases = [(copy.deepcopy(sc0), None, 3)]
+    cases.append((copy.deepcopy(sc0), esp['x'], 2))                    # log not locked
+    sc = copy.deepcopy(sc0)
+    sc['e2_khoa_cham'].update(esp_log='x.csv', esp_log_sha256=sha_x)
+    cases.append((sc, esp['x'], 3))                                    # matching log passes
+    sc = copy.deepcopy(sc0)
+    sc['e2_khoa_cham'].update(esp_log='x.csv', esp_log_sha256=sha_x)
+    cases.append((sc, esp['y'], 2))                                    # other file content
+    sc = copy.deepcopy(sc0)
+    sc['e2_khoa_cham'].update(esp_log='x.csv', esp_log_sha256=sha_x)
+    cases.append((sc, None, 2))                                        # locked log not given
+    for c in ('allow_final_set', 'allow_pre_b81_15'):
+        sc = copy.deepcopy(sc0)
+        sc['e2_khoa_cham'][c] = False
+        cases.append((sc, None, 2))
+    for m in ('gate_c8', 'protocol', 'o1_feasibility'):
+        sc = copy.deepcopy(sc0)
+        sc['e2_khoa_cham']['scorer'][m] = bogus
+        cases.append((sc, None, 2))
+    for m in ('protocol', 'gate_c8'):
+        sc = copy.deepcopy(sc0)
+        sc['e2_khoa_cham']['scorer'].pop(m, None)                      # lock of the old version
+        cases.append((sc, None, 2))
+    for i, (sc, esp_path, code) in enumerate(cases):
+        sj = tmp_path / f's{i}.json'
+        sj.write_text(json.dumps(sc), encoding='utf-8')
+        out = tmp_path / f'o{i}'
+        argv = ['--frame-log', npz_a, '--task', 'O1-F08', '--score-json', str(sj),
+                '--out', str(out)]
+        if esp_path is not None:
+            argv += ['--esp-log', esp_path]
+        assert hg.main(argv) == code, i
+        if code == 3:
+            row = read_one(out / 'o_gioi_han.csv')
+            brow = real_cham['rows']['runA']
+            assert row['win_ht_n'] == brow['win_ht_n'] and \
+                row['win_ht_src'] == brow['win_ht_src'], i
+
+
+def test_c3_28_t_end_outside_window(real_cham, tmp_path):
+    """Codex C3-28 counterexample: completed 'true' with a finite t_end before the completion
+    window passed. t_end (when present) must lie in [T_cmd; t_deadline] +-1e-9 whatever
+    completed is."""
+    npz_a, ja = real_cham['npz']['runA'], real_cham['js']['runA']
+    npz = _speed_npz(tmp_path)                     # T_cmd 10, t_deadline 12, k0/t0_step 100
+    cases = []
+    for te in (ja['T_cmd'] - 0.5, ja['t_deadline'] + 0.5):
+        sc = copy.deepcopy(ja)
+        sc['completed'], sc['t_end'] = 'true', te
+        cases.append((sc, npz_a, 2, None))
+    for kw, code, n_ht in ((dict(t_end=10.0), 3, 1),
+                           (dict(t_end=10.0 - 5e-10), 3, 1),
+                           (dict(t_end=10.0 - 2e-9), 2, None),
+                           (dict(t_end=12.0 + 5e-10), 3, 2000),
+                           (dict(t_end=12.0 + 2e-9), 2, None),
+                           (dict(t_end=9.0, completed='false'), 2, None),
+                           (dict(t_end=11.999, completed='false'), 3, 2000)):
+        cases.append((_score(npz, **kw), npz, code, n_ht))
+    for i, (sc, fl, code, n_ht) in enumerate(cases):
+        sj = tmp_path / f't{i}.json'
+        sj.write_text(json.dumps(sc), encoding='utf-8')
+        out = tmp_path / f'o{i}'
+        assert hg.main(['--frame-log', fl, '--task', 'O1-F08', '--score-json', str(sj),
+                        '--out', str(out)]) == code, i
+        if n_ht is not None:
+            assert int(read_one(out / 'o_gioi_han.csv')['win_ht_n']) == n_ht, i
+
+
+def test_c3_28_k0_index(tmp_path):
+    """C3-28: k0 must be an integer frame index in [0, n); float, bool, str and out-of-range
+    values are refused (hil_o1_score._json_safe always writes an int)."""
+    npz = _speed_npz(tmp_path)                                        # n = 12200
+    cases = [(-1, 12201, {}, 2, None), (12200, 0, {}, 2, None), (12201, -1, {}, 2, None),
+             (0, 12200, dict(t_end=None, completed='false'), 3, 2000), (12199, 1, {}, 3, None),
+             (100.5, 12100, {}, 2, None), (100.0, 12100, {}, 2, None), (True, 12199, {}, 2, None),
+             ('100', 12100, {}, 2, None)]
+    for i, (k0, fs, kw, code, n_ht) in enumerate(cases):
+        sc = _score(npz, k0=k0, frames_scored=fs, **kw)
+        sj = tmp_path / f'k{i}.json'
+        sj.write_text(json.dumps(sc), encoding='utf-8')
+        out = tmp_path / f'o{i}'
+        assert hg.main(['--frame-log', npz, '--task', 'O1-F08', '--score-json', str(sj),
+                        '--out', str(out)]) == code, i
+        if n_ht is not None:
+            assert int(read_one(out / 'o_gioi_han.csv')['win_ht_n']) == n_ht, i
