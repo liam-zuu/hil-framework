@@ -44,7 +44,9 @@ Per level (O1-F02, O1-F05, O1-F08; the K tasks take the F05 3b numbers only for 
                 ~05:00): the mounting declared at c8b_a6 do (lan_lap_cho of c8b_a6_v2) checked against F8 lan_lap_v1
                 (--lan-lap): an F8 run with the luot_id of the E clip must carry that lan_lap_id (another value ->
                 refused, exit 2); no such run -> dat only when every non-null lan_lap_id of the F8 runs of that place is
-                one value equal to the declared one; else chua_ket_luan, ly_do lan_lap_E_khong_doi_chieu. F8 of another
+                one value equal to the declared one; else chua_ket_luan, ly_do lan_lap_E_khong_doi_chieu. F8 whose every run has lan_lap_id null (no
+                mounting determined, CODE 23/11): no comparison, dat with nhan can_lech_tam_buoi1_chua_xac_minh_lan_lap
+                and gia_dinh (one mounting assumed). F8 of another
                 plate -> refused.
   trang_thai    'khoa' only when every level of --muc has hang_dong all numbers, a band, the plan and its branch
                 named, eps_H, mien_car_pose and lan_lap_E dat there; else 'chua_khoa' with ly_do_chua_khoa.
@@ -179,6 +181,12 @@ def mien_car_pose(a6, ses, cam):
 
 
 LL_E_LY_DO = 'lan_lap_E_khong_doi_chieu'
+LL_E_NULL = 'can_lech_tam_buoi1_chua_xac_minh_lan_lap'      # CODE 23/11 (Chot_F8_rong_buoi2_v1 muc 2): F8 all null
+LL_E_NULL_CAN_CU = ('F8 khong xac minh duoc lan lap (moi lan_lap_id null; Liam o NHACTAM 23/11 dung duong beta); '
+                    'khong doi chieu, gia dinh mot lan lap: Liam 22/11 o CODE_C8B "o ca 3 buoi deu co dinh, dan 1 lan '
+                    'va do luon dau co thao ra dau?", Liam 23/11 o CODE "Chua thao, con nguyen", nhat ky khong co '
+                    'buoc thao; lech tam lay theo can buoi 1 (0,57 mm; 0,234 do), CODE 23/11 '
+                    '03_CODE/docs/2026-11-23_Chot_F8_rong_buoi2_v1.md')
 
 
 def lan_lap_E(a6, lan_lap):
@@ -193,11 +201,17 @@ def lan_lap_E(a6, lan_lap):
     if lan_lap.get('tam_id') != a6.get('tam_id'):
         raise KhoaError(f'F8 lan_lap of plate {lan_lap.get("tam_id")!r}, A6 of {a6.get("tam_id")!r}')
     out, why = {}, []
+    # CODE 23/11 (Chot_F8_rong_buoi2_v1 muc 2; Liam at CODE_C8B, verbatim: "may gui cai cau hoi nay cho thang code cho
+    # tao", CODE chose option 1): an F8 whose every run has lan_lap_id null determined no mounting: no comparison,
+    # dat with the label LL_E_NULL (an assumption, written in the lock); an F8 with any id keeps the rule below.
+    f8_null = bool(rows) and all(isinstance(x, dict) and x.get('lan_lap_id') is None for x in rows)
     for cho, v in a6['lan_lap_cho'].items():
         lid, le = (v or {}).get('lan_lap_id'), (v or {}).get('luot_id_E')
         r = dict(lan_lap_id=lid, luot_id_E=le, trang_thai='chua_ket_luan', ly_do=None)
         if not isinstance(lid, str) or not lid or not isinstance(le, str) or not le:
             r['ly_do'] = f'{LL_E_LY_DO}: lan_lap_id / luot_id_E of {cho} not declared in the A6 file'
+        elif f8_null:
+            r.update(trang_thai='dat', nhan=LL_E_NULL, gia_dinh=LL_E_NULL_CAN_CU)
         else:
             same = [x for x in rows if isinstance(x, dict) and x.get('luot_id') == le]
             if same:

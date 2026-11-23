@@ -170,6 +170,15 @@ def test_a6c1_7_lan_lap_E_against_f8():
     r, st, _ = K.lan_lap_E(_a6(), _f8([dict(luot_id='r1', cho='goc', lan_lap_id='L5')]))   # one value, not declared
     assert r['goc']['trang_thai'] == 'chua_ket_luan' and r['K1']['trang_thai'] == 'chua_ket_luan'  # K1: no F8 value
     assert K.lan_lap_E(_a6(), None)[1] == 'chua_ket_luan'
+    # CODE 23/11 (Chot_F8_rong_buoi2_v1 muc 2): every F8 id null -> no comparison, dat with the assumption label
+    nul = _f8([dict(luot_id='r1', cho='goc', lan_lap_id=None), dict(luot_id='Ek', cho='K1', lan_lap_id=None)])
+    r, st, why = K.lan_lap_E(_a6(), nul)
+    assert st == 'dat' and not why and all(r[c]['nhan'] == K.LL_E_NULL and r[c]['gia_dinh'] for c in ('goc', 'K1'))
+    assert K.lan_lap_E(_a6(goc=dict(lan_lap_id='L0', luot_id_E=None)), nul)[1] == 'chua_ket_luan'   # still declared
+    assert K.lan_lap_E(_a6(), _f8([]))[1] == 'chua_ket_luan'                     # no run is not "all null"
+    with pytest.raises(K.KhoaError):                                              # a plate mismatch still refused
+        K.lan_lap_E(_a6(), _f8([dict(luot_id='r1', cho='goc', lan_lap_id=None)], tam='T9'))
+    assert 'nhan' not in K.lan_lap_E(_a6(), _f8())[0]['goc']                      # an F8 with ids: rule unchanged
     assert K.lan_lap_E(dict(_a6(), lan_lap_cho=None), _f8())[1] == 'chua_ket_luan'
     assert K.lan_lap_E(_a6(goc=dict(lan_lap_id='L0', luot_id_E=None)), _f8())[1] == 'chua_ket_luan'
     with pytest.raises(K.KhoaError):
