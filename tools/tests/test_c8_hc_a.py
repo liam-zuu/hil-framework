@@ -1185,17 +1185,26 @@ def test_cua_so_run2_lan_lap_from_f8(tmp_path, monkeypatch):
 
 
 def test_cua_so_run2_no_lan_lap_stays_chan_doan(tmp_path, monkeypatch):
-    """F8 without a verified run of this 12b, or with two ids, or no --lan-lap: F5 chan_doan with the reason."""
+    """F8 with two ids for this 12b, or no --lan-lap: F5 chan_doan with the reason. F8 read (identity checks passed)
+    with no id for this 12b (F8 rong, CODE 23/11 muc 1b): the gate passes, lan_lap_id null, lan_lap_nhan labelled."""
     d, f2, a6, f8, run2 = _f8_setup(tmp_path, monkeypatch)
-    cases = [('none', [_rec('C8_1', 'K2', None, None), _rec('C8_2', 'K1', 'L0', 'HC_K2_1')], 'khong co luot'),
-             ('two', [_rec('C8_1', 'K2', 'L0', 'HC_K2_1'), _rec('C8_2', 'K2', 'L1', 'HC_K2_1')], 'nhieu lan_lap_id'),
-             ('empty', [_rec('C8_1', 'K2', '', 'HC_K2_1')], 'khong co luot')]
-    for name, luot, why in cases:
-        rc, f5 = run2(f8(name, luot), f'r_{name}')
-        assert rc == 0 and f5['lan_lap_id'] is None and f5['trang_thai'] == 'chan_doan', name
+    cases = [('none', [_rec('C8_1', 'K2', None, None), _rec('C8_2', 'K1', 'L0', 'HC_K2_1')], 'khong co luot', True),
+             ('two', [_rec('C8_1', 'K2', 'L0', 'HC_K2_1'), _rec('C8_2', 'K2', 'L1', 'HC_K2_1')], 'nhieu lan_lap_id',
+              False),
+             ('empty', [_rec('C8_1', 'K2', '', 'HC_K2_1')], 'khong co luot', True)]
+    for name, luot, why, rong in cases:
+        ll = f8(name, luot)
+        rc, f5 = run2(ll, f'r_{name}')
+        assert rc == 0 and f5['lan_lap_id'] is None, name
         assert why in f5['lan_lap_id_ly_do'], (name, f5['lan_lap_id_ly_do'])
+        assert f5['lan_lap_v1_sha256'] == ca.sha256(ll) and ca.f5_problems(f5) == []
+        if rong:
+            assert f5['trang_thai'] == f5['chuoi'] == 'khoa' and f5['lan_lap_nhan'] == ca.NGUON_LECH_TAM, name
+        else:
+            assert f5['trang_thai'] == 'chan_doan' and f5['lan_lap_nhan'] is None, name
     rc, f5 = run2(None, 'r_no')
     assert rc == 0 and f5['trang_thai'] == 'chan_doan' and '--lan-lap' in f5['lan_lap_id_ly_do']
+    assert f5['lan_lap_nhan'] is None and f5['lan_lap_v1_sha256'] is None
 
 
 def test_cua_so_run2_refuses_other_f8(tmp_path, monkeypatch):
@@ -2080,3 +2089,140 @@ def test_cua_so_tinh_give_cam_the_mounting_ids(tmp_path, monkeypatch):
     assert seen[n] == dict(cho='K2')                                      # no --q-tu: nothing extra
 
 
+# ------------------------------------------------------------------ F8 rong (CODE 23/11, Chot_F8_rong_buoi2_v1 muc 1)
+def test_q_of_k2_f8_rong_borrows_with_plate_bound(tmp_path):
+    """F8 read on both sides (same lan_lap_v1_sha256) but an id null: K2 borrows q of K1, u_q + 0.57 mm, labelled;
+    two different non-null ids still refused; no F8 on one side, or two F8 files: not verified."""
+    a6, xv, x = _k2_setup(tmp_path)
+    k1 = _f5_file(tmp_path, 'f5_k1r', 'K1', 'HC_K1_1', None, xv, a6, lan_lap_v1_sha256='S8',
+                   lan_lap_nhan=ca.NGUON_LECH_TAM)
+    q, u, why, ng = ca.q_cua_cho(x, 'K2', a6, xv, None, k1, ll_sha='S8')
+    assert q == [-0.0004, 0.0002] and why is None
+    assert u == pytest.approx(0.0003 + 0.00057) and ca.U_LECH_TAM_BUOI1_M == 0.00057
+    assert ng['nguon_u'] == 'can_lech_tam_buoi1_chua_xac_minh_lan_lap' and ng['u_q_f4_m'] == 0.0003
+    assert ng['u_lech_tam_m'] == 0.00057 and ng['lan_lap_v1_sha256'] == 'S8' and 'F8 rong' in ng['cach']
+    assert ng['cho'] == 'K1' and ng['doan_12b_file_sha256'] == ca.sha256(k1)
+    q, u, why, ng = ca.q_cua_cho(x, 'K2', a6, xv, 'L2', k1, ll_sha='S8')          # one side null: same rule
+    assert u == pytest.approx(0.00087) and ng['nguon_u'] == ca.NGUON_LECH_TAM
+    for ll_sha in (None, '', 'S9'):                                               # no F8 here / another F8 file
+        q, u, why, ng = ca.q_cua_cho(x, 'K2', a6, xv, None, k1, ll_sha=ll_sha)
+        assert q is None and ng is None and 'chua xac minh' in why, ll_sha
+    k1n = _f5_file(tmp_path, 'f5_k1n', 'K1', 'HC_K1_1', None, xv, a6)            # F5 K1 not read against an F8
+    assert ca.q_cua_cho(x, 'K2', a6, xv, None, k1n, ll_sha='S8')[0] is None
+    k1t = _f5_file(tmp_path, 'f5_k1t', 'K1', 'HC_K1_1', None, xv, a6, lan_lap_v1_sha256='S8')   # no label (2 ids)
+    assert ca.q_cua_cho(x, 'K2', a6, xv, None, k1t, ll_sha='S8')[0] is None
+    k1d = _f5_file(tmp_path, 'f5_k1d', 'K1', 'HC_K1_1', 'L3', xv, a6, lan_lap_v1_sha256='S8')
+    q, u, why, ng = ca.q_cua_cho(x, 'K2', a6, xv, 'L2', k1d, ll_sha='S8')         # two ids, different: refused
+    assert q is None and 'khac lan lap' in why
+    k1s = _f5_file(tmp_path, 'f5_k1s', 'K1', 'HC_K1_1', 'L2', xv, a6, lan_lap_v1_sha256='S8')
+    q, u, why, ng = ca.q_cua_cho(x, 'K2', a6, xv, 'L2', k1s, ll_sha='S8')         # verified: no bound added
+    assert u == 0.0003 and 'nguon_u' not in ng
+    k1x = _f5_file(tmp_path, 'f5_k1rx', 'K1', 'HC_K1_1', None, write_json(str(tmp_path / 'xo2.json'), dict(x, n=1)),
+                   a6, lan_lap_v1_sha256='S8', lan_lap_nhan=ca.NGUON_LECH_TAM)
+    assert 'xoay / A6 khac' in ca.q_cua_cho(x, 'K2', a6, xv, None, k1x, ll_sha='S8')[2]
+    q, u, why, ng = ca.q_cua_cho(x, 'K1', a6, xv, None, k1, ll_sha='S8')          # own block: untouched
+    assert u == 0.0003 and ng['cach'] == 'khoi F4 cua chinh cho'
+    assert ca.cach_lan_lap('L2', None, dict(lan_lap_id='L2')) == 'cung'
+    assert ca.cach_lan_lap(None, None, dict(lan_lap_id=None, lan_lap_v1_sha256=None)) == 'chua'
+
+
+def test_q_cung_lan_lap_f8_rong_adds_bound(tmp_path):
+    a6, xv, x = _k2_setup(tmp_path)
+    k1 = _f5_file(tmp_path, 'f5_k1r', 'K1', 'HC_K1_1', None, xv, a6, lan_lap_v1_sha256='S8',
+                   lan_lap_nhan=ca.NGUON_LECH_TAM)
+    base = dict(cho_q='K1', ll_id=None, ll_id_q=None)
+    assert ca.q_cung_lan_lap(x, 'K2', k1, None, ll_sha='S8', a6_path=a6, xoay_path=xv) == dict(base, u_them_m=0.00057)
+    assert ca.q_cung_lan_lap(x, 'K2', k1, None, ll_sha='S9', a6_path=a6, xoay_path=xv) == base
+    assert ca.q_cung_lan_lap(x, 'K2', k1, None, ll_sha='S8') == base                # sha of xoay / A6 not checkable
+    other = write_json(str(tmp_path / 'a6b.json'), dict(schema='c8b_a6_v2', tam_id='T2'))
+    assert ca.q_cung_lan_lap(x, 'K2', k1, None, ll_sha='S8', a6_path=other, xoay_path=xv) == base
+    k1s = _f5_file(tmp_path, 'f5_k1s', 'K1', 'HC_K1_1', 'L2', xv, a6, lan_lap_v1_sha256='S8')
+    assert 'u_them_m' not in ca.q_cung_lan_lap(x, 'K2', k1s, 'L2', ll_sha='S8', a6_path=a6, xoay_path=xv)
+    assert ca.q_cung_lan_lap(x, 'K1', k1, None, ll_sha='S8', a6_path=a6, xoay_path=xv) is None
+
+
+def test_frames_chain_f8_rong_hands_cam_the_borrowed_block(tmp_path, monkeypatch):
+    """u_them_m: the block of cho_q is read with CAM's doc_xoay, u_q raised, and passed as a read xoay (no ids)."""
+    import c7_chuoi_khung as ck
+    a6, xv, x = _k2_setup(tmp_path)
+    seen = []
+
+    def fake(frames_csv, a6_, xoay, lan_lap=None, track=None, cho=None, tam_id=None, cho_q=None, ll_id=None,
+             ll_id_q=None):
+        seen.append(dict(xoay=xoay, cho=cho, cho_q=cho_q))
+        return [_row(0), _row(1), _row(2)]
+    monkeypatch.setattr(ck, 'chuoi_khung', fake)
+    monkeypatch.setattr(ck, 'doc_a6', lambda p: dict(sha256='x'))
+    F = ca.frames_chain('f.csv', a6, xv, cho='K2', cho_q='K1', ll_id=None, ll_id_q=None, u_them_m=0.00057)
+    assert F is not None and F['chuoi'] == 'khoa'
+    xo = seen[-1]['xoay']
+    assert seen[-1]['cho_q'] is None and isinstance(xo, dict) and xo['ok'] and xo['q'] == [-0.0004, 0.0002]
+    assert xo['u_q'] == pytest.approx(0.00087) and xo['nguon_q']['nguon_u'] == ca.NGUON_LECH_TAM
+    assert xo['nguon_q']['cho'] == 'K1'
+    xbad = write_json(str(tmp_path / 'xb.json'), dict(x, cho=dict(x['cho'], K1=dict(x['cho']['K1'],
+                                                                                     trang_thai='chua_ket_luan'))))
+    ca.frames_chain('f.csv', a6, xbad, cho='K2', cho_q='K1', u_them_m=0.00057)   # the E place not dat: no q
+    assert seen[-1]['xoay']['q'] is None or not seen[-1]['xoay']['ok']
+    assert 'nguon_q' not in seen[-1]['xoay']
+    ca.frames_chain('f.csv', a6, xv, cho='K2', cho_q='K1', ll_id='L2', ll_id_q='L2')   # verified: ids to CAM as before
+    assert seen[-1]['xoay'] == xv and seen[-1]['cho_q'] == 'K1'
+
+
+def test_tinh_k2_f8_rong_q_from_k1_with_bound(tmp_path):
+    """tinh --cho K2 --q-tu F5_K1, both F5 read against the same F8 (lan_lap_v1_sha256) with null ids: q of K1,
+    du_m = u_q + 0.57 mm, F7 q_nguon labelled; another F8 file on the K2 F5: no q."""
+    a6, xv, x = _k2_setup(tmp_path)
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    k1 = _f5_file(tmp_path, 'f5_k1', 'K1', 'HC_K1_1', None, xv, a6, lan_lap_v1_sha256='S8',
+                   lan_lap_nhan=ca.NGUON_LECH_TAM)
+    own = _f5_file(tmp_path, 'f5_k2_own', 'K2', 'HC_K2_1', None, xv, a6, lan_lap_v1_sha256='S8',
+                   lan_lap_nhan=ca.NGUON_LECH_TAM)
+    out = str(tmp_path / 'f7.json')
+    assert ca.main(tinh_args(d, 'K2', '--xoay', xv, '--a6', a6, '--q-tu', k1, '--doan', own, '--out', out)) in (0, 1)
+    r = json.load(open(out, encoding='utf-8'))
+    assert 'thieu q, du_m (xoay_v1)' not in r['ly_do'] and r['q_nguon']['cho'] == 'K1'
+    assert r['q_nguon']['nguon_u'] == ca.NGUON_LECH_TAM and r['q_nguon']['u_q_f4_m'] == 0.0003
+    own9 = _f5_file(tmp_path, 'f5_k2_S9', 'K2', 'HC_K2_1', None, xv, a6, lan_lap_v1_sha256='S9',
+                   lan_lap_nhan=ca.NGUON_LECH_TAM)
+    out = str(tmp_path / 'f7b.json')
+    assert ca.main(tinh_args(d, 'K2', '--xoay', xv, '--a6', a6, '--q-tu', k1, '--doan', own9, '--out', out)) in (0, 1)
+    r = json.load(open(out, encoding='utf-8'))
+    assert 'thieu q, du_m (xoay_v1)' in r['ly_do'] and r['q_nguon'] is None
+
+
+def test_cua_so_k2_f8_rong_end_to_end(tmp_path, monkeypatch):
+    """cua_so run 2 of K2 with --q-tu F5 K1 (both read against the same F8): F8 rong -> q of K1, du_m + 0.57 mm;
+    F8 with two ids for the K2 12b (no label) -> no q even though F5 K1 names that F8."""
+    d, f2, a6, f8, run2 = _f8_setup(tmp_path, monkeypatch)
+    xv = write_json(str(tmp_path / 'xv.json'), _x_v1(ca.sha256(a6), K1=dict(q_tag_m=[-0.0004, 0.0002], u_q_m=0.0003)))
+    for name, luot, rong in (('rong', [_rec('C8_1', 'K2', None, None)], True),
+                             ('two', [_rec('C8_1', 'K2', 'L0', 'HC_K2_1'), _rec('C8_2', 'K2', 'L1', 'HC_K2_1')], False)):
+        ll = f8(name, luot)
+        k1 = _f5_file(tmp_path, f'f5_k1_{name}', 'K1', 'HC_K1_1', None, xv, a6, lan_lap_v1_sha256=ca.sha256(ll),
+                      lan_lap_nhan=ca.NGUON_LECH_TAM)
+        rc, f5 = run2(ll, f'r_{name}', extra=('--xoay', xv, '--q-tu', k1))
+        cfg = f5['car_pose_cfg']
+        assert rc == 0, name
+        if rong:
+            assert cfg['q_m'] == [-0.0004, 0.0002] and cfg['du_m'] == pytest.approx(0.00087)
+            assert cfg['q_nguon']['nguon_u'] == ca.NGUON_LECH_TAM and f5['trang_thai'] == 'khoa'
+        else:
+            assert cfg['q_m'] is None and 'chua xac minh' in cfg['q_ly_do'] and f5['trang_thai'] == 'chan_doan'
+
+
+def test_q_f8_rong_needs_label_on_this_side_in_tinh(tmp_path):
+    """tinh: the F5 of the issued K2 attempt read against F8 but without the F8 rong label (F8 gave two ids): no q,
+    even when the F5 K1 of --q-tu is labelled and names the same F8; q_cung_lan_lap: F5 K1 of another xoay: no bound."""
+    a6, xv, x = _k2_setup(tmp_path)
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    k1 = _f5_file(tmp_path, 'f5_k1', 'K1', 'HC_K1_1', None, xv, a6, lan_lap_v1_sha256='S8',
+                  lan_lap_nhan=ca.NGUON_LECH_TAM)
+    own = _f5_file(tmp_path, 'f5_k2_two', 'K2', 'HC_K2_1', None, xv, a6, lan_lap_v1_sha256='S8')
+    out = str(tmp_path / 'f7.json')
+    assert ca.main(tinh_args(d, 'K2', '--xoay', xv, '--a6', a6, '--q-tu', k1, '--doan', own, '--out', out)) in (0, 1)
+    r = json.load(open(out, encoding='utf-8'))
+    assert 'thieu q, du_m (xoay_v1)' in r['ly_do'] and r['q_nguon'] is None
+    other = write_json(str(tmp_path / 'xo3.json'), dict(x, n=2))
+    k1x = _f5_file(tmp_path, 'f5_k1_ox', 'K1', 'HC_K1_1', None, other, a6, lan_lap_v1_sha256='S8',
+                   lan_lap_nhan=ca.NGUON_LECH_TAM)
+    assert 'u_them_m' not in ca.q_cung_lan_lap(x, 'K2', k1x, None, ll_sha='S8', a6_path=a6, xoay_path=xv)
