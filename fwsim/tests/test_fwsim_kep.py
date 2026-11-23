@@ -4,7 +4,7 @@ Run: python -m pytest -q fwsim/tests/test_fwsim_kep.py   (needs fwsim/build/fwsi
      python fwsim/tests/test_fwsim_kep.py --digest       (old channels of the golden run, as recorded in GOLDEN)
      python fwsim/tests/test_fwsim_kep.py --scan         (cross-check against phan_tich_kep_pid, one JSON line per run)
      python fwsim/tests/test_fwsim_kep.py --pair <dll>   (old / new DLL pair on the bit-exact channels, one JSON
-     line per run, with the SHA-256 of both DLLs)"""
+     line per run, with the path and SHA-256 of each DLL as passed and as really loaded)"""
 import argparse
 import csv
 import ctypes
@@ -1041,30 +1041,97 @@ def test_dll_pair_without_and_with_kep(fw, variants, tmp_path):
     assert [[x for i, x in enumerate(r) if i not in ik] for r in moi[1:]] == cu[1:]
 
 
-# fw_sim.c of commit 62e2fa5 (before the kep channel), placed by CODE: `git show 62e2fa5:fwsim/fw_sim.c` cannot run here
-NGUON_CU = os.path.join(fwsim.HERE, '..', '_nguon_cu', 'fw_sim_62e2fa5.c')
+# fw_sim.c of commit 62e2fa5 (before the kep channel), a file of the repo now, placed by CODE
+NGUON_CU = os.path.join(fwsim.HERE, 'tests', 'data', 'fw_sim_62e2fa5.c')
 NGUON_CU_SHA = 'a93b6d0928a83ea3c7301fd98a57ac9c67d2edfa88109f1deaa6310a9e3e4b4d'   # sha256, CR stripped
+
+
+def _doc_nguon_cu():
+    """The raw bytes of NGUON_CU (read at call time so a monkeypatched path is honored): missing
+    or wrong CR-stripped sha256 is an assertion failure, never a skip."""
+    assert os.path.isfile(NGUON_CU), \
+        f'{NGUON_CU} missing: the old wrapper source is a file of the repo (fwsim/tests/data); ' \
+        f'the pair cannot run without it'
+    with open(NGUON_CU, 'rb') as f:
+        raw = f.read()
+    sha = hashlib.sha256(raw.replace(b'\r\n', b'\n')).hexdigest()
+    assert sha == NGUON_CU_SHA, f'{NGUON_CU}: CR-stripped sha256 {sha} != {NGUON_CU_SHA}'
+    return raw
+
+
+def _dll_nap(lib):
+    """(path, sha256) of the DLL the process really loaded (GetModuleFileNameW on the ctypes
+    handle; lib._name elsewhere): the file Windows mapped, not the path CDLL was given."""
+    if os.name == 'nt':
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.GetModuleFileNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        k32.GetModuleFileNameW.restype = ctypes.c_uint32
+        buf = ctypes.create_unicode_buffer(32768)
+        n = k32.GetModuleFileNameW(ctypes.c_void_p(lib._handle), buf, ctypes.c_uint32(len(buf)))
+        if n == 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        path = buf.value
+    else:
+        path = lib._name
+    return path, build_fwsim.file_sha256(path)
+
+
+def _fw_src_sha():
+    """One sha256 for the firmware tree a variant build compiles: sha256 of the concatenation of
+    '<rel>\\n<file sha256>\\n' over the 'sources' list of fwsim/build/fwsim_build.json, in order."""
+    info = json.load(open(_BUILD_JSON))
+    h = hashlib.sha256()
+    for rel in info['sources']:
+        h.update(f"{rel}\n{build_fwsim.file_sha256(os.path.join(_fw_tree(), 'src', rel))}\n".encode())
+    return h.hexdigest()
+
+
+def _tin_cap(fw, nap_cu, nap_moi):
+    """The identification of both sides of the pre-kep pair, for the assert messages: the two
+    wrapper sources (old: path + raw and CR-stripped sha256; new: path + sha256 now and the one
+    fwsim_build.json recorded at build), the firmware tree of each side (new: commit + dirty of
+    the build json; old: the tree path + the combined sha256 of the compiled sources), the gcc
+    of each build (old: the gcc on PATH now; new: the recorded compiler + flags) and the two
+    DLLs the process really loaded (plus the dll_sha256 the json recorded)."""
+    gcc = shutil.which('gcc')
+    gcc_ver = subprocess.run([gcc, '--version'], capture_output=True,
+                             text=True).stdout.splitlines()[0]
+    esp = fw.build_info.get('esp32') or {}
+    raw = _doc_nguon_cu()
+    sach_cr = hashlib.sha256(raw.replace(b'\r\n', b'\n')).hexdigest()
+    return (f'nguon cu {os.path.abspath(NGUON_CU)} sha256={hashlib.sha256(raw).hexdigest()} sha256_sach_cr={sach_cr}; '
+            f'nguon moi {os.path.abspath(os.path.join(fwsim.HERE, "fw_sim.c"))} '
+            f'sha256={build_fwsim.file_sha256(os.path.join(fwsim.HERE, "fw_sim.c"))} '
+            f'luc_build={fw.build_info["wrapper_sha256"]["fw_sim.c"]}; '
+            f'firmware cu {os.path.abspath(_fw_tree())} nguon_sha256={_fw_src_sha()}; '
+            f'firmware moi commit={esp.get("commit")} dirty={esp.get("dirty")}; '
+            f'gcc cu {gcc} | {gcc_ver}; '
+            f'gcc moi {fw.build_info.get("compiler")} flags {fw.build_info.get("flags")}; '
+            f'dll cu nap {nap_cu[0]} sha256={nap_cu[1]}; '
+            f'dll moi nap {nap_moi[0]} sha256={nap_moi[1]} '
+            f'ghi_luc_build={fw.build_info.get("dll_sha256")}')
 
 
 def test_dll_pair_with_the_source_before_kep(fw, variants, tmp_path):
     """The pair against the real pre-kep source: a DLL built of the fw_sim.c of 62e2fa5 has no kep
-    channel, and the real --pair CLI reports every run identical on the BIT_EXACT keys."""
-    if not os.path.isfile(NGUON_CU):
-        pytest.skip(f'{NGUON_CU} not present: the pair with the DLL of 62e2fa5 is not run')
-    with open(NGUON_CU, 'rb') as f:
-        assert hashlib.sha256(f.read().replace(b'\r\n', b'\n')).hexdigest() == NGUON_CU_SHA
+    channel, and the real --pair CLI reports every run identical on the BIT_EXACT keys. The msg
+    identifies both wrapper sources, the firmware tree of each side, the toolchain and the DLLs
+    really loaded."""
+    _doc_nguon_cu()
     shutil.copytree(os.path.join(fwsim.HERE, 'shim'), str(tmp_path / 'shim'))
     src_cu = str(tmp_path / 'fw_sim_62e2fa5.c')
     shutil.copyfile(os.path.abspath(NGUON_CU), src_cu)
     old = variants('fwsim_62e2fa5', fw_sim_c=src_cu)
     sim = fwsim.FirmwareSim(old)
     assert sim.kep_cols == 0 and not hasattr(sim.lib, 'fwsim_kep_last')
+    nap_cu = _dll_nap(sim.lib)
     del sim
+    nap_moi = _dll_nap(fw.lib)
     r = subprocess.run([sys.executable, os.path.abspath(__file__), '--pair', old],
                        capture_output=True, text=True, cwd=os.path.dirname(fwsim.HERE), timeout=600)
     assert r.returncode == 0, r.stderr[-2000:]
-    msg = (f'old {_dll_tin(old)}; new {_dll_tin(_DLL)}; build {fw.build_info.get("compiler")} '
-           f'esp32 {fw.build_info.get("esp32")} flags {fw.build_info.get("flags")}')
+    msg = _tin_cap(fw, nap_cu, nap_moi)
+    assert build_fwsim.file_sha256(_DLL) == fw.build_info['dll_sha256'], msg
     lines = [json.loads(x) for x in r.stdout.splitlines() if x.strip()]
     assert [x['run'] for x in lines] == ['golden', 'adrc', 'motor_tat', 's03']
     for line in lines:
@@ -1077,7 +1144,61 @@ def test_dll_pair_with_the_source_before_kep(fw, variants, tmp_path):
         assert line['npz'], m
         assert line['dll_cu_sha256'] == build_fwsim.file_sha256(old), m
         assert line['dll_moi_sha256'] == build_fwsim.file_sha256(_DLL), m
+        assert os.path.normcase(os.path.abspath(line['dll_cu_nap'])) \
+            == os.path.normcase(os.path.abspath(old)), m
+        assert os.path.normcase(os.path.abspath(line['dll_moi_nap'])) \
+            == os.path.normcase(os.path.abspath(_DLL)), m
+        assert line['dll_cu_nap_sha256'] == build_fwsim.file_sha256(old), m
+        assert line['dll_moi_nap_sha256'] == build_fwsim.file_sha256(_DLL), m
     print(msg)
+
+
+def test_old_source_is_in_the_repo():
+    """The old wrapper source is a file of this repo (fwsim/tests/data): it exists and passes
+    the pinned-sha check of _doc_nguon_cu."""
+    assert os.path.normcase(os.path.dirname(os.path.abspath(NGUON_CU))) \
+        == os.path.normcase(os.path.abspath(os.path.join(fwsim.HERE, 'tests', 'data')))
+    assert isinstance(_doc_nguon_cu(), bytes)
+
+
+@pytest.mark.parametrize('case', ['thieu', 'sai_sha', 'crlf'])
+def test_old_source_check_rejects(tmp_path, monkeypatch, case):
+    """_doc_nguon_cu fails (never skips) on a missing file or a wrong CR-stripped sha256; a CRLF
+    copy still passes: the pinned sha is computed with CR stripped."""
+    mod = sys.modules[__name__]
+    if case == 'thieu':
+        monkeypatch.setattr(mod, 'NGUON_CU', str(tmp_path / 'khong_co_nguon_cu.c'))
+        with pytest.raises(AssertionError, match='missing'):
+            _doc_nguon_cu()
+        return
+    raw = open(NGUON_CU, 'rb').read()
+    path = str(tmp_path / 'fw_sim_62e2fa5.c')
+    if case == 'sai_sha':
+        with open(path, 'wb') as f:
+            f.write(raw + b'\n')
+        monkeypatch.setattr(mod, 'NGUON_CU', path)
+        with pytest.raises(AssertionError, match=NGUON_CU_SHA):
+            _doc_nguon_cu()
+    else:                                        # crlf: the boundary case of the CR-stripped sha
+        with open(path, 'wb') as f:
+            f.write(raw.replace(b'\n', b'\r\n'))
+        monkeypatch.setattr(mod, 'NGUON_CU', path)
+        assert _doc_nguon_cu() == raw.replace(b'\n', b'\r\n')
+
+
+def test_pair_fails_not_skips_without_the_old_source(fw, variants, tmp_path, monkeypatch):
+    """Without the old source the pair test must fail, not skip (a skip would still look green in
+    the report): pytest.skip is a BaseException, so it is caught explicitly."""
+    mod = sys.modules[__name__]
+    monkeypatch.setattr(mod, 'NGUON_CU', str(tmp_path / 'khong_co_nguon_cu.c'))
+    try:
+        test_dll_pair_with_the_source_before_kep(fw, variants, tmp_path)
+    except pytest.skip.Exception as e:
+        pytest.fail(f'skipped instead of failing: {e}')
+    except AssertionError as e:
+        assert 'missing' in str(e)
+    else:
+        pytest.fail('passed without the old source')
 
 
 def test_cap_runs_simulates_both_sides(fw, variants, monkeypatch):
@@ -1096,36 +1217,114 @@ def test_cap_runs_simulates_both_sides(fw, variants, monkeypatch):
     assert _RUNS['v08_mac_dinh'] is stale
 
 
-def test_trace_fallback_builds_a_separate_dll(variants, glog, monkeypatch):
-    """Codex C3-33: when a --wrap trace DLL records no calls, the renamed-symbol fallback is built
-    under its own name <name>_du_phong.dll: the first DLL stays loaded and is not overwritten."""
+def _bien_the(dll):
+    """'du_phong' for the renamed-symbol fallback (<name>_du_phong.dll), 'wrap' otherwise."""
+    return 'du_phong' if os.path.basename(dll).endswith('_du_phong.dll') else 'wrap'
+
+
+def _gia_lap_probe(monkeypatch, wrap_ld=True, wrap_bat=True, du_phong_bat=True):
+    """Patch the probe chain of the variants fixture (all on the module globals): _WRAP_OK back
+    to None, build_variant spied (built = [(out_dll, _WRAP_OK at the call)]), _gcc spied (cmds =
+    every gcc command; wrap_ld False makes a --wrap link raise RuntimeError before gcc runs, as
+    a rejecting ld would), _trace_works faked per probed variant: the real probe always runs
+    first (the DLL is really loaded), then wrap_bat / du_phong_bat decide the reported result.
+    Returns (built, cmds, probes); probes = [(_bien_the(dll), dll)]."""
     mod = sys.modules[__name__]
     monkeypatch.setattr(mod, '_WRAP_OK', None)
-    built, probes = [], []
-    real_build, real_works = mod.build_variant, mod._trace_works
+    built, cmds, probes = [], [], []
+    real_build, real_gcc, real_works = mod.build_variant, mod._gcc, mod._trace_works
 
     def spy_build(out_dll, **kw):
         built.append((out_dll, mod._WRAP_OK))
         return real_build(out_dll, **kw)
 
-    def fake_works(dll):   # loads the DLL (it stays loaded); the first probe: --wrap intercepts nothing
-        probes.append(dll)
-        return real_works(dll) and len(probes) > 1
+    def spy_gcc(cmd):
+        cmds.append(cmd)
+        if not wrap_ld and any('--wrap' in a for a in cmd):
+            raise RuntimeError("gcc failed (1): ld.exe: unrecognized option '--wrap=pid_update_vx'")
+        return real_gcc(cmd)
+
+    def fake_works(dll):
+        bt = _bien_the(dll)
+        probes.append((bt, dll))
+        return real_works(dll) and (wrap_bat if bt == 'wrap' else du_phong_bat)
 
     monkeypatch.setattr(mod, 'build_variant', spy_build)
+    monkeypatch.setattr(mod, '_gcc', spy_gcc)
     monkeypatch.setattr(mod, '_trace_works', fake_works)
-    dll = variants('fwsim_trace_thu_du_phong', trace=True)
+    return built, cmds, probes
+
+
+def test_trace_fallback_builds_a_separate_dll(variants, glog, monkeypatch):
+    """Codex C3-33: when a --wrap trace DLL records no calls, the renamed-symbol fallback is built
+    under its own name <name>_du_phong.dll: the first DLL stays loaded and is not overwritten."""
+    mod = sys.modules[__name__]
+    built, cmds, probes = _gia_lap_probe(monkeypatch, wrap_bat=False)
+    dll = variants('fwsim_trace_thu', trace=True)   # the wrap name must not end in _du_phong
     assert len(built) == 2, built
     msg = f'trace {_dll_tin(built[0][0])}; {_dll_tin(built[1][0])}'
     assert built[0][1] is None and built[1][1] is False, msg
-    assert built[1][0] != built[0][0], msg
+    assert built[1][0] == built[0][0].replace('.dll', '_du_phong.dll'), msg
     assert dll == built[1][0], msg
-    assert probes == [built[0][0], built[1][0]], msg
+    assert probes == [('wrap', built[0][0]), ('du_phong', built[1][0])], msg
     assert os.path.isfile(built[0][0]) and os.path.isfile(built[1][0]), msg
+    assert mod._WRAP_OK is False, msg
     log = golden_run(TraceSim(dll))
     assert list(log) == list(glog)
     for k in glog:
         assert _bits_eq(log[k], glog[k]), k
+
+
+def test_trace_fallback_when_the_linker_rejects_wrap(variants, glog, monkeypatch):
+    """Codex C3-35: when ld rejects --wrap at build time the first DLL is never created and never
+    probed: only the fallback build runs (no --wrap, no -DTRACE_WRAP) and is probed."""
+    mod = sys.modules[__name__]
+    built, cmds, probes = _gia_lap_probe(monkeypatch, wrap_ld=False)
+    dll = variants('fwsim_trace_ld_tu_choi', trace=True)
+    assert len(built) == 2, built
+    msg = f'trace {built[0][0]} (khong duoc tao); {_dll_tin(built[1][0])}'   # built[0]: no file
+    assert built[0][1] is None and built[1][1] is False, msg
+    assert built[1][0] == built[0][0].replace('.dll', '_du_phong.dll'), msg
+    assert '-DTRACE_WRAP' in cmds[0] and any('--wrap' in a for a in cmds[0]), cmds[0]
+    for cmd in cmds[1:]:
+        assert '-DTRACE_WRAP' not in cmd and not any('--wrap' in a for a in cmd), cmd
+    assert not os.path.exists(built[0][0]), msg            # the rejected link left no DLL
+    assert probes == [('du_phong', built[1][0])], msg      # the wrap variant is never probed
+    assert dll == built[1][0], msg
+    assert mod._WRAP_OK is False, msg
+    log = golden_run(TraceSim(dll))
+    assert list(log) == list(glog)
+    for k in glog:
+        assert _bits_eq(log[k], glog[k]), k
+
+
+def test_trace_wrap_probe_ok(variants, monkeypatch):
+    """The normal case: --wrap links and records calls: one build, one probe, no fallback file,
+    _WRAP_OK ends True."""
+    mod = sys.modules[__name__]
+    built, cmds, probes = _gia_lap_probe(monkeypatch)
+    dll = variants('fwsim_trace_thu_wrap', trace=True)
+    msg = f'trace {_dll_tin(dll)}'
+    assert built == [(dll, None)], msg
+    assert probes == [('wrap', dll)], msg
+    assert not os.path.exists(dll.replace('.dll', '_du_phong.dll')), msg
+    assert mod._WRAP_OK is True, msg
+
+
+@pytest.mark.parametrize('case', ['ld_tu_choi', 'ca_hai'])
+def test_trace_fallback_fails_too(variants, monkeypatch, case):
+    """When the fallback also records nothing the fixture must raise: ld rejects --wrap ('the
+    trace records no pid_update calls'), or both variants probe empty ('renamed symbols too')."""
+    if case == 'ld_tu_choi':
+        built, cmds, probes = _gia_lap_probe(monkeypatch, wrap_ld=False, du_phong_bat=False)
+        with pytest.raises(RuntimeError, match=r'^the trace records no pid_update calls$'):
+            variants('fwsim_trace_hong_ld', trace=True)
+        assert probes == [('du_phong', built[1][0])]       # the wrap DLL was never probed
+    else:
+        built, cmds, probes = _gia_lap_probe(monkeypatch, wrap_bat=False, du_phong_bat=False)
+        with pytest.raises(RuntimeError, match='renamed symbols too'):
+            variants('fwsim_trace_hong_ca_hai', trace=True)
+        assert probes == [('wrap', built[0][0]), ('du_phong', built[1][0])]
 
 
 def _eval_rows(log, v):
@@ -1209,12 +1408,18 @@ if __name__ == '__main__':
     fw_ = fwsim.FirmwareSim()
     if a.pair:
         ref_ = fwsim.FirmwareSim(a.pair)
+        cu_nap_ = _dll_nap(ref_.lib)
+        moi_nap_ = _dll_nap(fw_.lib)
         for name_, old_log_, new_log_ in _cap_runs(ref_, fw_):
             print(json.dumps(dict(run=name_, **so_cap(old_log_, new_log_),
                                   dll_cu=os.path.abspath(a.pair),
                                   dll_cu_sha256=build_fwsim.file_sha256(a.pair),
+                                  dll_cu_nap=cu_nap_[0],
+                                  dll_cu_nap_sha256=cu_nap_[1],
                                   dll_moi=os.path.abspath(_DLL),
-                                  dll_moi_sha256=build_fwsim.file_sha256(_DLL))))
+                                  dll_moi_sha256=build_fwsim.file_sha256(_DLL),
+                                  dll_moi_nap=moi_nap_[0],
+                                  dll_moi_nap_sha256=moi_nap_[1])))
         sys.exit(0)
     if a.digest:
         log_ = golden_run(fw_)
