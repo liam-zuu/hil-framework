@@ -1317,3 +1317,21 @@ def test_skip_report_tong_level_records_it(tmp_path):
     assert x['bo_report']['gyro']['tong'] == 1
     assert x['bo_report']['gyro']['trong_cua_so'] == (1 if a - 2.0 <= t_row <= b + 1.0 else 0)
     assert x['P'] == pytest.approx(x0['P']) and x['N'] == pytest.approx(x0['N'])
+
+
+def test_sparse_turn_rate_floor_of_the_command_bound(tmp_path):
+    """L156 (Liam 25/11): the floor of the turn rate inside a gap is the bound of the body turn command, 6.98 rad/s
+    (W_MAX r / (lx + ly)), not 4.0: a 200 ms gap passes (1.40 rad), a 250 ms gap is refused (1.75 rad > pi / 2; it
+    passed with 4.0), also when the logged |gz| is small."""
+    assert U.THUA_W_PHYS == pytest.approx(34.56 * 0.0485 / 0.24, abs=0.01)
+    p = str(tmp_path / 'a.csv')
+    rate, t_end = turns(5, 0.5, 1)
+    make_log(p, rate, t_end)
+    q20, q25 = str(tmp_path / 'a20.csv'), str(tmp_path / 'a25.csv')
+    sparse_copy(p, q20, every=20)
+    sparse_copy(p, q25, every=25)
+    out = U._yaw_thua(U.load_log(q20))
+    assert 0.19 < out[5] < 0.225 and out[5] * U.THUA_W_PHYS < U.THUA_STEP_MAX
+    with pytest.raises(U.InputError, match='could hide'):
+        U._yaw_thua(U.load_log(q25))
+    assert 0.25 * 4.0 < U.THUA_STEP_MAX < 0.25 * U.THUA_W_PHYS             # the case the old floor let through

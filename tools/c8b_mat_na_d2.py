@@ -24,7 +24,7 @@ values e_perp, e_trk, e_bao, e_theta_cmd_deg):
      the q of an undefined frame as a diagnostic). A finite violation of another frame stays (design 7c).
   3. The node numbers and its three-branch states are recomputed (cond_state2 on the new numbers); q_so_do (defined
      frames only, SD1-1) recomputed when the node has it.
-  4. G1 [CACH HIEU C8B, in the list for CODE/Liam]: the scorer turns an undefined frame into a gap of the tracker; the
+  4. G1 (L156, Liam 25/11 at CODE, box: "Co khung bi che thi G1 chua ket luan (Recommended)"): the scorer turns an undefined frame into a gap of the tracker; the
      gap rules cannot be rerun here, so a node with a MASKED frame in its union domain gets G1 chua_ket_luan (the
      safe side: never dat, never khong_dat on a masked frame). Any masked frame, not only one that had a finite
      bound (Codex D2-4: G1 follows the progress by the frame centres, which a frame can have with every G2-G5
@@ -264,7 +264,7 @@ def ap_dung(nodes, out_dir, mn, state_fn, key_dec=6):
                        if kk not in ('q_sd', 'q_sd_chung') or (kk in nm and _co_q_so_do(x, c))})
             st[c] = state_fn(nm['lo_chung'], nm['lo'], nm['hi'], nm['n_undef'], o1_gate.THRESHOLDS[c])
         if np.any(che & H['mu']):
-            st['g1'] = 'chua_ket_luan'                   # step 4 [CACH HIEU]; any masked frame (D2-4)
+            st['g1'] = 'chua_ket_luan'                   # step 4 (L156); any masked frame (D2-4)
         x['states'] = st
         for i, t in enumerate(H['t_cam']):
             r = x['rows'].get(round(float(t), key_dec))
@@ -278,7 +278,7 @@ def ap_dung(nodes, out_dir, mn, state_fn, key_dec=6):
                        nut=tom,
                        quy_tac='khung (luot, frame_id) khong trong khung_mo -> lo -inf, hi +inf G2-G5 (q giu); so lieu '
                                'nut va trang thai ba nhanh tinh lai; G1 chua_ket_luan khi nut co khung bi che trong '
-                               'mien hop [CACH HIEU]; cat_t1 mat vi pham chac chan -> nut khong cham; nut tam_doi doi, '
+                               'mien hop (L156, Liam 25/11); cat_t1 mat vi pham chac chan -> nut khong cham; nut tam_doi doi, '
                                'nut t_som co khung bi che trong mien hop -> tu choi')
 
 

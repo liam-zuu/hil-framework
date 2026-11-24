@@ -9,10 +9,11 @@ At every node D_n of the clock file the WHOLE camera scorer runs (frame set, com
 G1-G5) with U_t of section 3 (the node step 1 ms in it). Combination per condition (C8B4R2-2 rounds 3, 4; C8B4R5-1,
 R5-2):
   dat           dat at every node;
-  khong_dat     G2-G5: every grid cell (two adjacent nodes) has a violating frame (finite lo_k above the threshold,
-                lo_k of either node: each node's U_t holds the whole step, so it bounds the whole cell) that is in the
-                common domain at BOTH nodes of the cell (so in the domain all through the cell; two different frames
-                violating at the two nodes are not enough);
+  khong_dat     G2-G5: every grid cell (two adjacent nodes) has ONE frame that violates at BOTH nodes of the cell
+                (lo_k finite and above the threshold at each of the two nodes, the frame in the common domain at both;
+                J v6 section 5 line 112, design v7 0.2; two different frames violating at the two nodes are not
+                enough). Until Codex D2-16 (24/11) the lo of either node counted (v4: each node's U_t holds the whole
+                step); changed to the words of J v6 [CHO LIAM DUYET];
                 G1 (no lo_k): khong_dat at every node and the G1 state the same at the two nodes of every cell;
   chua_ket_luan otherwise. Zero-width interval (one node): the state of that node. A node not scored is never
                 dropped: every condition is chua_ket_luan at that node. Two kinds (hong_nut / loi_nut): the run lost to
@@ -177,9 +178,9 @@ def domain_key(sc, gate):
 # ── combination ──────────────────────────────────────────────────────────────────────────────
 
 def cell_violation(a, b, c):
-    """Largest lo of condition c over the frames in the common domain (the domain before t1 on the cat_t1 branch)
-    at both nodes a, b (either node's lo: each node's U_t holds the whole step); NaN when a node is not scored or no
-    such frame has a finite lo."""
+    """Largest, over the frames in the common domain (the domain before t1 on the cat_t1 branch) at both nodes a, b
+    with a finite lo of condition c at BOTH, of the smaller of the two lo (the frame violates at both nodes exactly
+    when this is above the threshold: J v6 line 112, Codex D2-16); NaN when a node is not scored or no such frame."""
     if not (a['ok'] and b['ok']):
         return math.nan
     best = math.nan
@@ -187,9 +188,8 @@ def cell_violation(a, b, c):
         rb = b['rows'].get(k)
         if rb is None or not (ra['mien_chung'] and rb['mien_chung']):
             continue
-        vals = [v for v in (ra[c], rb[c]) if math.isfinite(v)]
-        if vals:
-            m = max(vals)
+        if math.isfinite(ra[c]) and math.isfinite(rb[c]):
+            m = min(ra[c], rb[c])
             best = m if not math.isfinite(best) else max(best, m)
     return best
 

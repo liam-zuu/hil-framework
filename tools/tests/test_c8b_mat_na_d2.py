@@ -134,7 +134,7 @@ def test_masked_violation_becomes_undefined_other_stays(tmp_path):
     assert rc == 0
     assert r['states']['g3'] == 'chua_ket_luan' and r['nums']['g3']['n_undef'] == 1
     assert r['states']['g2'] == 'khong_dat'                         # a finite violation elsewhere stays (design 7c)
-    assert r['states']['g1'] == 'chua_ket_luan'                     # step 4 [CACH HIEU]
+    assert r['states']['g1'] == 'chua_ket_luan'                     # step 4 (L156, Liam 25/11)
     assert r['nums']['g3']['q'] == pytest.approx(0.15)               # q kept as a diagnostic (the scorer's rule)
     e = r['mat_na_d2']
     assert e['luot'] == 'r1' and e['n_khung_mo'] == 5 and e['nut'][0]['n_che'] == 1 and e['nut'][0]['g1_che']

@@ -604,7 +604,12 @@ def _still_ends(tg, gz, g_still, min_still_s):
 
 THUA_STEP_MAX = math.pi / 2     # --log-thua: largest yaw change allowed between two logged reports (no 2 pi doubt)
 THUA_GAP_MAX = 0.3              # s, largest gap between logged RV or gyro reports [ĐỀ XUẤT]; floor 16/11: RV 150, gyro 249 ms
-THUA_W_PHYS = 4.0               # rad/s, bound on the turn rate inside a gap [ĐỀ XUẤT]: about 2x the largest seen 16/11 (1.9)
+# rad/s, floor of the turn rate assumed inside a gap (L156, Liam 25/11 at CODE, box: "Ap ngay truoc gop (Recommended)";
+# the number chosen by Liam 21/11, proposal v6 part D4 (i)): the bound of the body turn command with the four wheels at
+# their largest command, W_MAX r / (lx + ly) = 34.56 x 0.0485 / 0.24 = 6.984 (AGV kinematics.c line 6, kinematics.h
+# lines 5-7). A floor: _yaw_thua takes the larger of it and the largest logged |gz|. Until 25/11: 4.0 (about 2x the
+# largest seen 16/11, 1.9). With THUA_STEP_MAX the largest gap allowed goes from about 390 ms to 225 ms.
+THUA_W_PHYS = 6.98
 THUA_STILL_SPAN = math.radians(1.0)   # still part: RV yaw spread at most 1 deg [ĐỀ XUẤT] (TT-2)
 
 
