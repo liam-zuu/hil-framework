@@ -617,9 +617,15 @@ def f7_thay_ref_12b(truc_xe, a6_sha256=None, cho=None):
     if not a6_sha256 or a6s != [a6_sha256]:
         return False
     dd = truc_xe.get('dau_doan')
+    # Codex F8R2 (round 2, F8R-2): each entry names a trial of the F7 whose frames source (nguon '<thu_id>:frames')
+    # has that frames_sha256, a leg index doan_i and integer frame ids
+    fr = {n.get('vai_tro'): n.get('sha256') for n in truc_xe.get('nguon') or [] if isinstance(n, dict)}
     return isinstance(dd, list) and bool(dd) and all(
         isinstance(e, dict) and isinstance(e.get('thu_id'), str) and e['thu_id'] and _hex64(e.get('frames_sha256'))
-        and isinstance(e.get('ids'), list) and len(e['ids']) > 0 for e in dd)
+        and fr.get(e['thu_id'] + ':frames') == e['frames_sha256']
+        and isinstance(e.get('doan_i'), int) and not isinstance(e.get('doan_i'), bool)
+        and isinstance(e.get('ids'), list) and len(e['ids']) > 0
+        and all(isinstance(i, int) and not isinstance(i, bool) for i in e['ids']) for e in dd)
 
 
 def f8_rong(lan_lap, a6_sha256, co_ref_12b, truc_xe=None):

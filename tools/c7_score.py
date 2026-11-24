@@ -2596,6 +2596,8 @@ def bind_f8_nhanh(tcf, f8_ok, ref12_nguon):
     if bool(f8f.get('ok')) != bool(f8_ok):
         raise ValueError(f'tham_chieu_v1 f8_rong.ok {f8f.get("ok")!r} != recomputed {bool(f8_ok)!r} (another --truc-xe, '
                          '--lan-lap or window file than at tham-chieu)')
+    if f8_ok and tcf.get('tap') != ctd.TAP_MA_CACH_A:        # Codex F8R2-1 (round 2): also with --khung-nhieu
+        raise ValueError(f'tham_chieu_v1 tap {tcf.get("tap")!r} on the f8_rong branch (cach A needs {ctd.TAP_MA_CACH_A!r})')
     want = ctd.REF_12B_TU_F7 if (f8_ok and ref12_nguon == ctd.REF_12B_TU_F7) else None
     if f8f.get('ref_12b') != want:
         raise ValueError(f'tham_chieu_v1 f8_rong.ref_12b {f8f.get("ref_12b")!r} != recomputed {want!r}')

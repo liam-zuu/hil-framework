@@ -1406,7 +1406,8 @@ def test_f8_rong_ref_12b_from_f7():
     a6 = 'a' * 64
     ll = _f8_ll(a6)
     dd = [dict(thu_id='12b_1', doan_i=0, frames_duong_dan='x/frames.csv', frames_sha256='b' * 64, ids=[1, 2])]
-    tx = tx_of('O1-F05', 1.0, dau_doan=dd, cho='goc', nguon=[dict(vai_tro='c8b_a6_v2', sha256=a6)])
+    tx = tx_of('O1-F05', 1.0, dau_doan=dd, cho='goc', nguon=[dict(vai_tro='c8b_a6_v2', sha256=a6),
+                                                             dict(vai_tro='12b_1:frames', sha256='b' * 64)])
     assert ctd.f8_rong(ll, a6, True, tx) == (True, []) and ctd.ref_12b_nguon(True, tx) == ctd.REF_12B_CUA_SO
     assert ctd.f8_rong(ll, a6, False, tx) == (True, [])
     assert ctd.ref_12b_nguon(False, tx, a6, 'goc') == ctd.REF_12B_TU_F7
@@ -1418,7 +1419,9 @@ def test_f8_rong_ref_12b_from_f7():
                 dict(tx, nguon=[dict(vai_tro='c8b_a6_v2', sha256='c' * 64)]), dict(tx, nguon=[]),
                 dict(tx, cho='K1', mien_hieu_luc=mh), dict(tx, mien_hieu_luc=mh), dict(tx, schema='khac'),
                 dict(tx, dau_doan=[{}]), dict(tx, dau_doan=dd + ['x']), dict(tx, dau_doan=[dict(dd[0], ids=[])]),
-                dict(tx, dau_doan=[dict(dd[0], frames_sha256='z')])):
+                dict(tx, dau_doan=[dict(dd[0], frames_sha256='z')]),
+                dict(tx, dau_doan=[dict(dd[0], thu_id='NO_SUCH_TRIAL')]), dict(tx, dau_doan=[dict(dd[0], frames_sha256='0' * 64)]),
+                dict(tx, dau_doan=[dict(dd[0], ids=[None])]), dict(tx, dau_doan=[{k: v for k, v in dd[0].items() if k != 'doan_i'}])):
         ok, why = ctd.f8_rong(ll, a6, False, bad)
         assert not ok and msg in why and ctd.ref_12b_nguon(False, bad, a6, 'goc') is None
     # Codex F8R-3: a null in mien_hieu_luc no longer hides a mounting or another F8 at the top level
@@ -1446,7 +1449,7 @@ def test_f8_rong_ref_12b_from_f7_scores_as_with_the_window(tmp_path):
     tc = ctd.tham_chieu(pre, chain, ll, kt, 0.10, 1 / B.FPS, f8_rong_ok=True)
     dd = [dict(thu_id='12b_1', doan_i=0, frames_duong_dan='x/frames.csv', frames_sha256='b' * 64, ids=[1, 2])]
     tx = tx_of('O1-F05', math.degrees(PHI0 - BETA), u=0.1, psi_chuan_k_deg=math.degrees(tc['psi_tc_rad'] - BETA),
-               dau_doan=dd, nguon=[dict(vai_tro='c8b_a6_v2', sha256=a6)])
+               dau_doan=dd, nguon=[dict(vai_tro='c8b_a6_v2', sha256=a6), dict(vai_tro='12b_1:frames', sha256='b' * 64)])
     r_w = cs.build_rel('O1-F05', chain, tc, tx, ll, 0.02, None, a6_sha256=a6, co_ref_12b=True)
     r_f7 = cs.build_rel('O1-F05', chain, tc, tx, ll, 0.02, None, a6_sha256=a6, co_ref_12b=False)
     assert r_w['can_cu'] and r_f7['can_cu'] and r_f7['f8_rong']['ok']
@@ -1469,12 +1472,13 @@ def test_f8_rong_ref_12b_from_f7_scores_as_with_the_window(tmp_path):
 def test_bind_f8_nhanh_branch_of_tham_chieu_and_scoring():
     """Codex F8R-5 (round 1 24/11): tham_chieu_v1 written on one F8 rong branch, scored on another (e.g. without
     --truc-xe at tham-chieu, with it at scoring; or the reverse) is refused, with or without --khung-nhieu."""
-    ok_w = dict(f8_rong=dict(ok=True, nhan=ctd.F8_RONG_NHAN))                    # session 2 / run03 F12 (window)
-    ok_f7 = dict(f8_rong=dict(ok=True, nhan=ctd.F8_RONG_NHAN, ref_12b=ctd.REF_12B_TU_F7))
+    ok_w = dict(tap=ctd.TAP_MA_CACH_A, f8_rong=dict(ok=True, nhan=ctd.F8_RONG_NHAN))      # session 2 / run03 F12
+    ok_f7 = dict(tap=ctd.TAP_MA_CACH_A, f8_rong=dict(ok=True, nhan=ctd.F8_RONG_NHAN, ref_12b=ctd.REF_12B_TU_F7))
     cs.bind_f8_nhanh(ok_w, True, ctd.REF_12B_CUA_SO)
     cs.bind_f8_nhanh(ok_f7, True, ctd.REF_12B_TU_F7)
     cs.bind_f8_nhanh({}, False, None)                                           # neither: as before
     for tcf, f8_ok, src in ((ok_w, False, None), ({}, True, ctd.REF_12B_CUA_SO), (ok_w, True, ctd.REF_12B_TU_F7),
-                            (ok_f7, True, ctd.REF_12B_CUA_SO), (ok_f7, False, None)):
+                            (ok_f7, True, ctd.REF_12B_CUA_SO), (ok_f7, False, None),
+                            (dict(ok_f7, tap='giao'), True, ctd.REF_12B_TU_F7)):           # Codex F8R2-1
         with pytest.raises(ValueError, match='f8_rong'):
             cs.bind_f8_nhanh(tcf, f8_ok, src)
