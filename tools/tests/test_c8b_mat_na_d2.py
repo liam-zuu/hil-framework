@@ -164,10 +164,9 @@ def test_frame_not_in_d2_rows_is_masked(tmp_path):
     rw = r['mat_na_d2']['nut'][0]['rows']                               # GATE: the rows file named with its sha
     assert rw['sha256'] == c8_u_imu.sha256(os.path.join(d, 'nut_000_rows.csv')) and os.path.isabs(rw['duong_dan'])
     p = os.path.join(d, 'nut_000_rows.csv')                             # a repeated frame_id: refused
-    txt = open(p, encoding='utf-8').read().replace('
-103,', '
-102,')
-    open(p, 'w', encoding='utf-8', newline='').write(txt)
+    lines = open(p, encoding='utf-8').read().split('\n')
+    lines = ['102,' + x[4:] if x.startswith('103,') else x for x in lines]
+    open(p, 'w', encoding='utf-8', newline='').write('\n'.join(lines))
     os.remove(os.path.join(d, 'luoi_d2.json'))
     assert run(d, gp, str(tmp_path / 'o.json'))[0] == 2
 

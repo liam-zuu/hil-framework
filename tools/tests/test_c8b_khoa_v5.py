@@ -931,7 +931,7 @@ def test_he_so_giu_ngoai_default_changes_nothing_and_factor_scales(monkeypatch):
                 W=dict(W_xy_m=5e-4, W_psi_rad=3e-4), P6_rieng_ii=dict(gia_tri_m=6e-4))
     v0, _, p0, lever = K.hang_dong_tinh(_src(**full), 0.1445)
     v1, _, p1, _ = K.hang_dong_tinh(_src(he_so_giu_ngoai=None, **full), 0.1445)
-    assert v1 == v0 and p1 == p0 and not any('he_so' in k for k in p0)
+    assert v1 == v0 and p1 == p0 and not any('he_so_giu_ngoai' in k or k.endswith('_truoc_he_so') for k in p0)
     hs = dict(P1_m=1.0, P_neo_m=1.2, A_neo_rad=1.1)
     v2, why, p2, _ = K.hang_dong_tinh(_src(he_so_giu_ngoai=hs, **full), 0.1445)
     assert not why

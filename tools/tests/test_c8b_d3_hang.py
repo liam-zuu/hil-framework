@@ -152,8 +152,8 @@ def test_p1a3_held_out_by_session_and_e(tmp_path):
     assert float(e['sai_m']) == pytest.approx(1.6 * 0.00066) and e['mien'] == 'goc'
     d3 = KV.build(KV.read_rows(str(out)), k, 'x' * 64)
     assert 'replay_neo' in d3['ly_do'][0] and 'P1_A3_H32' not in d3['ly_do'][0]
-    # run03 pair 4.4 mm over the session-2 index 4.0 mm: that segment's P1 domain is thieu (the file is not failed)
-    assert any(m['mien'] == '2026-11-23_run03/doan1:goc' for m in d3['mien_thieu'])
+    # L155: the run03 pair 4.4 mm is inside the session-2 index 4.0 mm x the margin 1.25 (thieu under the first rule)
+    assert not any(m['dai_luong'] == 'P1' for m in d3['mien_thieu'])
     # one session only, or a kiem_cheo the lock does not name: refused
     assert H.main(_argv(p, tmp_path / 'b.csv') + ['--kiem-cheo', f'2026-11-20_run02/doan2={k1}']) == 2
     k3, _ = _kc(tmp_path, '2026-11-24_run05/doan1', 0.0041, 0.21, [(0.001, 0.0)], [0.1])   # not named by the lock
