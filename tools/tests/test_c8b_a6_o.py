@@ -151,6 +151,7 @@ def test_d2_mask_cells_not_whole_file(tmp_path):
     why = {x['o_id']: x['ly_do'] for x in m['o_thieu']}
     assert sorted(map(tuple, why.values())) == [('thieu_id',), ('thieu_mau',), ('vuot',)]
     assert m['ngoai_dai_u'] == [['r1', 600], ['r1', 601]]
+    assert m['khung_mo'] == [['r1', 100 + i] for i in range(12)]              # the frames of cell A only
     # the A6 held-out check on the same kind of cells is still strict
     rk = _parse(_rows(n=3, tap='khop', luot='c1') + _rows(n=12, tap='kiem', luot='c2')
                 + _rows(n=12, tap='kiem', luot='c2', x=0.7, d=0.006, s0=200) + _rows(n=3, tap='dich', luot='r1'),

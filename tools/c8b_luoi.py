@@ -39,6 +39,8 @@ lo_g5. Interface asked of CODE 17/11 (c7_score --gio-c8b FILE --nut K): see the 
   python tools/c8b_luoi.py --gio gio.json --frames frames.csv --esp32 run.csv --sender run_sender.txt --task O1-F08 \
       --hang-so hang_so.json --out-dir luoi/ [--gate-file gate_c8.json] [--scorer-arg ARG ...]
   python tools/c8b_luoi.py --gop-only --gio gio.json --out-dir luoi/ [--gate-file ...]   (combine node files again)
+  python tools/c8b_luoi.py --gop-only --gio gio.json --out-dir luoi/ --mat-na-d2 c8b_a6_o.json --luot RUN ...
+      (the D2 cell mask, tools/c8b_mat_na_d2.py; written to luoi/luoi_d2.json beside luoi.json, block mat_na_d2)
 Last line: #ket_qua,ma=0,outcome=... / 2 refused or error.
 """
 from __future__ import annotations
@@ -583,6 +585,8 @@ def main(argv=None):
                          'before the middle H clip, (H giua, H cuoi) after')
     ap.add_argument('--file-cham-h1', default=None, help='score file of the scoring again with H1 (when done)')
     ap.add_argument('--file-gio-h1', default=None, help='clock file of the H1 scoring (H1 has its own clock file)')
+    ap.add_argument('--mat-na-d2', default=None, help='c8b_a6_o d2 file: the D2 cell mask (with --gop-only, --luot)')
+    ap.add_argument('--luot', default=None, help='run id of this grid in the D2 mask (target set)')
     a = ap.parse_args(argv)
     try:
         for p in (a.gio, a.out_dir):
@@ -594,6 +598,9 @@ def main(argv=None):
         task = a.task or gio['task']
         if task != gio['task']:
             raise LuoiError(f'--task {task} but the clock file is for {gio["task"]}')
+        if a.mat_na_d2 and not (a.gop_only and a.luot):
+            raise LuoiError('--mat-na-d2 goes with --gop-only and --luot (the mask is applied on node files)')
+        mn_d2 = None
         ro, gsha = so_do_of(a.gate_file, task)
         a.so_do_run, a.so_do_sha_run = ro, gsha          # the C8 gate file, or J v6 for G5 of F08 without one
         prov_scorer = None
@@ -609,6 +616,10 @@ def main(argv=None):
                 nodes = run_nodes(gio, a.gio, a, a.out_dir)
             else:
                 nodes = load_nodes(gio, a.out_dir)
+                if a.mat_na_d2:
+                    import c8b_mat_na_d2 as md2                  # C8B 24/11 khuya: the D2 cell mask (design 7c)
+                    nodes, mn_d2 = md2.ap_dung(nodes, a.out_dir, md2.doc_mat_na(a.mat_na_d2, a.luot),
+                                               _state_from_numbers, KEY_DEC)
             prov = node_provenance(gio, cu.sha256(a.gio), a.out_dir)
             commits = {x.get('commit') for x in prov}
             prov_scorer = dict(commit=commits.pop() if len(commits) == 1 else '',
@@ -649,13 +660,15 @@ def main(argv=None):
             kinds.add('he_do')
         res.update(nguon_nut=src, loai_hong_nut=kinds_nut, loai_hong=[x for x in LOAI_HONG if x in kinds])
         res.update(chain_files(a))
+        if a.mat_na_d2:
+            res['mat_na_d2'] = mn_d2                     # None when the clock file is not bounded (no node used)
         res.update(version=VERSION, task=task, nodes_s=gio.get('nodes_s', []), gio_sha256=cu.sha256(a.gio),
                    gate_file_sha256=gsha, script=c8b_gio.repo_state(), scorer=prov_scorer)
         os.makedirs(a.out_dir, exist_ok=True)
-        out = os.path.join(a.out_dir, 'luoi.json')
+        out = os.path.join(a.out_dir, 'luoi_d2.json' if a.mat_na_d2 else 'luoi.json')
         with open(out, 'x', encoding='utf-8') as f:
             f.write(json.dumps(_clean(res), indent=1, ensure_ascii=False, allow_nan=False))
-    except (LuoiError, cu.InputError, OSError, ValueError, KeyError) as exc:
+    except (LuoiError, cu.InputError, OSError, ValueError, KeyError) as exc:     # MatNaError is a ValueError
         print(f'c8b_luoi: {exc}', file=sys.stderr)
         print('#ket_qua,ma=2')
         return 2

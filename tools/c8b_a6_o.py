@@ -18,8 +18,9 @@ recomputes |d| <= U_psi + U_imu on the very numbers), signed d per controller (m
 n_id >= N_ID_MIN, n_thieu = 0, ty_le_max <= 1. File, A6 held-out check (giu_ngoai_a6): trang_thai dat (every cell of
 the checked set dat) | truot (a cell with ty_le_max > 1) | thieu (otherwise). File, D2 (d2; design 7c line 166, CODE
 24/11 khuya): a cell not dat masks only its frames: trang_thai dat once cells exist, with mat_na {o_dat, o_thieu
-[{o_id, ly_do: vuot | thieu_mau | thieu_id}], ngoai_dai_u [[run, id]]}: the scorer makes a frame whose cell is not in
-o_dat n_undef for G4, G5 and every position through q. The three sets (khop, kiem, dich) must be disjoint by run.
+[{o_id, ly_do: vuot | thieu_mau | thieu_id}], ngoai_dai_u [[run, id]], khung_mo [[run, id]] (the frames whose cell
+is in o_dat)}: c8b_luoi --mat-na-d2 makes every other frame of a target run n_undef for G2-G5 (G1 per its rule).
+The three sets (khop, kiem, dich) must be disjoint by run.
 
   python tools/c8b_a6_o.py --rows d2_rows.csv --muc-dich giu_ngoai_a6 --giu-ngoai-theo cho --khoa-truoc khoa.json \
       --cho-file a6_goc.json [--cho-file a6_K1.json] [--dai-u 0,0.3,0.6,1.0,1.5] --out c8b_a6_o.json
@@ -187,7 +188,16 @@ def build(rows, muc_dich, giu_ngoai_theo, khoa_sha, cho_sha, dai_u=DAI_U):
             return w_ or ['khong_so_duoc']
         ngoai = sorted([luot, fid] for (luot, fid), rs in per.items()
                        if cell_of(rs[0]['x'], rs[0]['y'], rs[0]['psi'], rs[0]['u'], rs[0]['lan'], dai_u) is None)
-        mat_na = dict(o_dat=[c['o_id'] for c in o if c['dat']],
+        o_dat = {c['o_id'] for c in o if c['dat']}
+        # khung_mo (C8B 24/11 khuya, for c8b_luoi --mat-na-d2): the frames (run, id) of the target set whose cell is
+        # in o_dat, listed so the consumer never maps frames to cells again; a frame of the run not listed is masked
+        mo = []
+        for (luot, fid), rs in per.items():
+            k = cell_of(rs[0]['x'], rs[0]['y'], rs[0]['psi'], rs[0]['u'], rs[0]['lan'], dai_u)
+            if k is not None and 'x{}_y{}_h{}_u{}_{}'.format(*k) in o_dat:
+                mo.append([luot, fid])
+        mo.sort()
+        mat_na = dict(o_dat=[c['o_id'] for c in o if c['dat']], khung_mo=mo,
                       o_thieu=[dict(o_id=c['o_id'], ly_do=ly_do(c)) for c in o if not c['dat']],
                       ngoai_dai_u=ngoai,
                       quy_tac='khung co o khong nam trong o_dat (o vuot, thieu mau, thieu id) hay ngoai dai u -> '
