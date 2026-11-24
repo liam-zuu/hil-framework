@@ -943,7 +943,12 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
             bang[key]['nguon_3b'] = dict(duong_dan=n.get('duong_dan', n['file']), sha256=n['sha256'])
     eh, ehw = eps_h_of(nguong)
     lle, lle_st, lle_why = lan_lap_E(a6, lan_lap)
-    out = dict(lan_lap_E=lle, lan_lap_E_trang_thai=lle_st, lan_lap_E_ly_do=lle_why, version=VERSION, le=LE, muc=muc, bang_man_trap=bang, u_beta_cam_deg=ub, u_beta_cam_trang_thai=ust, u_beta_cam_trang_thai_cho=ust_cho, u_beta_cam_dau_chan=dau_chan or {}, u_beta_cam_gia_dinh=ugd,
+    out = dict(lan_lap_E=lle, lan_lap_E_trang_thai=lle_st, lan_lap_E_ly_do=lle_why, version=VERSION, le=LE, muc=muc, bang_man_trap=bang, u_beta_cam_deg=ub,
+               # N1 (FABLE_C8 24/11, CODE 24/11 local_42161302): the scorer (c7_score 2805) reads this field per place
+               # (dict -> st.get(cho)); a whole-lock 'thieu' (K1, K2 missing) left u_phi infinite at goc for every
+               # figure 8 run. Per place here; the whole-lock state kept as u_beta_cam_trang_thai_chung.
+               u_beta_cam_trang_thai=dict(ust_cho), u_beta_cam_trang_thai_chung=ust,
+               u_beta_cam_trang_thai_cho=ust_cho,u_beta_cam_dau_chan=dau_chan or {}, u_beta_cam_gia_dinh=ugd,
                u_beta_cam_ly_do=uwhy, nhanh_tick=nhanh_tick, commit_hil=commit_hil, muc_kha_thi=list(muc_kha_thi),
                eps_H=eh, eps_H_ly_do=ehw, mien_car_pose=mien_car_pose(a6, ses, cam),
                khoa_truoc=dict(nguon=nguon or [], script=script, commit_hil=commit_hil,

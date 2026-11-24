@@ -64,8 +64,12 @@ def test_u_beta_cam_margin_and_missing():
                                    K1=dict(max_abs_dbeta_rad=math.radians(0.2), trang_thai='dat')))
     k = K.build({}, ll)
     assert k['u_beta_cam_deg']['goc'] == pytest.approx(0.125) and k['u_beta_cam_deg']['K2'] is None
-    assert k['u_beta_cam_trang_thai'] == 'thieu' and any('K2' in w for w in k['u_beta_cam_ly_do'])
-    assert K.build({})['u_beta_cam_trang_thai'] == 'thieu'
+    assert k['u_beta_cam_trang_thai_chung'] == 'thieu' and any('K2' in w for w in k['u_beta_cam_ly_do'])
+    # N1 (CODE 24/11): per place, the way c7_score reads it (st.get(cho) when a dict)
+    assert k['u_beta_cam_trang_thai'] == dict(goc='dat', K1='dat', K2='thieu') == k['u_beta_cam_trang_thai_cho']
+    k0 = K.build({})
+    assert k0['u_beta_cam_trang_thai_chung'] == 'thieu'
+    assert k0['u_beta_cam_trang_thai'] == dict(goc='thieu', K1='thieu', K2='thieu')
 
 
 @pytest.mark.skipif(not os.path.isdir(REAL), reason='session-1 3b results not on this machine')
@@ -433,7 +437,12 @@ def test_full_hang_m_hang_rad_u_phi_and_lever(monkeypatch):
     assert b['P4_tay_don_m'] == pytest.approx(m['P4_tay_don']['L_m'] * math.radians(b['A4_deg']))
     assert b['P4_m'] == pytest.approx(m['can_quay']['p_m'] + b['P4_tay_don_m'], rel=1e-12)
     assert k['u_beta_cam_trang_thai_cho']['goc'] == 'dat' and k['u_beta_cam_gia_dinh']['nhan'] == K.LL_E_NULL
-    assert k['u_beta_cam_trang_thai'] == 'thieu'           # _kc carries the A3 flags of goc only: K1, K2 thieu
+    assert k['u_beta_cam_trang_thai_chung'] == 'thieu'     # _kc carries the A3 flags of goc only: K1, K2 thieu
+    # N1 (CODE 24/11): the scorer's rule (c7_score: dict -> st.get(cho); the value only when 'dat') gives goc a finite
+    # u_beta_cam on the cach A path, K1, K2 none
+    st = k['u_beta_cam_trang_thai']
+    assert isinstance(st, dict) and st['goc'] == 'dat' and st['K1'] == st['K2'] == 'thieu'
+    assert math.isfinite(k['u_beta_cam_deg']['goc'])
 
 
 def test_cli_tham_chieu_one_a6_and_place(tmp_path, capsys):
