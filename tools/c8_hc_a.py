@@ -150,43 +150,61 @@ LOG_COLS = ('timestamp_us', 'fl_count', 'fr_count', 'rl_count', 'rr_count', 'sp_
 
 
 def _segment_marks(path, n_lines):
-    """Status of each data line from <log>.segments.csv of agv_logger (row, log_seq, timestamp_us, segment, status),
-    or None without that file. A file whose rows do not match the data lines one by one: AError."""
+    """(status rows of <log>.segments.csv of agv_logger (row, log_seq, timestamp_us, segment, status), its sha256,
+    sha256 the logger summary names for it) or (None, None, None) without that file. A file whose rows do not
+    match the data lines one by one, or that cannot be read as CSV: AError (HCD1-8)."""
     seg = path + '.segments.csv'
     if not os.path.isfile(seg):
-        return None
-    with open(seg, newline='', encoding='utf-8') as f:
-        marks = list(csv.DictReader(f))
+        return None, None, None
+    try:
+        with open(seg, newline='', encoding='utf-8') as f:
+            marks = list(csv.DictReader(f))
+    except (csv.Error, UnicodeDecodeError) as exc:
+        raise AError(f'{seg}: {type(exc).__name__}: {exc}')
     if len(marks) != n_lines:
         raise AError(f'{seg}: {len(marks)} rows for {n_lines} data lines')
-    return marks
+    try:
+        s = json.load(open(path + '.summary.json', encoding='utf-8'))
+        named = ((s.get('files') or {}).get('segments') or {}).get('sha256')
+    except (OSError, ValueError, AttributeError):
+        named = None
+    return marks, sha256(seg), named if isinstance(named, str) else None
 
 
 def load_log(path):
     """The agv_logger CSV as arrays. Repeated UDP datagram (Pi on LAN + WiFi of one subnet, CAM 24/11; CODE 24/11
     chot cach doc; L92 rule of c5_lifted_check / c8_u_imu / gain_line_check): a data line is dropped only when the
-    logger marked it 'duplicate' in <log>.segments.csv AND its bytes equal the data line kept just before it; the
-    count goes to L['n_dong_trung_bo'] (log_seq of each in L['seq_trung_bo']). A line marked 'duplicate' that does
-    not equal the line before: AError. A repeated log_seq with other content, or no segments file, keeps every line
-    (log_seq_lien then fails as before)."""
+    logger marked it 'duplicate' in <log>.segments.csv AND the line, without its line ending, is byte-equal to the
+    data line kept just before it (HCD1-7: CR/LF are not compared); the count goes to L['n_dong_trung_bo'] (log_seq of
+    each in L['seq_trung_bo']). A line marked 'duplicate' that does not equal the line before: AError. The segments
+    file must match the data lines (row, log_seq, timestamp_us) and, when a line is dropped, the sha256 the logger
+    summary names for it (HCD1-1; a summary naming another sha256 is refused even with nothing dropped). A repeated
+    log_seq with other content, or no segments file, keeps every line (log_seq_lien then fails as before). Only empty
+    lines are skipped, as csv.DictReader did (HCD1-3); a line that is not a CSV row of numbers: AError."""
     with open(path, 'rb') as f:
         raw = [ln for ln in f.read().splitlines() if not ln.startswith(b'#')]
     if not raw:
         raise AError(f'{path}: no data rows')
-    head, data = raw[0], [ln for ln in raw[1:] if ln.strip()]
+    head, data = raw[0], [ln for ln in raw[1:] if ln]
     text = lambda b: b.decode('utf-8', errors='replace')                     # noqa: E731
-    r = csv.DictReader([text(head)] + [text(b) for b in data])
-    miss = [c for c in LOG_COLS if c not in (r.fieldnames or [])]
+    try:
+        r = csv.DictReader([text(head)] + [text(b) for b in data])
+        miss = [c for c in LOG_COLS if c not in (r.fieldnames or [])]
+        parsed = list(r)
+    except csv.Error as exc:
+        raise AError(f'{path}: {type(exc).__name__}: {exc}')
     if miss:
         raise AError(f'{path}: missing columns {miss}')
-    parsed = list(r)
     if len(parsed) != len(data):
         raise AError(f'{path}: {len(parsed)} CSV rows for {len(data)} data lines')
-    marks = _segment_marks(path, len(data))
+    marks, seg_sha, seg_named = _segment_marks(path, len(data))
+    if seg_named is not None and seg_named != seg_sha:
+        raise AError(f'{path}.segments.csv: sha256 khac sha256 logger summary ghi')
     rows, kept_raw, seq_bo = [], None, []
     for i, (b, row) in enumerate(zip(data, parsed), start=1):
         m = marks[i - 1] if marks is not None else None
-        if m is not None and (m.get('row') != str(i) or m.get('log_seq') != row.get('log_seq')):
+        if m is not None and (m.get('row') != str(i) or m.get('log_seq') != row.get('log_seq')
+                              or m.get('timestamp_us') != row.get('timestamp_us')):
             raise AError(f'{path}.segments.csv row {i} does not match CSV data line {i}')
         if m is not None and m.get('status') == 'duplicate':
             if kept_raw is None or b != kept_raw:
@@ -196,15 +214,21 @@ def load_log(path):
             continue
         rows.append(row)
         kept_raw = b
+    if seq_bo and seg_named is None:
+        raise AError(f'{path}: bo {len(seq_bo)} dong theo segments.csv ma logger summary khong ghi sha256 file do')
     if not rows:
         raise AError(f'{path}: no data rows')
-    L = {c: np.array([float(x[c]) for x in rows]) for c in LOG_COLS}
+    try:
+        L = {c: np.array([float(x[c]) for x in rows]) for c in LOG_COLS}
+    except (TypeError, ValueError) as exc:
+        raise AError(f'{path}: {type(exc).__name__}: {exc}')
     L['t'] = L['timestamp_us'] * 1e-6
     L['C'] = np.column_stack([L[c] for c in ('fl_count', 'fr_count', 'rl_count', 'rr_count')]).astype(np.int64)
     L['bad'] = np.any(L['C'] == INT32_MIN, axis=1)
     L['n'] = len(rows)
     L['n_dong_trung_bo'] = len(seq_bo)
     L['seq_trung_bo'] = seq_bo
+    L['segments_sha256'] = seg_sha
     return L
 
 
@@ -534,9 +558,9 @@ def kiem(A, age_r_max_ms=125.0):
     add('pos_reset_tang_1', i0 > 0 and L['pos_reset_n'][i1] - L['pos_reset_n'][i0 - 1] == 1
         and L['pos_reset_n'][i0] == L['pos_reset_n'][i1],
         f"{L['pos_reset_n'][max(i0 - 1, 0)]:.0f}->{L['pos_reset_n'][i1]:.0f}")
-    add('log_seq_lien', np.all(np.diff(seq[rng]) == 1),
-        f"bo {L.get('n_dong_trung_bo', 0)} dong trung byte (logger danh dau duplicate)"
-        + (f": log_seq {L['seq_trung_bo']}" if L.get('seq_trung_bo') else ''))
+    add('log_seq_lien', np.all(np.diff(seq[rng]) == 1),      # HCD1-6: a clean log prints as before
+        f"bo {L['n_dong_trung_bo']} dong trung byte (logger danh dau duplicate): log_seq {L['seq_trung_bo']}"
+        if L.get('n_dong_trung_bo') else '')
     add('so_dem_hop_le', not np.any(L['bad'][rng]))
     try:
         j_s, exp_prob = sender_domain(L, i0, i1)
@@ -1694,6 +1718,7 @@ def cmd_cua_so(a):
                 frames_sha256=sha256(a.frames), track_sha256=sha256(a.track), cua_so_v1_sha256=sha256(out),
                 esp32_sha256=sha256(A['log_path']), commit_hil=commit_hil(),
                 n_dong_trung_bo=A['log']['n_dong_trung_bo'], seq_trung_bo=A['log']['seq_trung_bo'],
+                segments_sha256=A['log']['segments_sha256'],
                 car_pose_cfg=dict(side_m=S.get('car_side_m'), h_m=S.get('tag_h_m'), tag_offset=tj.get('tag_offset'),
                                   q_m=xq, du_m=xu, q_ly_do=x_why, q_nguon=x_ng),
                 xoay_sha256=sha256(a.xoay) if a.xoay else None, a6_sha256=sha256(a.a6) if a.a6 else None,
@@ -2130,7 +2155,7 @@ def cap_f2_f5(d, doan=None):
     return (hit or cand or [side])[0], doan
 
 
-def check_cap_sources(d, frames, track, log_path, a6, xoay, need, doan=None):
+def check_cap_sources(d, frames, track, log_path, a6, xoay, need, doan=None, L=None):
     """HCC2-5: the F2 rows and the F5 of the issued attempt must have been made from the very frames, track and log
     tinh analyses now (and the same A6, xoay files); need=True (F6/F9 given) and a file missing -> AError. doan: the
     F5 of --doan (run 2; its F2 beside it, cap_f2_f5)."""
@@ -2150,6 +2175,11 @@ def check_cap_sources(d, frames, track, log_path, a6, xoay, need, doan=None):
     want = dict(frames_sha256=fs, track_sha256=sha256(track), esp32_sha256=ls, cua_so_v1_sha256=sha256(p2),
                 a6_sha256=sha256(a6) if a6 else None, xoay_sha256=sha256(xoay) if xoay else None)
     bad = [k for k, v in want.items() if d5.get(k) != v]
+    if L is not None:                 # HCD1-2: the F5 was made on the very rows tinh analyses (dropped duplicates)
+        if list(d5.get('seq_trung_bo') or []) != list(L.get('seq_trung_bo') or []):
+            bad.append('seq_trung_bo')
+        if 'segments_sha256' in d5 and d5['segments_sha256'] != L.get('segments_sha256'):
+            bad.append('segments_sha256')
     if bad:
         raise AError(f'{p5}: {bad} khac nguon dang tinh')
 
@@ -2263,7 +2293,7 @@ def cmd_tinh(a):
         A = load_attempt(d)
         if A['cho'] != a.cho:
             raise AError(f'{d}: cho {A["cho"]} != {a.cho}')
-        att_trung[A['thu_id']] = A['log']['n_dong_trung_bo']
+        att_trung[A['thu_id']] = (A['log']['n_dong_trung_bo'], A['log']['seq_trung_bo'])
         fr = a.frames_of.get(d) if a.frames_of else None
         if not fr:
             raise AError(f'{d}: --frames-of {d}=FRAMES,TRACK missing')
@@ -2300,7 +2330,7 @@ def cmd_tinh(a):
         attempts.append((A['thu_id'], an, failed))
         att_src[A['thu_id']] = (frames, F)                # dau_doan (F7 thu 2): frame ids of the leg-start windows
         if is_cap:
-            check_cap_sources(d, frames, track, A['log_path'], a.a6, a.xoay, need=bool(a.neo or a.e_hieu),
+            check_cap_sources(d, frames, track, A['log_path'], a.a6, a.xoay, need=bool(a.neo or a.e_hieu), L=A['log'],
                               doan=a.doan)
             cap_F, cap_A, cap_an = F, A, an
             p = cap_f2_f5(d, a.doan)[0]                    # run 2 (--doan): the F2 of that F5, not of run 1
@@ -2414,7 +2444,7 @@ def cmd_tinh(a):
                      can_hai_dau=can_fn, p_ref_tag=p_ref_tag, khung=kg)
     for x in r['luot_thu']:
         x['session_sha256'] = att_ses.get(x['thu_id'])
-        x['n_dong_trung_bo'] = att_trung.get(x['thu_id'])          # repeated UDP lines dropped (load_log)
+        x['n_dong_trung_bo'], x['seq_trung_bo'] = att_trung.get(x['thu_id'], (None, None))   # load_log; HCD1-4
     r['dau_doan'] = dau_doan(attempts, att_src, att_ses, cap_id, every=can_fn is not None)
     if x_why:                                            # why the xoay_v1 file gave no q for this place
         r['ly_do'].append(f'xoay: {x_why}')
