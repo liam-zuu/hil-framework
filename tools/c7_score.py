@@ -1284,7 +1284,7 @@ def build_rel(task, chain, tc, truc_xe, lan_lap, u_beta_cam_deg=None, sources=No
             if f8_ok and phi_ok else None)
     f8 = (dict(ok=True, nhan=ctd.F8_RONG_NHAN, gia_dinh=ctd.F8_RONG_GIA_DINH, beta_deg=beta,
                u_beta_deg=ctd.U_BETA_F8_RONG_DEG, ly_do=[]) if f8_ok else dict(ok=False, ly_do=f8_why))
-    if f8_ok and ctd.ref_12b_nguon(co_ref_12b, truc_xe) == ctd.REF_12B_TU_F7:
+    if f8_ok and ctd.ref_12b_nguon(co_ref_12b, truc_xe, a6_sha256, (lan_lap or {}).get('cho')) == ctd.REF_12B_TU_F7:
         f8['ref_12b'] = ctd.REF_12B_TU_F7              # Liam 24/11: no ref_12b window, the 12b reference is the F7's
     why = []
     if not phi_ok:
@@ -1368,7 +1368,10 @@ def rel_block(rel, R):
                 phi_ok=rel['phi_ok'],
                 duong_phi='beta', phi_ly_do=rel['phi_why'], tam_doi=rel['tam_doi'], ca_t_som=rel['ly_do_can_cu'],
                 can_cu_vi_tri=rel['can_cu'], tham_chieu_trang_thai=tc['trang_thai'],
-                bien_doi=None if R is None else dict(p_dd=[0.0, 0.0], psi_dd=R['psi_dd']))
+                bien_doi=None if R is None else dict(p_dd=[0.0, 0.0], psi_dd=R['psi_dd']),
+                # Codex F8R-6: only on the path of Liam 24/11 (no ref_12b window, the F7's 12b reference)
+                **({'f8_ref_12b': rel['f8_rong']['ref_12b']}
+                   if isinstance(rel.get('f8_rong'), dict) and rel['f8_rong'].get('ref_12b') else {}))
 
 
 def evaluate_t_som(t, x, y, psi, R, lane, hs, upsi_k, u_t, psi_imu_al, level, yaw_ok, t_dyn=None):
@@ -2585,6 +2588,19 @@ def _bind_sets(ll, end, row):
             raise ValueError(f'lan_lap_v1 {what}.{end} pts_s differ from the PTS of those frames in cua_so_v1 {end}')
 
 
+def bind_f8_nhanh(tcf, f8_ok, ref12_nguon):
+    """Codex F8R-5 (round 1 24/11): the F8 rong branch of the scoring, and where its 12b reference came from
+    (ctd.ref_12b_nguon), must be the ones tham_chieu_v1 was written with (tc f8_rong of the tham-chieu command), also
+    with --khung-nhieu, whose number checks are skipped: another --truc-xe, --lan-lap or window file -> ValueError."""
+    f8f = tcf.get('f8_rong') if isinstance(tcf.get('f8_rong'), dict) else {}
+    if bool(f8f.get('ok')) != bool(f8_ok):
+        raise ValueError(f'tham_chieu_v1 f8_rong.ok {f8f.get("ok")!r} != recomputed {bool(f8_ok)!r} (another --truc-xe, '
+                         '--lan-lap or window file than at tham-chieu)')
+    want = ctd.REF_12B_TU_F7 if (f8_ok and ref12_nguon == ctd.REF_12B_TU_F7) else None
+    if f8f.get('ref_12b') != want:
+        raise ValueError(f'tham_chieu_v1 f8_rong.ref_12b {f8f.get("ref_12b")!r} != recomputed {want!r}')
+
+
 def bind_lan_lap(ll, pre, cua_sha, task, post=None):
     """Codex CT1-3: lan_lap_v1 must be the one of THIS run and of THIS window file: same luot_id and place as the
     'pre' row, cua_so_v1_sha256 = the window file given, its frame sets of both ends inside the windows of cua_so_v1
@@ -2730,7 +2746,7 @@ def main_rel(argv):
             if f8_ok:
                 tc['f8_rong'] = dict(ok=True, nhan=ctd.F8_RONG_NHAN, u_lech_tam_m=ck.U_LECH_TAM_BUOI1_M,
                                      q_tu=ck.F8_RONG_Q_TU.get(ctd.cho_of(a.task), ctd.cho_of(a.task)))
-                if ctd.ref_12b_nguon(ref12, truc) == ctd.REF_12B_TU_F7:
+                if ctd.ref_12b_nguon(ref12, truc, None if a6 is None else a6['sha256'], ll.get('cho')) == ctd.REF_12B_TU_F7:
                     tc['f8_rong']['ref_12b'] = ctd.REF_12B_TU_F7   # Liam 24/11 (run05: no 12b clip)
             with open(a.out, 'x', encoding='utf-8') as f:
                 f.write(json.dumps(cm._json(tc), ensure_ascii=False, indent=1) + '\n')
@@ -2769,6 +2785,8 @@ def load_rel(a, frames, track, fsha, esha, task, hs, nhieu=False):
     if tcf.get('truc_xe_sha256') not in (None, a.truc_xe and cm.sha256(a.truc_xe)):
         raise ValueError('tham_chieu_v1 truc_xe_sha256 differs from --truc-xe')
     f8_ok = ctd.f8_rong(ll, None if a6 is None else a6['sha256'], co_ref_12b(cua, cho), truc)[0]
+    bind_f8_nhanh(tcf, f8_ok, ctd.ref_12b_nguon(co_ref_12b(cua, cho), truc, None if a6 is None else a6['sha256'],
+                                                (ll or {}).get('cho')) if f8_ok else None)
     chain, tc = chain_and_ref(frames, a6, a.xoay, ll, track, task, truc, pre, hs,
                               {k: tcf.get(k) for k in ('cua_so_v1_sha256', 'frames_sha256', 'a6_sha256', 'xoay_sha256')},
                               f8_rong_ok=f8_ok)
