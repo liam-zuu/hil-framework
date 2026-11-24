@@ -58,7 +58,7 @@ def test_rows_and_kiem_vi_tri(tmp_path, capsys):
     assert float(g['sai_m']) == pytest.approx(1.6 * math.radians(0.03))
     assert float(g['chi_so_m']) == pytest.approx(1.6 * math.radians(0.36)) and g['co_chuan_dong'] == '0'
     meta = json.load(open(str(out) + '.nguon.json', encoding='utf-8'))
-    assert meta['nguon_chua'] == ['P1_A3_H32', 'replay_neo', '12b', 'E']
+    assert meta['nguon_chua'] == ['P1_A3_H32', 'replay_neo', 'E']
     assert meta['thong_tin']['dau_cuoi_lan_lap']['gioi_han_dau_sau'] and 'HC_goc' in meta['liam_dau_cuoi_lan_lap']
     # the consumer reads it; the four missing sources keep the file thieu
     k = json.load(open(p['kh'], encoding='utf-8'))
@@ -100,3 +100,60 @@ def test_refused(tmp_path, bad):
         i = a.index('--goc-a')
         a = a[:i] + a[i + 2:]
     assert H.main(a) == 2 and not out.exists()
+
+
+def _kc(tmp_path, seg, p1, a3, pairs, quys):
+    d = tmp_path / seg.replace('/', '_')
+    d.mkdir()
+    kc, s = _w(d / 'kiem_cheo.json', dict(P1_tuong_doi=dict(theo_vung=dict(goc=dict(max_m=p1))),
+                                          A3_tuong_doi=dict(A3loc_max_deg=a3)))
+    with open(d / 'cap_tuong_doi.csv', 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=['clip', 'vung', 's', 'j', 'd_x', 'd_y'])
+        w.writeheader()
+        for i, (dx, dy) in enumerate(pairs):
+            w.writerow(dict(clip='H_a', vung='goc', s=25, j=i, d_x=dx, d_y=dy))
+            w.writerow(dict(clip='H_a', vung='goc', s=25, j=i, d_x=dx, d_y=dy))      # repeated (phi x nhin): once
+    with open(d / 'a3_cap.csv', 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=['clip', 'i', 'j', 'quy_deg'])
+        w.writeheader()
+        for i, q in enumerate(quys):
+            w.writerow(dict(clip='H_a', i=1, j=i + 2, quy_deg=q))
+    return kc, s
+
+
+def test_p1a3_held_out_by_session_and_e(tmp_path):
+    p = _setup(tmp_path)
+    k1, s1 = _kc(tmp_path, '2026-11-20_run02/doan2', 0.004, 0.2, [(0.003, 0.0), (0.0, -0.002)], [0.15])
+    k2, s2 = _kc(tmp_path, '2026-11-23_run03/doan1', 0.0045, 0.25, [(0.0044, 0.0)], [0.25])
+    a6 = json.load(open(p['a6'], encoding='utf-8'))
+    a6['kiem_imu'] = [dict(luot_id_E='HC_goc_1', cho='goc', du_rad=0.00066, nguong_rad=0.0031)]
+    p['a6'], a6s = _w(tmp_path / 'a6.json', a6)
+    k = json.load(open(p['kh'], encoding='utf-8'))
+    k['khoa_truoc']['nguon'] = [n for n in k['khoa_truoc']['nguon'] if n['vai'] != 'a6'] + [
+        dict(vai='a6', sha256=a6s), dict(vai='kiem_cheo', sha256=s1), dict(vai='kiem_cheo', sha256=s2)]
+    _w(tmp_path / 'khoa.json', k)
+    out = tmp_path / 'd3.csv'
+    argv = _argv(p, out) + ['--kiem-cheo', f'2026-11-20_run02/doan2={k1}', '--kiem-cheo',
+                            f'2026-11-23_run03/doan1={k2}', '--e']
+    assert H.main(argv) == 0
+    rows = list(csv.DictReader(open(out, encoding='utf-8')))
+    p1 = [r for r in rows if r['nguon'] == 'P1_A3_H32' and r['dai_luong'] == 'P1']
+    assert len(p1) == 3                                                    # repeated pair rows taken once
+    r2 = [r for r in p1 if r['mien'] == '2026-11-20_run02/doan2:goc']
+    assert all(float(r['chi_so_m']) == 0.0045 for r in r2)                 # index of the OTHER session
+    r3 = [r for r in p1 if r['mien'] == '2026-11-23_run03/doan1:goc']
+    assert float(r3[0]['chi_so_m']) == 0.004 and float(r3[0]['sai_m']) == pytest.approx(0.0044)
+    a3 = [r for r in rows if r['dai_luong'] == 'A3']
+    assert {r['mien']: float(r['chi_so_m']) for r in a3} == pytest.approx(
+        {'2026-11-20_run02/doan2': 1.6 * math.radians(0.25), '2026-11-23_run03/doan1': 1.6 * math.radians(0.2)})
+    (e,) = [r for r in rows if r['nguon'] == 'E']
+    assert float(e['sai_m']) == pytest.approx(1.6 * 0.00066) and e['mien'] == 'goc'
+    d3 = KV.build(KV.read_rows(str(out)), k, 'x' * 64)
+    assert 'replay_neo' in d3['ly_do'][0] and 'P1_A3_H32' not in d3['ly_do'][0]
+    # run03 pair 4.4 mm over the session-2 index 4.0 mm: that segment's P1 domain is thieu (the file is not failed)
+    assert any(m['mien'] == '2026-11-23_run03/doan1:goc' for m in d3['mien_thieu'])
+    # one session only, or a kiem_cheo the lock does not name: refused
+    assert H.main(_argv(p, tmp_path / 'b.csv') + ['--kiem-cheo', f'2026-11-20_run02/doan2={k1}']) == 2
+    k3, _ = _kc(tmp_path, '2026-11-24_run05/doan1', 0.004, 0.2, [(0.001, 0.0)], [0.1])
+    assert H.main(_argv(p, tmp_path / 'c.csv') + ['--kiem-cheo', f'2026-11-20_run02/doan2={k1}', '--kiem-cheo',
+                                                  f'2026-11-24_run05/doan1={k3}']) == 2

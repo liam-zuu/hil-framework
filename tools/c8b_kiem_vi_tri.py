@@ -44,7 +44,9 @@ import c8b_a6 as a6m                                                     # noqa:
 VERSION = 'c8b_kiem_vi_tri_v1'
 KHOA_VERSION = 'c8b_khoa_v5'
 # design 8 (1)-(7): P1/A3 held-out H32, replay anchors / marks, 12b, E, height sensitivity, mounting ends, H drift
-NGUON_CAN = ('P1_A3_H32', 'replay_neo', '12b', 'E', 'do_nhay_cao', 'dau_cuoi_lan_lap', 'troi_H')   # [DE XUAT] names
+# 12b dropped 24/11 khuya (CODE applying C8B's recommendation, contract log C8: no signed position error of 12b; it is
+# in the F7 and in the angle a of dau_cuoi_lan_lap); dau_cuoi_lan_lap = the angle a between HC_goc (Liam 24/11 at CODE)
+NGUON_CAN = ('P1_A3_H32', 'replay_neo', 'E', 'do_nhay_cao', 'dau_cuoi_lan_lap', 'troi_H')   # [DE XUAT] names
 COLS = ('nguon', 'tap', 'dai_luong', 'mien', 'sai_m', 'chi_so_m', 'co_chuan_dong')
 
 
