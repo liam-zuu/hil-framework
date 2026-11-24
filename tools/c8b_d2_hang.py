@@ -13,9 +13,17 @@ hang (one target run, every scored node of its grid folder):
                     scorer's own (c7_score.imu_from with the constants' imu block); self-check: wrap(psi_tc - m_W)
                     equals the node's yaw_check.align_c_deg (else refused), every suspect frame's widened U_psi_k
                     equals |d| + U_IMU (else refused), the rows' command time t equals t_cam + D - t0.
-  U_psi_rad       the camera heading bound of the frame: gate_v3.u_psi_deg where the heading is defined
-                    (huong_xac_dinh 1), empty otherwise [CACH HIEU C8B: not U_psi_k_deg of the rows, which a suspect
-                    frame widens to |d| + U_IMU: comparing d with it would pass by construction].
+  U_psi_rad       the camera heading bound of the frame BEFORE the margin, from the lock the nodes were scored with
+                    (--khoa; L156, Liam 25/11 at CODE, box: "Theo thiet ke, tinh theo khung (Recommended)"; design
+                    7c, Codex D2-9; until then the scorer's constant U_psi_deg, which has the margin 1.25 in it):
+                    u_psi_khung = hang_dong_truoc_le.hang_rad of the level (the constant terms of design section 1:
+                    A3, A6 du, A5, neo, moc, W; before the margin) + A4 of the speed band of the frame taken back
+                    before the margin (A4_deg / le), u = |speed| + |wz| a / sqrt 2 as the lock's bands; a standing
+                    frame (u < v_d, the band B0 of the P6 rule; design 0.7) has A4 = 0; a frame beyond the bands
+                    or in a band without a number has no bound (empty: not comparable). Empty where the heading
+                    is not defined (huong_xac_dinh 0). Not U_psi_k_deg of the rows, which a suspect frame widens to
+                    |d| + U_IMU: comparing d with it would pass by construction. A K run takes the F05 block (the
+                    lock's bang_man_trap: K by F05, J v6 J4-7) [CACH HIEU C8B].
   U_imu_rad       U_IMU,D(k) of u_imu_dong_v3 (c8b_u_imu_v3 formula, the turn totals by prefix sums, checked
                     equal to c8b_u_imu_v3.u_imu_delta in the tests), omega / alpha from the camera yaw (frames.csv,
                     as the E_noi table), clock pairing u- = u+ = U_t_s of the node [CACH HIEU C8B: gio.json carries no
@@ -39,7 +47,8 @@ loo: the E_chuyen inputs: tau_hat of tre.json recomputed leaving each run out (m
 ghep: concatenate per-run row files (same columns) for c8b_a6_o.
 
   python tools/c8b_d2_hang.py hang --luot R --luoi-dir DIR --gio gio.json --frames frames.csv --esp32 log.csv \
-      --hang-so hang_so.json --tham-chieu tham_chieu_v1.json --u-imu u_imu_dong_v3.json [--lan-lap L0] --out rows.csv
+      --hang-so hang_so.json --tham-chieu tham_chieu_v1.json --u-imu u_imu_dong_v3.json --khoa c8b_khoa_v5.json \
+      --lan-lap BUOI/L0 --out rows.csv
   python tools/c8b_d2_hang.py noi-loo --cap frames,log,offset_s,run [--cap ...] --dich R [--dich ...] \
       --thang thang.json --tre tre.json --out-dir DIR
   python tools/c8b_d2_hang.py loo --tre tre.json --thang thang.json --troi troi.json --out-dir DIR
@@ -238,6 +247,43 @@ def read_cam(path):
 
 # ── hang ─────────────────────────────────────────────────────────────────────────────────────────
 
+def muc_cua_task(khoa, task):
+    """The level block of the lock for a task: its own, or the F05 block for a K task (bang_man_trap: K by F05)."""
+    muc = khoa.get('muc') or {}
+    if task in muc:
+        return task
+    if isinstance(task, str) and 'K' in task.split('-')[-1] and 'O1-F05' in muc:
+        return 'O1-F05'
+    raise D2Error(f'the lock has no level block for task {task!r}')
+
+
+def u_psi_khung(m, le, v_d, speed, wz):
+    """(bound [rad] before the margin or None, reason): the camera heading bound of one frame from the level block m
+    of the lock (module docstring, U_psi_rad). Bands closed at both ends as the gate reads them: a u on an edge
+    takes the larger of the two bands."""
+    c0 = (m.get('hang_dong_truoc_le') or {}).get('hang_rad')
+    a = (m.get('hang_dong') or {}).get('a_m')
+    if not all(isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in (c0, a, le, v_d)) \
+            or c0 < 0 or a <= 0 or le < 1 or v_d <= 0:
+        return None, 'the lock has no constant heading term before the margin (hang_dong_truoc_le.hang_rad), a, le'
+    if not (math.isfinite(speed) and math.isfinite(wz)):
+        return None, 'no speed or turn rate of the frame: its speed band is not known'
+    u = abs(speed) + abs(wz) * a / math.sqrt(2.0)
+    if u < v_d:
+        return float(c0), None                           # standing frame: no turning bound (design 0.7)
+    a4 = []
+    for b in m.get('hang_theo_u') or []:
+        if b['u_lo_m_s'] <= u <= b['u_hi_m_s']:
+            v = b.get('A4_deg')
+            if b.get('trang_thai') == 'thieu' or not isinstance(v, (int, float)) or isinstance(v, bool) \
+                    or not math.isfinite(v) or v < 0:
+                return None, f'the speed band of the frame (u {u:.3f} m/s) has no turning bound A4 in the lock'
+            a4.append(float(v))
+    if not a4:
+        return None, f'u {u:.3f} m/s is beyond the speed bands of the lock at this level'
+    return float(c0) + math.radians(max(a4)) / le, None
+
+
 def imu_samples(log_path, t0, imu):
     """The scorer's IMU samples (c7_score.imu_from on the constants' imu block) plus the report ages."""
     import c7_score
@@ -268,6 +314,11 @@ def hang(a):
     if a.luot in ((P3.get('E_noi') or {}).get('luot') or []):
         raise D2Error(f'the E_noi table of {a.u_imu} holds run {a.luot}: not held out (design 7b)')
     gio = _read_json(a.gio)
+    khoa = _read_json(a.khoa)
+    if khoa.get('version') != 'c8b_khoa_v5' or khoa.get('trang_thai') != 'khoa':
+        raise D2Error(f'{a.khoa}: a locked c8b_khoa_v5 file needed (the heading bound of the frames comes from it)')
+    muc_k = khoa['muc'][muc_cua_task(khoa, gio.get('task'))]
+    le_k, v_d = _f(khoa.get('le')), _f(hs.get('v_d'))
     tc = _read_json(a.tham_chieu)
     if tc.get('schema') != 'tham_chieu_v1' or tc.get('trang_thai') != 'dat' or not tc.get('ids'):
         raise D2Error(f'{a.tham_chieu}: a tham_chieu_v1 file, trang_thai dat, with ids')
@@ -277,7 +328,8 @@ def hang(a):
     if miss:
         raise D2Error(f'W ids {miss[:5]} not in {a.frames}')
     sha = dict(frames=cu.sha256(a.frames), esp32=cu.sha256(a.esp32), gio=cu.sha256(a.gio),
-               tham_chieu=cu.sha256(a.tham_chieu), hang_so=cu.sha256(a.hang_so), u_imu=cu.sha256(a.u_imu))
+               tham_chieu=cu.sha256(a.tham_chieu), hang_so=cu.sha256(a.hang_so), u_imu=cu.sha256(a.u_imu),
+               khoa=cu.sha256(a.khoa))
     S, turns, t0_seen = None, None, None
     out, nodes, n_left = [], [], 0
     pose_of = {}                       # frame id -> (x, y, psi, u) of the first node holding it (one frame, one pose)
@@ -302,6 +354,8 @@ def hang(a):
         ktd = sc.get('khung_tuong_doi_v1') or {}
         if ((ktd.get('nguon') or {}).get('tham_chieu_v1') or {}).get('sha256') != sha['tham_chieu']:
             raise D2Error(f'node {k}: scored with another tham_chieu_v1 than {a.tham_chieu}')
+        if ((ktd.get('nguon') or {}).get('c8b_khoa_v5') or {}).get('sha256') != sha['khoa']:
+            raise D2Error(f'node {k}: scored with another C8b lock than {a.khoa}')
         rows_sha = cu.sha256(rp)
         if ktd.get('rows_sha256') != rows_sha:           # Codex D2-6
             raise D2Error(f'node {k}: {rp} is not the rows file the scorer wrote (rows_sha256 of the node score)')
@@ -331,9 +385,8 @@ def hang(a):
             if not abs(float(_wrap(c - c_sc))) <= TOL_C_RAD:
                 raise D2Error(f'node {k}: wrap(psi_tc - m_W) {c!r} is not the scorer alignment {c_sc!r} (self-check)')
             u_imu_sc = math.radians(_f(yc.get('U_IMU_deg')))
-            u_psi = math.radians(_f(g.get('u_psi_deg')))
-            if not (math.isfinite(u_psi) and math.isfinite(u_t) and u_t >= 0):
-                raise D2Error(f'node {k}: gate u_psi_deg or U_t_s not finite')
+            if not (math.isfinite(u_t) and u_t >= 0):
+                raise D2Error(f'node {k}: U_t_s not finite')
             UN = UNode(P3, S, t_W, [cam['om'].get(i, math.nan) for i in W],
                        [cam['al'].get(i, math.nan) for i in W], u_t, u_t, turns)
         with open(rp, newline='', encoding='utf-8') as f:
@@ -378,9 +431,11 @@ def hang(a):
                 w = math.radians(_f(r.get('U_psi_k_deg')))
                 if abs(w - (abs(d) + u_imu_sc)) > 1e-9 * max(1.0, w):
                     raise D2Error(f'node {k} frame {fid}: suspect U_psi_k is not |d| + U_IMU (self-check of d)')
-            up_ = u_psi if r.get('huong_xac_dinh') == '1' else None
+            up_, wup = None, 'heading not defined at the frame'
+            if r.get('huong_xac_dinh') == '1':
+                up_, wup = u_psi_khung(muc_k, le_k, v_d, u, _f(r.get('wz')))
             if up_ is None:
-                why.append('heading not defined at the frame')
+                why.append(wup)
             Ui, _, wu = UN(t_log, cam['om'].get(fid, math.nan), cam['al'].get(fid, math.nan))
             why += wu
             out.append(dict(luot=a.luot, tap='dich', id=fid, nut=k, x_m=repr(x), y_m=repr(y), psi_rad=repr(psi),
@@ -395,8 +450,10 @@ def hang(a):
         raise D2Error('no row: no node of the grid could be used')
     return out, dict(version=VERSION, luot=a.luot, n_hang=len(out), n_khung_bo_vi_tri=n_left, nut=nodes, sha256=sha,
                      u_lag_s=P3['u_lag_s'], lan_lap_id=a.lan_lap,
-                     cach_hieu=['U_psi_rad = gate_v3.u_psi_deg o khung co huong (khong lay U_psi_k da noi cua khung '
-                                'nghi ngo)', 'u-/u+ = U_t_s cua nut (gio.json khong co u_cham-/+)'])
+                     u_psi='can truoc le theo khung tu khoa (L156, Liam 25/11): hang_dong_truoc_le.hang_rad + '
+                           'A4_deg cua dai toc do / le; khung dung yen (u < v_d) A4 = 0',
+                     cach_hieu=['luot K lay khoi muc O1-F05 cua khoa (bang_man_trap: K theo F05)',
+                                'u-/u+ = U_t_s cua nut (gio.json khong co u_cham-/+)'])
 
 
 def write_rows(path, rows):
@@ -472,7 +529,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
     h = sub.add_parser('hang')
-    for k in ('--luot', '--luoi-dir', '--gio', '--frames', '--esp32', '--hang-so', '--tham-chieu', '--u-imu', '--out'):
+    for k in ('--luot', '--luoi-dir', '--gio', '--frames', '--esp32', '--hang-so', '--tham-chieu', '--u-imu', '--khoa',
+              '--out'):
         h.add_argument(k, required=True)
     h.add_argument('--lan-lap', required=True,
                    help='mounting id of the run, one name per mounting over the whole C8 (e.g. <session>/L0)')

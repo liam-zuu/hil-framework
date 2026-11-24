@@ -153,5 +153,34 @@ def test_hang_needs_a_mounting_name():
     """D2-15: no default mounting id (two mountings under one name would be counted in one cell)."""
     with pytest.raises(SystemExit):
         DH.main(['hang', '--luot', 'R', '--luoi-dir', 'x', '--gio', 'g', '--frames', 'f', '--esp32', 'e',
-                 '--hang-so', 'h', '--tham-chieu', 't', '--u-imu', 'u', '--out', 'o'])
+                 '--hang-so', 'h', '--tham-chieu', 't', '--u-imu', 'u', '--khoa', 'k', '--out', 'o'])
     assert 'mien_hop' in DH.COLS
+
+
+def test_u_psi_of_a_frame_before_the_margin():
+    """L156 (2), Codex D2-9: the heading bound of a frame = the lock's constant term before the margin + A4 of its
+    speed band / le; standing frame: A4 = 0; beyond the bands or a band without a number: no bound."""
+    le, v_d, a = 1.25, 0.01, 0.1445
+    m = dict(hang_dong=dict(a_m=a), hang_dong_truoc_le=dict(hang_rad=0.030),
+             hang_theo_u=[dict(u_lo_m_s=0.0, u_hi_m_s=0.358, A4_deg=0.5, trang_thai='gioi_han'),
+                          dict(u_lo_m_s=0.358, u_hi_m_s=0.896, A4_deg=1.0, trang_thai='gioi_han'),
+                          dict(u_lo_m_s=0.896, u_hi_m_s=1.433, A4_deg=None, trang_thai='thieu')])
+    f = DH.u_psi_khung
+    assert f(m, le, v_d, 0.0, 0.0) == (0.030, None)                                  # standing
+    assert f(m, le, v_d, 0.005, 0.02)[0] == 0.030                                    # u = 0.005 + 0.002 < v_d
+    assert f(m, le, v_d, 0.2, 0.0)[0] == pytest.approx(0.030 + math.radians(0.5) / 1.25, rel=1e-12)
+    assert f(m, le, v_d, -0.2, 0.0)[0] == f(m, le, v_d, 0.2, 0.0)[0]
+    u = 0.3 + 1.0 * a / math.sqrt(2.0)                                               # 0.402: the second band by wz
+    assert u > 0.358 and f(m, le, v_d, 0.3, -1.0)[0] == pytest.approx(0.030 + math.radians(1.0) / 1.25, rel=1e-12)
+    assert f(m, le, v_d, 0.358, 0.0)[0] == pytest.approx(0.030 + math.radians(1.0) / 1.25, rel=1e-12)   # edge: larger
+    for sp, wz in ((1.0, 0.0), (1.5, 0.0), (0.2, math.nan), (math.nan, 0.0)):        # band thieu, beyond, no rate
+        b, why = f(m, le, v_d, sp, wz)
+        assert b is None and why
+    assert f(dict(m, hang_dong_truoc_le=dict(hang_rad=None)), le, v_d, 0.2, 0.0)[0] is None
+    assert f(m, 0.9, v_d, 0.2, 0.0)[0] is None                                       # a margin below 1 is not a margin
+    # smaller than the scorer's constant with the margin on the same numbers: the check is tighter
+    assert f(m, le, v_d, 0.5, 0.0)[0] < le * 0.030 + math.radians(1.0)
+    khoa = dict(muc={'O1-F05': 1, 'O1-F08': 2})
+    assert DH.muc_cua_task(khoa, 'O1-F08') == 'O1-F08' and DH.muc_cua_task(khoa, 'O1-K1') == 'O1-F05'
+    with pytest.raises(DH.D2Error):
+        DH.muc_cua_task(khoa, 'O1-F02')
