@@ -6,7 +6,10 @@ CODE_C8B local_adeaeda8, 24/11/2026 (CODE local_42161302: "lam D3 truoc").
 
 Columns (c8b_kiem_vi_tri COLS): nguon, tap, dai_luong, mien, sai_m, chi_so_m, co_chuan_dong. Every source file must be
 one the C8b lock names (khoa_truoc.nguon, same sha256), so the index compared is the one the lock used.
-Sources written here (replay_neo comes when KIEMCHEO delivers --khung-csv; c8b_kiem_vi_tri lists a missing source):
+Sources written here (c8b_kiem_vi_tri lists a missing source):
+  replay_neo        (2) held out by session as P1_A3_H32: every valid frame of KIEMCHEO neo_luot --khung-csv
+                    (hypot(dx, dy); |dpsi| at rho_max) against P_neo_m / A_neo_rad of the other sessions; frames
+                    mat_W / khong_hop_le listed in the sidecar (khung_thieu_replay_neo), no row.
   P1_A3_H32         (1) held out BY SESSION (CODE 24/11 khuya, contract log): pairs of each segment (KIEMCHEO
                     cap_tuong_doi.csv |d|, a3_cap.csv quy_deg) against the index of the OTHER sessions' segments
                     (P1_tuong_doi.theo_vung.<vung>.max_m, A3_tuong_doi.A3loc_max_deg); A3 at rho_max; mien per
@@ -213,6 +216,43 @@ def rows_e(a6, rho):
     return out
 
 
+def rows_neo(items, rho):
+    """replay_neo (2) held out BY SESSION, the rule of P1_A3_H32 (CODE 24/11 khuya): every valid frame of the replay of
+    anchors of a run of session s (KIEMCHEO neo_luot --khung-csv: trang_thai hop_le, dx_m, dy_m = e_t - mean_W,
+    dpsi_rad) against the index of the OTHER sessions (neo_luot.json theo_cho.<cho>.P_neo_m, A_neo_rad: the max over
+    their own frames). items [(buoi, neo_luot dict, khung rows)]. A frame mat_W / khong_hop_le has no number: listed in
+    khung_thieu (design 8 (2): that quantity thieu on that frame), not a row. mien = '<buoi>:<cho>'."""
+    if len({b for b, _, _ in items}) < 2:
+        raise HangError('--neo: held out by session needs runs of at least two sessions')
+    idx = {}
+    for b, n, _ in items:
+        for cho, v in ((n or {}).get('theo_cho') or {}).items():
+            P, A = _num((v or {}).get('P_neo_m')), _num((v or {}).get('A_neo_rad'))
+            if P is None or A is None:
+                raise HangError(f'--neo {b}: theo_cho.{cho} without P_neo_m / A_neo_rad')
+            idx.setdefault(b, {})[cho] = (P, A)
+    out, thieu = [], []
+    for b, n, kh in items:
+        cho_of = {lid: (v or {}).get('cho') for lid, v in ((n or {}).get('luot') or {}).items()}
+        for r in kh:
+            lid = r.get('luot_id')
+            cho = cho_of.get(lid)
+            if cho is None:
+                raise HangError(f'--neo {b}: frame of run {lid!r} not in neo_luot.json luot')
+            if r.get('trang_thai') != 'hop_le':
+                thieu.append([b, lid, r.get('khung'), r.get('trang_thai'), r.get('ly_do')])
+                continue
+            o = [idx[x][cho] for x in idx if x != b and cho in idx[x]]
+            if not o:
+                raise HangError(f'--neo {b}: no other session has an index at place {cho}')
+            dx, dy, dp = _num(r.get('dx_m')), _num(r.get('dy_m')), _num(r.get('dpsi_rad'))
+            if dx is None or dy is None or dp is None:
+                raise HangError(f'--neo {b}: valid frame {lid}/{r.get("khung")} without finite dx, dy, dpsi')
+            out.append(_row('replay_neo', 'P_neo', f'{b}:{cho}', math.hypot(dx, dy), max(x[0] for x in o)))
+            out.append(_row('replay_neo', 'A_neo', f'{b}:{cho}', rho * abs(dp), rho * max(x[1] for x in o)))
+    return out, thieu
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--khoa', required=True, help='the C8b lock (c8b_khoa_v5; the combined one of the gate)')
@@ -224,6 +264,8 @@ def main(argv=None):
     ap.add_argument('--kiem-cheo', action='append', default=[],
                     help='BUOI/doanN=kiem_cheo.json of KIEMCHEO (P1_A3_H32; cap_tuong_doi.csv, a3_cap.csv beside it)')
     ap.add_argument('--e', action='store_true', help='E: kiem_imu of the held-out E clips of --a6')
+    ap.add_argument('--neo', action='append', default=[],
+                    help='BUOI=neo_luot.json,khung.csv (KIEMCHEO neo_luot --khung-csv; replay_neo), repeat')
     ap.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
@@ -282,6 +324,22 @@ def main(argv=None):
             rows += rows_p1a3(segs, _rho(a6))
         if a.e:
             rows += rows_e(a6, _rho(a6))
+        neo = []
+        for x in a.neo:
+            b, sep, ps = x.partition('=')
+            pj, sep2, pc = ps.partition(',')
+            if not sep or not sep2 or not b:
+                raise HangError(f'--neo {x!r}: BUOI=neo_luot.json,khung.csv')
+            n, s = _read(pj)
+            if s not in lock_shas(khoa, 'neo'):
+                raise HangError(f'--neo {b}: neo_luot.json sha256 {s[:12]} is not a neo source of the lock')
+            kh, ks = _csv(pc)
+            neo.append((b, n, kh))
+            src += [dict(vai=f'neo {b}', duong_dan=os.path.abspath(pj), sha256=s),
+                    dict(vai=f'neo_khung {b}', duong_dan=os.path.abspath(pc), sha256=ks)]
+        if neo:
+            r, info['khung_thieu_replay_neo'] = rows_neo(neo, _rho(a6))
+            rows += r
         if not rows:
             raise HangError('no source given')
         with open(a.out, 'x', newline='', encoding='utf-8') as f:
