@@ -2104,3 +2104,15 @@ def test_score_json_has_car_pose_version():
     out = cs.lost_output('O1-F02', 'x', 'thao_tac')
     assert out['car_pose_version'] == cm.CAR_POSE_VERSION == 'car_pose_v2'
     assert out['version'] == cs.VERSION
+
+
+def test_code_23_11_q_so_do_of_defined_frames_only():
+    """SD1-1 (Codex 24/11): q_so_do is the largest q on the defined frames (q, lo, hi finite) of each domain; an
+    undefined frame keeps its q as a diagnostic only."""
+    q = np.array([7.0, 8.0, 6.0])
+    lo, hi = np.array([6.0, 7.0, 5.0]), np.array([7.5, np.inf, 6.5])          # frame 1 undefined (hi not finite)
+    per = {'g5': (q, lo, hi)}
+    out = cs.q_so_do_of(per, np.array([True, True, False]), np.ones(3, bool), ['g5'])
+    assert out == {'g5': dict(nut=None, q=7.0, q_chung=7.0)}
+    out = cs.q_so_do_of(per, np.array([False, True, False]), np.array([False, True, False]), ['g5'])
+    assert out == {'g5': dict(nut=None, q=None, q_chung=None)}
