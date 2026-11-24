@@ -876,6 +876,16 @@ def test_sd1_6_node_so_do_read_from_the_gate_block_only(tmp_path):
     r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
     assert r['trang_thai_luot'] == 'cham' and r['nodes_ok'] == [True, True] and r['so_do'] == []
     assert r['outcome'] == 'dat'
+    # round 2 (Codex): a block that is not gate_v3.4 carrying a gate_file_sha256 was not written by the scorer of a
+    # run without so_do: that node is a tool error (the C8 gate refuses the same node)
+    os.remove(os.path.join(d, 'luoi.json'))
+    p = os.path.join(d, 'nut_001.json')
+    sc = json.load(open(p, encoding='utf-8'))
+    sc['gate_v3']['gate_file_sha256'] = 'b' * 64
+    json.dump(sc, open(p, 'w', encoding='utf-8'))
+    assert LU.main(['--gio', gp, '--out-dir', d, '--gop-only']) == 0
+    r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
+    assert r['nodes_ok'] == [True, False]
 
 
 def test_f19_luoi_chain_files(tmp_path):

@@ -3048,6 +3048,16 @@ def test_sd1_2_middle_node_tie_to_one_microsecond():
     assert GC._nut_giua(ns, [True, False, True, True]) == 2 == LU.nut_giua(ns, [True, False, True, True])
     assert GC.TIE_S == LU.TIE_S
     assert GC._nut_giua([0.0, 0.0010, 0.0011, 0.003], [True] * 4) == 2   # a real difference (0.1 ms) is no tie
+    # CODE 24/11: the smallest real difference on a c8b_gio lattice is its spacing s > STEP_S / 2 (k = 2 with 2h just
+    # above STEP_S gives s just above 0.5 ms): never a tie. Checked at a boot clock of 1000 s too
+    for c in (0.0012, 1000.0):
+        ns = c8b_gio.nodes(c, 0.5 * c8b_gio.STEP_S * (1 + 1e-6))
+        assert len(ns) == 3 and 0.5 * c8b_gio.STEP_S < ns[1] - ns[0] < 0.51 * c8b_gio.STEP_S
+        assert GC._nut_giua(ns, [True, True, False]) == 1 == LU.nut_giua(ns, [True, True, False])   # 0 is s farther
+        assert GC._nut_giua(ns, [True, False, True]) == 0 == LU.nut_giua(ns, [True, False, True])   # a tie
+    # the edge of TIE_S itself: 3 ns apart is no tie (the nearer node, the higher index), 0.5 ns apart is one
+    assert GC._nut_giua([0.0, 0.399999997, 0.6, 1.0], [True] * 4) == 2 == LU.nut_giua([0.0, 0.399999997, 0.6, 1.0], [True] * 4)
+    assert GC._nut_giua([0.0, 0.3999999995, 0.6, 1.0], [True] * 4) == 1
 
 
 def test_sd1_3_q_so_do_required_and_bounded():

@@ -616,7 +616,13 @@ def so_do_state(q_common, q_union, n_undef_union, threshold: float) -> str:
     return 'dat'
 
 
-TIE_S = 1e-9                      # two node distances to the middle of the grid within 1 ns are equal (float equality)
+# Two node distances to the middle of the grid within TIE_S are equal (SD1-2). Basis of 1 ns: the offsets are those
+# of c8b_gio.nodes, a linspace of k + 1 nodes over [c - h, c + h] with k = ceil(2h / STEP_S), STEP_S = 1 ms. Their
+# distances to the middle c are |i - k/2| * s with s = 2h / k, so two distances that are not equal differ by a whole
+# multiple of s, and s is about STEP_S / 2 = 0.5 ms or more for k >= 2 (2h > (k - 1) STEP_S; k = 1: two nodes, a tie).
+# Float noise of an offset is about 1e-16 s at 1 s (1e-13 s at a boot clock of 1000 s). 1 ns is 5e5 times below the
+# smallest real difference and 1e4 times above the noise.
+TIE_S = 1e-9
 
 
 def _nut_giua(nodes_s, ok) -> Optional[int]:

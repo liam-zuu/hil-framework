@@ -135,8 +135,11 @@ def node_from_files(score_path, rows_path):
         return dict(out, ok=False, kind='loi', why='node scored with report_only (before 23/11): score it again')
     v34 = gate.get('version') == 'gate_v3.4'
     sd_n = list(gate.get('so_do') or []) if v34 else []
-    if not v34 and 'so_do' in gate:
-        return dict(out, ok=False, kind='loi', why=f'gate so_do on a {gate.get("version")!r} block')
+    if not v34 and ('so_do' in gate or gate.get('gate_file_sha256') is not None):
+        # SD1-6 (round 2): c7_score writes so_do and its source only on a gate_v3.4 block (apply_so_do); another
+        # block carrying either was not written by the scorer of this run
+        return dict(out, ok=False, kind='loi',
+                    why=f'gate so_do / gate_file_sha256 on a {gate.get("version")!r} block (SD1-6)')
     if any(not isinstance((gate.get(c) or {}).get('q_so_do'), dict) for c in sd_n):
         return dict(out, ok=False, kind='loi', why=f'gate so_do {sd_n} without q_so_do on each (SD1-1)')
     out.update(states=st, nums=nums, gate=gate, bien=bien, so_do=sd_n,
@@ -215,7 +218,13 @@ def g1_rule(node_st):
     return 'chua_ket_luan'
 
 
-TIE_S = 1e-9                      # node distances to the middle of the grid within 1 ns are equal (= gate_c8.TIE_S)
+# Two node distances to the middle of the grid within TIE_S are equal (SD1-2). Basis of 1 ns: the offsets are those
+# of c8b_gio.nodes, a linspace of k + 1 nodes over [c - h, c + h] with k = ceil(2h / STEP_S), STEP_S = 1 ms. Their
+# distances to the middle c are |i - k/2| * s with s = 2h / k, so two distances that are not equal differ by a whole
+# multiple of s, and s is about STEP_S / 2 = 0.5 ms or more for k >= 2 (2h > (k - 1) STEP_S; k = 1: two nodes, a tie).
+# Float noise of an offset is about 1e-16 s at 1 s (1e-13 s at a boot clock of 1000 s). 1 ns is 5e5 times below the
+# smallest real difference and 1e4 times above the noise.
+TIE_S = 1e-9                      # = gate_c8.TIE_S (a test keeps the two equal)
 
 
 def nut_giua(nodes_s, ok):
