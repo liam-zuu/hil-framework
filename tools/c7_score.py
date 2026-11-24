@@ -1284,6 +1284,8 @@ def build_rel(task, chain, tc, truc_xe, lan_lap, u_beta_cam_deg=None, sources=No
             if f8_ok and phi_ok else None)
     f8 = (dict(ok=True, nhan=ctd.F8_RONG_NHAN, gia_dinh=ctd.F8_RONG_GIA_DINH, beta_deg=beta,
                u_beta_deg=ctd.U_BETA_F8_RONG_DEG, ly_do=[]) if f8_ok else dict(ok=False, ly_do=f8_why))
+    if f8_ok and ctd.ref_12b_nguon(co_ref_12b, truc_xe) == ctd.REF_12B_TU_F7:
+        f8['ref_12b'] = ctd.REF_12B_TU_F7              # Liam 24/11: no ref_12b window, the 12b reference is the F7's
     why = []
     if not phi_ok:
         why += ['phi: ' + w for w in phi_why]
@@ -2722,12 +2724,14 @@ def main_rel(argv):
                          a6_sha256=None if a6 is None else a6['sha256'],
                          xoay_sha256=a.xoay and cm.sha256(a.xoay), nguon=ck.nguon(a.frames, a6, a.xoay, ll),
                          truc_xe_sha256=a.truc_xe and cm.sha256(a.truc_xe))
-            f8_ok = ctd.f8_rong(ll, None if a6 is None else a6['sha256'],
-                                co_ref_12b(cua_rows, ctd.cho_of(a.task)), truc)[0]
+            ref12 = co_ref_12b(cua_rows, ctd.cho_of(a.task))
+            f8_ok = ctd.f8_rong(ll, None if a6 is None else a6['sha256'], ref12, truc)[0]
             chain, tc = chain_and_ref(frames, a6, a.xoay, ll, track, a.task, truc, pre, hs, extra, f8_rong_ok=f8_ok)
             if f8_ok:
                 tc['f8_rong'] = dict(ok=True, nhan=ctd.F8_RONG_NHAN, u_lech_tam_m=ck.U_LECH_TAM_BUOI1_M,
                                      q_tu=ck.F8_RONG_Q_TU.get(ctd.cho_of(a.task), ctd.cho_of(a.task)))
+                if ctd.ref_12b_nguon(ref12, truc) == ctd.REF_12B_TU_F7:
+                    tc['f8_rong']['ref_12b'] = ctd.REF_12B_TU_F7   # Liam 24/11 (run05: no 12b clip)
             with open(a.out, 'x', encoding='utf-8') as f:
                 f.write(json.dumps(cm._json(tc), ensure_ascii=False, indent=1) + '\n')
             print(f'tham chieu: {tc["trang_thai"]} tap {tc["tap"]} n {tc["n"]} {"; ".join(tc["ly_do"])}')

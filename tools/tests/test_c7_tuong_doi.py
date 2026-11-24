@@ -1389,3 +1389,63 @@ def test_f8_rong_cach_a_scores_as_the_beta_path(tmp_path):
     assert out_a['khung_tuong_doi_v1']['tap'] == ctd.TAP_MA_CACH_A
     y = out_a['yaw_check']                                  # the IMU aligned on exactly the W ids (Codex CT2-3)
     assert y['compared'] and y['align_set'] == 'tham_chieu_ids' and y['n_align'] == tc['n']
+
+
+
+def _f8_ll(a6):
+    return ll_of('O1-F05', [1, 2, 3], lan_lap_id=None, chuan_12b=None, cung_lan_lap=None,
+                 trang_thai={'beta': 'chua_ket_luan', 'delta_c_B': 'chua_ket_luan'}, tam_doi_trong_luot=None,
+                 beta_deg=-0.5, u_beta_deg=None, tam_id='T1', a6={'sha256': a6}, _moi_lan_lap_id_null=True,
+                 _sha256='f' * 64)
+
+
+def test_f8_rong_ref_12b_from_f7():
+    """Liam 24/11 tonight at CODE ("Sua 1 dieu kien (Recommended)"; run05 has no 12b clip): without a ref_12b window
+    in the window file, the F8 rong identity check holds when --truc-xe is a 'khoa' F7 with dau_doan (the 12b
+    reference of cach A is the F7's); still refused with an F7 not 'khoa', without dau_doan, or without an F7."""
+    a6 = 'a' * 64
+    ll = _f8_ll(a6)
+    dd = [dict(thu_id='12b_1', doan_i=0, frames_duong_dan='x/frames.csv', frames_sha256='b' * 64, ids=[1, 2])]
+    tx = tx_of('O1-F05', 1.0, dau_doan=dd)
+    assert ctd.f8_rong(ll, a6, True, tx) == (True, []) and ctd.ref_12b_nguon(True, tx) == ctd.REF_12B_CUA_SO
+    assert ctd.f8_rong(ll, a6, False, tx) == (True, []) and ctd.ref_12b_nguon(False, tx) == ctd.REF_12B_TU_F7
+    msg = 'cua_so_v1 khong co cua so ref_12b cua cho nay'
+    for bad in (dict(tx, trang_thai='chan_doan'), dict(tx, dau_doan=[]), tx_of('O1-F05', 1.0), None):
+        ok, why = ctd.f8_rong(ll, a6, False, bad)
+        assert not ok and msg in why and ctd.ref_12b_nguon(False, bad) is None
+    assert ctd.f8_rong(ll, a6, True, None) == (True, [])           # as before: the window file's ref_12b alone
+    ok, why = ctd.f8_rong(ll, 'c' * 64, False, tx)                  # the other identity checks still apply
+    assert not ok and why == ['F8 a6.sha256 khac A6 dang dung']
+
+
+def test_f8_rong_ref_12b_from_f7_scores_as_with_the_window(tmp_path):
+    """The run without a ref_12b window but with a 'khoa' F7 that has dau_doan scores exactly as with the window
+    (cach A reads no number of the run's own ref_12b window); only f8_rong.ref_12b records where the reference came
+    from; with the window nothing is added (outputs of session 2 and run03 unchanged)."""
+    lane_rows = B.make_frames('O1-F05', lat_fn=lambda t: 0.02 * min(1.0, max(0.0, t)))
+    fl, chain = to_floor('O1-F05', lane_rows)
+    pre, ids = ref_of(fl, chain)
+    a6 = 'a' * 64
+    ll = ll_of('O1-F05', [i for k, i in enumerate(ids) if not 40 <= k < 60], lan_lap_id=None, chuan_12b=None,
+               cung_lan_lap=None, trang_thai={'beta': 'chua_ket_luan', 'delta_c_B': 'chua_ket_luan'},
+               tam_doi_trong_luot=None, beta_deg=-0.5, u_beta_deg=None, tam_id='T1', a6={'sha256': a6},
+               _moi_lan_lap_id_null=True, _sha256='f' * 64)
+    kt = dict(ctd.KHUNG_TC_DE_XUAT, nguon='test')
+    tc = ctd.tham_chieu(pre, chain, ll, kt, 0.10, 1 / B.FPS, f8_rong_ok=True)
+    dd = [dict(thu_id='12b_1', doan_i=0, frames_duong_dan='x/frames.csv', frames_sha256='b' * 64, ids=[1, 2])]
+    tx = tx_of('O1-F05', math.degrees(PHI0 - BETA), u=0.1, psi_chuan_k_deg=math.degrees(tc['psi_tc_rad'] - BETA),
+               dau_doan=dd)
+    r_w = cs.build_rel('O1-F05', chain, tc, tx, ll, 0.02, None, a6_sha256=a6, co_ref_12b=True)
+    r_f7 = cs.build_rel('O1-F05', chain, tc, tx, ll, 0.02, None, a6_sha256=a6, co_ref_12b=False)
+    assert r_w['can_cu'] and r_f7['can_cu'] and r_f7['f8_rong']['ok']
+    assert 'ref_12b' not in r_w['f8_rong'] and r_f7['f8_rong']['ref_12b'] == ctd.REF_12B_TU_F7
+    assert r_f7['phi'] == r_w['phi'] and r_f7['u_phi'] == r_w['u_phi']
+    out_w, _ = score(tmp_path / 'w', 'O1-F05', fl, rel=r_w)
+    out_f, _ = score(tmp_path / 'f', 'O1-F05', fl, rel=r_f7)
+    gw, gf = gate_ok(out_w), gate_ok(out_f)
+    assert out_f['outcome'] == out_w['outcome']
+    for c in ('g2', 'g3', 'g4', 'g5'):
+        assert gf[c]['q'] == gw[c]['q'], c
+    r_no = cs.build_rel('O1-F05', chain, tc, dict(tx, trang_thai='chan_doan'), ll, 0.02, None, a6_sha256=a6,
+                        co_ref_12b=False)
+    assert not r_no['f8_rong']['ok'] and not r_no['can_cu']
