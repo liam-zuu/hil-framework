@@ -633,6 +633,8 @@ def _yaw_thua(L):
     tg, gz = gyro_samples(L, gskip)
     if gz.size < 2:
         raise InputError('sparse log: fewer than two gyro reports')
+    if not np.all(np.isfinite(gz)):                       # Codex D3-13: a NaN gyro report made w NaN and the
+        raise InputError('sparse log: a gyro report is not finite')      # gap x w test passed whatever the gap
     w = max(float(np.max(np.abs(gz))), THUA_W_PHYS)       # TT-1: the logged peak alone does not bound a gap
     gap = float(np.max(np.diff(r)))
     ggap = float(np.max(np.diff(tg)))                     # TT-2: gyro near-continuous, so a still part is still

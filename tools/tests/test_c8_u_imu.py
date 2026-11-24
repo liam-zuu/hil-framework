@@ -1335,3 +1335,19 @@ def test_sparse_turn_rate_floor_of_the_command_bound(tmp_path):
     with pytest.raises(U.InputError, match='could hide'):
         U._yaw_thua(U.load_log(q25))
     assert 0.25 * 4.0 < U.THUA_STEP_MAX < 0.25 * U.THUA_W_PHYS             # the case the old floor let through
+
+
+def test_sparse_gap_check_refuses_a_gyro_report_that_is_not_a_number(tmp_path, monkeypatch):
+    """Codex D3-13: one NaN gyro report made the turn rate of the gap test NaN, and a 250 ms gap passed; now the log
+    is refused before the test."""
+    p, q25 = str(tmp_path / 'a.csv'), str(tmp_path / 'a25.csv')
+    rate, t_end = turns(5, 0.5, 1)
+    make_log(p, rate, t_end)
+    sparse_copy(p, q25, every=25)
+    L = U.load_log(q25)
+    tg, gz = U.gyro_samples(L, [])
+    gz = gz.copy()
+    gz[gz.size // 2] = math.nan
+    monkeypatch.setattr(U, 'gyro_samples', lambda L_, skip: (tg, gz))
+    with pytest.raises(U.InputError, match='not finite'):
+        U._yaw_thua(L)

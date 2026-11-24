@@ -1109,6 +1109,36 @@ def test_band_edges_one_function_counts_the_frames():
     assert k['muc']['O1-F05']['hang_theo_u'][-1]['u_hi_m_s'] == e2
 
 
+def test_no_frame_flag_needs_every_run_of_the_lock_in_the_p6_file():
+    """Codex D3-1: the runs the lock knows of its session (luot_id of its U_moc files) must all be among the runs the
+    P6 file counted, else a band without frames in P6 is not 'no frame of the session'; a run id with a trailing
+    newline is not a run id."""
+    f5 = ['C8-P-F05-1_lai5', 'C8-P-F05-2_lai1']
+    p = _p6_buoi(f5)
+    assert K.p6_khong_khung(p, 'B3') and K.p6_khong_khung(p, 'B3', f5) and K.p6_khong_khung(p, 'B3', f5[:1])
+    assert K.p6_khong_khung(p, 'B3', f5 + ['C8-L-F08-1_lai1']) is False       # an F08 run the P6 did not count
+    assert K.p6_khong_khung(p, 'B3', ['C8-P-K1-1']) is False
+    assert K.p6_muc_cua_luot(_p6_buoi(['C8-P-F05-1' + chr(10)])) is None
+    s = _src()
+    tbs = {lv: _tb(lv) for lv in K.LEVELS}
+    um = [dict(U_moc_hieu_xy_m=1e-4, U_moc_hieu_psi_rad=1e-4, luot_id=x) for x in f5]
+    k = K.build(tbs, a_m=0.1445, a6=s['a6'], p6_dong=p, u_moc=um)
+    assert k['muc']['O1-F08']['hang_theo_u'][2]['khong_khung'] is True
+    um.append(dict(U_moc_hieu_xy_m=1e-4, U_moc_hieu_psi_rad=1e-4, luot_id='C8-L-F08-1_lai1'))
+    k = K.build(tbs, a_m=0.1445, a6=s['a6'], p6_dong=p, u_moc=um)
+    assert k['muc']['O1-F08']['hang_theo_u'][2]['khong_khung'] is False
+    assert 'O1-F08: hang_theo_u thieu' in k['ly_do_chua_khoa']
+
+
+def test_held_out_factor_below_one_refused_on_a_direct_call():
+    """Codex D3-5: build() itself refuses a factor below 1 or of another term (the CLI reads the file via doc_he_so)."""
+    s = _src()
+    tbs = {lv: _tb(lv) for lv in K.LEVELS}
+    for bad in (dict(P1_m=0.5), dict(P1_m=float('nan')), dict(A3_rad=1.2), dict(P1_m='1.2')):
+        with pytest.raises(K.KhoaError):
+            K.build(tbs, a_m=0.1445, a6=s['a6'], kiem_cheo=s.get('kiem_cheo'), he_so_giu_ngoai=bad)
+
+
 def test_trang_thai_khoa_bands():
     """trang_thai_khoa on the bands alone: a khong_khung band passes, a thieu band with frames does not, a level whose
     every band is khong_khung does not."""
@@ -1119,9 +1149,13 @@ def test_trang_thai_khoa_bands():
                    muc={'O1-F08': dict(hang_dong=dict(a_m=0.1, hang_m=0.01, he_so_r=0.0, u_phi_rad=0.0, hang_rad=0.0),
                                        hang_theo_u=bands)})
         return K.trang_thai_khoa(out, ['O1-F08'])[0]
-    co = dict(trang_thai='gioi_han', khong_khung=False)
+    co = dict(trang_thai='gioi_han', khong_khung=False, P4_m=0.005, A4_deg=0.5)
     kk = dict(trang_thai='thieu', khong_khung=True)
     assert st([co, co, kk]) == 'khoa' and st([co, co, co]) == 'khoa'
+    # Codex D3-11: a band whose state says it has a number, without P4_m or A4_deg, does not lock
+    for bad in (dict(co, P4_m=None), dict(co, A4_deg=None), dict(trang_thai='gioi_han', khong_khung=False),
+                dict(co, P4_m=float('nan')), dict(co, P4_m=True)):
+        assert st([co, bad, co]) == 'chua_khoa', bad
     assert st([co, co, dict(trang_thai='thieu', khong_khung=False)]) == 'chua_khoa'
     assert st([co, co, dict(trang_thai='thieu')]) == 'chua_khoa'                      # a lock made before the flag
     assert st([co, co, dict(trang_thai='thieu', khong_khung='true')]) == 'chua_khoa'

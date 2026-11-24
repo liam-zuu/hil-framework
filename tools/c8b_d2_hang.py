@@ -79,6 +79,7 @@ VERSION = 'c8b_d2_hang_v1'
 COLS = ('luot', 'tap', 'id', 'nut', 'x_m', 'y_m', 'psi_rad', 'u_mps', 'lan_lap_id', 'd_rad', 'U_psi_rad', 'U_imu_rad',
         'mien_hop', 'controller', 'ly_do')
 TOL_C_RAD = 1e-9
+TURN_MAX_RAD = 100.0            # input check only (TurnSums): a turn of one report pair above it is not a number to sum
 
 
 class D2Error(ValueError):
@@ -139,7 +140,10 @@ class TurnSums:
             extra[k] = float(np.max(np.abs(gz[sel]))) * (b - a)
         # Codex D2-12: a step or an extra that is not finite (a NaN gyro report in a suspect pair) would poison every
         # later prefix sum, also for windows that do not hold the pair: kept out of the sums, an error of ITS pair
-        bad = ~(np.isfinite(d) & np.isfinite(extra))
+        # Codex round 2 D2v2-8: a finite but absurd value (1e20) would swallow the later steps in the prefix sums:
+        # a yaw step is at most pi, and extra (rad) above TURN_MAX_RAD is no rotation of this car (the gyro range
+        # of the BNO085 is 2000 deg/s = 34.9 rad/s; a pair spans well under a second)
+        bad = ~(np.isfinite(d) & np.isfinite(extra)) | (np.abs(d) > TURN_MAX_RAD) | (extra > TURN_MAX_RAD)
         err |= bad
         d = np.where(bad, 0.0, d)
         extra = np.where(bad, 0.0, extra)
@@ -257,23 +261,29 @@ def muc_cua_task(khoa, task):
     raise D2Error(f'the lock has no level block for task {task!r}')
 
 
-def u_psi_khung(m, le, v_d, speed, wz):
+def u_psi_khung(m, le, v_d, speed, wz, u=None):
     """(bound [rad] before the margin or None, reason): the camera heading bound of one frame from the level block m
-    of the lock (module docstring, U_psi_rad). Bands closed at both ends as the gate reads them: a u on an edge
-    takes the larger of the two bands."""
+    of the lock (module docstring, U_psi_rad). u: the band speed of the frame as the lock's P6 file counted it
+    (c8b_p6_ngang.read_u: speed + |wz| a / sqrt 2 of frames.csv), given by hang (Codex round 2 D2v2-6: the scorer's
+    recomputed speed of the node rows could put a frame near v_d or an edge in another band than the lock did);
+    without it, from speed and wz. Bands as c8b_p6_ngang.in_band: the first closed at both ends, the others open
+    below (a u on an edge is of the lower band); standing u < v_d."""
     c0 = (m.get('hang_dong_truoc_le') or {}).get('hang_rad')
     a = (m.get('hang_dong') or {}).get('a_m')
     if not all(isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in (c0, a, le, v_d)) \
             or c0 < 0 or a <= 0 or le < 1 or v_d <= 0:
         return None, 'the lock has no constant heading term before the margin (hang_dong_truoc_le.hang_rad), a, le'
-    if not (math.isfinite(speed) and math.isfinite(wz)):
-        return None, 'no speed or turn rate of the frame: its speed band is not known'
-    u = abs(speed) + abs(wz) * a / math.sqrt(2.0)
+    if u is None:
+        if not (math.isfinite(speed) and math.isfinite(wz)):
+            return None, 'no speed or turn rate of the frame: its speed band is not known'
+        u = abs(speed) + abs(wz) * a / math.sqrt(2.0)
+    if not math.isfinite(u):
+        return None, 'the band speed of the frame is not finite'
     if u < v_d:
         return float(c0), None                           # standing frame: no turning bound (design 0.7)
     a4 = []
-    for b in m.get('hang_theo_u') or []:
-        if b['u_lo_m_s'] <= u <= b['u_hi_m_s']:
+    for j, b in enumerate(m.get('hang_theo_u') or []):
+        if (b['u_lo_m_s'] <= u if j == 0 else b['u_lo_m_s'] < u) and u <= b['u_hi_m_s']:
             v = b.get('A4_deg')
             if b.get('trang_thai') == 'thieu' or not isinstance(v, (int, float)) or isinstance(v, bool) \
                     or not math.isfinite(v) or v < 0:
@@ -333,6 +343,13 @@ def hang(a):
     S, turns, t0_seen = None, None, None
     out, nodes, n_left = [], [], 0
     pose_of = {}                       # frame id -> (x, y, psi, u) of the first node holding it (one frame, one pose)
+    # Codex round 2 D2v2-6: the band speed of a frame as the lock's P6 counted it (frames.csv), not the node rows'
+    import c8b_p6_ngang as p6n
+    u_p6 = p6n.read_u(a.frames, None, _f((muc_k.get('hang_dong') or {}).get('a_m')))
+    # Codex round 2 D2v2-5: the scored nodes are those the grid loader scores (a node the scorer marks cham_c8 false,
+    # or whose block the loader refuses, gives no row: its frames must not fill a cell)
+    import c8b_luoi
+    ln = c8b_luoi.load_nodes(gio, a.luoi_dir)
     for k in range(len(gio.get('nodes_s') or [])):
         sp = os.path.join(a.luoi_dir, f'nut_{k:03d}.json')
         rp = os.path.join(a.luoi_dir, f'nut_{k:03d}_rows.csv')
@@ -344,6 +361,16 @@ def hang(a):
         if sc.get('outcome') == 'hong_he_do' or not isinstance(g, dict):
             nodes.append(dict(nut=k, dung=False, cham=False, ly_do=f'node not scored ({sc.get("outcome")})'))
             continue
+        if not ln[k].get('ok') and os.path.isfile(rp):
+            nodes.append(dict(nut=k, dung=False, cham=False,
+                              ly_do=f'node not scored by the grid loader ({ln[k].get("kind")}: {ln[k].get("why")})'))
+            continue
+        # D2v2-5: the score file is the one of THIS node of the clock file (a copy of another node's pair of files
+        # would pass every SHA check below)
+        gc = sc.get('gio_c8b') or {}
+        if gc.get('nut') != k or gc.get('D') != gio['nodes_s'][k]:
+            raise D2Error(f'node {k}: the score file is of node {gc.get("nut")!r}, D {gc.get("D")!r} (the clock file '
+                          f'has D {gio["nodes_s"][k]!r} there)')
         # Codex D2-8: a scored node decides on its frames; without its rows file they are not known
         if not os.path.isfile(rp):
             raise D2Error(f'node {k}: scored, but no rows file {rp}: its deciding frames cannot be listed')
@@ -433,7 +460,10 @@ def hang(a):
                     raise D2Error(f'node {k} frame {fid}: suspect U_psi_k is not |d| + U_IMU (self-check of d)')
             up_, wup = None, 'heading not defined at the frame'
             if r.get('huong_xac_dinh') == '1':
-                up_, wup = u_psi_khung(muc_k, le_k, v_d, u, _f(r.get('wz')))
+                if fid in u_p6:
+                    up_, wup = u_psi_khung(muc_k, le_k, v_d, u, _f(r.get('wz')), u=u_p6[fid][0])
+                else:
+                    wup = 'the frame is not among those the P6 bands count (frames.csv: valid, scale, speed, wz)'
             if up_ is None:
                 why.append(wup)
             Ui, _, wu = UN(t_log, cam['om'].get(fid, math.nan), cam['al'].get(fid, math.nan))

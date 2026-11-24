@@ -600,7 +600,7 @@ def main(argv=None):
             raise LuoiError(f'--task {task} but the clock file is for {gio["task"]}')
         if a.mat_na_d2 and not (a.gop_only and a.luot):
             raise LuoiError('--mat-na-d2 goes with --gop-only and --luot (the mask is applied on node files)')
-        mn_d2 = None
+        mn_d2, khong_che = None, None
         ro, gsha = so_do_of(a.gate_file, task)
         a.so_do_run, a.so_do_sha_run = ro, gsha          # the C8 gate file, or J v6 for G5 of F08 without one
         prov_scorer = None
@@ -617,7 +617,18 @@ def main(argv=None):
             else:
                 nodes = load_nodes(gio, a.out_dir)
                 if a.mat_na_d2:
+                    import inspect
                     import c8b_mat_na_d2 as md2                  # C8B 24/11 khuya: the D2 cell mask (design 7c)
+                    # Codex round 2 D2v2-2: a so_do condition is decided on the q of the middle node; only the
+                    # combine of SD1-1 (the gate branch, q_sd over the defined frames) leaves a masked frame out
+                    if ro and 'q_sd' not in inspect.getsource(combine):
+                        raise LuoiError('--mat-na-d2 with a so_do condition needs the combine of SD1-1 (q_sd over '
+                                        'the defined frames; the merged scoring commit): this code would keep the '
+                                        'q of a masked frame')
+                    # D2v2-1: the grid of these node files without the mask, combined now (goc_luoi compares
+                    # luoi.json with it)
+                    r0 = combine(load_nodes(gio, a.out_dir), ro, gio.get('nodes_s'))
+                    khong_che = _clean(dict(states=r0['states'], nodes_ok=r0['nodes_ok']))
                     nodes, mn_d2 = md2.ap_dung(nodes, a.out_dir, md2.doc_mat_na(a.mat_na_d2, a.luot),
                                                _state_from_numbers, KEY_DEC)
             prov = node_provenance(gio, cu.sha256(a.gio), a.out_dir)
@@ -668,7 +679,7 @@ def main(argv=None):
             # Codex D2-1, D2-2 (C8B 24/11 khuya): the masked grid against luoi.json of the same folder: the same chain
             # fields, and no conclusion made by the mask; luoi.json named with its sha
             import c8b_mat_na_d2 as md2
-            goc = md2.goc_luoi(os.path.join(a.out_dir, 'luoi.json'), _clean(res))
+            goc = md2.goc_luoi(os.path.join(a.out_dir, 'luoi.json'), _clean(res), khong_che)
             res['luoi_goc'] = goc
         os.makedirs(a.out_dir, exist_ok=True)
         out = os.path.join(a.out_dir, 'luoi_d2.json' if a.mat_na_d2 else 'luoi.json')

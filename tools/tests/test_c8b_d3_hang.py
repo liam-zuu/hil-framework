@@ -104,10 +104,10 @@ def test_refused(tmp_path, bad):
 
 
 def _kc(tmp_path, seg, p1, a3, pairs, quys):
+    """a3: A3_xp_deg.goc, the A3 number the lock takes (the index of the other sessions); A3loc_max_deg is the largest
+    quy of a3_cap.csv, and the JSON records the SHA of cap_tuong_doi.csv, as KIEMCHEO writes them (D3-7)."""
     d = tmp_path / seg.replace('/', '_')
     d.mkdir()
-    kc, s = _w(d / 'kiem_cheo.json', dict(P1_tuong_doi=dict(theo_vung=dict(goc=dict(max_m=p1))),
-                                          A3_tuong_doi=dict(A3loc_max_deg=a3)))
     with open(d / 'cap_tuong_doi.csv', 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=['clip', 'vung', 's', 'j', 'd_x', 'd_y'])
         w.writeheader()
@@ -119,6 +119,9 @@ def _kc(tmp_path, seg, p1, a3, pairs, quys):
         w.writeheader()
         for i, q in enumerate(quys):
             w.writerow(dict(clip='H_a', i=1, j=i + 2, quy_deg=q))
+    cs = hashlib.sha256((d / 'cap_tuong_doi.csv').read_bytes()).hexdigest()
+    kc, s = _w(d / 'kiem_cheo.json', dict(P1_tuong_doi=dict(theo_vung=dict(goc=dict(max_m=p1)), cap_csv=dict(sha256=cs)),
+                                          A3_tuong_doi=dict(A3_xp_deg=dict(goc=a3), A3loc_max_deg=max(quys))))
     return kc, s
 
 
@@ -258,3 +261,70 @@ def test_l155_factor_file_of_the_lock(tmp_path):
     import c8b_kiem_vi_tri as KV
     d3 = KV.build(KV.read_rows(str(out)), k, 'x' * 64)
     assert not [m for m in d3['mien_thieu'] if m['nguon'] in ('replay_neo', 'P1_A3_H32')]
+    # Codex D3-3: c8b_kiem_vi_tri takes the rows c8b_d3_hang wrote for THIS lock only (the .nguon.json beside them)
+    assert KV.main(['--rows', str(out), '--khoa', p['kh'], '--out', str(tmp_path / 'kvt.json')]) == 0
+    kb, _ = _w(tmp_path / 'khoa_b.json', dict(k, ghi_chu='another lock'))
+    assert KV.main(['--rows', str(out), '--khoa', kb, '--out', str(tmp_path / 'kvt_b.json')]) == 2
+    with open(out, 'a', encoding='utf-8') as f:                                    # the rows edited after c8b_d3_hang
+        f.write('E,kiem,kiem_imu_E,K9,0.0,0.001,0\n')
+    assert KV.main(['--rows', str(out), '--khoa', p['kh'], '--out', str(tmp_path / 'kvt_c.json')]) == 2
+    # Codex D3-4: the factor file is of exactly the files compared (labels and SHA); one file under two labels refused
+    kcx = ['--kiem-cheo', f'2026-11-20_run02/doan9={k1}', '--kiem-cheo', f'2026-11-23_run03/doan1={k2}']
+    assert H.main(_argv(p, tmp_path / 'y.csv') + kcx + neov + ['--he-so', str(hs)]) == 2
+    kc2 = ['--kiem-cheo', f'2026-11-20_run02/doan2={k1}', '--kiem-cheo', f'2026-11-23_run03/doan1={k1}']
+    assert HS.main(kc2 + neov + ['--out', str(tmp_path / 'hs2.json')]) == 2
+    ne2 = ['--neo', f'2026-11-20_run02={n1},{c1}', '--neo', f'2026-11-23_run03={n1},{c1}']
+    assert HS.main(kcv + ne2 + ['--out', str(tmp_path / 'hs3.json')]) == 2
+
+
+def test_pair_csv_tied_to_the_kiem_cheo_json(tmp_path):
+    """Codex D3-7: cap_tuong_doi.csv by the SHA the JSON records, a3_cap.csv by its largest quy = A3loc_max_deg."""
+    k1, _ = _kc(tmp_path, '2026-11-20_run02/doan2', 0.004, 0.2, [(0.004, 0.0)], [0.2, 0.1])
+    kc, s, cap, cs, a3, as_ = H.doc_kiem_cheo(k1)
+    assert len(cap) == 2 and len(a3) == 2
+    d = os.path.dirname(k1)
+    rows = open(os.path.join(d, 'a3_cap.csv'), encoding='utf-8').read().splitlines()
+    with open(os.path.join(d, 'a3_cap.csv'), 'w', encoding='utf-8', newline='') as f:   # the largest pair taken out
+        f.write('\n'.join([rows[0], rows[2]]) + '\n')
+    with pytest.raises(H.HangError, match='a3_cap'):
+        H.doc_kiem_cheo(k1)
+    k2, _ = _kc(tmp_path, '2026-11-23_run03/doan1', 0.004, 0.2, [(0.004, 0.0)], [0.2])
+    with open(os.path.join(os.path.dirname(k2), 'cap_tuong_doi.csv'), 'a', encoding='utf-8') as f:
+        f.write('H_a,goc,25,9,0.001,0.0\n')
+    with pytest.raises(H.HangError, match='cap_tuong_doi'):
+        H.doc_kiem_cheo(k2)
+
+
+def test_a3_index_is_the_number_the_lock_takes(tmp_path):
+    """Codex D3-6: the A3 index of the other sessions is A3_xp_deg.<CHO_MUC> (what c8b_khoa_v5 puts in the lock), not
+    the largest quy over every pair of the floor."""
+    k1, _ = _kc(tmp_path, '2026-11-20_run02/doan2', 0.004, 0.20, [(0.004, 0.0)], [0.40])   # 0.40 outside goc
+    k2, _ = _kc(tmp_path, '2026-11-23_run03/doan1', 0.004, 0.30, [(0.004, 0.0)], [0.30])
+    segs = []
+    for seg, k in (('2026-11-20_run02/doan2', k1), ('2026-11-23_run03/doan1', k2)):
+        kc, _, cap, _, a3, _ = H.doc_kiem_cheo(k)
+        segs.append((seg, kc, cap, a3))
+    a = {r['mien']: (float(r['sai_m']), float(r['chi_so_m'])) for r in H.rows_p1a3(segs, 1.0) if r['dai_luong'] == 'A3'}
+    assert a['2026-11-20_run02/doan2'] == pytest.approx((math.radians(0.40), math.radians(0.30)))
+    assert a['2026-11-23_run03/doan1'] == pytest.approx((math.radians(0.30), math.radians(0.20)))
+
+
+def test_factor_covers_its_own_rows_after_rounding(tmp_path):
+    """Codex D3-5: P_neo 1.5e-7 and 2.0625e-7 m (ratio 1.375, factor 1.1): index x le x factor fell one rounding step
+    below the largest error; the factor is raised until every row of c8b_d3_hang passes, at any rho."""
+    import c8b_he_so_giu_ngoai as HS
+    k1, _ = _kc(tmp_path, '2026-11-20_run02/doan2', 0.004, 0.2, [(0.004, 0.0)], [0.2])
+    k2, _ = _kc(tmp_path, '2026-11-23_run03/doan1', 0.004, 0.2, [(0.004, 0.0)], [0.2])
+    n1, _, c1 = _neo(tmp_path, '2026-11-20_run02', 1.5e-7, 1.5e-7, [('hop_le', 1.5e-7, 0.0, 1.5e-7)])
+    n2, _, c2 = _neo(tmp_path, '2026-11-23_run03', 2.0625e-7, 2.0625e-7, [('hop_le', 0.0, 2.0625e-7, -2.0625e-7)])
+    segs, neo = [], []
+    for seg, k in (('2026-11-20_run02/doan2', k1), ('2026-11-23_run03/doan1', k2)):
+        kc, _, cap, _, a3, _ = H.doc_kiem_cheo(k)
+        segs.append((seg, kc, cap, a3))
+    for b, nj, c in (('2026-11-20_run02', n1, c1), ('2026-11-23_run03', n2, c2)):
+        neo.append((b, H._read(nj)[0], H._csv(c)[0]))
+    d = HS.build(segs, neo)
+    assert d['trang_thai'] == 'dat' and 1.1 <= d['hang']['P_neo_m'] <= 1.1 + 1e-8
+    for rho in (1.0, 1.615, 0.37):
+        rows, _ = H.rows_neo(neo, rho, 1.25, d['hang'])
+        assert all(abs(float(r['sai_m'])) <= float(r['chi_so_m']) for r in rows), rho

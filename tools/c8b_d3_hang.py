@@ -177,6 +177,38 @@ def _csv(p):
         return list(csv.DictReader(f)), cu.sha256(p)
 
 
+def doc_kiem_cheo(p):
+    """(kiem_cheo dict, its sha, cap rows, cap sha, a3 rows, a3 sha) of a KIEMCHEO kiem_cheo.json and the two pair CSVs
+    beside it, the CSVs tied to the JSON (Codex D3-7): cap_tuong_doi.csv by the SHA the JSON records
+    (P1_tuong_doi.cap_csv.sha256); a3_cap.csv, which the JSON records no SHA of, by its number (the largest quy_deg
+    of its rows is A3_tuong_doi.A3loc_max_deg; checked on the four real segments 25/11). Rows taken out below the
+    maximum of a3_cap.csv are not seen (limit)."""
+    kc, s = _read(p)
+    d = os.path.dirname(os.path.abspath(p))
+    cap, cs = _csv(os.path.join(d, 'cap_tuong_doi.csv'))
+    a3, as_ = _csv(os.path.join(d, 'a3_cap.csv'))
+    if not isinstance(kc, dict):
+        raise HangError(f'{p}: not a kiem_cheo file')
+    want = (((kc.get('P1_tuong_doi') or {}).get('cap_csv') or {}).get('sha256'))
+    if want != cs:
+        raise HangError(f'{p}: cap_tuong_doi.csv beside it is not the file it records (P1_tuong_doi.cap_csv.sha256)')
+    q = [_fnum(r.get('quy_deg')) for r in a3]
+    am = _num((kc.get('A3_tuong_doi') or {}).get('A3loc_max_deg'))
+    if not q or any(x is None for x in q) or am is None or abs(max(q) - am) > 1e-9 * max(1e-6, am):
+        raise HangError(f'{p}: a3_cap.csv beside it does not give A3_tuong_doi.A3loc_max_deg (not the pairs of that '
+                        'file, or a quy_deg not finite)')
+    return kc, s, cap, cs, a3, as_
+
+
+def khong_lap(items, what):
+    """Codex D3-4, D3-8: one file under two labels (sessions, segments) would be compared with itself as 'another
+    session'. items [(label, sha256)]."""
+    seen = {}
+    for lab, sha in items:
+        if seen.setdefault(sha, lab) != lab:
+            raise HangError(f'{what}: {seen[sha]} and {lab} are the same file (sha256 {sha[:12]})')
+
+
 def rows_p1a3(segs, rho, le=1.0, he_so=None):
     """P1_A3_H32 held out BY SESSION (CODE 24/11 khuya, applying C8B's recommendation; contract log 24/11): every pair
     of a segment of session s against the index of the segments of the OTHER sessions (KIEMCHEO: no fixed held-out ID
@@ -184,7 +216,11 @@ def rows_p1a3(segs, rho, le=1.0, he_so=None):
     a3 rows)]. P1 per place (vung): sai = |d| = hypot(d_x, d_y) of each pair (deduplicated on clip, vung, s, j)
     against max over other sessions of P1_tuong_doi.theo_vung.<vung>.max_m (the same |d| max, KIEMCHEO). A3: sai =
     quy_deg (|dtheta| + gap) of each pair (L <= 1.05 m as written) against max over other sessions of
-    A3_tuong_doi.A3loc_max_deg (the max of quy), as a position at rho_max. mien = '<seg>:<vung>' / '<seg>'."""
+    A3_tuong_doi.A3_xp_deg.<CHO_MUC> (the A3 number the lock takes, c8b_khoa_v5.hang_dong_tinh; Codex D3-6: until
+    25/11 A3loc_max_deg, the max of quy over every pair, which is the same number on the four real segments but need
+    not be the one the lock uses), as a position at rho_max. mien = '<seg>:<vung>' / '<seg>'. |sai| only: the sign of
+    d_x, d_y, dtheta stays in the CSVs (limit: the table is not signed for these two sources)."""
+    import c8b_khoa_v5 as khoa_mod
     hs = he_so or {}
     k_p1 = le * hs.get('P1_m', 1.0)           # L155: the index as the lock uses it (margin, held-out factor)
     buoi = {s.split('/')[0] for s, *_ in segs}
@@ -194,7 +230,7 @@ def rows_p1a3(segs, rho, le=1.0, he_so=None):
     for s, kc, _, _ in segs:
         tv = ((kc.get('P1_tuong_doi') or {}).get('theo_vung') or {})
         p1_of[s] = {v: _num((tv.get(v) or {}).get('max_m')) for v in tv}
-        a3_of[s] = _num((kc.get('A3_tuong_doi') or {}).get('A3loc_max_deg'))
+        a3_of[s] = _num(((kc.get('A3_tuong_doi') or {}).get('A3_xp_deg') or {}).get(khoa_mod.CHO_MUC))
     out = []
     for s, kc, cap, a3 in segs:
         b = s.split('/')[0]
@@ -215,12 +251,13 @@ def rows_p1a3(segs, rho, le=1.0, he_so=None):
             out.append(_row('P1_A3_H32', 'P1', f'{s}:{v}', math.hypot(dx, dy), k_p1 * max(idx)))
         ia = [a3_of[o] for o in others]
         if any(x is None for x in ia):
-            raise HangError(f'A3 {s}: an other session has no A3_tuong_doi.A3loc_max_deg')
+            raise HangError(f'A3 {s}: an other session has no A3_tuong_doi.A3_xp_deg.{khoa_mod.CHO_MUC}')
         for r in a3:
             q = _fnum(r.get('quy_deg'))
             if q is None:
                 raise HangError(f'A3 {s}: pair {r.get("i")}-{r.get("j")} without finite quy_deg')
-            out.append(_row('P1_A3_H32', 'A3', s, rho * math.radians(q), le * rho * math.radians(max(ia))))
+            # rho x (...) on both sides: a product by the same rho keeps the order (Codex D3-5)
+            out.append(_row('P1_A3_H32', 'A3', s, rho * math.radians(q), rho * (le * math.radians(max(ia)))))
     return out
 
 
@@ -287,7 +324,9 @@ def rows_neo(items, rho, le=1.0, he_so=None):
             if dx is None or dy is None or dp is None:
                 raise HangError(f'--neo {b}: valid frame {lid}/{r.get("khung")} without finite dx, dy, dpsi')
             out.append(_row('replay_neo', 'P_neo', f'{b}:{cho}', math.hypot(dx, dy), k_p * max(x[0] for x in o)))
-            out.append(_row('replay_neo', 'A_neo', f'{b}:{cho}', rho * abs(dp), k_a * rho * max(x[1] for x in o)))
+            # rho x (k_a x index), as c8b_he_so_giu_ngoai checks the factor with rho 1: the same rho on both sides
+            # keeps the order, so a factor that passes there passes here (Codex D3-5)
+            out.append(_row('replay_neo', 'A_neo', f'{b}:{cho}', rho * abs(dp), rho * (k_a * max(x[1] for x in o))))
     return out, thieu
 
 
@@ -331,6 +370,7 @@ def main(argv=None):
                 raise HangError('--he-so is not the he_so_giu_ngoai file of the lock')
             he_so = {k: float(v) for k, v in hd['hang'].items()}
             src.append(dict(vai='he_so_giu_ngoai', duong_dan=os.path.abspath(a.he_so), sha256=hsha))
+            hs_nguon = {(n.get('vai'), n.get('sha256')) for n in hd.get('nguon') or [] if isinstance(n, dict)}
         info['giu_ngoai_theo_buoi'] = dict(le=le, he_so=he_so, luat='L155')
         if a.u_h:
             d, s = _read(a.u_h)
@@ -344,6 +384,7 @@ def main(argv=None):
             d, s = _read(p)
             items.append((seg, d))
             src.append(dict(vai=f'troi_H {seg}', duong_dan=os.path.abspath(p), sha256=s))
+        khong_lap([(x['vai'], x['sha256']) for x in src if x['vai'].startswith('troi_H ')], '--drift')
         rows += rows_drift(items, khoa) if items else []
         if bool(a.goc_a_dau) != bool(a.goc_a):
             raise HangError('--goc-a-dau and --goc-a go together')
@@ -358,6 +399,7 @@ def main(argv=None):
                 sau.append((b, f, s))
                 src.append(dict(vai=f'goc_a {b}', duong_dan=os.path.abspath(p), sha256=s))
             src.append(dict(vai='goc_a_dau', duong_dan=os.path.abspath(a.goc_a_dau), sha256=s0))
+            khong_lap([('goc_a_dau', s0)] + [(b, s) for b, _, s in sau], '--goc-a')
             r, info['dau_cuoi_lan_lap'] = rows_goc_a(f0, s0, sau, khoa, a6)
             rows += r
         segs = []
@@ -365,16 +407,15 @@ def main(argv=None):
             seg, sep, p = x.partition('=')
             if not sep or '/' not in seg:
                 raise HangError(f'--kiem-cheo {x!r}: BUOI/doanN=path')
-            kc, s = _read(p)
+            kc, s, cap, cs, a3, as_ = doc_kiem_cheo(p)
             if s not in lock_shas(khoa, 'kiem_cheo'):
                 raise HangError(f'--kiem-cheo {seg}: sha256 {s[:12]} is not a kiem_cheo source of the lock')
             d = os.path.dirname(os.path.abspath(p))
-            cap, cs = _csv(os.path.join(d, 'cap_tuong_doi.csv'))
-            a3, as_ = _csv(os.path.join(d, 'a3_cap.csv'))
             segs.append((seg, kc, cap, a3))
             src += [dict(vai=f'kiem_cheo {seg}', duong_dan=os.path.abspath(p), sha256=s),
                     dict(vai=f'cap_tuong_doi {seg}', duong_dan=os.path.join(d, 'cap_tuong_doi.csv'), sha256=cs),
                     dict(vai=f'a3_cap {seg}', duong_dan=os.path.join(d, 'a3_cap.csv'), sha256=as_)]
+        khong_lap([(x['vai'], x['sha256']) for x in src if x['vai'].startswith('kiem_cheo ')], '--kiem-cheo')
         if segs:
             rows += rows_p1a3(segs, _rho(a6), le, he_so)
         if a.e:
@@ -392,9 +433,19 @@ def main(argv=None):
             neo.append((b, n, kh))
             src += [dict(vai=f'neo {b}', duong_dan=os.path.abspath(pj), sha256=s),
                     dict(vai=f'neo_khung {b}', duong_dan=os.path.abspath(pc), sha256=ks)]
+        khong_lap([(x['vai'], x['sha256']) for x in src if x['vai'].startswith('neo ')], '--neo')
         if neo:
             r, info['khung_thieu_replay_neo'] = rows_neo(neo, _rho(a6), le, he_so)
             rows += r
+        if a.he_so:
+            # Codex D3-4: the factors are those of exactly the files compared here (session labels and SHA of every
+            # kiem_cheo, pair CSV, neo_luot and frame CSV); the lock already asks its own sources among them
+            giu = ('kiem_cheo ', 'cap_tuong_doi ', 'a3_cap ', 'neo ', 'neo_khung ')
+            day = {(x['vai'], x['sha256']) for x in src if x['vai'].startswith(giu)}
+            hsn = {x for x in hs_nguon if isinstance(x[0], str) and x[0].startswith(giu)}
+            if day != hsn:
+                raise HangError('--he-so was not computed from exactly the --kiem-cheo / --neo files given here '
+                                f'(labels and sha256): {sorted(v for v, _ in day ^ hsn)}')
         if not rows:
             raise HangError('no source given')
         with open(a.out, 'x', newline='', encoding='utf-8') as f:

@@ -75,6 +75,19 @@ def build(segs, neo, le=khoa.LE):
         raise HeSoError(f'no ratio for {miss}')
     # rounded UP at the 9th decimal, so index x le x factor is never below the largest error by rounding
     hang = {TEN[k]: max(1.0, math.ceil(tl[k]['ti_le'] / le * 1e9) / 1e9) for k in ('P1', 'P_neo', 'A_neo')}
+    # Codex D3-5: the rounding up above is done on the ratio, the check of D3 on index x (le x factor): the same rows
+    # are built again with the factors as c8b_d3_hang builds them (rho 1 here; a product by the same rho keeps the
+    # order), and a factor still short by a rounding step is raised by 1e-9 until every row passes
+    for _ in range(20):
+        r2, _t = d3.rows_neo(neo, 1.0, le, hang)
+        ngan = {r['dai_luong'] for r in d3.rows_p1a3(segs, 1.0, le, hang) + r2
+                if r['dai_luong'] in ('P1', 'P_neo', 'A_neo') and abs(float(r['sai_m'])) > float(r['chi_so_m'])}
+        if not ngan:
+            break
+        for k in ngan:
+            hang[TEN[k]] = round(hang[TEN[k]] + 1e-9, 9)
+    else:
+        raise HeSoError(f'the factors of {sorted(ngan)} do not cover their own rows after 20 rounding steps')
     why = []
     if tl['A3']['ti_le'] > le:
         why.append(f'A3 ratio {tl["A3"]["ti_le"]:.4f} above the margin {le}: A3 is not scaled by the lock (it also '
@@ -97,10 +110,8 @@ def main(argv=None):
             seg, sep, p = x.partition('=')
             if not sep or '/' not in seg:
                 raise HeSoError(f'--kiem-cheo {x!r}: BUOI/doanN=path')
-            kc, s = d3._read(p)
+            kc, s, cap, cs, a3, as_ = d3.doc_kiem_cheo(p)       # the pair CSVs tied to the JSON (Codex D3-7)
             d = os.path.dirname(os.path.abspath(p))
-            cap, cs = d3._csv(os.path.join(d, 'cap_tuong_doi.csv'))
-            a3, as_ = d3._csv(os.path.join(d, 'a3_cap.csv'))
             segs.append((seg, kc, cap, a3))
             src += [dict(vai=f'kiem_cheo {seg}', duong_dan=os.path.abspath(p), sha256=s),
                     dict(vai=f'cap_tuong_doi {seg}', duong_dan=os.path.join(d, 'cap_tuong_doi.csv'), sha256=cs),
@@ -115,6 +126,9 @@ def main(argv=None):
             neo.append((b, n, kh))
             src += [dict(vai=f'neo {b}', duong_dan=os.path.abspath(pj), sha256=s),
                     dict(vai=f'neo_khung {b}', duong_dan=os.path.abspath(pc), sha256=ks)]
+        # Codex D3-4: one file under two session labels would be 'another session' of itself
+        d3.khong_lap([(x['vai'], x['sha256']) for x in src if x['vai'].startswith('kiem_cheo ')], '--kiem-cheo')
+        d3.khong_lap([(x['vai'], x['sha256']) for x in src if x['vai'].startswith('neo ')], '--neo')
         out = build(segs, neo)
         c = subprocess.run(['git', '-C', HERE, 'rev-parse', 'HEAD'], capture_output=True, text=True)
         st = subprocess.run(['git', '-C', HERE, 'status', '--porcelain', '--', 'c8b_he_so_giu_ngoai.py',

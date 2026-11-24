@@ -49,6 +49,7 @@ KHOA_VERSION = 'c8b_khoa_v5'
 # 12b dropped 24/11 khuya (CODE applying C8B's recommendation, contract log C8: no signed position error of 12b; it is
 # in the F7 and in the angle a of dau_cuoi_lan_lap); dau_cuoi_lan_lap = the angle a between HC_goc (Liam 24/11 at CODE)
 NGUON_CAN = ('P1_A3_H32', 'replay_neo', 'E', 'do_nhay_cao', 'dau_cuoi_lan_lap', 'troi_H')   # [DE XUAT] names
+NGUON_DL = {'P1_A3_H32': ('P1', 'A3'), 'replay_neo': ('P_neo', 'A_neo')}   # the quantities c8b_d3_hang writes for them
 COLS = ('nguon', 'tap', 'dai_luong', 'mien', 'sai_m', 'chi_so_m', 'co_chuan_dong')
 
 
@@ -90,6 +91,11 @@ def build(rows, khoa, khoa_sha):
     miss = [n for n in NGUON_CAN if n not in have]
     if miss:
         why.append(f'required sources without test rows: {miss}')
+    # Codex D3-3: a source held out by session has two quantities; rows of one alone do not make the source
+    for ng, dls in NGUON_DL.items():
+        co = {r['dl'] for r in rows if r['tap'] == 'kiem' and r['nguon'] == ng}
+        if ng in have and not set(dls) <= co:
+            why.append(f'source {ng}: test rows of {sorted(set(dls) - co)} missing')
     groups = {}
     for r in rows:
         groups.setdefault((r['nguon'], r['dl'], r['mien']), []).append(r)
@@ -135,6 +141,19 @@ def main(argv=None):
         cu.check_path(a.khoa)
         with open(a.khoa, encoding='utf-8') as f:
             khoa = json.load(f)
+        # Codex D3-3: the rows are those c8b_d3_hang wrote for THIS lock: its file <rows>.nguon.json names the rows
+        # file (sha256) and the lock (vai khoa, sha256); rows made by hand or for another lock are refused
+        try:
+            with open(a.rows + '.nguon.json', encoding='utf-8') as f:
+                ng = json.load(f)
+        except (OSError, ValueError) as exc:
+            raise ViTriError(f'{a.rows}.nguon.json (written by c8b_d3_hang beside the rows) cannot be read: {exc}')
+        ks = {n.get('sha256') for n in (ng.get('nguon') if isinstance(ng, dict) else None) or []
+              if isinstance(n, dict) and n.get('vai') == 'khoa'}
+        if not isinstance(ng, dict) or ng.get('version') != 'c8b_d3_hang_v1' or ng.get('sha256') != cu.sha256(a.rows) \
+                or ks != {cu.sha256(a.khoa)}:
+            raise ViTriError(f'{a.rows}: not the rows c8b_d3_hang wrote for the lock {a.khoa} (its .nguon.json: '
+                             'version, sha256 of the rows, sha256 of the lock)')
         out = build(read_rows(a.rows), khoa, cu.sha256(a.khoa))
         c = subprocess.run(['git', '-C', HERE, 'rev-parse', 'HEAD'], capture_output=True, text=True)
         s = subprocess.run(['git', '-C', HERE, 'status', '--porcelain', '--', 'c8b_kiem_vi_tri.py'],

@@ -397,3 +397,59 @@ def test_so_do_decides_on_the_open_defined_frames_through_combine(tmp_path):
     d, gio, nodes = _nodes_sd(tmp_path / 'b', n_nodes=3)
     out, _ = M.ap_dung(nodes, d, M.doc_mat_na(mask_file(tmp_path, [101]), 'r1'), LU._state_from_numbers)
     assert LU.combine(out, {'g5'}, gio['nodes_s'])['states']['g5'] == 'chua_ket_luan'
+
+
+def test_t_som_node_refused_for_a_masked_frame_outside_its_domain(tmp_path):
+    """Codex round 2 D2v2-3: a frame outside the union domain of a t_som node can still be a sample of the turn rate
+    that places t_som: any masked frame of such a node is refused."""
+    fr = frames()
+    fr[5] = (fr[5][0], fr[5][1], 0, 0, fr[5][4])                        # frame 105 outside both domains
+    d, gp = grid(tmp_path, [fr], g1=dict(ca_t_som=True, t_som_s=1.0), ktd=dict(tam_doi='khong_doi'))
+    nodes = LU.load_nodes(json.load(open(gp, encoding='utf-8')), d)
+    assert nodes[0]['ok']
+    with pytest.raises(M.MatNaError, match='t_som'):
+        M.ap_dung(nodes, d, M.doc_mat_na(mask_file(tmp_path, [100, 101, 102, 103, 104]), 'r1'), LU._state_from_numbers)
+
+
+def test_luoi_json_must_be_the_grid_of_these_node_files(tmp_path, capsys):
+    """Codex round 2 D2v2-1: a luoi.json left from other node files (their SHA, or the states of a fresh combine
+    without the mask) is refused; combined again from the node files of the folder, the mask is applied."""
+    fr = frames(viol={102: {'g3': 0.15}})
+    d, gp = grid(tmp_path, [fr, fr])
+    assert run(d, gp)[0] == 0
+    mp = mask_file(tmp_path, range(100, 106))
+    assert run(d, gp, mp)[0] == 0
+    os.remove(os.path.join(d, 'luoi_d2.json'))
+    gio = json.load(open(gp, encoding='utf-8'))
+    write_node(d, 1, frames(), D=gio['nodes_s'][1])                    # node 1 scored again: no violation there
+    capsys.readouterr()
+    assert run(d, gp, mp)[0] == 2 and 'not the grid of the node files' in capsys.readouterr().err
+    os.remove(os.path.join(d, 'luoi.json'))
+    assert run(d, gp)[0] == 0
+    rc, r = run(d, gp, mp)
+    assert rc == 0 and r['luoi_goc']['sha256'] == c8_u_imu.sha256(os.path.join(d, 'luoi.json'))
+    # the check itself: the node SHA in order, the states and the scored nodes of the combine without the mask
+    g = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
+    p = os.path.join(d, 'luoi.json')
+    kc = dict(states=g['states'], nodes_ok=g['nodes_ok'])
+    assert M.goc_luoi(p, g, kc)['sha256'] == c8_u_imu.sha256(p)
+    for bad_res, bad_kc in ((dict(g, nguon_nut=g['nguon_nut'][::-1]), kc),
+                            (g, dict(kc, states=dict(g['states'], g3='dat'))),
+                            (g, dict(kc, nodes_ok=[True, False]))):
+        with pytest.raises(M.MatNaError, match='not the grid'):
+            M.goc_luoi(p, bad_res, bad_kc)
+
+
+@pytest.mark.skipif('q_sd' in __import__('inspect').getsource(LU.combine),
+                    reason='c8b_luoi.combine of SD1-1 (after the merge with the gate branch): the mask is applied')
+def test_mask_on_a_so_do_condition_refused_before_sd1_1(tmp_path, capsys):
+    """Codex round 2 D2v2-2: before SD1-1 the combine decides a so_do condition on the q of the middle node, masked
+    frames included: the mask is refused for a run with a so_do condition (O1-F08: G5)."""
+    fr = frames()
+    d, gp = grid(tmp_path, [fr, fr])
+    gio = json.load(open(gp, encoding='utf-8'))
+    json.dump(dict(gio, task='O1-F08'), open(gp, 'w', encoding='utf-8'))
+    capsys.readouterr()
+    rc = LU.main(['--gio', gp, '--out-dir', d, '--gop-only', '--mat-na-d2', mask_file(tmp_path, range(100, 106)),
+                  '--luot', 'r1'])
+    assert rc == 2 and 'SD1-1' in capsys.readouterr().err

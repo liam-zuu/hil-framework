@@ -172,7 +172,13 @@ def test_u_psi_of_a_frame_before_the_margin():
     assert f(m, le, v_d, -0.2, 0.0)[0] == f(m, le, v_d, 0.2, 0.0)[0]
     u = 0.3 + 1.0 * a / math.sqrt(2.0)                                               # 0.402: the second band by wz
     assert u > 0.358 and f(m, le, v_d, 0.3, -1.0)[0] == pytest.approx(0.030 + math.radians(1.0) / 1.25, rel=1e-12)
-    assert f(m, le, v_d, 0.358, 0.0)[0] == pytest.approx(0.030 + math.radians(1.0) / 1.25, rel=1e-12)   # edge: larger
+    # an edge is of the LOWER band, as c8b_p6_ngang.in_band counts the frames of the lock (Codex round 2 D2v2-6)
+    assert f(m, le, v_d, 0.358, 0.0)[0] == pytest.approx(0.030 + math.radians(0.5) / 1.25, rel=1e-12)
+    assert f(m, le, v_d, 0.896, 0.0)[0] == pytest.approx(0.030 + math.radians(1.0) / 1.25, rel=1e-12)
+    # u given (the band speed of frames.csv, as P6): it decides, not the speed and wz of the node rows
+    assert f(m, le, v_d, 0.011, 0.0, u=0.009)[0] == 0.030 and f(m, le, v_d, 0.009, 0.0, u=0.011)[0] > 0.030
+    assert f(m, le, v_d, 0.2, 0.0, u=0.5)[0] == pytest.approx(0.030 + math.radians(1.0) / 1.25, rel=1e-12)
+    assert f(m, le, v_d, 0.2, 0.0, u=math.nan)[0] is None and f(m, le, v_d, math.nan, 0.0, u=0.2)[0] is not None
     for sp, wz in ((1.0, 0.0), (1.5, 0.0), (0.2, math.nan), (math.nan, 0.0)):        # band thieu, beyond, no rate
         b, why = f(m, le, v_d, sp, wz)
         assert b is None and why
@@ -184,3 +190,24 @@ def test_u_psi_of_a_frame_before_the_margin():
     assert DH.muc_cua_task(khoa, 'O1-F08') == 'O1-F08' and DH.muc_cua_task(khoa, 'O1-K1') == 'O1-F05'
     with pytest.raises(DH.D2Error):
         DH.muc_cua_task(khoa, 'O1-F02')
+
+
+def test_turn_sums_absurd_gyro_value_is_an_error_of_its_pair(tmp_path):
+    """Codex round 2 D2v2-8: a finite but absurd gyro value (1e20) in a suspect pair swallowed the later steps in the
+    prefix sums (0 instead of the turn); it is an error of its pair, the windows after it are those of turn_totals."""
+    p = str(tmp_path / 'd.csv')
+    TV.T.make_log(p, TV._rate, TV.A + 9.0, run=(TV.A, TV.A + 8.0), miss=[100, 101, 150], gyro_miss=())
+    S = V.rv_samples_age(U.load_log(p))
+    ta, tr, na = S['t_all'], S['t_recv'], S['n_all']
+    k = int(np.argmax(np.diff(na) > 1))
+    a, b = min(ta[k], tr[k]), max(ta[k + 1], tr[k + 1])
+    j = int(np.searchsorted(S['tg'], 0.5 * (a + b)))
+    S2 = dict(S, gz=S['gz'].copy())
+    S2['gz'][j] = 1e20
+    ts = DH.TurnSums(S2)
+    assert ts.mono
+    for w0, w1 in ((b + 0.2, b + 1.0), (b + 0.3, S['t_all'][-1] - 0.1)):
+        got, want = ts(w0, w1), U.turn_totals(S, w0, w1)
+        assert got == pytest.approx(want, abs=1e-12) and max(want) > 0.01
+    with pytest.raises(U.InputError):
+        ts(a - 0.1, b + 0.1)

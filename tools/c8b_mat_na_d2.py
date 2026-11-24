@@ -238,9 +238,11 @@ def ap_dung(nodes, out_dir, mn, state_fn, key_dec=6):
         for c in MEASURED:
             dinh |= np.isfinite(H['lo'][c]) & np.isfinite(H['hi'][c])
         moi = che & dinh                                 # frames newly undefined by the mask (reported)
-        if (x['gate'].get('g1') or {}).get('ca_t_som') and np.any(che & H['mu']):       # D2-5
-            raise MatNaError(f'node {k}: t_som case with a masked frame in the union domain: the end of the common '
-                             'domain comes from the frame speeds; the mask cannot be applied without the scorer')
+        # D2-5; Codex round 2 D2v2-3: ANY masked frame of the node, not only one in its union domain (a frame outside
+        # the domain the scorer cut can still be a sample of the turn rate that places t_som)
+        if (x['gate'].get('g1') or {}).get('ca_t_som') and np.any(che):
+            raise MatNaError(f'node {k}: t_som case with a masked frame: the end of the common domain comes from the '
+                             'frame speeds; the mask cannot be applied without the scorer')
         for c in MEASURED:
             H['lo'][c] = np.where(che, -math.inf, H['lo'][c])
             H['hi'][c] = np.where(che, math.inf, H['hi'][c])
@@ -285,7 +287,7 @@ def ap_dung(nodes, out_dir, mn, state_fn, key_dec=6):
 LUOI_GOC = ('task', 'gio_sha256', 'gate_file_sha256', 'clip', 'file_so_h', 'file_cham_h1', 'file_gio_h1')
 
 
-def goc_luoi(path, res):
+def goc_luoi(path, res, khong_che=None):
     """Step 6 (Codex D2-1, D2-2): `res` (the grid result about to be written as luoi_d2.json) against the luoi.json
     of the same folder. Returns {duong_dan, sha256} of luoi.json for the mat_na_d2 block; MatNaError when a chain
     field differs or the mask made a conclusion."""
@@ -304,7 +306,18 @@ def goc_luoi(path, res):
     if bad:
         raise MatNaError(f'{path}: {bad} differ from the grid being written with the mask: pass the same --gate-file, '
                          '--clip, --clip-sha256, --file-so-h, --file-cham-h1, --file-gio-h1 again')
-    made = [c for c, v in (res.get('states') or {}).items()
+    if khong_che is not None:
+        # Codex round 2 D2v2-1: luoi.json must be the grid of THESE node files as this code combines them without the
+        # mask (the node score SHA in order, the states and the scored nodes of a fresh combine): a luoi.json left
+        # from other node files could carry the conclusion the mask is not allowed to make
+        sg = [x.get('sha256') for x in g.get('nguon_nut') or [] if isinstance(x, dict)]
+        sr = [x.get('sha256') for x in res.get('nguon_nut') or [] if isinstance(x, dict)]
+        cu_ = [k for k in ('states', 'nodes_ok') if js(g.get(k)) != js(khong_che.get(k))]
+        if sg != sr or cu_:
+            raise MatNaError(f'{path}: not the grid of the node files of this folder without the mask '
+                             f'({"node score SHA differ; " if sg != sr else ""}{cu_}): combine again '
+                             '(c8b_luoi --gop-only) before the mask')
+    made =[c for c, v in (res.get('states') or {}).items()
             if v in ('dat', 'khong_dat') and g['states'].get(c) != v]
     if res.get('outcome') in ('dat', 'khong_dat') and g.get('outcome') != res.get('outcome'):
         made.append('outcome')

@@ -277,6 +277,9 @@ def hang_dong_tinh(src, side):
     # loosened); the factors come from c8b_he_so_giu_ngoai.py (made from the neo / kiem_cheo files, before the lock)
     hs = src.get('he_so_giu_ngoai')
     if isinstance(hs, dict) and hs:
+        # Codex D3-5: also on a direct call (the CLI reads the file through doc_he_so): a factor only makes U larger
+        if set(hs) - set(HE_SO_HANG) or any(_num(v) is None or float(v) < 1.0 for v in hs.values()):
+            raise KhoaError(f'he_so_giu_ngoai {hs!r}: factors >= 1 of {HE_SO_HANG} only')
         for name in sorted(hs):
             if name in part:
                 part[f'{name}_truoc_he_so'] = part[name]
@@ -349,7 +352,7 @@ def p6_delta(p6, band):
 
 
 # figure-8 run ids of the C8 session guide (the cells of rule 2b and their retakes); the level is the F0x part
-P6_LUOT_MUC = re.compile(r'^C8-[PL]-(F02|F05|F08)-[0-9]+(_lai[0-9]+)?$')
+P6_LUOT_MUC = re.compile(r'^C8-[PL]-(F02|F05|F08)-[0-9]+(_lai[0-9]+)?' + chr(92) + 'Z')   # Z: no trailing newline (D3-1)
 
 
 def p6_muc_cua_luot(p6):
@@ -365,7 +368,7 @@ def p6_muc_cua_luot(p6):
     return sorted({'O1-' + m.group(1) for m in ms})
 
 
-def p6_khong_khung(p6, band):
+def p6_khong_khung(p6, band, luot_buoi=None):
     """CODE 24/11 khuya (2026-11-24_CODE_chot_khoa_gop_dai_khong_co_khung, with its condition (a)): True when the
     session of a c8b_P6_rieng_ii_v2 file has NO frame in a band B1 ..: the file says n_khung = 0, n_do = 0 there (no
     number, thieu) AND every run it counted is of a level whose table does not hold the band (LEVELS[i] holds B1 ..
@@ -379,10 +382,14 @@ def p6_khong_khung(p6, band):
             or any(type(d.get(k)) is not int or d[k] != 0 for k in ('n_khung', 'n_do')):
         return False
     lvs = p6_muc_cua_luot(p6)
+    # Codex D3-1 (25/11): the runs this lock knows of its session (the luot_id of its U_moc files) must all be among
+    # the runs the P6 file counted: a P6 made without one of them says nothing of that run's frames
+    if luot_buoi and not set(luot_buoi) <= {x.get('luot') for x in p6.get('luot') or [] if isinstance(x, dict)}:
+        return False
     return lvs is not None and all(LEVELS.index(lv) < P6_BANDS.index(band) for lv in lvs)
 
 
-def hang_theo_u(cq, level, a_m, p6=None, c6=None):
+def hang_theo_u(cq, level, a_m, p6=None, c6=None, luot_buoi=None):
     """The bands of u of a level. Without p6: one band [0, u_3b] with the turning bounds. With a c8b_P6_rieng_ii_v2
     file: the bands B1 .. of the level (edges u_3b of the levels up to its own), P4_m = can_quay + LE c6 delta_h_dong
     (band), A4 the same; a band without its delta_h_dong (or without c6) -> thieu (P4_m, A4_deg null). khong_khung:
@@ -399,7 +406,7 @@ def hang_theo_u(cq, level, a_m, p6=None, c6=None):
     for j, nm in enumerate(P6_BANDS[:len(edges) - 1]):
         d = p6_delta(p6, nm)
         ok = not gone and d is not None and c6 is not None
-        kk = not gone and d is None and p6_khong_khung(p6, nm)
+        kk = not gone and d is None and p6_khong_khung(p6, nm, luot_buoi)
         if kk:
             why.append(f'{nm}: buoi khong co khung nao o dai nay (P6 n_khung = 0; cac luot cua P6 o muc '
                        f'{p6_muc_cua_luot(p6)}, khong muc nao toi dai): buoi khong dong gop cho dai, khoa buoi khong '
@@ -569,6 +576,10 @@ def trang_thai_khoa(out, muc_kha_thi):
         if not bs or any(b['trang_thai'] == 'thieu' and b.get('khong_khung') is not True for b in bs) \
                 or all(b.get('khong_khung') is True for b in bs):
             why.append(f'{lv}: hang_theo_u thieu')
+        # Codex D3-11: a band whose state says it has a number must carry P4_m and A4_deg
+        elif any(b['trang_thai'] != 'thieu' and (_num(b.get('P4_m')) is None or _num(b.get('A4_deg')) is None)
+                 for b in bs):
+            why.append(f'{lv}: hang_theo_u co dai trang thai khong thieu ma P4_m / A4_deg khong phai so')
     return ('khoa', None) if not why else ('chua_khoa', '; '.join(why))
 
 
@@ -981,7 +992,9 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
     for lv in LEVELS:
         tb = tbs.get(lv)
         cq = can_quay(tb, lv)
-        bands, bwhy = hang_theo_u(cq, lv, a_m, p6_dong, p6_he_so(a6))
+        bands, bwhy = hang_theo_u(cq, lv, a_m, p6_dong, p6_he_so(a6),
+                                  [u['luot_id'] for u in (u_moc or [])
+                                   if isinstance(u, dict) and isinstance(u.get('luot_id'), str)])
         if lever is not None:                                 # (|q_hat| + dq) A4(u) into P4 (v7 10, GATE RT4-3)
             for b in bands:
                 if b.get('P4_m') is not None and b.get('A4_deg') is not None:
