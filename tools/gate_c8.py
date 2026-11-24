@@ -1201,7 +1201,13 @@ def _check_camera(d: dict) -> dict:
     for i, x in enumerate(ng['manifests']):
         _ref(x, f'{w}.moc_dich.nguon.manifests[{i}]')
     cp = car_pose_v2_of(ng['car_pose'], f'{w}.moc_dich.nguon')
-    mc = _obj(c8b['mien_car_pose'], ('side_m', 'phien_ban', 'h_m', 'kappa'), f'{w}.mien_car_pose')
+    # KG-1 (Codex N1 + merged lock round 1, CODE 24/11): the lock writes the domain with its state and reasons; the
+    # gate takes the six keys and needs the state dat (a domain C8B could not state is no domain)
+    mc = _obj(c8b['mien_car_pose'], ('side_m', 'phien_ban', 'h_m', 'kappa', 'trang_thai', 'ly_do'),
+              f'{w}.mien_car_pose')
+    if mc['trang_thai'] != 'dat':
+        raise GateFileError(f'{w}.mien_car_pose.trang_thai {mc["trang_thai"]!r}: dat needed (the C8b lock could not '
+                            f'state the camera domain: {mc["ly_do"]!r}); C8 is not locked')
     hl, hh = _range(mc['h_m'], f'{w}.mien_car_pose.h_m')
     kl, kh = _range(mc['kappa'], f'{w}.mien_car_pose.kappa')
     if mc['side_m'] != cp['side_m'] or mc['phien_ban'] != cp['phien_ban'] or not hl <= cp['h_m'] <= hh \
@@ -2104,7 +2110,9 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
     # CODE 20/11 (the luot_c8 check of c8b_u cong, C8BU4-R1-3, now here): each run of the plan is scored once; its
     # scoring is the one first scoring of its clip under the C8 folder, and the clip H comparison, second scoring and
     # second time file of the chain are those that scoring names (so its time files are those of its gio_sha256)
-    first = _first_scorings(goc)
+    kl = _open_ref(goc, d['khoa_c8b'], 'khoa_c8b')
+    commit = kl.get('commit_hil') if kl.get('nhanh_tick') == 'bo_tick' else None
+    first = _first_scorings(goc, commit)                 # KG-6: only the scorings at commit_hil count
     for c in d['o_c8']:
         for x in c['chuoi']:
             w = f'cell {c["o"]} run {x["run_id"]}'
@@ -2156,10 +2164,43 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
     return eligible, cham_luc, scorers, elig_seg
 
 
-def _first_scorings(goc: str) -> Dict[str, set]:
+def luoi_commit(x: dict) -> Optional[str]:
+    """The commit a c8b_luoi file was made at (script.commit), None when not stated."""
+    sc = x.get('script')
+    return sc.get('commit') if isinstance(sc, dict) else None
+
+
+def scorings_dropped(goc: str, commit: Optional[str]) -> List[dict]:
+    """KG-6 (Codex 24/11; CODE 24/11, Liam A2 "Một khóa, lấy lớn nhất"): with a bo_tick lock (commit = its
+    commit_hil), the c8b_luoi luoi.json files under the C8 folder (also in folders _...) made at another commit: the
+    scorings before the N1 fix and the merged lock, dropped, never a scoring of the gate. [{duong_dan, sha256,
+    script_commit}] by path; [] when commit is None (giu_tick)."""
+    if commit is None:
+        return []
+    out = []
+    base = os.path.realpath(goc)
+    for root, dirs, names in os.walk(base):
+        dirs.sort()
+        if 'luoi.json' not in names:
+            continue
+        p = os.path.join(root, 'luoi.json')
+        try:
+            with open(p, 'rb') as f:
+                raw = f.read()
+            x = json.loads(raw.decode('utf-8'))
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        if isinstance(x, dict) and 'trang_thai_luot' in x and luoi_commit(x) != commit:
+            out.append(dict(duong_dan=os.path.relpath(p, base).replace(os.sep, '/'),
+                            sha256=hashlib.sha256(raw).hexdigest(), script_commit=luoi_commit(x)))
+    return sorted(out, key=lambda e: e['duong_dan'])
+
+
+def _first_scorings(goc: str, commit: Optional[str] = None) -> Dict[str, set]:
     """{clip name: sha256 of every first scoring of it} under the C8 folder: the c8b_luoi luoi.json files (as ghep
     finds them: named luoi.json, with trang_thai_luot) that no other luoi.json names as its second scoring
-    (file_cham_h1). Copies with the same bytes are one scoring. A file that is no UTF-8 JSON object is skipped."""
+    (file_cham_h1). Copies with the same bytes are one scoring. A file that is no UTF-8 JSON object is skipped.
+    commit (KG-6): with a bo_tick lock its commit_hil; a file made at another commit is no scoring (scorings_dropped)."""
     found, h1 = [], set()
     for root, dirs, names in os.walk(os.path.realpath(goc)):
         dirs.sort()
@@ -2173,6 +2214,8 @@ def _first_scorings(goc: str) -> Dict[str, set]:
             continue
         if not isinstance(x, dict) or 'trang_thai_luot' not in x:
             continue
+        if commit is not None and luoi_commit(x) != commit:
+            continue                                     # KG-6: a dropped scoring (scorings_dropped)
         found.append((hashlib.sha256(raw).hexdigest(), x))
         if isinstance(x.get('file_cham_h1'), dict):
             h1.add(x['file_cham_h1'].get('sha256'))
@@ -2573,6 +2616,19 @@ def check_nguon(d: dict, goc: str) -> dict:
                             'GATE, approved; never a list typed by hand; GC9-2)')
     # J v6 section 6 condition (1), KCJ1-14 (CODE 19/11): the S7 check of KIEMCHEO locked by a manifest committed in
     # git before the held-out runs were scored; the commit is read back from git, not taken from the files
+    # KG-6 (CODE 24/11): the scorings dropped (made at another commit than commit_hil) recomputed from the folder; the
+    # dossier lists them, with Liam's record when there is one
+    kl = _open_ref(goc, d['khoa_c8b'], 'khoa_c8b')
+    bo_want = scorings_dropped(goc, kl.get('commit_hil') if kl.get('nhanh_tick') == 'bo_tick' else None)
+    cb = _obj(hs.get('cham_cu_bo'), ('luoi', 'liam'), 'chuan_u.ho_so_c8.cham_cu_bo')
+    if cb['luoi'] != bo_want:
+        raise GateFileError(f'chuan_u.ho_so_c8.cham_cu_bo.luoi: {len(cb["luoi"]) if isinstance(cb["luoi"], list) else cb["luoi"]!r} '
+                            f'files; the C8 folder has {len(bo_want)} c8b_luoi files made at another commit than '
+                            'commit_hil, every one listed (KG-6)')
+    if bo_want:
+        _liam(cb['liam'], 'chuan_u.ho_so_c8.cham_cu_bo.liam')
+    elif cb['liam'] is not None:
+        raise GateFileError('chuan_u.ho_so_c8.cham_cu_bo.liam: no dropped scoring, no record')
     # CODE 24/11 (FABLE_C8 V2, GATE (d)): one S7 lock per C8 session, in session order; the S7 numbers the same in
     # every session; each lock committed before the first scoring of a held-out run of its session
     kkl = hs.get('khoa_kiem_luc')
@@ -2881,7 +2937,8 @@ def fake_gate(levels=('O1-F05',), u_p_m=0.002, u_psi_deg=2.0, u_t_s=0.010) -> di
                          manifests=[ref('u_moc_manifest.json')],
                          car_pose=dict(tag_offset=None, side_m=0.1445, h_m=0.20, kappa=0.0, phien_ban='FAKE')))
     cam = {'c8b': dict(moc_dich=md, khoa_sha256='f' * 64, eps_H=dict(mm=1.0, huong_deg=0.2),
-                       mien_car_pose=dict(side_m=0.1445, phien_ban='FAKE', h_m=[0.19, 0.21], kappa=[0.0, 0.0]))}
+                       mien_car_pose=dict(side_m=0.1445, phien_ban='FAKE', h_m=[0.19, 0.21], kappa=[0.0, 0.0],
+                                          trang_thai='dat', ly_do=[]))}
     lv = list(levels)
     return dict(format=FORMAT, c8_dir='FAKE', written_by=dict(script='FAKE', commit='', dirty=True),
                 levels=lv, muc_kha_thi=lv, muc_bo_theo_liam={}, quyet_liam={}, u_t_branch='bo_tick',
@@ -3069,7 +3126,8 @@ def ghep_va_ghi(out: str, goc: str, *args, **kw) -> str:
 
 def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem_cheo,
          bang_chung: Dict[str, str], ho_so: str, muc_bo_theo_liam: Optional[dict] = None,
-         quyet_liam: Optional[dict] = None, o_hong_theo_liam: Optional[dict] = None) -> dict:
+         quyet_liam: Optional[dict] = None, o_hong_theo_liam: Optional[dict] = None,
+         bo_cham_cu: Optional[dict] = None) -> dict:
     """The gate content of C8 assembled from its sources under the C8 folder goc (paths relative to it; F10-F19, the
     contract of 19/11 with C8B: the gate reads the C8B files, C8B does not call the gate):
       sessions     thu_tu_clip: the thu_tu_clip.csv of one C8 session (a path) or of each, in session order (a list;
@@ -3130,8 +3188,9 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
         b = re.sub(r'_lai\d+$', '', (r.get('buoc') or '').strip())
         if b in plan:
             order[b].append(r)
+    commit_bo = khoa.get('commit_hil') if khoa.get('nhanh_tick') == 'bo_tick' else None
     luois = kho.all_json(lambda x, rel: os.path.basename(rel) == 'luoi.json' and isinstance(x, dict)
-                         and 'trang_thai_luot' in x)
+                         and 'trang_thai_luot' in x and (commit_bo is None or luoi_commit(x) == commit_bo))   # KG-6
     h1_shas = {x['file_cham_h1']['sha256'] for _, x in luois if isinstance(x.get('file_cham_h1'), dict)}
     edos = kho.all_json(lambda x, rel: isinstance(x, dict) and 'vuot_moi_nut' in x and 'gio_sha256' in x)
     ccs = kho.all_json(lambda x, rel: isinstance(x, dict) and isinstance(x.get('chung_cu_c8'), dict))
@@ -3337,9 +3396,17 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
         kkl.append(dict(buoi=tien_de_c8[k]['buoi'], kiem_cheo=kcj_ref, khoa_s7=ks_ref,
                         git_commit=rec.get('git_commit'), git_time=rec.get('git_time')))
     all_runs = [e['run_id'] for c in cells for e in c['chuoi']] + [x['run_id'] for x in luot_k]
+    bo_cu = scorings_dropped(kho.goc, commit_bo)            # KG-6: the scorings before the merged lock, dropped
+    if bo_cu and bo_cham_cu is None:
+        raise GateFileError(f'ghep: {len(bo_cu)} c8b_luoi files under the C8 folder were made at another commit than '
+                            'commit_hil of the lock (scorings before the merged lock); the dossier lists them as '
+                            'dropped with Liam\'s record: --liam bo_cham_cu {ngay, phien, nguyen_van} (KG-6)')
+    if bo_cham_cu is not None:
+        _liam(bo_cham_cu, 'ghep: bo_cham_cu')
     hs = dict(format=HO_SO_FORMAT, bang_chung={k: v['sha256'] for k, v in bc_refs.items()},
               ke_hoach_c8_sha256=kh_ref['sha256'], khoa_c8b_sha256=kc8_ref['sha256'],
-              giu_ngoai=all_runs, cham_luc=cham_luc, khoa_kiem_luc=kkl)
+              giu_ngoai=all_runs, cham_luc=cham_luc, khoa_kiem_luc=kkl,
+              cham_cu_bo=dict(luoi=bo_cu, liam=dict(bo_cham_cu) if bo_cu else None))
     raw = (json.dumps(hs, indent=1, ensure_ascii=False) + '\n').encode('utf-8')
     p = os.path.join(kho.goc, ho_so)
     q = os.path.realpath(os.path.dirname(p))
@@ -3416,7 +3483,7 @@ def main(argv=None) -> int:
                         'order, in the folder of its session (CODE 24/11: the S7 lock per session)')
     g.add_argument('--bang-chung', action='append', required=True, help='CONDITION=path, once for each of the four')
     g.add_argument('--ho-so', required=True, help='the dossier ho_so_c8_v1 to write (new, or the same bytes)')
-    g.add_argument('--liam', default=None, help='JSON {muc_bo_theo_liam, quyet_liam, o_hong_theo_liam} of Liam\'s '
+    g.add_argument('--liam', default=None, help='JSON {muc_bo_theo_liam, quyet_liam, o_hong_theo_liam, bo_cham_cu} of Liam\'s '
                    'recorded choices')
     g.add_argument('--out', required=True, help='the gate file (new, never replaced; not under the C8 folder)')
     a = ap.parse_args(argv)
@@ -3436,13 +3503,13 @@ def main(argv=None) -> int:
         if a.liam:
             with open(a.liam, encoding='utf-8') as f:
                 liam = json.load(f)
-            keys = ('muc_bo_theo_liam', 'quyet_liam', 'o_hong_theo_liam')
+            keys = ('muc_bo_theo_liam', 'quyet_liam', 'o_hong_theo_liam', 'bo_cham_cu')
             if not isinstance(liam, dict) or not set(liam) <= set(keys):
                 raise GateFileError(f'--liam {a.liam}: a JSON object with keys among {list(keys)}')
         try:
             sha = ghep_va_ghi(a.out, a.goc, a.ke_hoach, a.thu_tu_clip, a.khoa_c8b, a.tien_de, a.kiem_cheo, bc,
                               a.ho_so, liam.get('muc_bo_theo_liam'), liam.get('quyet_liam'),
-                              liam.get('o_hong_theo_liam'))
+                              liam.get('o_hong_theo_liam'), liam.get('bo_cham_cu'))
         except CanLiamChon as exc:
             # CODE 24/11: the decision sheet beside --out (never replaced), no gate file; exit 3
             sp = os.path.splitext(a.out)[0] + '_phieu_chon.json'

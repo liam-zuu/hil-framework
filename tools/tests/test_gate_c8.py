@@ -759,7 +759,8 @@ def build_c8(tmp_path, levels=LEVELS, u_t=0.014, two=False, sub=''):
                                                 ke_hoach_c8_sha256=kh['sha256'], khoa_c8b_sha256=kv5['sha256'],
                                                 giu_ngoai=all_runs, cham_luc={r: LUC_CHAM for r in all_runs},
                                                 khoa_kiem_luc=[dict(buoi='C8_buoi2', kiem_cheo=kc, khoa_s7=ks,
-                                                                    git_commit=commit, git_time=when)]))
+                                                                    git_commit=commit, git_time=when)],
+                                                cham_cu_bo=dict(luoi=[], liam=None)))
     td = _jw(goc, 'tien_de_c8.json', dict(format=GC.TIEN_DE_FORMAT, ket_qua='dat', session_id='C8_buoi2',
                                           doan=dict(ten='doan2'), vai_tro_clip_h=dict(zip(names, GC.TD_ROLES)),
                                           sha256=dict(sessions={n: c['sha256'] for n, c in zip(names, clips)},
@@ -3141,3 +3142,44 @@ def test_code_24_11_s7_lock_per_session(tmp_path):
         else:
             with pytest.raises(GC.GateFileError, match='differ from those of session 0'):
                 GC.check_nguon(d, goc)
+
+
+# ── Codex N1 + merged lock round 1 (KG-1, KG-6; CODE 24/11) ──
+
+def test_kg_1_camera_domain_with_its_state():
+    d = _good()
+    assert d['camera']['c8b']['mien_car_pose']['trang_thai'] == 'dat'
+    GC.check(d)
+    for edit, msg in [(lambda m: m.update(trang_thai='thieu', ly_do=['K2 thieu']), 'dat needed'),
+                      (lambda m: m.pop('ly_do'), 'mien_car_pose')]:
+        d = _good()
+        edit(d['camera']['c8b']['mien_car_pose'])
+        with pytest.raises(GC.GateFileError, match=msg):
+            GC.check(d)
+
+
+def test_kg_6_scorings_before_the_merged_lock_are_dropped(tmp_path):
+    """A c8b_luoi file of a run made at another commit than commit_hil (a scoring before the N1 fix and the merged
+    lock, kept in the folder, also under _archive): no scoring of the gate; the dossier lists it with Liam's record."""
+    d, goc = build_c8(tmp_path / 'a')
+    x = d['o_c8'][0]['chuoi'][0]
+    old = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
+    old['script'] = dict(old['script'], commit='9' * 40)               # the same clip, scored before at another commit
+    for rel in ('cu/luoi.json', '_archive/cu2/luoi.json'):
+        _jw(goc, rel, old)
+    with pytest.raises(GC.GateFileError, match='KG-6'):                # the dossier does not list them
+        GC.check_nguon(d, goc)
+    bo = GC.scorings_dropped(goc, '5' * 40)
+    assert [e['duong_dan'] for e in bo] == sorted(['cu/luoi.json', '_archive/cu2/luoi.json'])
+    rec = dict(ngay='2026-11-24', phien='local_42161302', nguyen_van='Một khóa, lấy lớn nhất')
+    _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: y.update(cham_cu_bo=dict(luoi=bo, liam=None)))
+    with pytest.raises(GC.GateFileError, match='cham_cu_bo.liam'):     # listed without Liam's record
+        GC.check_nguon(d, goc)
+    _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: y.update(cham_cu_bo=dict(luoi=bo, liam=rec)))
+    GC.check_nguon(d, goc)                                             # the old scorings do not count as first ones
+    with pytest.raises(GC.GateFileError, match='bo_cham_cu'):          # ghep needs Liam's record
+        _ghep(goc, ho_so='chuan_u/ho_so_kg6a.json')
+    g = _ghep(goc, ho_so='chuan_u/ho_so_kg6b.json', bo_cham_cu=rec)
+    hs = json.load(open(os.path.join(goc, 'chuan_u/ho_so_kg6b.json'), encoding='utf-8'))
+    assert hs['cham_cu_bo'] == dict(luoi=GC.scorings_dropped(goc, '5' * 40), liam=rec)
+    assert g['o_c8'][0]['chuoi'][0]['file_cham']['sha256'] == x['file_cham']['sha256']
