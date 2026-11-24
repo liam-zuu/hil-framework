@@ -177,8 +177,8 @@ def _neo(tmp_path, b, P, A, frames):
 
 def test_replay_neo_held_out_by_session(tmp_path):
     p = _setup(tmp_path)
-    n1, s1, c1 = _neo(tmp_path, '2026-11-20_run02', 4e-5, 1.5e-5, [('hop_le', 3e-5, 0.0, 1e-5), ('mat_W', '', '', '')])
-    n2, s2, c2 = _neo(tmp_path, '2026-11-23_run03', 3e-5, 1e-5, [('hop_le', 0.0, 4.5e-5, -2e-5)])
+    n1, s1, c1 = _neo(tmp_path, '2026-11-20_run02', 3e-5, 1e-5, [('hop_le', 3e-5, 0.0, 1e-5), ('mat_W', '', '', '')])
+    n2, s2, c2 = _neo(tmp_path, '2026-11-23_run03', 4.5e-5, 2e-5, [('hop_le', 0.0, 4.5e-5, -2e-5)])
     k = json.load(open(p['kh'], encoding='utf-8'))
     k['khoa_truoc']['nguon'] += [dict(vai='neo', sha256=s1), dict(vai='neo', sha256=s2)]
     _w(tmp_path / 'khoa.json', k)
@@ -187,11 +187,14 @@ def test_replay_neo_held_out_by_session(tmp_path):
     assert H.main(argv) == 0
     rows = [r for r in csv.DictReader(open(out, encoding='utf-8')) if r['nguon'] == 'replay_neo']
     pr = {r['mien']: (float(r['sai_m']), float(r['chi_so_m'])) for r in rows if r['dai_luong'] == 'P_neo'}
-    assert pr['2026-11-20_run02:goc'] == pytest.approx((3e-5, 3e-5))      # index of the OTHER session
-    assert pr['2026-11-23_run03:goc'] == pytest.approx((4.5e-5, 4e-5))
+    assert pr['2026-11-20_run02:goc'] == pytest.approx((3e-5, 4.5e-5))    # index of the OTHER session
+    assert pr['2026-11-23_run03:goc'] == pytest.approx((4.5e-5, 3e-5))
     ar = [r for r in rows if r['dai_luong'] == 'A_neo' and r['mien'] == '2026-11-23_run03:goc']
-    assert float(ar[0]['sai_m']) == pytest.approx(1.6 * 2e-5) and float(ar[0]['chi_so_m']) == pytest.approx(1.6 * 1.5e-5)
+    assert float(ar[0]['sai_m']) == pytest.approx(1.6 * 2e-5) and float(ar[0]['chi_so_m']) == pytest.approx(1.6 * 1e-5)
     meta = json.load(open(str(out) + '.nguon.json', encoding='utf-8'))
     assert meta['thong_tin']['khung_thieu_replay_neo'] == [['2026-11-20_run02', 'L_2026-11-20_run02', '1', 'mat_W',
                                                              'mat_W']]
     assert H.main(_argv(p, tmp_path / 'b.csv') + ['--neo', f'2026-11-20_run02={n1},{c1}']) == 2   # one session
+    # the CSV of another neo_luot.json (its frames do not give P_neo_m, A_neo_rad of the lock's file): refused
+    assert H.main(_argv(p, tmp_path / 'c.csv') + ['--neo', f'2026-11-20_run02={n1},{c2}',
+                                                  '--neo', f'2026-11-23_run03={n2},{c2}']) == 2
