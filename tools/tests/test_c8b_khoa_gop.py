@@ -29,7 +29,7 @@ def _khoa(s, ub_goc, kap=(0.0413, 0.0531), sess='d' * 64, buoi='x'):
                        so_do=['g5'] if lv == 'O1-F08' else [],
                        hang_theo_u=[dict(u_lo_m_s=0.0, u_hi_m_s=0.358, dai='B1', A4_deg=0.6,
                                          P4_m=0.004 + K.LE * 0.003 * s + 0.04 * math.radians(0.6),   # Codex KG7-1
-                                         P6_rieng_ii_m=0.003 * s, trang_thai='gioi_han',
+                                         P6_rieng_ii_m=0.003 * s, trang_thai='gioi_han', khong_khung=False,
                                          P4_tay_don_m=0.04 * math.radians(0.6))],
                        hang_theo_u_ly_do=[], hang_dong=hd, hang_dong_truoc_le=tr,
                        hang_dong_thanh_phan=dict(W_n_luot=int(10 * s)), P4_tay_don=dict(L_m=0.04, ly_do=None),
@@ -221,3 +221,110 @@ def test_per_session_sources_may_differ():
     vai = [n['vai'] for n in G.gop(kb, CH)['khoa_truoc']['nguon']]
     assert vai.count('session') == 2 and vai.count('kiem_cheo') == 2 and vai.count('tham_chieu goc') == 2
     assert vai.count('truc_xe') == 1 and vai.count('nguong') == 1
+
+
+# ── a session without frames in a speed band (CODE 24/11 khuya, 2026-11-24_CODE_chot_khoa_gop_dai_khong_co_khung) ──
+
+EDGES = (0.0, 0.358, 0.896, 1.433)
+
+
+def _ba_dai(k, s, khong=(), lv='O1-F08'):
+    """Three bands B1..B3 at a level of a session lock (terms scaled by s); the bands of `khong`: no frame of the
+    session there (as c8b_khoa_v5.hang_theo_u writes them: thieu, null, no lever key)."""
+    bands = []
+    for i, nm in enumerate(K.P6_BANDS):
+        b = dict(u_lo_m_s=EDGES[i], u_hi_m_s=EDGES[i + 1], dai=nm)
+        if nm in khong:
+            b.update(P4_m=None, A4_deg=None, P6_rieng_ii_m=None, trang_thai='thieu', khong_khung=True)
+        else:
+            b.update(P4_m=0.004 + K.LE * 0.003 * s * (i + 1) + 0.04 * math.radians(0.6), A4_deg=0.6,
+                     P6_rieng_ii_m=0.003 * s * (i + 1), trang_thai='gioi_han', khong_khung=False,
+                     P4_tay_don_m=0.04 * math.radians(0.6))
+        bands.append(b)
+    k['muc'][lv]['hang_theo_u'] = bands
+    return k
+
+
+def _ba_buoi():
+    """Session 2 (every level), run05 (F05 runs only: no frame in B3), run06 (F02 + F08: every band)."""
+    return [('2026-11-20_run02', _ba_dai(_khoa(1.0, 1.058, sess='1' * 64), 1.0)),
+            ('2026-11-24_run05', _ba_dai(_khoa(1.5, 1.174, sess='2' * 64), 1.5, khong=('B3',))),
+            ('2026-11-24_run06', _ba_dai(_khoa(1.2, 1.1, sess='3' * 64), 1.2))]
+
+
+def test_session_without_frames_gives_nothing_to_the_band():
+    k = G.gop(_ba_buoi(), CH)
+    b = k['muc']['O1-F08']['hang_theo_u']
+    p4 = lambda s, i: 0.004 + K.LE * 0.003 * s * (i + 1) + 0.04 * math.radians(0.6)   # noqa: E731
+    assert b[0]['P4_m'] == pytest.approx(p4(1.5, 0)) and b[1]['P4_m'] == pytest.approx(p4(1.5, 1))   # run05 the largest
+    assert b[2]['P4_m'] == pytest.approx(p4(1.2, 2)) and b[2]['P6_rieng_ii_m'] == pytest.approx(0.003 * 1.2 * 3)
+    assert b[2]['A4_deg'] == 0.6 and b[2]['trang_thai'] == 'gioi_han' and b[2]['khong_khung'] is False
+    assert all(x['khong_khung'] is False and x['P4_m'] is not None for x in b)
+    assert [(x['u_lo_m_s'], x['u_hi_m_s'], x['dai']) for x in b] == [(EDGES[i], EDGES[i + 1], nm)
+                                                                    for i, nm in enumerate(K.P6_BANDS)]
+    assert k['gop']['lon_nhat_tu']['muc.O1-F08.hang_theo_u[2].P4_m'] == '2026-11-24_run06'
+    assert k['gop']['lon_nhat_tu']['muc.O1-F08.hang_theo_u[1].P4_m'] == '2026-11-24_run05'
+    d = k['gop']['dai_theo_buoi']['O1-F08']
+    assert d[2] == dict(u_lo_m_s=EDGES[2], u_hi_m_s=EDGES[3], dai='B3',
+                        dong_gop=['2026-11-20_run02', '2026-11-24_run06'], khong_khung=['2026-11-24_run05'])
+    assert d[0]['khong_khung'] == [] and len(d[0]['dong_gop']) == 3
+    assert k['gop']['dai_theo_buoi']['O1-F05'] == [dict(u_lo_m_s=0.0, u_hi_m_s=0.358, dai='B1', khong_khung=[],
+                                                        dong_gop=[b_ for b_, _ in _ba_buoi()])]
+    assert k['muc_du_dai_theo_buoi'] == {'C8_2026-11-20_run02': list(K.LEVELS),
+                                         'C8_2026-11-24_run05': ['O1-F02', 'O1-F05'],
+                                         'C8_2026-11-24_run06': list(K.LEVELS)}
+    assert k['trang_thai'] == 'khoa' and 'khong dong gop' in k['gop']['quy_tac']
+    # the order of the sessions changes nothing
+    k2 = G.gop(_ba_buoi()[::-1], CH)
+    assert k2['muc']['O1-F08']['hang_theo_u'] == b and k2['muc_du_dai_theo_buoi'] == k['muc_du_dai_theo_buoi']
+    # a level outside muc_kha_thi may keep a band nobody has frames in (null, as before it was not looked at)
+    kb = _ba_buoi()
+    for _, x in kb:
+        x['muc_kha_thi'] = ['O1-F02', 'O1-F05']
+        _ba_dai(x, 1.0, khong=('B3',))
+    k3 = G.gop(kb, CH)
+    assert k3['muc']['O1-F08']['hang_theo_u'][2] == dict(u_lo_m_s=EDGES[2], u_hi_m_s=EDGES[3], dai='B3', P4_m=None,
+                                                         A4_deg=None, P6_rieng_ii_m=None, trang_thai='thieu',
+                                                         khong_khung=True)
+    assert all('O1-F08' not in v for v in k3['muc_du_dai_theo_buoi'].values())
+
+
+@pytest.mark.parametrize('ca', ['khong_ai', 'co_khung_thieu', 'kk_co_so', 'kk_trang_thai', 'thieu_co', 'co_la', 'mep',
+                                'mot_buoi'])
+def test_band_cases_refused(ca):
+    """(b) a band no session has a frame in: null, refused as before; item 3: a session WITH frames and no number
+    still makes the band null (refused); a flag that contradicts the band, a lock without the flag, other edges."""
+    kb = _ba_buoi()
+    k5 = kb[1][1]
+    b3 = k5['muc']['O1-F08']['hang_theo_u'][2]
+    if ca == 'khong_ai':
+        for _, x in kb:
+            _ba_dai(x, 1.0, khong=('B3',))
+    elif ca == 'co_khung_thieu':
+        b3['khong_khung'] = False                        # frames without a number: not concluded in one session
+    elif ca == 'kk_co_so':
+        b3['P4_m'] = 0.01
+    elif ca == 'kk_trang_thai':
+        b3['trang_thai'] = 'gioi_han'
+    elif ca == 'thieu_co':
+        del kb[0][1]['muc']['O1-F08']['hang_theo_u'][0]['khong_khung']
+    elif ca == 'co_la':
+        b3['khong_khung'] = 'true'
+    elif ca == 'mep':
+        b3['u_hi_m_s'] = 1.5
+    else:
+        kb = [kb[1]]                                     # one session, a band without frames at a level to lock
+    with pytest.raises(G.GopError):
+        G.gop(kb, CH)
+
+
+def test_band_refusals_say_why():
+    kb = _ba_buoi()
+    for _, x in kb:
+        _ba_dai(x, 1.0, khong=('B3',))
+    with pytest.raises(G.GopError, match='no session has a frame'):
+        G.gop(kb, CH)
+    kb = _ba_buoi()
+    del kb[2][1]['muc']['O1-F08']['hang_theo_u'][1]['khong_khung']
+    with pytest.raises(G.GopError, match='khong_khung'):
+        G.gop(kb, CH)

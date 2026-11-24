@@ -14,6 +14,16 @@ Rules (a field not named here must be the same in every session lock, else refus
            muc.<lv>.hang_theo_u[i] {P4_m, A4_deg, P6_rieng_ii_m, P4_tay_don_m} (band edges u_lo_m_s, u_hi_m_s, dai the
            same); u_beta_cam_deg[cho]. A null in one session -> null (a term not concluded in one session is not
            concluded).
+  bands    (CODE 24/11 khuya, local_577c658d, 2026-11-24_CODE_chot_khoa_gop_dai_khong_co_khung: a consequence of A2
+           for a session that redid some levels only, e.g. run05 with F05 runs only has no frame above u_3b(F05))
+           a session whose lock says khong_khung for a band (no frame of its runs there: c8b_khoa_v5.p6_khong_khung)
+           gives nothing to that band: the largest and the worst state are taken over the sessions WITH frames in
+           it; a null among those -> null as before; a band no session has a frame in stays null and the combined
+           lock is refused when the level is in muc_kha_thi, as before. gop.dai_theo_buoi names, per level and
+           band, the sessions that gave and those that did not. muc_du_dai_theo_buoi {C8_<session>: [levels]}: the
+           levels the session has every band of; for the gate (GATE): a scoring of a session at a level outside
+           its list must be refused, never scored with a band bound no frame of that session entered (the gate
+           applies the bands by the commanded speed of the level, P6 counted the frames by their measured speed).
   state    worst over the sessions, only the states accepted for the field (Codex KG-8): hang_theo_u[i].trang_thai
            in {thieu, gioi_han, dat}; u_beta_cam_trang_thai[cho] (per place, the field c7_score reads),
            u_beta_cam_trang_thai_cho, u_beta_cam_trang_thai_chung, mien_car_pose.trang_thai in {thieu, dat}.
@@ -65,6 +75,7 @@ GOP_VERSION = 'c8b_khoa_gop_v1'
 HD_MAX = ('hang_m', 'he_so_r', 'hang_rad', 'u_phi_rad')
 BAND_MAX = ('P4_m', 'A4_deg', 'P6_rieng_ii_m', 'P4_tay_don_m')
 BAND_SAME = ('u_lo_m_s', 'u_hi_m_s', 'dai')
+KK = 'khong_khung'                                   # c8b_khoa_v5 band flag: the session has no frame in the band
 MUC_PER_BUOI = ('hang_dong_thanh_phan', 'hang_dong_ly_do', 'hang_theo_u_ly_do', 'P4_tay_don')
 TOP_PER_BUOI = ('u_beta_cam_dau_chan', 'u_beta_cam_gia_dinh', 'u_beta_cam_ly_do')
 ST_FIELDS = ('u_beta_cam_trang_thai', 'u_beta_cam_trang_thai_cho')
@@ -194,6 +205,7 @@ def gop(khoa_buoi, commit_hil, script=None, nguon_khoa=None):
     # levels
     lvs = _keys_same([(b, k['muc']) for b, k in khoa_buoi], 'muc')
     muc = {}
+    dai_buoi = {}                                   # level -> per band {edges, dong_gop [sessions], khong_khung [..]}
     for lv in lvs:
         ms = [(b, k['muc'][lv]) for b, k in khoa_buoi]
         mk = _keys_same(ms, f'muc.{lv}')
@@ -212,16 +224,31 @@ def gop(khoa_buoi, commit_hil, script=None, nguon_khoa=None):
                 if len(n) != 1 or any(not isinstance(x, list) for _, x in vals):
                     raise GopError(f'muc.{lv}.hang_theo_u: not lists of the same length in every session lock')
                 bands = []
+                dai_buoi[lv] = []
                 for i in range(n.pop()):
                     bv = [(b, x[i]) for b, x in vals]
-                    bk = _keys_same(bv, f'muc.{lv}.hang_theo_u[{i}]')
+                    w0 = f'muc.{lv}.hang_theo_u[{i}]'
+                    if any(not isinstance(x, dict) or not isinstance(x.get(KK), bool) for _, x in bv):
+                        raise GopError(f'{w0}: {KK} (true / false) missing in a session lock: made before the rule of '
+                                       'a session without frames in a band (CODE 24/11 khuya); make it again')
+                    same = {q: _same([(b, x.get(q)) for b, x in bv], f'{w0}.{q}') for q in BAND_SAME}
+                    for b, x in bv:                  # no frame in the band: no number of that session either
+                        if x[KK] and (x.get('trang_thai') != 'thieu' or any(x.get(q) is not None for q in BAND_MAX)):
+                            raise GopError(f'{w0}: {b} says {KK} with a number or a state other than thieu')
+                    co = [(b, x) for b, x in bv if not x[KK]]
+                    dai_buoi[lv].append(dict(same, dong_gop=[b for b, _ in co],
+                                             khong_khung=[b for b, x in bv if x[KK]]))
                     band = {}
-                    for q in bk:
-                        qv = [(b, x[q]) for b, x in bv]
-                        w = f'muc.{lv}.hang_theo_u[{i}].{q}'
-                        if q in BAND_MAX:
+                    # the sessions WITH frames in the band give its numbers and states (a null among them -> null, as
+                    # before); none of them -> the band of the session locks as it is (null, thieu, khong_khung)
+                    for q in _keys_same(co or bv, w0):
+                        qv = [(b, x[q]) for b, x in (co or bv)]
+                        w = f'{w0}.{q}'
+                        if q in BAND_SAME:
+                            band[q] = same[q]
+                        elif q in BAND_MAX and co:
                             band[q] = _lon_nhat(qv, w, nguon_max)[0]
-                        elif q == 'trang_thai':
+                        elif q == 'trang_thai' and co:
                             band[q] = _te_nhat(qv, w, ST_BAND)
                         else:
                             band[q] = _same(qv, w)
@@ -233,6 +260,12 @@ def gop(khoa_buoi, commit_hil, script=None, nguon_khoa=None):
                 m[f] = _same(vals, f'muc.{lv}.{f}')
         muc[lv] = m
     out['muc'] = muc
+    # CODE 24/11 khuya, condition (a): the levels each session has every band of (frames of its own in each), keyed by
+    # the gate's session id: a run of a session at a level outside its list would take a band bound no frame of that
+    # session entered (the gate applies the bands by the commanded speed of the level, to every session alike)
+    out['muc_du_dai_theo_buoi'] = {
+        f'C8_{b}': [lv for lv in lvs if k['muc'][lv]['hang_theo_u']
+                    and not any(x[KK] for x in k['muc'][lv]['hang_theo_u'])] for b, k in khoa_buoi}
     # u_beta_cam per place
     cho = _keys_same([(b, k['u_beta_cam_deg']) for b, k in khoa_buoi], 'u_beta_cam_deg')
     out['u_beta_cam_deg'] = {c: _lon_nhat([(b, k['u_beta_cam_deg'][c]) for b, k in khoa_buoi],
@@ -310,12 +343,20 @@ def gop(khoa_buoi, commit_hil, script=None, nguon_khoa=None):
     st, why = kv.trang_thai_khoa(out, out.get('muc_kha_thi') or [])
     if st != 'khoa':
         raise GopError(f'combined lock not locked: {why}')
+    for lv in out.get('muc_kha_thi') or []:          # (b): a band no session has a frame in stays null, as before
+        ai = [d.get('dai') or i for i, d in enumerate(dai_buoi.get(lv, [])) if not d['dong_gop']]
+        if ai:
+            raise GopError(f'combined lock not locked: {lv}: hang_theo_u thieu (bands {ai}: no session has a frame '
+                           'there, so no session gives a number; null as before)')
     out.update(trang_thai=st, ly_do_chua_khoa=why,
                gop=dict(version=GOP_VERSION, buoi=names, khoa_buoi=nguon_khoa or {},
-                        lon_nhat_tu=nguon_max,
+                        lon_nhat_tu=nguon_max, dai_theo_buoi=dai_buoi,
                         quy_tac='hang so: lon nhat qua cac buoi (Liam 24/11 o CODE local_42161302, hop chon A2, nguyen '
                                 'van: "Mot khoa, lay lon nhat (Recommended)"); trang thai: te nhat; '
-                                'mien_car_pose.kappa: bao [min lo, max hi]; cac truong khac phai trung'))
+                                'mien_car_pose.kappa: bao [min lo, max hi]; cac truong khac phai trung; hang theo dai '
+                                'toc do: lon nhat qua cac buoi CO khung o dai do, buoi khong co khung nao o dai '
+                                '(khong_khung cua khoa buoi) khong dong gop (CODE 24/11 khuya, phien local_577c658d, '
+                                'he qua cua A2 cho buoi chi do lai mot phan muc; dai_theo_buoi, muc_du_dai_theo_buoi)'))
     return out
 
 

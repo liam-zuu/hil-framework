@@ -33,6 +33,17 @@ Per level (O1-F02, O1-F05, O1-F08; the K tasks take the F05 3b numbers only for 
                 the 3b covered: c8b_3b dung_duoc needs both ways up to v_max, wz_max), P4_m, A4_deg = can_quay after the
                 margin; trang_thai of can_quay (thieu: P4_m, A4_deg null). A frame with u outside every band has no
                 P4 / A4 (design v7 section 10). Without a (--canh-ma-m) the band is empty.
+                khong_khung (CODE 24/11 khuya, 2026-11-24_CODE_chot_khoa_gop_dai_khong_co_khung; a consequence of
+                Liam's A2 'one merged lock, each term the largest' for a session that redid some levels only): true
+                when the session has no frame at all in the band (p6_khong_khung: the P6 file counts n_khung = 0
+                there and every run it counted is of a level whose table does not hold the band). Such a band has no
+                number of this session (thieu, P4_m, A4_deg null), does not stop the session lock, and gives nothing
+                to the merged lock (c8b_khoa_gop takes the largest over the sessions WITH frames in the band). A band
+                with frames but no number (n_khung > 0, or a run of a level reaching the band) stops the lock as
+                before. Not one banding function on both sides: P6 counts the valid frames by their MEASURED u
+                (c8b_p6_ngang.in_band, lower edge open, upper closed), the gate applies the table of the level by the
+                COMMANDED u of its schedule (gate_c8._grid_bounds), to every run of the level whatever the session;
+                hence the level condition above, and muc_du_dai_theo_buoi of the merged lock for the gate.
   hang_dong     the constant closed terms the gate takes {a_m, hang_m, he_so_r, u_phi_rad, hang_rad} (names GATE
                 F19): a_m = the tag side; the others null until their sources come (hang_dong_ly_do says which).
   nhanh_tick    the U_t branch of the C8 plan (bo_tick / giu_tick), copied from it (GATE: = u_t_branch).
@@ -54,8 +65,9 @@ Per level (O1-F02, O1-F05, O1-F08; the K tasks take the F05 3b numbers only for 
                 mounting determined, CODE 23/11): no comparison, dat with nhan can_lech_tam_buoi1_chua_xac_minh_lan_lap
                 and gia_dinh (one mounting assumed). F8 of another
                 plate -> refused.
-  trang_thai    'khoa' only when every level of --muc has hang_dong all numbers, a band, the plan and its branch
-                named, eps_H, mien_car_pose and lan_lap_E dat there; else 'chua_khoa' with ly_do_chua_khoa.
+  trang_thai    'khoa' only when every level of --muc has hang_dong all numbers, a band (every band a number, or
+                khong_khung; not all of them khong_khung), the plan and its branch named, eps_H, mien_car_pose and
+                lan_lap_E dat there; else 'chua_khoa' with ly_do_chua_khoa.
 khoa_truoc: SHA-256 of every input and of this script (commit, dirty) and the time, written before any held-out part
 is looked at (design 0.3); the C8 plan with vai 'ke_hoach_c8' (GATE GC6-1).
 
@@ -71,6 +83,7 @@ import datetime
 import json
 import math
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -335,26 +348,68 @@ def p6_delta(p6, band):
     return _num(d.get('delta_h_m')) if isinstance(d, dict) and d.get('trang_thai') == 'dat' else None
 
 
+# figure-8 run ids of the C8 session guide (the cells of rule 2b and their retakes); the level is the F0x part
+P6_LUOT_MUC = re.compile(r'^C8-[PL]-(F02|F05|F08)-[0-9]+(_lai[0-9]+)?$')
+
+
+def p6_muc_cua_luot(p6):
+    """The levels (sorted, of LEVELS) of the runs a c8b_P6_rieng_ii_v2 file counted its frames over (luot[].luot);
+    None when the list is absent or empty, an id is repeated or is not a figure-8 run id: the levels are not known."""
+    ls = p6.get('luot') if isinstance(p6, dict) and p6.get('schema') == P6_VERSION else None
+    if not isinstance(ls, list) or not ls:
+        return None
+    ids = [x.get('luot') if isinstance(x, dict) else None for x in ls]
+    ms = [P6_LUOT_MUC.match(i) if isinstance(i, str) else None for i in ids]
+    if any(m is None for m in ms) or len(set(ids)) != len(ids):
+        return None
+    return sorted({'O1-' + m.group(1) for m in ms})
+
+
+def p6_khong_khung(p6, band):
+    """CODE 24/11 khuya (2026-11-24_CODE_chot_khoa_gop_dai_khong_co_khung, with its condition (a)): True when the
+    session of a c8b_P6_rieng_ii_v2 file has NO frame in a band B1 ..: the file says n_khung = 0, n_do = 0 there (no
+    number, thieu) AND every run it counted is of a level whose table does not hold the band (LEVELS[i] holds B1 ..
+    B(i+1)). The second part is the stop of (a): the gate applies a band by the commanded speed of the level, not by
+    the measured speed P6 counts with, so a session with a run of a level reaching the band needs the band even when
+    none of its valid frames was measured there; that case stays thieu and stops the lock. B0 (standing) never."""
+    if not isinstance(p6, dict) or p6.get('schema') != P6_VERSION or band not in P6_BANDS:
+        return False
+    d = (p6.get('dai') or {}).get(band)
+    if not isinstance(d, dict) or d.get('trang_thai') != 'thieu' or d.get('delta_h_m') is not None \
+            or any(type(d.get(k)) is not int or d[k] != 0 for k in ('n_khung', 'n_do')):
+        return False
+    lvs = p6_muc_cua_luot(p6)
+    return lvs is not None and all(LEVELS.index(lv) < P6_BANDS.index(band) for lv in lvs)
+
+
 def hang_theo_u(cq, level, a_m, p6=None, c6=None):
     """The bands of u of a level. Without p6: one band [0, u_3b] with the turning bounds. With a c8b_P6_rieng_ii_v2
     file: the bands B1 .. of the level (edges u_3b of the levels up to its own), P4_m = can_quay + LE c6 delta_h_dong
-    (band), A4 the same; a band without its delta_h_dong (or without c6) -> thieu (P4_m, A4_deg null)."""
+    (band), A4 the same; a band without its delta_h_dong (or without c6) -> thieu (P4_m, A4_deg null). khong_khung:
+    the session has no frame in the band (p6_khong_khung; only with a turning bound, else the band is thieu as
+    before): thieu, null, but it does not stop the lock (trang_thai_khoa) and gives nothing to the merged lock."""
     if a_m is None:
         return [], 'thieu canh ma a (--canh-ma-m): dai u khong xac dinh'
     gone = cq['trang_thai'] == 'thieu'
     if p6 is None:
         return [dict(u_lo_m_s=0.0, u_hi_m_s=u_3b(level, a_m), P4_m=None if gone else cq['p_m'],
-                     A4_deg=None if gone else cq['psi_deg'], trang_thai=cq['trang_thai'])], None
+                     A4_deg=None if gone else cq['psi_deg'], trang_thai=cq['trang_thai'], khong_khung=False)], None
     edges = [0.0] + [u_3b(lv, a_m) for lv in LEVELS[:LEVELS.index(level) + 1]]
     out, why = [], []
     for j, nm in enumerate(P6_BANDS[:len(edges) - 1]):
         d = p6_delta(p6, nm)
         ok = not gone and d is not None and c6 is not None
-        if not gone and not ok:
+        kk = not gone and d is None and p6_khong_khung(p6, nm)
+        if kk:
+            why.append(f'{nm}: buoi khong co khung nao o dai nay (P6 n_khung = 0; cac luot cua P6 o muc '
+                       f'{p6_muc_cua_luot(p6)}, khong muc nao toi dai): buoi khong dong gop cho dai, khoa buoi khong '
+                       'bi chan (CODE 24/11 khuya)')
+        elif not gone and not ok:
             why.append(f'{nm}: thieu delta_h_dong (c8b_p6_ngang) hay he so rho_max / (H - h_max) cua A6')
         out.append(dict(u_lo_m_s=edges[j], u_hi_m_s=edges[j + 1], dai=nm,
                         P4_m=(cq['p_m'] + LE * c6 * d) if ok else None, A4_deg=cq['psi_deg'] if ok else None,
-                        P6_rieng_ii_m=(c6 * d) if ok else None, trang_thai=cq['trang_thai'] if ok else 'thieu'))
+                        P6_rieng_ii_m=(c6 * d) if ok else None, trang_thai=cq['trang_thai'] if ok else 'thieu',
+                        khong_khung=kk))
     return out, ('; '.join(why) or None)
 
 
@@ -508,7 +563,11 @@ def trang_thai_khoa(out, muc_kha_thi):
         miss = [k for k in HANG_DONG if _num(m['hang_dong'].get(k)) is None]
         if miss:
             why.append(f'{lv}: hang_dong {miss} chua co')
-        if not m['hang_theo_u'] or any(b['trang_thai'] == 'thieu' for b in m['hang_theo_u']):
+        # a band the session has no frame in (khong_khung, CODE 24/11 khuya) does not stop the lock; a band with
+        # frames and no number does, and so does a level with no band of its own at all
+        bs = m['hang_theo_u']
+        if not bs or any(b['trang_thai'] == 'thieu' and b.get('khong_khung') is not True for b in bs) \
+                or all(b.get('khong_khung') is True for b in bs):
             why.append(f'{lv}: hang_theo_u thieu')
     return ('khoa', None) if not why else ('chua_khoa', '; '.join(why))
 

@@ -967,3 +967,162 @@ def test_doc_he_so_checks(tmp_path):
     edited['hang'] = dict(good['hang'], A_neo_rad=1.0)                             # edited after the sha
     with pytest.raises(K.KhoaError):
         K.doc_he_so(edited, ng)
+
+
+# ── a session without frames in a speed band (CODE 24/11 khuya, 2026-11-24_CODE_chot_khoa_gop_dai_khong_co_khung) ──
+
+def _p6_buoi(luot, khong=('B3',), n=(0, 0)):
+    """A P6 file of a session: the bands of `khong` without a number, n = (n_khung, n_do) there; luot: run ids."""
+    p = _p6(thieu=khong)
+    for nm in ('B0',) + K.P6_BANDS:
+        p['dai'][nm].update(n_khung=500, n_do=300)
+    for nm in khong:
+        p['dai'][nm].update(n_khung=n[0], n_do=n[1])
+    if luot is not None:
+        p['luot'] = [dict(luot=x) for x in luot]
+    return p
+
+
+def test_p6_levels_of_the_runs():
+    f = K.p6_muc_cua_luot
+    assert f(_p6_buoi(['C8-P-F05-1_lai5', 'C8-P-F05-2_lai1'])) == ['O1-F05']
+    assert f(_p6_buoi(['C8-L-F08-1', 'C8-P-F02-1_lai1', 'C8-L-F02-2'])) == ['O1-F02', 'O1-F08']
+    for bad in (None, [], ['C8-P-K1-1'], ['C8-P-F05-1', 'C8-P-F05-1'], ['C8-P-F05-1', 'HC_goc_6'], ['C8-P-F05-1x'],
+                ['C8-P-F05-1_lai'], ['C8-P-F5-1']):
+        assert f(_p6_buoi(bad)) is None, bad
+    p = _p6_buoi(['C8-P-F05-1'])
+    p['luot'] = [dict(luot=None)]
+    assert f(p) is None and f(dict(p, luot='C8-P-F05-1')) is None and f(None) is None
+    assert f(dict(_p6_buoi(['C8-P-F05-1']), schema='c8b_P6_rieng_ii_v1')) is None
+
+
+def test_session_without_frames_in_a_band_does_not_stop_the_lock():
+    """run05 (two F05 runs): no frame above u_3b(F05), the P6 file says B3 n_khung = 0 and its runs are F05: the band
+    B3 of the F08 table is khong_khung (thieu, null) and the F08 level is not reported as missing its bands."""
+    s = _src()
+    tbs = {lv: _tb(lv) for lv in K.LEVELS}
+    k = K.build(tbs, a_m=0.1445, a6=s['a6'], p6_dong=_p6_buoi(['C8-P-F05-1_lai5', 'C8-P-F05-2_lai1']))
+    b8 = k['muc']['O1-F08']['hang_theo_u']
+    assert [b['khong_khung'] for b in b8] == [False, False, True]
+    assert b8[2]['trang_thai'] == 'thieu' and b8[2]['P4_m'] is None and b8[2]['A4_deg'] is None \
+        and b8[2]['P6_rieng_ii_m'] is None and b8[0]['P4_m'] is not None and b8[1]['P4_m'] is not None
+    assert 'khong co khung' in k['muc']['O1-F08']['hang_theo_u_ly_do']
+    assert all(not b['khong_khung'] for lv in ('O1-F02', 'O1-F05') for b in k['muc'][lv]['hang_theo_u'])
+    assert k['muc']['O1-F05']['hang_theo_u_ly_do'] is None
+    assert 'hang_theo_u thieu' not in k['ly_do_chua_khoa']
+    # without a P6 file: one band, the flag false
+    assert [b['khong_khung'] for b in K.build(tbs, a_m=0.1445, a6=s['a6'])['muc']['O1-F08']['hang_theo_u']] == [False]
+    # F02 runs only: B2 and B3 without frames
+    k = K.build(tbs, a_m=0.1445, a6=s['a6'], p6_dong=_p6_buoi(['C8-L-F02-1', 'C8-L-F02-2'], khong=('B2', 'B3')))
+    assert [b['khong_khung'] for b in k['muc']['O1-F08']['hang_theo_u']] == [False, True, True]
+    assert [b['khong_khung'] for b in k['muc']['O1-F05']['hang_theo_u']] == [False, True]
+    assert 'hang_theo_u thieu' not in k['ly_do_chua_khoa']
+
+
+@pytest.mark.parametrize('ca', ['co_khung', 'do_duoc_0', 'luot_F08', 'luot_la', 'luot_trong', 'khong_luot', 'n_thieu',
+                                'n_float', 'n_bool', 'B2_luot_F05', 'B1', 'co_so', 'trang_thai', 'khong_can_quay'])
+def test_band_with_frames_or_a_run_reaching_it_still_stops(ca):
+    """Condition (a) and item 3 of the decision: a band stays thieu and stops the lock when it has a frame without a
+    number, when a run of the session is of a level whose table holds the band (the gate would score that run with
+    the band), or when the P6 file does not say enough to know."""
+    s = _src()
+    tbs = {lv: _tb(lv) for lv in K.LEVELS}
+    f5 = ['C8-P-F05-1_lai5', 'C8-P-F05-2_lai1']
+    band, lv = 'B3', 'O1-F08'
+    if ca == 'co_khung':
+        p = _p6_buoi(f5, n=(1, 0))                       # one frame just above the edge, not measured
+    elif ca == 'do_duoc_0':
+        p = _p6_buoi(f5, n=(0, 1))                       # inconsistent counts
+    elif ca == 'luot_F08':
+        p = _p6_buoi(f5 + ['C8-L-F08-1_lai1'])           # an F08 run and no valid frame above u_3b(F05)
+    elif ca == 'luot_la':
+        p = _p6_buoi(f5 + ['C8-P-K1-1'])
+    elif ca == 'luot_trong':
+        p = _p6_buoi([])
+    elif ca == 'khong_luot':
+        p = _p6_buoi(None)
+    elif ca == 'n_thieu':
+        p = _p6_buoi(f5)
+        del p['dai']['B3']['n_khung']
+    elif ca == 'n_float':
+        p = _p6_buoi(f5, n=(0.0, 0))
+    elif ca == 'n_bool':
+        p = _p6_buoi(f5, n=(False, 0))
+    elif ca == 'B2_luot_F05':
+        p, band, lv = _p6_buoi(f5, khong=('B2',)), 'B2', 'O1-F05'
+    elif ca == 'B1':
+        p, band, lv = _p6_buoi(['C8-L-F02-1', 'C8-L-F02-2'], khong=('B1',)), 'B1', 'O1-F02'
+    elif ca == 'co_so':
+        p = _p6_buoi(f5)
+        p['dai']['B3']['delta_h_m'] = 0.011              # a number with the state thieu: not 'no frame'
+    elif ca == 'trang_thai':
+        p = _p6_buoi(f5)
+        p['dai']['B3']['trang_thai'] = 'chua_ket_luan'
+    else:
+        p = _p6_buoi(f5)
+        tbs[lv] = _tb(lv, dung=False)                    # no turning bound: the level is not lockable anyway
+    assert K.p6_khong_khung(p, band) is (ca == 'khong_can_quay')
+    k = K.build(tbs, a_m=0.1445, a6=s['a6'], p6_dong=p)
+    b = [x for x in k['muc'][lv]['hang_theo_u'] if x['dai'] == band][0]
+    assert b['khong_khung'] is False and b['trang_thai'] == 'thieu' and b['P4_m'] is None
+    assert f'{lv}: hang_theo_u thieu' in k['ly_do_chua_khoa']
+    assert K.p6_khong_khung(p, 'B0') is False and K.p6_khong_khung(None, band) is False
+
+
+def test_band_edges_one_function_counts_the_frames():
+    """Condition (a), the edge of a band: P6 counts a frame in exactly one band (c8b_p6_ngang.in_band: lower edge
+    open, upper closed), so a frame AT u_3b(F05) is of B2 and leaves n_khung(B3) = 0, a frame one float above it is of
+    B3: n_khung(B3) = 1 without a number, and the lock is stopped."""
+    import numpy as np
+    import c8b_p6_ngang as P
+    a = 0.1445
+    bs = P.bands_of(a)
+    e2, e3 = K.u_3b('O1-F05', a), K.u_3b('O1-F08', a)
+    assert [b[0] for b in bs] == list(K.P6_BANDS) and bs[1][2] == e2 == bs[2][1] and bs[2][2] == e3
+    u = np.array([0.0, np.nextafter(e2, 0.0), e2, np.nextafter(e2, np.inf), e3, np.nextafter(e3, np.inf)])
+    inb = np.array([P.in_band(u, b) for b in bs])
+    assert inb[:, :5].sum(axis=0).tolist() == [1, 1, 1, 1, 1] and not inb[:, 5].any()   # one band each; beyond: none
+    assert inb[1].tolist() == [False, True, True, False, False, False]
+    assert inb[2].tolist() == [False, False, False, True, True, False]
+
+    def dem(u_top):
+        n = 12
+        runs = []
+        for i, name in enumerate(('C8-P-F05-1_lai5', 'C8-P-F05-2_lai1')):
+            uu = np.full(n, 0.5)
+            uu[0] = u_top if i == 0 else 0.5
+            runs.append(dict(luot=name, session='s' * 64, u=uu, lam=np.full(n, 1.0), T=np.zeros((n, 2)),
+                             psi=np.zeros(n)))
+        d = P.do_c8(runs, 2.632, 0.126, 0.01, 0.05, math.radians(5.0), a)
+        return d['B3']['n_khung'], d['B3']['n_do'], d['B2']['n_khung']
+
+    assert dem(e2) == (0, 0, 24)                             # at the edge: B2
+    n3 = dem(float(np.nextafter(e2, np.inf)))
+    assert n3[0] == 1 and n3[2] == 23                        # one float above: B3 has a frame
+    s = _src()
+    tbs = {lv: _tb(lv) for lv in K.LEVELS}
+    k = K.build(tbs, a_m=a, a6=s['a6'], p6_dong=_p6_buoi(['C8-P-F05-1_lai5', 'C8-P-F05-2_lai1'], n=(n3[0], 0)))
+    assert k['muc']['O1-F08']['hang_theo_u'][2]['khong_khung'] is False
+    assert 'O1-F08: hang_theo_u thieu' in k['ly_do_chua_khoa']
+    # the level tables end where the commanded speed of the level ends: an F05 run is never given B3 by the gate
+    assert [b['dai'] for b in k['muc']['O1-F05']['hang_theo_u']] == ['B1', 'B2']
+    assert k['muc']['O1-F05']['hang_theo_u'][-1]['u_hi_m_s'] == e2
+
+
+def test_trang_thai_khoa_bands():
+    """trang_thai_khoa on the bands alone: a khong_khung band passes, a thieu band with frames does not, a level whose
+    every band is khong_khung does not."""
+    def st(bands):
+        out = dict(lan_lap_E_trang_thai='dat', eps_H=dict(mm=2.0, huong_deg=0.15),
+                   mien_car_pose=dict(trang_thai='dat'), nhanh_tick='giu_tick',
+                   khoa_truoc=dict(nguon=[dict(vai='ke_hoach_c8')]),
+                   muc={'O1-F08': dict(hang_dong=dict(a_m=0.1, hang_m=0.01, he_so_r=0.0, u_phi_rad=0.0, hang_rad=0.0),
+                                       hang_theo_u=bands)})
+        return K.trang_thai_khoa(out, ['O1-F08'])[0]
+    co = dict(trang_thai='gioi_han', khong_khung=False)
+    kk = dict(trang_thai='thieu', khong_khung=True)
+    assert st([co, co, kk]) == 'khoa' and st([co, co, co]) == 'khoa'
+    assert st([co, co, dict(trang_thai='thieu', khong_khung=False)]) == 'chua_khoa'
+    assert st([co, co, dict(trang_thai='thieu')]) == 'chua_khoa'                      # a lock made before the flag
+    assert st([co, co, dict(trang_thai='thieu', khong_khung='true')]) == 'chua_khoa'
+    assert st([kk, kk, kk]) == 'chua_khoa' and st([]) == 'chua_khoa'
