@@ -14,7 +14,7 @@ values e_perp, e_trk, e_bao, e_theta_cmd_deg):
      applied on the scorer's own numbers). q per frame as in c7_score.evaluate: G2 e_perp, G3 e_trk, G4 e_bao,
      G5 |e_theta_cmd_deg| (the t_som branch with the IMU heading gives another G5 q: the self-check refuses it).
   2. A frame of the run whose (run, frame_id) is not in the mask's khung_mo (cell not in o_dat, outside the u bands,
-     not in the D2 rows at all, or no frame_id) is masked: lo = -inf, hi = +inf for G2-G5 (q kept, as the scorer keeps
+     not in the D2 rows at all) is masked (rows with an empty or repeated frame_id are refused): lo = -inf, hi = +inf for G2-G5 (q kept, as the scorer keeps
      the q of an undefined frame as a diagnostic). A finite violation of another frame stays (design 7c).
   3. The node numbers and its three-branch states are recomputed (cond_state2 on the new numbers); q_so_do (defined
      frames only, SD1-1) recomputed when the node has it.
@@ -180,9 +180,13 @@ def ap_dung(nodes, out_dir, mn, state_fn, key_dec=6):
         if not x.get('ok'):
             tom.append(dict(nut=k, cham=False))
             continue
-        H = doc_hang(os.path.join(out_dir, f'nut_{k:03d}_rows.csv'))
+        rp = os.path.join(out_dir, f'nut_{k:03d}_rows.csv')
+        H = doc_hang(rp)
         tu_kiem(x, H, k)
-        che = np.array([f is None or f not in mn['mo'] for f in H['fid']], bool)
+        if any(f is None for f in H['fid']) or len(set(H['fid'])) != len(H['fid']):
+            # the relative scoring (C8) writes frame_id on every row, once (GATE 24/11: an empty id is an error)
+            raise MatNaError(f'node {k}: rows with an empty or repeated frame_id (not a relative C8 scoring)')
+        che = np.array([f not in mn['mo'] for f in H['fid']], bool)
         dinh = np.zeros(len(che), bool)
         for c in MEASURED:
             dinh |= np.isfinite(H['lo'][c]) & np.isfinite(H['hi'][c])
@@ -191,7 +195,10 @@ def ap_dung(nodes, out_dir, mn, state_fn, key_dec=6):
             H['lo'][c] = np.where(che, -math.inf, H['lo'][c])
             H['hi'][c] = np.where(che, math.inf, H['hi'][c])
         truoc = dict(x['states'])
-        e = dict(nut=k, cham=True, n_khung=len(che), n_che=int(che.sum()), n_che_moi=int(moi.sum()),
+        # rows: the frame file the mask was applied on (GATE 24/11: the mask goes by frame_id, the node score names
+        # only its own sha)
+        e = dict(nut=k, cham=True, rows=dict(duong_dan=os.path.abspath(rp), sha256=cu.sha256(rp)),
+                 n_khung=len(che), n_che=int(che.sum()), n_che_moi=int(moi.sum()),
                  n_che_moi_mien_hop=int((moi & H['mu']).sum()), trang_thai_truoc=truoc)
         if x.get('cat') and np.any(moi & H['mc']) and not _certain_before(H, set(x.get('so_do') or [])):
             why = 'mat_na_d2: the violation before t1 (cat_t1) stands only on masked frames: score the node again'

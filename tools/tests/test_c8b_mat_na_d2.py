@@ -156,11 +156,20 @@ def test_self_check_refuses_numbers_not_from_the_rows(tmp_path):
     assert run(d, gp)[0] == 0                                        # the plain grid does not check this
 
 
-def test_frame_without_id_or_not_in_d2_rows_is_masked(tmp_path):
+def test_frame_not_in_d2_rows_is_masked(tmp_path):
     fr = frames(n=4)
     d, gp = grid(tmp_path, [fr])
     rc, r = run(d, gp, mask_file(tmp_path, [100, 101, 102]))       # 103 not listed (no D2 row): masked
     assert rc == 0 and r['mat_na_d2']['nut'][0]['n_che'] == 1 and r['nums']['g2']['n_undef'] == 1
+    rw = r['mat_na_d2']['nut'][0]['rows']                               # GATE: the rows file named with its sha
+    assert rw['sha256'] == c8_u_imu.sha256(os.path.join(d, 'nut_000_rows.csv')) and os.path.isabs(rw['duong_dan'])
+    p = os.path.join(d, 'nut_000_rows.csv')                             # a repeated frame_id: refused
+    txt = open(p, encoding='utf-8').read().replace('
+103,', '
+102,')
+    open(p, 'w', encoding='utf-8', newline='').write(txt)
+    os.remove(os.path.join(d, 'luoi_d2.json'))
+    assert run(d, gp, str(tmp_path / 'o.json'))[0] == 2
 
 
 def test_mask_file_checks(tmp_path):

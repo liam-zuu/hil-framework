@@ -917,3 +917,53 @@ def test_nguon_cheo_per_session_files_name_the_common_sources():
             e['p6_dong']['nguon'][1]['sha256'] = 't' * 64
         with pytest.raises(K.KhoaError):
             K.nguon_cheo(ng, e)
+
+
+def test_he_so_giu_ngoai_default_changes_nothing_and_factor_scales(monkeypatch):
+    """Held out by session (CODE 24/11 khuya): without factors the lock numbers and the fields written are those of
+    before; with factors P1, P_neo, A_neo are multiplied, U grows, the unscaled values are kept."""
+    import c8b_a6 as a6m
+    monkeypatch.setattr(a6m, 'a6du_rad', lambda a6, rho: 0.0078)
+    full = dict(lan_lap=_f8null(), truc_xe=_f7(),
+                neo=dict(schema='c7_neo_luot_v1', theo_cho=dict(goc=dict(trang_thai='dat', P_neo_m=3e-4,
+                                                                          A_neo_rad=2e-4))),
+                u_moc=[dict(U_moc_hieu_xy_m=1e-4, U_moc_hieu_psi_rad=1e-4)],
+                W=dict(W_xy_m=5e-4, W_psi_rad=3e-4), P6_rieng_ii=dict(gia_tri_m=6e-4))
+    v0, _, p0, lever = K.hang_dong_tinh(_src(**full), 0.1445)
+    v1, _, p1, _ = K.hang_dong_tinh(_src(he_so_giu_ngoai=None, **full), 0.1445)
+    assert v1 == v0 and p1 == p0 and not any('he_so' in k for k in p0)
+    hs = dict(P1_m=1.0, P_neo_m=1.2, A_neo_rad=1.1)
+    v2, why, p2, _ = K.hang_dong_tinh(_src(he_so_giu_ngoai=hs, **full), 0.1445)
+    assert not why
+    assert p2['P_neo_m'] == pytest.approx(3.6e-4) and p2['P_neo_m_truoc_he_so'] == 3e-4
+    assert p2['A_neo_rad'] == pytest.approx(2.2e-4) and p2['P1_m'] == p0['P1_m'] and p2['he_so_giu_ngoai'] == hs
+    assert v2['hang_m'] == pytest.approx(v0['hang_m'] + 0.2 * 3e-4 + lever * 0.1 * 2e-4, rel=1e-12)
+    assert v2['hang_rad'] == pytest.approx(v0['hang_rad'] + 0.1 * 2e-4, rel=1e-12)
+    assert v2['he_so_r'] == v0['he_so_r'] and v2['u_phi_rad'] == v0['u_phi_rad']
+    s = _src(**full)
+    kw = dict(lan_lap=s['lan_lap'], a_m=0.1445, kiem_cheo=s['kiem_cheo'], a6=s['a6'], xoay=s['xoay'], u_h=s['u_h'],
+              cam=s['cam'], truc_xe=s['truc_xe'], neo=s['neo'], u_moc=s['u_moc'])
+    ka = K.build({'O1-F05': _tb('O1-F05')}, **kw)
+    kb = K.build({'O1-F05': _tb('O1-F05')}, he_so_giu_ngoai=None, **kw)
+    for k in (ka, kb):
+        k['khoa_truoc'].pop('luc')
+    assert json.dumps(ka, sort_keys=True) == json.dumps(kb, sort_keys=True)      # the same lock without the file
+    assert 'he_so_giu_ngoai' not in json.dumps(ka)
+
+
+def test_doc_he_so_checks(tmp_path):
+    import c8b_a6 as a6m
+    ng = [dict(vai='neo', file='n.json', sha256='a' * 64), dict(vai='kiem_cheo', file='k.json', sha256='b' * 64),
+          dict(vai='a6', file='a.json', sha256='c' * 64)]
+    good = dict(schema=K.HE_SO_SCHEMA, le=K.LE, trang_thai='dat', hang=dict(P1_m=1.0, P_neo_m=1.0, A_neo_rad=1.1),
+                nguon=[dict(vai='neo x', sha256='a' * 64), dict(vai='kiem_cheo x', sha256='b' * 64)])
+    assert K.doc_he_so(a6m.with_sha(dict(good)), ng) == dict(P1_m=1.0, P_neo_m=1.0, A_neo_rad=1.1)
+    for bad in (dict(good, trang_thai='thieu'), dict(good, le=1.5), dict(good, hang=dict(good['hang'], A_neo_rad=0.9)),
+                dict(good, hang=dict(P_neo_m=1.0)), dict(good, hang=dict(good['hang'], A3_rad=1.1)),
+                dict(good, nguon=good['nguon'][:1])):
+        with pytest.raises(K.KhoaError):
+            K.doc_he_so(a6m.with_sha(dict(bad)), ng)
+    edited = a6m.with_sha(dict(good))
+    edited['hang'] = dict(good['hang'], A_neo_rad=1.0)                             # edited after the sha
+    with pytest.raises(K.KhoaError):
+        K.doc_he_so(edited, ng)

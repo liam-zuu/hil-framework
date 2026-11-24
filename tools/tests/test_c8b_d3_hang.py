@@ -198,3 +198,29 @@ def test_replay_neo_held_out_by_session(tmp_path):
     # the CSV of another neo_luot.json (its frames do not give P_neo_m, A_neo_rad of the lock's file): refused
     assert H.main(_argv(p, tmp_path / 'c.csv') + ['--neo', f'2026-11-20_run02={n1},{c2}',
                                                   '--neo', f'2026-11-23_run03={n2},{c2}']) == 2
+
+
+def test_he_so_giu_ngoai_from_the_ratios(tmp_path):
+    """c8b_he_so_giu_ngoai: ratio = largest |error| of a session / index of the others; above the margin 1.25 the
+    factor is ratio / 1.25, else 1; an A3 ratio above the margin is thieu (A3 is not scaled by the lock)."""
+    import c8b_he_so_giu_ngoai as HS
+    k1, _ = _kc(tmp_path, '2026-11-20_run02/doan2', 0.003, 0.2, [(0.003, 0.0), (0.0, -0.002)], [0.2])
+    k2, _ = _kc(tmp_path, '2026-11-23_run03/doan1', 0.0045, 0.21, [(0.0045, 0.0)], [0.21])
+    n1, _, c1 = _neo(tmp_path, '2026-11-20_run02', 3e-5, 1e-5, [('hop_le', 3e-5, 0.0, 1e-5)])
+    n2, _, c2 = _neo(tmp_path, '2026-11-23_run03', 3.3e-5, 2e-5, [('hop_le', 0.0, 3.3e-5, -2e-5)])
+    out = tmp_path / 'hs.json'
+    argv = ['--kiem-cheo', f'2026-11-20_run02/doan2={k1}', '--kiem-cheo', f'2026-11-23_run03/doan1={k2}',
+            '--neo', f'2026-11-20_run02={n1},{c1}', '--neo', f'2026-11-23_run03={n2},{c2}', '--out', str(out)]
+    assert HS.main(argv) == 0
+    d = json.load(open(out, encoding='utf-8'))
+    assert d['trang_thai'] == 'dat' and d['le'] == 1.25
+    assert d['ti_le']['P1_m']['ti_le'] == pytest.approx(1.5) and d['hang']['P1_m'] == pytest.approx(1.2)
+    assert d['ti_le']['P_neo_m']['ti_le'] == pytest.approx(1.1) and d['hang']['P_neo_m'] == 1.0
+    assert d['ti_le']['A_neo_rad']['ti_le'] == pytest.approx(2.0) and d['hang']['A_neo_rad'] == pytest.approx(1.6)
+    assert d['ti_le']['A3_rad']['ti_le'] == pytest.approx(1.05)
+    import c8b_khoa_v5 as K
+    ng = [dict(vai='neo', file='n', sha256=H.cu.sha256(n1)), dict(vai='kiem_cheo', file='k', sha256=H.cu.sha256(k2))]
+    assert K.doc_he_so(d, ng) == d['hang']                                         # the lock reads it
+    k3, _ = _kc(tmp_path, '2026-11-24_run05/doan1', 0.004, 0.3, [(0.004, 0.0)], [0.3])
+    assert HS.main(argv[:-2] + ['--kiem-cheo', f'2026-11-24_run05/doan1={k3}', '--out', str(tmp_path / 'h2.json')]) == 0
+    assert json.load(open(tmp_path / 'h2.json', encoding='utf-8'))['trang_thai'] == 'thieu'    # A3 0.3 / 0.21 > 1.25

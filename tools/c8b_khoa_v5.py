@@ -258,6 +258,16 @@ def hang_dong_tinh(src, side):
     if 'P6_rieng_ii_m' not in part and c6 is not None and d0 is not None:
         part['P6_rieng_ii_he_so'], part['P6_rieng_ii_B0_m'] = c6, d0
         part['P6_rieng_ii_m'] = c6 * d0
+    # Held out by session (CODE 24/11 khuya, Liam's decision pending; default: no file, nothing changes): a term whose
+    # largest leave-one-session-out ratio is above the margin LE is multiplied by ratio / LE (U grows, no threshold is
+    # loosened); the factors come from c8b_he_so_giu_ngoai.py (made from the neo / kiem_cheo files, before the lock)
+    hs = src.get('he_so_giu_ngoai')
+    if isinstance(hs, dict) and hs:
+        for name in sorted(hs):
+            if name in part:
+                part[f'{name}_truoc_he_so'] = part[name]
+                part[name] = part[name] * hs[name]
+        part['he_so_giu_ngoai'] = {k: hs[k] for k in sorted(hs)}
     have = dict(u_theta='u_theta_rad' in part, P6_rieng_i='P6_rieng_i_m' in part,
                 P6_rieng_ii='P6_rieng_ii_m' in part, neo='P_neo_m' in part, U_moc='U_moc_hieu_xy_m' in part,
                 W='W_psi_rad' in part)
@@ -871,12 +881,14 @@ def u_beta_cam(lan_lap, kiem_cheo=None, a6=None, side=None, tham_chieu=None, dau
 
 def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None, muc_kha_thi=LEVELS, nguong=None,
           a6=None, ses=None, cam=None, commit_hil=None, kiem_cheo=None, xoay=None, u_h=None, truc_xe=None,
-          neo=None, u_moc=None, tham_chieu=None, dau_chan=None, kc_doan=None, p6_dong=None):
+          neo=None, u_moc=None, tham_chieu=None, dau_chan=None, kc_doan=None, p6_dong=None,
+          he_so_giu_ngoai=None):
     muc = {}
     side = a_m
     hd, hd_why, hd_part, lever = (hang_dong_tinh(dict(kiem_cheo=kiem_cheo, a6=a6, xoay=xoay, u_h=u_h,
                                                        lan_lap=lan_lap, truc_xe=truc_xe, neo=neo, u_moc=u_moc,
                                                        tham_chieu=tham_chieu, p6_dong=p6_dong,
+                                                       he_so_giu_ngoai=he_so_giu_ngoai,
                                                        cam=cam if isinstance(cam, list) else [cam] if cam else []),
                                                   side)
                                   if side is not None else (dict(hang_m=None, he_so_r=None, hang_rad=None,
@@ -956,6 +968,35 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
     st, why = trang_thai_khoa(out, muc_kha_thi)
     out.update(trang_thai=st, ly_do_chua_khoa=why)
     return out
+
+
+HE_SO_SCHEMA = 'c8b_he_so_giu_ngoai_v1'
+HE_SO_HANG = ('P1_m', 'P_neo_m', 'A_neo_rad')         # the terms a factor can scale (A3 also enters u_beta_cam: not here)
+
+
+def doc_he_so(d, nguon):
+    """The factors {term: k >= 1} of a c8b_he_so_giu_ngoai_v1 file for this lock: content sha, the same margin LE,
+    trang_thai dat, and every neo / kiem_cheo source of this lock among the files the factors were computed from."""
+    import c8b_a6 as a6m
+    if not isinstance(d, dict) or d.get('schema') != HE_SO_SCHEMA:
+        raise KhoaError(f'--he-so-giu-ngoai: not a {HE_SO_SCHEMA} file')
+    try:
+        a6m._check_sha(d, '--he-so-giu-ngoai')
+    except a6m.A6Error as exc:
+        raise KhoaError(str(exc))
+    if d.get('trang_thai') != 'dat' or d.get('le') != LE:
+        raise KhoaError(f'--he-so-giu-ngoai: trang_thai {d.get("trang_thai")!r}, le {d.get("le")!r} (dat, {LE})')
+    hang = d.get('hang')
+    if not isinstance(hang, dict) or set(hang) != set(HE_SO_HANG):
+        raise KhoaError(f'--he-so-giu-ngoai: hang must give exactly {HE_SO_HANG}')
+    for k, v in hang.items():
+        if _num(v) is None or not 1.0 <= float(v) <= 10.0:
+            raise KhoaError(f'--he-so-giu-ngoai: factor {k} {v!r} (a number in [1, 10])')
+    co = {n.get('sha256') for n in d.get('nguon') or [] if isinstance(n, dict)}
+    thieu = [n['file'] for n in nguon if n['vai'] in ('neo', 'kiem_cheo') and n['sha256'] not in co]
+    if thieu:
+        raise KhoaError(f'--he-so-giu-ngoai: not computed with the neo / kiem_cheo files of this lock: {thieu}')
+    return {k: float(hang[k]) for k in HE_SO_HANG}
 
 
 def nguon_cheo(nguon, extra):
@@ -1127,6 +1168,9 @@ def main(argv=None):
     ap.add_argument('--truc-xe-cho', action='append', default=None,
                     help='CHO=F7 truc_xe_v1 of K1 / K2 (dau_doan for u_beta_cam of that place); goc comes from --truc-xe')
     ap.add_argument('--neo', default=None, help='KIEMCHEO neo_luot.json (c7_neo_luot_v1, theo_cho.goc)')
+    ap.add_argument('--he-so-giu-ngoai', default=None,
+                    help='c8b_he_so_giu_ngoai_v1 (factors >= 1 of P1, P_neo, A_neo held out by session); without '
+                         'it nothing changes')
     ap.add_argument('--p6-dong', default=None,
                     help='c8b_p6_ngang tinh output (c8b_P6_rieng_ii_v2): B0 into hang_m, the bands of u into P4_m')
     ap.add_argument('--u-moc', action='append', default=None,
@@ -1231,6 +1275,11 @@ def main(argv=None):
             nguon.append(dict(vai=f'truc_xe {cho}', file=os.path.basename(pth), duong_dan=os.path.abspath(pth),
                               sha256=cu.sha256(pth)))
         nguon_cheo(nguon, extra)
+        if a.he_so_giu_ngoai:
+            with open(a.he_so_giu_ngoai, encoding='utf-8') as f:
+                extra['he_so_giu_ngoai'] = doc_he_so(json.load(f), nguon)
+            nguon.append(dict(vai='he_so_giu_ngoai', file=os.path.basename(a.he_so_giu_ngoai),
+                              duong_dan=os.path.abspath(a.he_so_giu_ngoai), sha256=cu.sha256(a.he_so_giu_ngoai)))
         co_dd = any(isinstance(v.get('dau_doan'), list) and v['dau_doan'] for v in txc.values())
         if a.khung_12b or co_dd or any(v.get('trang_thai') != 'khoa' for v in txc.values()):
             extra['truc_xe_cho'] = txc
