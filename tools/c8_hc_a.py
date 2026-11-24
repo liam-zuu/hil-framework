@@ -149,15 +149,53 @@ LOG_COLS = ('timestamp_us', 'fl_count', 'fr_count', 'rl_count', 'rr_count', 'sp_
             'psi_reset_count', 'traj_age_ms', 'pos_x_ref', 'pos_y_ref')
 
 
+def _segment_marks(path, n_lines):
+    """Status of each data line from <log>.segments.csv of agv_logger (row, log_seq, timestamp_us, segment, status),
+    or None without that file. A file whose rows do not match the data lines one by one: AError."""
+    seg = path + '.segments.csv'
+    if not os.path.isfile(seg):
+        return None
+    with open(seg, newline='', encoding='utf-8') as f:
+        marks = list(csv.DictReader(f))
+    if len(marks) != n_lines:
+        raise AError(f'{seg}: {len(marks)} rows for {n_lines} data lines')
+    return marks
+
+
 def load_log(path):
-    rows = []
-    with open(path, newline='', encoding='utf-8', errors='replace') as f:
-        r = csv.DictReader(ln for ln in f if not ln.startswith('#'))
-        miss = [c for c in LOG_COLS if c not in (r.fieldnames or [])]
-        if miss:
-            raise AError(f'{path}: missing columns {miss}')
-        for row in r:
-            rows.append(row)
+    """The agv_logger CSV as arrays. Repeated UDP datagram (Pi on LAN + WiFi of one subnet, CAM 24/11; CODE 24/11
+    chot cach doc; L92 rule of c5_lifted_check / c8_u_imu / gain_line_check): a data line is dropped only when the
+    logger marked it 'duplicate' in <log>.segments.csv AND its bytes equal the data line kept just before it; the
+    count goes to L['n_dong_trung_bo'] (log_seq of each in L['seq_trung_bo']). A line marked 'duplicate' that does
+    not equal the line before: AError. A repeated log_seq with other content, or no segments file, keeps every line
+    (log_seq_lien then fails as before)."""
+    with open(path, 'rb') as f:
+        raw = [ln for ln in f.read().splitlines() if not ln.startswith(b'#')]
+    if not raw:
+        raise AError(f'{path}: no data rows')
+    head, data = raw[0], [ln for ln in raw[1:] if ln.strip()]
+    text = lambda b: b.decode('utf-8', errors='replace')                     # noqa: E731
+    r = csv.DictReader([text(head)] + [text(b) for b in data])
+    miss = [c for c in LOG_COLS if c not in (r.fieldnames or [])]
+    if miss:
+        raise AError(f'{path}: missing columns {miss}')
+    parsed = list(r)
+    if len(parsed) != len(data):
+        raise AError(f'{path}: {len(parsed)} CSV rows for {len(data)} data lines')
+    marks = _segment_marks(path, len(data))
+    rows, kept_raw, seq_bo = [], None, []
+    for i, (b, row) in enumerate(zip(data, parsed), start=1):
+        m = marks[i - 1] if marks is not None else None
+        if m is not None and (m.get('row') != str(i) or m.get('log_seq') != row.get('log_seq')):
+            raise AError(f'{path}.segments.csv row {i} does not match CSV data line {i}')
+        if m is not None and m.get('status') == 'duplicate':
+            if kept_raw is None or b != kept_raw:
+                raise AError(f'{path}: line {i} marked duplicate (log_seq {row.get("log_seq")}) but not byte-equal '
+                             'to the line before')
+            seq_bo.append(int(float(row['log_seq'])))
+            continue
+        rows.append(row)
+        kept_raw = b
     if not rows:
         raise AError(f'{path}: no data rows')
     L = {c: np.array([float(x[c]) for x in rows]) for c in LOG_COLS}
@@ -165,6 +203,8 @@ def load_log(path):
     L['C'] = np.column_stack([L[c] for c in ('fl_count', 'fr_count', 'rl_count', 'rr_count')]).astype(np.int64)
     L['bad'] = np.any(L['C'] == INT32_MIN, axis=1)
     L['n'] = len(rows)
+    L['n_dong_trung_bo'] = len(seq_bo)
+    L['seq_trung_bo'] = seq_bo
     return L
 
 
@@ -494,7 +534,9 @@ def kiem(A, age_r_max_ms=125.0):
     add('pos_reset_tang_1', i0 > 0 and L['pos_reset_n'][i1] - L['pos_reset_n'][i0 - 1] == 1
         and L['pos_reset_n'][i0] == L['pos_reset_n'][i1],
         f"{L['pos_reset_n'][max(i0 - 1, 0)]:.0f}->{L['pos_reset_n'][i1]:.0f}")
-    add('log_seq_lien', np.all(np.diff(seq[rng]) == 1))
+    add('log_seq_lien', np.all(np.diff(seq[rng]) == 1),
+        f"bo {L.get('n_dong_trung_bo', 0)} dong trung byte (logger danh dau duplicate)"
+        + (f": log_seq {L['seq_trung_bo']}" if L.get('seq_trung_bo') else ''))
     add('so_dem_hop_le', not np.any(L['bad'][rng]))
     try:
         j_s, exp_prob = sender_domain(L, i0, i1)
@@ -1651,6 +1693,7 @@ def cmd_cua_so(a):
                 trang_thai=an['chuoi'] if src_ok else 'chan_doan', clip=a.clip, clip_sha256=clip_sha, session_sha256=ses_sha,
                 frames_sha256=sha256(a.frames), track_sha256=sha256(a.track), cua_so_v1_sha256=sha256(out),
                 esp32_sha256=sha256(A['log_path']), commit_hil=commit_hil(),
+                n_dong_trung_bo=A['log']['n_dong_trung_bo'], seq_trung_bo=A['log']['seq_trung_bo'],
                 car_pose_cfg=dict(side_m=S.get('car_side_m'), h_m=S.get('tag_h_m'), tag_offset=tj.get('tag_offset'),
                                   q_m=xq, du_m=xu, q_ly_do=x_why, q_nguon=x_ng),
                 xoay_sha256=sha256(a.xoay) if a.xoay else None, a6_sha256=sha256(a.a6) if a.a6 else None,
@@ -2204,7 +2247,7 @@ def cmd_tinh(a):
     ses_given = {sha256(p) for p in ses_files}
     nguon += [dict(vai_tro='session', duong_dan=os.path.abspath(p), sha256=sha256(p)) for p in ses_files]
     khung_files = read_khung_giua_session(getattr(a, 'khung_giua_session', None))
-    att_ses, att_src = {}, {}
+    att_ses, att_src, att_trung = {}, {}, {}
     # option A (CODE 22/11): the mounting of the issued attempt from its F5 (run 2 of cua_so), read before the chain
     q_tu, ll_cap_q, q_cung_cap, sha_cap_q = getattr(a, 'q_tu', None), None, None, None
     if a.xoay and q_tu:
@@ -2220,6 +2263,7 @@ def cmd_tinh(a):
         A = load_attempt(d)
         if A['cho'] != a.cho:
             raise AError(f'{d}: cho {A["cho"]} != {a.cho}')
+        att_trung[A['thu_id']] = A['log']['n_dong_trung_bo']
         fr = a.frames_of.get(d) if a.frames_of else None
         if not fr:
             raise AError(f'{d}: --frames-of {d}=FRAMES,TRACK missing')
@@ -2370,6 +2414,7 @@ def cmd_tinh(a):
                      can_hai_dau=can_fn, p_ref_tag=p_ref_tag, khung=kg)
     for x in r['luot_thu']:
         x['session_sha256'] = att_ses.get(x['thu_id'])
+        x['n_dong_trung_bo'] = att_trung.get(x['thu_id'])          # repeated UDP lines dropped (load_log)
     r['dau_doan'] = dau_doan(attempts, att_src, att_ses, cap_id, every=can_fn is not None)
     if x_why:                                            # why the xoay_v1 file gave no q for this place
         r['ly_do'].append(f'xoay: {x_why}')
