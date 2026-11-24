@@ -18,7 +18,7 @@ Sources written here (c8b_kiem_vi_tri lists a missing source):
                     session 2 only; co_chuan_dong 0.
   (12b, source (3) of design 8, is dropped: no signed position error is measured by 12b; it is in the F7 and in the
                     angle a of dau_cuoi_lan_lap; CODE 24/11 khuya, contract log.)
-  do_nhay_cao       (5) c8b_u_h_v1 (c8b_u_h.py): every held-out row giu_ngoai[].sai_m (h predicted - h calibrated, m)
+  do_nhay_cao       (5) c8b_u_h_chung_v1 (c8b_u_h.py): every held-out row giu_ngoai[].sai_m (h predicted - h calibrated, m)
                     against u_h_chung_m; dai_luong h, mien chung; co_chuan_dong 0 (no dynamic height reference).
   troi_H            (7) c7_calib_drift files, one per camera segment (BUOI/doanN): sai_m = D_H_mm / 1000 against the
                     lock's eps_H.mm / 1000 (D_H only triggers a scoring again; design 8 (7)); a file without the end
@@ -94,8 +94,12 @@ def _row(nguon, dl, mien, sai, cs, dong=False):
 def rows_u_h(d, sha, khoa):
     if sha not in lock_shas(khoa, 'u_h_chung'):
         raise HangError(f'--u-h sha256 {sha[:12]} is not a u_h_chung source of the lock (index must be the one used)')
-    if not isinstance(d, dict) or d.get('schema') != 'c8b_u_h_v1':
-        raise HangError('--u-h: not a c8b_u_h_v1 file')
+    # the file c8b_u_h.py writes: schema c8b_u_h_chung_v1 (c8b_a6.SCHEMA_UH), version c8b_u_h_v1 (real data 24/11: the
+    # reader asked schema c8b_u_h_v1 and refused the real file), trang_thai dat
+    if not isinstance(d, dict) or d.get('schema') != 'c8b_u_h_chung_v1' or d.get('version') != 'c8b_u_h_v1':
+        raise HangError('--u-h: not a c8b_u_h_chung_v1 file of c8b_u_h_v1')
+    if d.get('trang_thai') != 'dat':
+        raise HangError(f'--u-h: trang_thai {d.get("trang_thai")!r}')
     cs = _num(d.get('u_h_chung_m'))
     g = d.get('giu_ngoai')
     if cs is None or cs < 0 or not isinstance(g, list) or not g:
@@ -244,6 +248,19 @@ def rows_neo(items, rho):
     out, thieu = [], []
     for b, n, kh in items:
         cho_of = {lid: (v or {}).get('cho') for lid, v in ((n or {}).get('luot') or {}).items()}
+        # the frames are those of THIS neo_luot.json (the lock's file; real data 24/11: the JSON written beside the
+        # CSV differs from the lock's in commit_hil only, so the CSV is tied by its numbers): per run the largest
+        # hypot(dx, dy) and |dpsi| of the valid frames are P_neo_m, A_neo_rad of the run
+        for lid, v in ((n or {}).get('luot') or {}).items():
+            fr = [r for r in kh if r.get('luot_id') == lid and r.get('trang_thai') == 'hop_le']
+            P, A = _num((v or {}).get('P_neo_m')), _num((v or {}).get('A_neo_rad'))
+            if not fr or P is None or A is None:
+                raise HangError(f'--neo {b}: run {lid} without valid frames in the CSV or without P_neo_m / A_neo_rad')
+            mp = max(math.hypot(_fnum(r.get('dx_m')) or 0.0, _fnum(r.get('dy_m')) or 0.0) for r in fr)
+            ma = max(abs(_fnum(r.get('dpsi_rad')) or 0.0) for r in fr)
+            if abs(mp - P) > 1e-9 * max(1e-6, P) or abs(ma - A) > 1e-9 * max(1e-6, A):
+                raise HangError(f'--neo {b}: the CSV frames of run {lid} do not give P_neo_m / A_neo_rad of the '
+                                f'neo_luot.json ({mp!r}, {ma!r} vs {P!r}, {A!r}): not the frames of that file')
         for r in kh:
             lid = r.get('luot_id')
             cho = cho_of.get(lid)
@@ -267,7 +284,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--khoa', required=True, help='the C8b lock (c8b_khoa_v5; the combined one of the gate)')
     ap.add_argument('--a6', required=True, help='the A6 of the lock (c8b_a6_v2: mien.rho_max_m)')
-    ap.add_argument('--u-h', default=None, help='c8b_u_h_v1 file (do_nhay_cao)')
+    ap.add_argument('--u-h', default=None, help='c8b_u_h_chung_v1 file (do_nhay_cao)')
     ap.add_argument('--drift', action='append', default=[], help='BUOI/doanN=c7_calib_drift json (troi_H), repeat')
     ap.add_argument('--goc-a-dau', default=None, help='F7 truc_xe_v1 of the first HC_goc (session 2, khoa)')
     ap.add_argument('--goc-a', action='append', default=[], help='BUOI=F7 truc_xe_v1 of a later HC_goc, repeat')

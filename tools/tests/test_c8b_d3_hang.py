@@ -21,7 +21,7 @@ def _w(p, d):
 
 def _setup(tmp_path, f_sau_trang_thai='chan_doan'):
     a6, a6s = _w(tmp_path / 'a6.json', dict(mien=dict(rho_max_m=1.6)))
-    uh, uhs = _w(tmp_path / 'uh.json', dict(schema='c8b_u_h_v1', u_h_chung_m=0.00825,
+    uh, uhs = _w(tmp_path / 'uh.json', dict(schema='c8b_u_h_chung_v1', version='c8b_u_h_v1', trang_thai='dat', u_h_chung_m=0.00825,
                                             giu_ngoai=[dict(ten='A', sai_m=0.0022), dict(ten='A2', sai_m=-0.0029)]))
     f0, f0s = _w(tmp_path / 'f7_0.json', dict(schema='truc_xe_v1', cho='goc', trang_thai='khoa', a_k_deg=0.30,
                                               u_a_noi_bo_deg=0.36, session_sha256='1' * 64))
@@ -74,7 +74,7 @@ def test_rows_and_kiem_vi_tri(tmp_path, capsys):
 def test_refused(tmp_path, bad):
     p = _setup(tmp_path)
     if bad == 'uh_not_lock':
-        p['uh'], _ = _w(tmp_path / 'uh2.json', dict(schema='c8b_u_h_v1', u_h_chung_m=0.01, giu_ngoai=[dict(sai_m=0.0)]))
+        p['uh'], _ = _w(tmp_path / 'uh2.json', dict(schema='c8b_u_h_chung_v1', version='c8b_u_h_v1', trang_thai='dat', u_h_chung_m=0.01, giu_ngoai=[dict(sai_m=0.0)]))
     elif bad == 'a6_not_lock':
         p['a6'], _ = _w(tmp_path / 'a62.json', dict(mien=dict(rho_max_m=1.7)))
     elif bad == 'f7_not_lock':
