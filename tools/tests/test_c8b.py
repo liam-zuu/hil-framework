@@ -861,6 +861,23 @@ def test_ct4_4_g5_of_f08_so_do_without_a_gate_mask(tmp_path):
     assert LU.J_V6_SHA256 == c7_score.J_V6_SHA256
 
 
+def test_sd1_6_node_so_do_read_from_the_gate_block_only(tmp_path):
+    # SD1-6 (Codex 24/11): the so_do set of a node is the one of its gate block (gate_v3.4); a so_do written outside
+    # the block is not read: at F05 (no so_do by J) such a node is scored as a node without so_do
+    d, gp = _luoi_dir(tmp_path)
+    for k in range(2):
+        _write_node(d, k, ['dat'] * 5, [(10.000001, 1, [0.05, 0.05, 0.05, 1.0])])
+        p = os.path.join(d, f'nut_{k:03d}.json')
+        sc = json.load(open(p, encoding='utf-8'))
+        assert 'so_do' not in sc['gate_v3']
+        sc['so_do'] = ['g5']
+        json.dump(sc, open(p, 'w', encoding='utf-8'))
+    assert LU.main(['--gio', gp, '--out-dir', d, '--gop-only']) == 0
+    r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
+    assert r['trang_thai_luot'] == 'cham' and r['nodes_ok'] == [True, True] and r['so_do'] == []
+    assert r['outcome'] == 'dat'
+
+
 def test_f19_luoi_chain_files(tmp_path):
     # F19 (CODE 19/11): the cell chain fields of every run's luoi.json: clip {ten, clip_sha256}; file_so_h, and with
     # the H1 scoring file_cham_h1 + file_gio_h1 {duong_dan, sha256}

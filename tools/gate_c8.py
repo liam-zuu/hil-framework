@@ -2111,13 +2111,14 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
     # scoring is the one first scoring of its clip under the C8 folder, and the clip H comparison, second scoring and
     # second time file of the chain are those that scoring names (so its time files are those of its gio_sha256)
     kl = _open_ref(goc, d['khoa_c8b'], 'khoa_c8b')
-    commit = kl.get('commit_hil') if kl.get('nhanh_tick') == 'bo_tick' else None
-    first = _first_scorings(goc, commit)                 # KG-6: only the scorings at commit_hil count
+    commit_bo = commit_bo_of(kl)
+    first = _first_scorings(goc, commit_bo)              # KG-6: only the scorings at commit_hil count
     for c in d['o_c8']:
         for x in c['chuoi']:
             w = f'cell {c["o"]} run {x["run_id"]}'
-            _one_first_scoring(first, x, w)
             fc = _open_ref(goc, x['file_cham'], f'{w}: file_cham')
+            _not_dropped(fc, commit_bo, w)
+            _one_first_scoring(first, x, w)
             for k in ('file_so_h', 'file_cham_h1', 'file_gio_h1'):
                 a, b = x[k], fc.get(k)
                 if (a is None) != (b is None) or (a is not None and (not isinstance(b, dict)
@@ -2160,8 +2161,17 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
                     raise GateFileError(f'{w}: luoi.json scorer: one clean commit of every node (GC10-2)')
                 scorers.add(sc.get('commit'))
         cham_luc[x['run_id']] = min(t for fk in fks for t in _scoring_times(fk, f'{w}: scoring'))
+        _not_dropped(fks[0], commit_bo, w)
         _one_first_scoring(first, x, w)
     return eligible, cham_luc, scorers, elig_seg
+
+
+def commit_bo_of(khoa: dict) -> Optional[str]:
+    """The commit the scorings of the gate were made at (KG-6): commit_hil of a bo_tick C8b lock when it is a commit
+    (40 hex); None with giu_tick, and None for a commit_hil that is no commit (nothing is dropped on such a string:
+    _check_commit_hil refuses the lock by its own message)."""
+    ch = khoa.get('commit_hil') if khoa.get('nhanh_tick') == 'bo_tick' else None
+    return ch if isinstance(ch, str) and re.fullmatch(r'[0-9a-f]{40}', ch) else None
 
 
 def luoi_commit(x: dict) -> Optional[str]:
@@ -2249,6 +2259,15 @@ def _first_scorings(goc: str, commit: Optional[str] = None) -> Dict[str, set]:
         if sha not in h1 and isinstance(cl, dict) and isinstance(cl.get('ten'), str):
             out.setdefault(cl['ten'], set()).add(sha)
     return out
+
+
+def _not_dropped(fc: dict, commit_bo: Optional[str], w: str) -> None:
+    """KG-6: the scoring a run names (file_cham) is none of the dropped ones (made at another commit than commit_hil
+    of a bo_tick lock); said by its own message, before the count of first scorings."""
+    if commit_bo is not None and luoi_commit(fc) != commit_bo:
+        raise GateFileError(f'{w}: file_cham was made at commit {luoi_commit(fc)!r} (luoi.json script), not at '
+                            f'commit_hil {commit_bo[:12]}... of the C8b lock: a scoring made at another commit is '
+                            'dropped, never the scoring of the gate (KG-6)')
 
 
 def _one_first_scoring(first: Dict[str, set], x: dict, w: str) -> None:
@@ -2644,7 +2663,7 @@ def check_nguon(d: dict, goc: str) -> dict:
     # dossier lists them, with Liam's record when there is one
     kl = _open_ref(goc, d['khoa_c8b'], 'khoa_c8b')
     _check_mien_theo_buoi(d, kl, elig_seg)              # KG-5
-    bo_want = scorings_dropped(goc, kl.get('commit_hil') if kl.get('nhanh_tick') == 'bo_tick' else None)
+    bo_want = scorings_dropped(goc, commit_bo_of(kl))
     cb = _obj(hs.get('cham_cu_bo'), ('luoi', 'liam'), 'chuan_u.ho_so_c8.cham_cu_bo')
     if cb['luoi'] != bo_want:
         raise GateFileError(f'chuan_u.ho_so_c8.cham_cu_bo.luoi: {len(cb["luoi"]) if isinstance(cb["luoi"], list) else cb["luoi"]!r} '
@@ -3213,7 +3232,7 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
         b = re.sub(r'_lai\d+$', '', (r.get('buoc') or '').strip())
         if b in plan:
             order[b].append(r)
-    commit_bo = khoa.get('commit_hil') if khoa.get('nhanh_tick') == 'bo_tick' else None
+    commit_bo = commit_bo_of(khoa)
     luois = kho.all_json(lambda x, rel: os.path.basename(rel) == 'luoi.json' and isinstance(x, dict)
                          and 'trang_thai_luot' in x and (commit_bo is None or luoi_commit(x) == commit_bo))   # KG-6
     h1_shas = {x['file_cham_h1']['sha256'] for _, x in luois if isinstance(x.get('file_cham_h1'), dict)}

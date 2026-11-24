@@ -1304,7 +1304,7 @@ def test_code_23_11_grid_so_do_at_the_middle_node_through_rq3_log(ds):
     rl._recompute(back, 'HW', ('g5',))
     for edit, msg in [(lambda x: x['g5']['q_so_do'].update(nut=3), 'q_so_do'),
                       (lambda x: x['luoi']['hong_nut'].__setitem__(1, True), 'q_so_do|lost|n_undef'),
-                      (lambda x: x['g5']['q_so_do'].update(q=7.6), 'above the grid maxima'),
+                      (lambda x: x['g5']['q_so_do'].update(q=7.6), 'above q of the block'),      # SD1-3
                       (lambda x: x['g5'].update(state='chua_ket_luan'), 'so_do')]:
         y = json.loads(json.dumps(g))
         edit(y)

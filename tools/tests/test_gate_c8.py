@@ -2852,7 +2852,7 @@ def test_code_23_11_bo_tick_needs_the_scoring_commit_of_the_lock(tmp_path):
     cases = ((lambda k: k.pop('commit_hil'), 'with commit_hil None'),
              (lambda k: k.update(commit_hil='5' * 39), 'with commit_hil'),
              (lambda k: k.update(commit_hil='6' * 40) or k['khoa_truoc'].update(commit_hil='6' * 40),
-              'is not commit_hil 666666'),
+              'not at commit_hil 666666'),                           # KG-6: a scoring at another commit is dropped
              (lambda k: k['khoa_truoc'].update(commit_hil='6' * 40), 'khoa_truoc.commit_hil'))
     for i, (edit, msg) in enumerate(cases):
         d, goc = build_c8(tmp_path / f'b{i}')
@@ -2861,7 +2861,12 @@ def test_code_23_11_bo_tick_needs_the_scoring_commit_of_the_lock(tmp_path):
             GC.check_nguon(d, goc)
     # the c8b_luoi and the final c8b_gio script of every scoring (CODE 23/11), clean
     x0 = None
-    for key, edit, msg in (('file_cham', lambda y: y['script'].update(commit='6' * 40), 'luoi.json script'),
+    def other_scorer(y):                                               # the node scorer (c7_score) at another commit
+        y['scorer'].update(commit='6' * 40)
+        for e in y['scorer']['nut']:
+            e.update(commit='6' * 40)
+    for key, edit, msg in (('file_cham', lambda y: y['script'].update(commit='6' * 40), 'not at commit_hil'),   # KG-6
+                           ('file_cham', other_scorer, 'is not commit_hil 555555'),
                            ('file_cham', lambda y: y['script'].update(dirty=True), 'luoi.json script'),
                            ('file_gio', lambda y: y['script'].update(commit='6' * 40), 'time file script'),
                            ('file_gio', lambda y: y.pop('script'), 'time file script')):
@@ -2879,7 +2884,7 @@ def test_code_23_11_bo_tick_needs_the_scoring_commit_of_the_lock(tmp_path):
     raw = open(os.path.join(goc, d['luot_k'][0]['file_cham']['duong_dan']), 'rb').read()
     sha = d['luot_k'][0]['file_cham']['sha256']
     _rewrite(goc, d['luot_k'][0]['file_cham'], lambda y: y['script'].update(commit='6' * 40))
-    with pytest.raises(GC.GateFileError, match='K run C8-P-K1-1: file_cham: luoi.json script'):
+    with pytest.raises(GC.GateFileError, match='K run C8-P-K1-1: file_cham was made at commit .* not at commit_hil'):
         GC.check_nguon(d, goc)
     with open(os.path.join(goc, d['luot_k'][0]['file_cham']['duong_dan']), 'wb') as f:
         f.write(raw)
