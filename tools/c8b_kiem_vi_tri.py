@@ -143,6 +143,7 @@ def main(argv=None):
             khoa = json.load(f)
         # Codex D3-3: the rows are those c8b_d3_hang wrote for THIS lock: its file <rows>.nguon.json names the rows
         # file (sha256) and the lock (vai khoa, sha256); rows made by hand or for another lock are refused
+        cu.check_path(a.rows)                        # before any read of the rows (Codex round 2 D3v2-10)
         try:
             with open(a.rows + '.nguon.json', encoding='utf-8') as f:
                 ng = json.load(f)

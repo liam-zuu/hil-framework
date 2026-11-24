@@ -84,8 +84,8 @@ def build(segs, neo, le=khoa.LE):
                 if r['dai_luong'] in ('P1', 'P_neo', 'A_neo') and abs(float(r['sai_m'])) > float(r['chi_so_m'])}
         if not ngan:
             break
-        for k in ngan:
-            hang[TEN[k]] = round(hang[TEN[k]] + 1e-9, 9)
+        for k in ngan:                               # at least one float step (Codex round 2 D3v2-5)
+            hang[TEN[k]] = max(round(hang[TEN[k]] + 1e-9, 9), math.nextafter(hang[TEN[k]], math.inf))
     else:
         raise HeSoError(f'the factors of {sorted(ngan)} do not cover their own rows after 20 rounding steps')
     why = []

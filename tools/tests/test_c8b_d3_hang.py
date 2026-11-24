@@ -127,7 +127,7 @@ def _kc(tmp_path, seg, p1, a3, pairs, quys):
 
 def test_p1a3_held_out_by_session_and_e(tmp_path):
     p = _setup(tmp_path)
-    k1, s1 = _kc(tmp_path, '2026-11-20_run02/doan2', 0.004, 0.2, [(0.003, 0.0), (0.0, -0.002)], [0.15])
+    k1, s1 = _kc(tmp_path, '2026-11-20_run02/doan2', 0.004, 0.2, [(0.003, 0.0), (0.0, -0.002)], [0.15, 0.2])
     k2, s2 = _kc(tmp_path, '2026-11-23_run03/doan1', 0.0045, 0.25, [(0.0044, 0.0)], [0.25])
     a6 = json.load(open(p['a6'], encoding='utf-8'))
     a6['kiem_imu'] = [dict(luot_id_E='HC_goc_1', cho='goc', du_rad=0.00066, nguong_rad=0.0031)]
@@ -159,7 +159,7 @@ def test_p1a3_held_out_by_session_and_e(tmp_path):
     assert not any(m['dai_luong'] == 'P1' for m in d3['mien_thieu'])
     # one session only, or a kiem_cheo the lock does not name: refused
     assert H.main(_argv(p, tmp_path / 'b.csv') + ['--kiem-cheo', f'2026-11-20_run02/doan2={k1}']) == 2
-    k3, _ = _kc(tmp_path, '2026-11-24_run05/doan1', 0.0041, 0.21, [(0.001, 0.0)], [0.1])   # not named by the lock
+    k3, _ = _kc(tmp_path, '2026-11-24_run05/doan1', 0.0041, 0.21, [(0.001, 0.0)], [0.21])   # not named by the lock
     assert H.main(_argv(p, tmp_path / 'c.csv') + ['--kiem-cheo', f'2026-11-20_run02/doan2={k1}', '--kiem-cheo',
                                                   f'2026-11-24_run05/doan1={k3}']) == 2
 
@@ -275,6 +275,10 @@ def test_l155_factor_file_of_the_lock(tmp_path):
     assert HS.main(kc2 + neov + ['--out', str(tmp_path / 'hs2.json')]) == 2
     ne2 = ['--neo', f'2026-11-20_run02={n1},{c1}', '--neo', f'2026-11-23_run03={n1},{c1}']
     assert HS.main(kcv + ne2 + ['--out', str(tmp_path / 'hs3.json')]) == 2
+    # Codex round 2 D3v2-4: two files under ONE label (the last would win, the order would decide the factor)
+    kc3 = kcv + ['--kiem-cheo', f'2026-11-20_run02/doan2={k2}']
+    assert HS.main(kc3 + neov + ['--out', str(tmp_path / 'hs4.json')]) == 2
+    assert H.main(_argv(p, tmp_path / 'z.csv') + kc3 + neov + ['--he-so', str(hs)]) == 2
 
 
 def test_pair_csv_tied_to_the_kiem_cheo_json(tmp_path):
@@ -288,6 +292,9 @@ def test_pair_csv_tied_to_the_kiem_cheo_json(tmp_path):
         f.write('\n'.join([rows[0], rows[2]]) + '\n')
     with pytest.raises(H.HangError, match='a3_cap'):
         H.doc_kiem_cheo(k1)
+    k3, _ = _kc(tmp_path, '2026-11-24_run05/doan1', 0.004, 0.30, [(0.004, 0.0)], [0.20])   # A3_xp above the pairs
+    with pytest.raises(H.HangError, match='contradicts'):
+        H.doc_kiem_cheo(k3)
     k2, _ = _kc(tmp_path, '2026-11-23_run03/doan1', 0.004, 0.2, [(0.004, 0.0)], [0.2])
     with open(os.path.join(os.path.dirname(k2), 'cap_tuong_doi.csv'), 'a', encoding='utf-8') as f:
         f.write('H_a,goc,25,9,0.001,0.0\n')

@@ -384,6 +384,10 @@ def p6_khong_khung(p6, band, luot_buoi=None):
     lvs = p6_muc_cua_luot(p6)
     # Codex D3-1 (25/11): the runs this lock knows of its session (the luot_id of its U_moc files) must all be among
     # the runs the P6 file counted: a P6 made without one of them says nothing of that run's frames
+    # Codex round 2 D3v2-1: False = the lock does not know the runs of its session (no U_moc file, or one without a
+    # luot_id): the flag stays off
+    if luot_buoi is False:
+        return False
     if luot_buoi and not set(luot_buoi) <= {x.get('luot') for x in p6.get('luot') or [] if isinstance(x, dict)}:
         return False
     return lvs is not None and all(LEVELS.index(lv) < P6_BANDS.index(band) for lv in lvs)
@@ -996,9 +1000,9 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
     for lv in LEVELS:
         tb = tbs.get(lv)
         cq = can_quay(tb, lv)
+        lb = [u.get('luot_id') if isinstance(u, dict) else None for u in (u_moc or [])]
         bands, bwhy = hang_theo_u(cq, lv, a_m, p6_dong, p6_he_so(a6),
-                                  [u['luot_id'] for u in (u_moc or [])
-                                   if isinstance(u, dict) and isinstance(u.get('luot_id'), str)])
+                                  lb if lb and all(isinstance(x, str) and x for x in lb) else False)
         if lever is not None:                                 # (|q_hat| + dq) A4(u) into P4 (v7 10, GATE RT4-3)
             for b in bands:
                 if b.get('P4_m') is not None and b.get('A4_deg') is not None:

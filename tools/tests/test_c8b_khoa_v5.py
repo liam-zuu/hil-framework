@@ -1001,7 +1001,9 @@ def test_session_without_frames_in_a_band_does_not_stop_the_lock():
     B3 of the F08 table is khong_khung (thieu, null) and the F08 level is not reported as missing its bands."""
     s = _src()
     tbs = {lv: _tb(lv) for lv in K.LEVELS}
-    k = K.build(tbs, a_m=0.1445, a6=s['a6'], p6_dong=_p6_buoi(['C8-P-F05-1_lai5', 'C8-P-F05-2_lai1']))
+    um5 = [dict(U_moc_hieu_xy_m=1e-4, U_moc_hieu_psi_rad=1e-4, luot_id=x)
+           for x in ('C8-P-F05-1_lai5', 'C8-P-F05-2_lai1')]
+    k = K.build(tbs, a_m=0.1445, a6=s['a6'], p6_dong=_p6_buoi(['C8-P-F05-1_lai5', 'C8-P-F05-2_lai1']), u_moc=um5)
     b8 = k['muc']['O1-F08']['hang_theo_u']
     assert [b['khong_khung'] for b in b8] == [False, False, True]
     assert b8[2]['trang_thai'] == 'thieu' and b8[2]['P4_m'] is None and b8[2]['A4_deg'] is None \
@@ -1013,7 +1015,9 @@ def test_session_without_frames_in_a_band_does_not_stop_the_lock():
     # without a P6 file: one band, the flag false
     assert [b['khong_khung'] for b in K.build(tbs, a_m=0.1445, a6=s['a6'])['muc']['O1-F08']['hang_theo_u']] == [False]
     # F02 runs only: B2 and B3 without frames
-    k = K.build(tbs, a_m=0.1445, a6=s['a6'], p6_dong=_p6_buoi(['C8-L-F02-1', 'C8-L-F02-2'], khong=('B2', 'B3')))
+    um2 = [dict(U_moc_hieu_xy_m=1e-4, U_moc_hieu_psi_rad=1e-4, luot_id=x) for x in ('C8-L-F02-1', 'C8-L-F02-2')]
+    k = K.build(tbs, a_m=0.1445, a6=s['a6'], p6_dong=_p6_buoi(['C8-L-F02-1', 'C8-L-F02-2'], khong=('B2', 'B3')),
+                u_moc=um2)
     assert [b['khong_khung'] for b in k['muc']['O1-F08']['hang_theo_u']] == [False, True, True]
     assert [b['khong_khung'] for b in k['muc']['O1-F05']['hang_theo_u']] == [False, True]
     assert 'hang_theo_u thieu' not in k['ly_do_chua_khoa']
@@ -1128,6 +1132,12 @@ def test_no_frame_flag_needs_every_run_of_the_lock_in_the_p6_file():
     k = K.build(tbs, a_m=0.1445, a6=s['a6'], p6_dong=p, u_moc=um)
     assert k['muc']['O1-F08']['hang_theo_u'][2]['khong_khung'] is False
     assert 'O1-F08: hang_theo_u thieu' in k['ly_do_chua_khoa']
+    # Codex round 2 D3v2-1: a U_moc file without a luot_id, or no U_moc at all: the lock does not know its runs
+    assert K.p6_khong_khung(p, 'B3', False) is False
+    for um_ in ([dict(um[0]), dict(U_moc_hieu_xy_m=1e-4, U_moc_hieu_psi_rad=1e-4)], [dict(um[0], luot_id='')], None,
+                []):
+        k = K.build(tbs, a_m=0.1445, a6=s['a6'], p6_dong=p, u_moc=um_)
+        assert k['muc']['O1-F08']['hang_theo_u'][2]['khong_khung'] is False, um_
 
 
 def test_held_out_factor_below_one_refused_on_a_direct_call():

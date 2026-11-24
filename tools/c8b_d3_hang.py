@@ -150,6 +150,9 @@ def rows_goc_a(f_dau, sha_dau, sau, khoa, a6):
     if rho is None or rho <= 0:
         raise HangError('--a6: mien.rho_max_m missing')
     out, gh = [], []
+    ses = [f.get('session_sha256') for _, f, _ in sau if isinstance(f, dict)]
+    if len(set(ses)) != len(ses):                    # Codex round 2 D3v2-8: one HC_goc under two labels
+        raise HangError('--goc-a: two later F7 of the same camera session (one HC_goc under two labels)')
     for buoi, f, sha in sau:
         if not isinstance(f, dict) or f.get('schema') != 'truc_xe_v1' or f.get('cho') != cho:
             raise HangError(f'--goc-a {buoi}: not a truc_xe_v1 F7 of place {cho}')
@@ -197,6 +200,10 @@ def doc_kiem_cheo(p):
     if not q or any(x is None for x in q) or am is None or abs(max(q) - am) > 1e-9 * max(1e-6, am):
         raise HangError(f'{p}: a3_cap.csv beside it does not give A3_tuong_doi.A3loc_max_deg (not the pairs of that '
                         'file, or a quy_deg not finite)')
+    # Codex round 2 D3v2-6: the number the lock takes at a place is not above the largest pair of the file
+    xp = [_num(v) for v in ((kc.get('A3_tuong_doi') or {}).get('A3_xp_deg') or {}).values()]
+    if any(v is not None and v > am * (1 + 1e-9) for v in xp):
+        raise HangError(f'{p}: an A3_xp_deg above A3loc_max_deg (the file contradicts itself)')
     return kc, s, cap, cs, a3, as_
 
 
@@ -204,6 +211,9 @@ def khong_lap(items, what):
     """Codex D3-4, D3-8: one file under two labels (sessions, segments) would be compared with itself as 'another
     session'. items [(label, sha256)]."""
     seen = {}
+    labs = [lab for lab, _ in items]
+    if len(set(labs)) != len(labs):                  # Codex round 2 D3v2-4: the last file of a label would win
+        raise HangError(f'{what}: a label is given twice ({sorted(x for x in set(labs) if labs.count(x) > 1)})')
     for lab, sha in items:
         if seen.setdefault(sha, lab) != lab:
             raise HangError(f'{what}: {seen[sha]} and {lab} are the same file (sha256 {sha[:12]})')
