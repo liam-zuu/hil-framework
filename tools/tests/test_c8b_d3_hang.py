@@ -154,7 +154,7 @@ def test_p1a3_held_out_by_session_and_e(tmp_path):
     assert any(m['mien'] == '2026-11-23_run03/doan1:goc' for m in d3['mien_thieu'])
     # one session only, or a kiem_cheo the lock does not name: refused
     assert H.main(_argv(p, tmp_path / 'b.csv') + ['--kiem-cheo', f'2026-11-20_run02/doan2={k1}']) == 2
-    k3, _ = _kc(tmp_path, '2026-11-24_run05/doan1', 0.004, 0.2, [(0.001, 0.0)], [0.1])
+    k3, _ = _kc(tmp_path, '2026-11-24_run05/doan1', 0.0041, 0.21, [(0.001, 0.0)], [0.1])   # not named by the lock
     assert H.main(_argv(p, tmp_path / 'c.csv') + ['--kiem-cheo', f'2026-11-20_run02/doan2={k1}', '--kiem-cheo',
                                                   f'2026-11-24_run05/doan1={k3}']) == 2
 

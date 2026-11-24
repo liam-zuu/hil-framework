@@ -65,6 +65,16 @@ def _num(x):
     return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) else None
 
 
+def _fnum(x):
+    """A finite float from a CSV cell (a string) or a number; None otherwise."""
+    if isinstance(x, str):
+        try:
+            x = float(x)
+        except ValueError:
+            return None
+    return _num(x)
+
+
 def _read(p):
     cu.check_path(p)
     with open(p, encoding='utf-8') as f:
@@ -186,7 +196,7 @@ def rows_p1a3(segs, rho):
             idx = [p1_of[o].get(v) for o in others]
             if not idx or any(x is None for x in idx):
                 raise HangError(f'P1 {s} vung {v!r}: an other session has no P1_tuong_doi.theo_vung.{v}.max_m')
-            dx, dy = _num(r.get('d_x')), _num(r.get('d_y'))
+            dx, dy = _fnum(r.get('d_x')), _fnum(r.get('d_y'))
             if dx is None or dy is None:
                 raise HangError(f'P1 {s}: pair {key} without finite d_x, d_y')
             out.append(_row('P1_A3_H32', 'P1', f'{s}:{v}', math.hypot(dx, dy), max(idx)))
@@ -194,7 +204,7 @@ def rows_p1a3(segs, rho):
         if any(x is None for x in ia):
             raise HangError(f'A3 {s}: an other session has no A3_tuong_doi.A3loc_max_deg')
         for r in a3:
-            q = _num(r.get('quy_deg'))
+            q = _fnum(r.get('quy_deg'))
             if q is None:
                 raise HangError(f'A3 {s}: pair {r.get("i")}-{r.get("j")} without finite quy_deg')
             out.append(_row('P1_A3_H32', 'A3', s, rho * math.radians(q), rho * math.radians(max(ia))))
@@ -245,7 +255,7 @@ def rows_neo(items, rho):
             o = [idx[x][cho] for x in idx if x != b and cho in idx[x]]
             if not o:
                 raise HangError(f'--neo {b}: no other session has an index at place {cho}')
-            dx, dy, dp = _num(r.get('dx_m')), _num(r.get('dy_m')), _num(r.get('dpsi_rad'))
+            dx, dy, dp = _fnum(r.get('dx_m')), _fnum(r.get('dy_m')), _fnum(r.get('dpsi_rad'))
             if dx is None or dy is None or dp is None:
                 raise HangError(f'--neo {b}: valid frame {lid}/{r.get("khung")} without finite dx, dy, dpsi')
             out.append(_row('replay_neo', 'P_neo', f'{b}:{cho}', math.hypot(dx, dy), max(x[0] for x in o)))
