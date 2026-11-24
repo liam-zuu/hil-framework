@@ -545,9 +545,15 @@ def test_khong_dat_needs_same_frame_both_nodes():
     b['rows'][0.2] = dict(mien_chung=False, **{m: 0.05 for m in LU.MEASURED})
     res = LU.combine([a, b])
     assert res['states']['g3'] == 'chua_ket_luan'
-    # the same frames in the domain at both nodes: each one's bound (U_t with the whole step) holds over the cell
+    # the same frames in the domain at both nodes, each above the threshold at ONE node only: two different frames
+    # violating at the two nodes of a cell are not enough (J v6 line 112; L156, Liam 25/11 at CODE, box: "Sua code
+    # theo J (Recommended)"). Until 25/11 this was khong_dat (v4: the lo of either node counted).
     a['rows'][0.3]['mien_chung'] = True
     b['rows'][0.2]['mien_chung'] = True
+    res = LU.combine([a, b])
+    assert res['states']['g3'] == 'chua_ket_luan' and res['lo_cells']['g3'] == [pytest.approx(0.05)]
+    # frame 0.2 above at both nodes: the cell is violated
+    b['rows'][0.2]['g3'] = 0.11
     assert LU.combine([a, b])['states']['g3'] == 'khong_dat'
 
 

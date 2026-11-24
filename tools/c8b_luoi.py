@@ -13,7 +13,7 @@ R5-2):
                 (lo_k finite and above the threshold at each of the two nodes, the frame in the common domain at both;
                 J v6 section 5 line 112, design v7 0.2; two different frames violating at the two nodes are not
                 enough). Until Codex D2-16 (24/11) the lo of either node counted (v4: each node's U_t holds the whole
-                step); changed to the words of J v6 [CHO LIAM DUYET];
+                step); changed to the words of J v6 (L156, Liam 25/11 at CODE);
                 G1 (no lo_k): khong_dat at every node and the G1 state the same at the two nodes of every cell;
   chua_ket_luan otherwise. Zero-width interval (one node): the state of that node. A node not scored is never
                 dropped: every condition is chua_ket_luan at that node. Two kinds (hong_nut / loi_nut): the run lost to
