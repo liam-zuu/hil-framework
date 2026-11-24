@@ -44,7 +44,7 @@ def write_node(d, k, fr, D=1.0, cat=False, t1=None, edit=None):
             per[c][2].append(v + U[c])
     mc = np.array([f[2] == 1 for f in fr])
     mu = np.array([f[3] == 1 for f in fr])
-    g = {'g1': dict(state='dat', t_done=[0.5, 0.5], t1=t1)}
+    g = {'g1': dict(state='dat', t1=t1)}         # no t_done: a command-time end would move between nodes (C8BS-6)
     for c in LU.MEASURED:                                # c7_score.build_gate
         q, lo, hi = (np.array(x) for x in per[c])
         thr = o1_gate.THRESHOLDS[c]
