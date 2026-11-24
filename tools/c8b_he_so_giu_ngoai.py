@@ -11,6 +11,9 @@ proposed: ratio(term) = largest over the sessions s and the domains of (largest 
 sessions, before the margin) (the rows of c8b_d3_hang.rows_p1a3 / rows_neo); ratio <= LE (the lock's margin 1.25):
 the margin covers the transfer between sessions, factor 1; ratio > LE: the term is multiplied by ratio / LE in the
 lock (U grows; no threshold is loosened).
+Decided: L155, Liam 24/11 khuya at CODE (box, verbatim: "So co le, vuot thi noi bat dinh (Recommended)"); the rule was
+changed after the numbers of a trial on 2-3 sessions were seen; LE is in c8b_khoa_v5 since 8ff78a8. The factors used in
+the locks are computed from ALL the C8 sessions, not from the trial.
 Terms scaled by the lock: P1_m, P_neo_m, A_neo_rad. A3 also enters u_beta_cam, which the lock does not scale: an A3
 ratio above LE gives trang_thai thieu (the lock refuses the file) [GIOI HAN].
 
@@ -70,7 +73,8 @@ def build(segs, neo, le=khoa.LE):
     miss = [k for k in TEN if k not in tl]
     if miss:
         raise HeSoError(f'no ratio for {miss}')
-    hang = {TEN[k]: max(1.0, tl[k]['ti_le'] / le) for k in ('P1', 'P_neo', 'A_neo')}
+    # rounded UP at the 9th decimal, so index x le x factor is never below the largest error by rounding
+    hang = {TEN[k]: max(1.0, math.ceil(tl[k]['ti_le'] / le * 1e9) / 1e9) for k in ('P1', 'P_neo', 'A_neo')}
     why = []
     if tl['A3']['ti_le'] > le:
         why.append(f'A3 ratio {tl["A3"]["ti_le"]:.4f} above the margin {le}: A3 is not scaled by the lock (it also '

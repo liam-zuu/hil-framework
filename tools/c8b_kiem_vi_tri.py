@@ -10,15 +10,17 @@ Input: one CSV row per signed error of a position source on a set (upstream: KIE
 anchors / marks on real frames, 12b, E, the height sensitivity, the mounting ends of NHACTAM, the H drift; this tool
 does not compute them):
   nguon, tap (khop | kiem), dai_luong, mien, sai_m, chi_so_m, co_chuan_dong
-  sai_m signed (measured - reference); chi_so_m the index of that quantity in use (before the margin); co_chuan_dong
+  sai_m signed (measured - reference); chi_so_m the index of that quantity in use (before the margin; for the
+  sources held out by session, L155: the other sessions' index x the lock's margin x its held-out factor, written by
+  c8b_d3_hang); co_chuan_dong
   1 when the source has an independent dynamic reference, 0 when not (P4 combined motion, dynamic height).
 State rule (design 8): per (dai_luong, mien): every |sai| of the test set (kiem, after the lock) <= chi_so -> dat;
 one above -> that quantity thieu in that domain (listed in mien_thieu; the index is NOT raised after the lock); on the
 fit set (khop, before the lock) an excess raises the index to the largest |sai| seen (listed in chi_so_nang); a source
 without an independent dynamic reference -> gioi_han (usable, the assumption written). File trang_thai: dat when the
 lock is a c8b_khoa_v5 file with trang_thai khoa, every required source of design 8 (NGUON_CAN) has test rows, and every
-value is finite; else thieu with the reasons. A dat file may still carry mien_thieu: those domains are thieu in the
-scoring (n_undef), not the whole check (CACH HIEU, sent to CODE 20/11).
+value is finite; else thieu with the reasons. A dat file may still carry mien_thieu. LIMIT (found 24/11, L155): no
+tool reads mien_thieu yet (lock, scorer and gate do not): a domain listed there is NOT made n_undef in the scoring.
 
   python tools/c8b_kiem_vi_tri.py --rows d3_rows.csv --khoa c8b_khoa_v5.json --out c8b_kiem_vi_tri.json
 Last line: #ket_qua,ma=0 written / 2 refused or error.

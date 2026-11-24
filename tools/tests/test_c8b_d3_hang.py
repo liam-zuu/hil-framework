@@ -28,7 +28,8 @@ def _setup(tmp_path, f_sau_trang_thai='chan_doan'):
     f1, _ = _w(tmp_path / 'f7_1.json', dict(schema='truc_xe_v1', cho='goc', trang_thai=f_sau_trang_thai,
                                             a_k_deg=0.33, u_a_noi_bo_deg=None, session_sha256='2' * 64))
     d2, _ = _w(tmp_path / 'dr2.json', dict(kind='c7_calib_drift', D_H_mm=0.29, eps_H_mm=2.0, thieu_H1=False))
-    kh, _ = _w(tmp_path / 'khoa.json', dict(version='c8b_khoa_v5', trang_thai='khoa', eps_H=dict(mm=2.0, huong_deg=0.15),
+    kh, _ = _w(tmp_path / 'khoa.json', dict(version='c8b_khoa_v5', trang_thai='khoa', le=1.25,
+                                            eps_H=dict(mm=2.0, huong_deg=0.15),
                                             khoa_truoc=dict(nguon=[dict(vai='a6', sha256=a6s),
                                                                    dict(vai='u_h_chung', sha256=uhs),
                                                                    dict(vai='truc_xe', sha256=f0s)])))
@@ -140,12 +141,13 @@ def test_p1a3_held_out_by_session_and_e(tmp_path):
     p1 = [r for r in rows if r['nguon'] == 'P1_A3_H32' and r['dai_luong'] == 'P1']
     assert len(p1) == 3                                                    # repeated pair rows taken once
     r2 = [r for r in p1 if r['mien'] == '2026-11-20_run02/doan2:goc']
-    assert all(float(r['chi_so_m']) == 0.0045 for r in r2)                 # index of the OTHER session
+    assert all(float(r['chi_so_m']) == pytest.approx(1.25 * 0.0045) for r in r2)   # the OTHER session x le (L155)
     r3 = [r for r in p1 if r['mien'] == '2026-11-23_run03/doan1:goc']
-    assert float(r3[0]['chi_so_m']) == 0.004 and float(r3[0]['sai_m']) == pytest.approx(0.0044)
+    assert float(r3[0]['chi_so_m']) == pytest.approx(1.25 * 0.004) and float(r3[0]['sai_m']) == pytest.approx(0.0044)
     a3 = [r for r in rows if r['dai_luong'] == 'A3']
     assert {r['mien']: float(r['chi_so_m']) for r in a3} == pytest.approx(
-        {'2026-11-20_run02/doan2': 1.6 * math.radians(0.25), '2026-11-23_run03/doan1': 1.6 * math.radians(0.2)})
+        {'2026-11-20_run02/doan2': 1.25 * 1.6 * math.radians(0.25),
+         '2026-11-23_run03/doan1': 1.25 * 1.6 * math.radians(0.2)})
     (e,) = [r for r in rows if r['nguon'] == 'E']
     assert float(e['sai_m']) == pytest.approx(1.6 * 0.00066) and e['mien'] == 'goc'
     d3 = KV.build(KV.read_rows(str(out)), k, 'x' * 64)
@@ -187,10 +189,10 @@ def test_replay_neo_held_out_by_session(tmp_path):
     assert H.main(argv) == 0
     rows = [r for r in csv.DictReader(open(out, encoding='utf-8')) if r['nguon'] == 'replay_neo']
     pr = {r['mien']: (float(r['sai_m']), float(r['chi_so_m'])) for r in rows if r['dai_luong'] == 'P_neo'}
-    assert pr['2026-11-20_run02:goc'] == pytest.approx((3e-5, 4.5e-5))    # index of the OTHER session
-    assert pr['2026-11-23_run03:goc'] == pytest.approx((4.5e-5, 3e-5))
+    assert pr['2026-11-20_run02:goc'] == pytest.approx((3e-5, 1.25 * 4.5e-5))    # the OTHER session x le (L155)
+    assert pr['2026-11-23_run03:goc'] == pytest.approx((4.5e-5, 1.25 * 3e-5))
     ar = [r for r in rows if r['dai_luong'] == 'A_neo' and r['mien'] == '2026-11-23_run03:goc']
-    assert float(ar[0]['sai_m']) == pytest.approx(1.6 * 2e-5) and float(ar[0]['chi_so_m']) == pytest.approx(1.6 * 1e-5)
+    assert float(ar[0]['sai_m']) == pytest.approx(1.6 * 2e-5) and float(ar[0]['chi_so_m']) == pytest.approx(1.25 * 1.6 * 1e-5)
     meta = json.load(open(str(out) + '.nguon.json', encoding='utf-8'))
     assert meta['thong_tin']['khung_thieu_replay_neo'] == [['2026-11-20_run02', 'L_2026-11-20_run02', '1', 'mat_W',
                                                              'mat_W']]
@@ -224,3 +226,35 @@ def test_he_so_giu_ngoai_from_the_ratios(tmp_path):
     k3, _ = _kc(tmp_path, '2026-11-24_run05/doan1', 0.004, 0.3, [(0.004, 0.0)], [0.3])
     assert HS.main(argv[:-2] + ['--kiem-cheo', f'2026-11-24_run05/doan1={k3}', '--out', str(tmp_path / 'h2.json')]) == 0
     assert json.load(open(tmp_path / 'h2.json', encoding='utf-8'))['trang_thai'] == 'thieu'    # A3 0.3 / 0.21 > 1.25
+
+
+def test_l155_factor_file_of_the_lock(tmp_path):
+    """L155: a lock that names a he_so_giu_ngoai source needs --he-so (that file); the index of a scaled term is the
+    other sessions' index x le x factor, so the largest error of the trial session is inside it."""
+    import c8b_he_so_giu_ngoai as HS
+    p = _setup(tmp_path)
+    n1, s1, c1 = _neo(tmp_path, '2026-11-20_run02', 3e-5, 1e-5, [('hop_le', 3e-5, 0.0, 1e-5)])
+    n2, s2, c2 = _neo(tmp_path, '2026-11-23_run03', 3.3e-5, 2e-5, [('hop_le', 0.0, 3.3e-5, -2e-5)])
+    k1, ks1 = _kc(tmp_path, '2026-11-20_run02/doan2', 0.004, 0.2, [(0.004, 0.0)], [0.2])
+    k2, ks2 = _kc(tmp_path, '2026-11-23_run03/doan1', 0.0045, 0.21, [(0.0045, 0.0)], [0.21])
+    hs = tmp_path / 'hs.json'
+    kcv = ['--kiem-cheo', f'2026-11-20_run02/doan2={k1}', '--kiem-cheo', f'2026-11-23_run03/doan1={k2}']
+    neov = ['--neo', f'2026-11-20_run02={n1},{c1}', '--neo', f'2026-11-23_run03={n2},{c2}']
+    assert HS.main(kcv + neov + ['--out', str(hs)]) == 0
+    hd = json.load(open(hs, encoding='utf-8'))
+    assert hd['hang']['A_neo_rad'] == pytest.approx(2.0 / 1.25) and hd['hang']['P1_m'] == 1.0
+    k = json.load(open(p['kh'], encoding='utf-8'))
+    k['khoa_truoc']['nguon'] += [dict(vai='neo', sha256=s1), dict(vai='neo', sha256=s2),
+                                 dict(vai='kiem_cheo', sha256=ks1), dict(vai='kiem_cheo', sha256=ks2),
+                                 dict(vai='he_so_giu_ngoai', sha256=H.cu.sha256(str(hs)))]
+    _w(tmp_path / 'khoa.json', k)
+    out = tmp_path / 'd3.csv'
+    assert H.main(_argv(p, tmp_path / 'x.csv') + kcv + neov) == 2                  # the lock names a factor file
+    assert H.main(_argv(p, out) + kcv + neov + ['--he-so', str(hs)]) == 0
+    rows = [r for r in csv.DictReader(open(out, encoding='utf-8')) if r['dai_luong'] == 'A_neo']
+    worst = max(rows, key=lambda r: abs(float(r['sai_m'])) / float(r['chi_so_m']))
+    assert abs(float(worst['sai_m'])) <= float(worst['chi_so_m'])                   # inside, by the factor
+    assert abs(float(worst['sai_m'])) / float(worst['chi_so_m']) == pytest.approx(1.0, abs=1e-8)
+    import c8b_kiem_vi_tri as KV
+    d3 = KV.build(KV.read_rows(str(out)), k, 'x' * 64)
+    assert not [m for m in d3['mien_thieu'] if m['nguon'] in ('replay_neo', 'P1_A3_H32')]

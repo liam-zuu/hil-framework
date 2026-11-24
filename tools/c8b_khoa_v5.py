@@ -258,7 +258,8 @@ def hang_dong_tinh(src, side):
     if 'P6_rieng_ii_m' not in part and c6 is not None and d0 is not None:
         part['P6_rieng_ii_he_so'], part['P6_rieng_ii_B0_m'] = c6, d0
         part['P6_rieng_ii_m'] = c6 * d0
-    # Held out by session (CODE 24/11 khuya, Liam's decision pending; default: no file, nothing changes): a term whose
+    # Held out by session (L155, Liam 24/11 khuya at CODE, box: "So co le, vuot thi noi bat dinh (Recommended)"; the
+    # rule was changed after a trial on real data, LE is here since 8ff78a8; no file: nothing changes): a term whose
     # largest leave-one-session-out ratio is above the margin LE is multiplied by ratio / LE (U grows, no threshold is
     # loosened); the factors come from c8b_he_so_giu_ngoai.py (made from the neo / kiem_cheo files, before the lock)
     hs = src.get('he_so_giu_ngoai')
@@ -976,7 +977,8 @@ HE_SO_HANG = ('P1_m', 'P_neo_m', 'A_neo_rad')         # the terms a factor can s
 
 def doc_he_so(d, nguon):
     """The factors {term: k >= 1} of a c8b_he_so_giu_ngoai_v1 file for this lock: content sha, the same margin LE,
-    trang_thai dat, and every neo / kiem_cheo source of this lock among the files the factors were computed from."""
+    trang_thai dat, and every neo / kiem_cheo source of this lock among the files the factors were computed from.
+    The range [1, 10] of a factor is an input check only (a file outside it is refused), not a decision threshold."""
     import c8b_a6 as a6m
     if not isinstance(d, dict) or d.get('schema') != HE_SO_SCHEMA:
         raise KhoaError(f'--he-so-giu-ngoai: not a {HE_SO_SCHEMA} file')
