@@ -15,8 +15,11 @@ CUNG_DEG x band of u (--dai-u edges) x mounting (lan_lap_id). Per frame id (desi
 EVERY node compares it; its worst node is the largest |d| / (U_psi + U_imu). Per cell: n_tho (ids seen), n_id
 (comparable ids), n_thieu (ids not comparable), ty_le_max and the worst id with its d, U_psi, U_imu (so the reader
 recomputes |d| <= U_psi + U_imu on the very numbers), signed d per controller (median, p95, max |d|). Cell dat:
-n_id >= N_ID_MIN, n_thieu = 0, ty_le_max <= 1. File: trang_thai dat (every cell of the checked set dat) | truot (a
-cell with ty_le_max > 1) | thieu (otherwise); the three sets (khop, kiem, dich) must be disjoint by run.
+n_id >= N_ID_MIN, n_thieu = 0, ty_le_max <= 1. File, A6 held-out check (giu_ngoai_a6): trang_thai dat (every cell of
+the checked set dat) | truot (a cell with ty_le_max > 1) | thieu (otherwise). File, D2 (d2; design 7c line 166, CODE
+24/11 khuya): a cell not dat masks only its frames: trang_thai dat once cells exist, with mat_na {o_dat, o_thieu
+[{o_id, ly_do: vuot | thieu_mau | thieu_id}], ngoai_dai_u [[run, id]]}: the scorer makes a frame whose cell is not in
+o_dat n_undef for G4, G5 and every position through q. The three sets (khop, kiem, dich) must be disjoint by run.
 
   python tools/c8b_a6_o.py --rows d2_rows.csv --muc-dich giu_ngoai_a6 --giu-ngoai-theo cho --khoa-truoc khoa.json \
       --cho-file a6_goc.json [--cho-file a6_K1.json] [--dai-u 0,0.3,0.6,1.0,1.5] --out c8b_a6_o.json
@@ -166,7 +169,32 @@ def build(rows, muc_dich, giu_ngoai_theo, khoa_sha, cho_sha, dai_u=DAI_U):
                       d_max_rad=None if w is None else abs(w['d']), d_co_dau_rad=None if w is None else w['d'],
                       U_psi_rad=None if w is None else w['up'], U_imu_rad=None if w is None else w['ui'],
                       dat=dat, bao_cao_controller=bao))
-    if not o:
+    mat_na = None
+    if muc_dich == 'd2':
+        # D2 (design v7 7c line 166; CODE 24/11 khuya: the code had the strict rule of the A6 held-out check): a cell
+        # over the bound (one id) or short of samples (n_id < N_ID_MIN, n_thieu > 0) masks ITS frames only (n_undef for
+        # G4, G5 and every position through q); a frame outside the u bands is in no cell and is masked too. The file
+        # is dat once cells exist: the mask is the result, read by the scorer (o_dat: frames whose cell is not listed
+        # there are n_undef).
+        def ly_do(c):
+            w_ = []
+            if c['ty_le_max'] is not None and c['ty_le_max'] > 1.0:
+                w_.append('vuot')
+            if c['n_id'] < N_ID_MIN:
+                w_.append('thieu_mau')
+            if c['n_thieu']:
+                w_.append('thieu_id')
+            return w_ or ['khong_so_duoc']
+        ngoai = sorted([luot, fid] for (luot, fid), rs in per.items()
+                       if cell_of(rs[0]['x'], rs[0]['y'], rs[0]['psi'], rs[0]['u'], rs[0]['lan'], dai_u) is None)
+        mat_na = dict(o_dat=[c['o_id'] for c in o if c['dat']],
+                      o_thieu=[dict(o_id=c['o_id'], ly_do=ly_do(c)) for c in o if not c['dat']],
+                      ngoai_dai_u=ngoai,
+                      quy_tac='khung co o khong nam trong o_dat (o vuot, thieu mau, thieu id) hay ngoai dai u -> '
+                              'n_undef cho G4, G5 va moi dai luong vi tri qua q (thiet ke C8b v7 7c dong 166); o cua '
+                              'khung theo cell_of (x, y, psi, u, lan_lap_id) va khoa_o')
+        st = 'dat' if o else 'thieu'
+    elif not o:
         st = 'thieu'
     elif any(c['ty_le_max'] is not None and c['ty_le_max'] > 1.0 for c in o):
         st = 'truot'
@@ -182,7 +210,7 @@ def build(rows, muc_dich, giu_ngoai_theo, khoa_sha, cho_sha, dai_u=DAI_U):
         a6_khop=dict(cho_sha256=list(cho_sha)), tap=tap,
         khoa_o=dict(O_M=O_M, CUNG_DEG=CUNG_DEG, DAI_U=list(dai_u), N_ID_MIN=N_ID_MIN, lan_lap='lan_lap_id',
                     quy_tac='o dat: n_id >= N_ID_MIN, n_thieu 0, moi id |d| <= U_psi + U_IMU,D o moi nut'),
-        n_ngoai_dai_u=outside, o=o, trang_thai=st))
+        n_ngoai_dai_u=outside, o=o, trang_thai=st, **({} if mat_na is None else dict(mat_na=mat_na))))
 
 
 def main(argv=None):

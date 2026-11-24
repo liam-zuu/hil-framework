@@ -131,3 +131,31 @@ def test_cli(tmp_path):
         w.writerows(rows)
     assert O.main(['--rows', str(p), '--muc-dich', 'giu_ngoai_a6', '--giu-ngoai-theo', 'cho', '--khoa-truoc', str(k),
                    '--out', str(tmp_path / 'o2.json')]) == 2
+
+
+def test_d2_mask_cells_not_whole_file(tmp_path):
+    """D2 (design v7 7c line 166; CODE 24/11 khuya): a cell over the bound or short of samples masks its own frames
+    only; the file stays dat with the mask (o_dat, o_thieu, ngoai_dai_u). The A6 held-out branch keeps its strict rule."""
+    dich = (_rows(n=12, tap='dich', luot='r1')                                  # cell A: dat
+            + _rows(n=12, tap='dich', luot='r1', x=0.7, d=0.006, s0=200)        # cell B: over (0.006 > 0.005)
+            + _rows(n=4, tap='dich', luot='r1', x=1.3, s0=300)                  # cell C: 4 ids < N_ID_MIN
+            + _rows(n=12, tap='dich', luot='r1', x=1.9, s0=400, missing={(0, '1')})  # cell D: one id not compared
+            + [dict(r, u_mps=2.5) for r in _rows(n=2, tap='dich', luot='r1', s0=600)])  # outside the u bands
+    rows = _parse(dich + _rows(n=3, tap='khop', luot='c1') + _rows(n=3, tap='kiem', luot='c2'), tmp_path)
+    o = O.build(rows, 'd2', 'cho', KHOA, CHO)
+    assert o['trang_thai'] == 'dat'
+    m = o['mat_na']
+    ids = {c['o_id']: c for c in o['o']}
+    a = [k for k, c in ids.items() if c['vung'][0] == 0][0]
+    assert m['o_dat'] == [a]
+    why = {x['o_id']: x['ly_do'] for x in m['o_thieu']}
+    assert sorted(map(tuple, why.values())) == [('thieu_id',), ('thieu_mau',), ('vuot',)]
+    assert m['ngoai_dai_u'] == [['r1', 600], ['r1', 601]]
+    # the A6 held-out check on the same kind of cells is still strict
+    rk = _parse(_rows(n=3, tap='khop', luot='c1') + _rows(n=12, tap='kiem', luot='c2')
+                + _rows(n=12, tap='kiem', luot='c2', x=0.7, d=0.006, s0=200) + _rows(n=3, tap='dich', luot='r1'),
+                tmp_path, 'rk.csv')
+    ok = O.build(rk, 'giu_ngoai_a6', 'cho', KHOA, CHO)
+    assert ok['trang_thai'] == 'truot' and 'mat_na' not in ok
+    assert O.build(_parse(_rows(n=3, tap='khop', luot='c1') + _rows(n=3, tap='kiem', luot='c2'), tmp_path, 'e.csv'),
+                   'd2', 'cho', KHOA, CHO)['trang_thai'] == 'thieu'           # no target run, no cell
