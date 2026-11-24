@@ -3159,9 +3159,12 @@ def test_sd2_1_node_q_so_do_tied_to_the_node_numbers(tmp_path):
             ('b', lambda y: y['gate_v3']['g5'].update(state='khong_dat'), 'SD2-1'),
             ('c', lambda y: y['gate_v3']['g5'].update(q_so_do=dict(nut=0, q=5.0, q_chung=5.0)), 'nut'),
             # round 3 (Codex): the grid copies the node's q_so_do, no tolerance (a node 1e-9 above, the grid below)
-            ('d', lambda y: y['gate_v3']['g5'].update(q=5.000000001, chung=dict(q=5.000000001, n_undef=0),
-                                                     q_so_do=dict(nut=None, q=5.000000001, q_chung=5.000000001)),
-             'not the q_so_do'),
+            ('d', lambda y: y['gate_v3']['g5'].update(q=5.000000001, chung=dict(q=5.0, n_undef=0),
+                                                     q_so_do=dict(nut=None, q=5.000000001, q_chung=5.0)),
+             'not the q_so_do'),                                       # q alone differs (2e-10 relative)
+            ('d2', lambda y: y['gate_v3']['g5'].update(q=5.0, chung=dict(q=4.999999999, n_undef=0),
+                                                      q_so_do=dict(nut=None, q=5.0, q_chung=4.999999999)),
+             'not the q_so_do'),                                       # q_chung alone differs
             ('e', lambda y: y['gate_v3']['g5'].update(n_undef=0.0, q=8.0, chung=dict(q=8.0, n_undef=0.0)),
              'is undefined')]:
         d, goc = build_c8(tmp_path / name)
