@@ -22,7 +22,15 @@ hang (one target run, every scored node of its grid folder):
                     u_cham-/+; U_t bounds the camera-log time of a frame at that node, the safe side].
   x_m, y_m, psi_rad, u_mps  the lane pose and camera speed of the frame (rows x, y, psi, speed); a frame without a
                     finite pose has no cell: left out (counted), so c8b_luoi --mat-na-d2 masks it.
-  luot, tap = dich, id = frame_id, nut, lan_lap_id (--lan-lap, L0 for the F8-empty sessions), controller (gio.json).
+  mien_hop        1 when the frame is in the union (deciding) domain of that node (the scorer's rows): c8b_a6_o d2
+                    builds the cells on the frames that can decide somewhere and asks a comparison at EVERY node
+                    where the frame can decide (design 0.4, 7c; Codex D2-8). A scored node that cannot compare (IMU
+                    yaw missing at a W frame, yaw not compared) still gives its rows, with d and the bounds empty,
+                    so its deciding frames count as not comparable; a scored node without its rows file is refused.
+  luot, tap = dich, id = frame_id, nut, lan_lap_id (--lan-lap, required: one name per mounting over the whole C8,
+  e.g. <session>/L0 for an F8-empty session; two mountings under one name would be counted in one cell, D2-15),
+  controller (gio.json). The rows file of a node must be the one its score names (rows_sha256, D2-6); the meta file
+  lists the score and rows SHA of every node used.
 noi-loo: c8b_u_imu_v3.noi_table on every held-out capture once, then for each target run the band maxima over the
   OTHER captures (design 7b "khoi giu ngoai = luot C8 khac luot dang cham"; the max over captures splits, so this is
   the table c8b_u_imu_v3 noi would give without that run); one file per target, c8b_u_imu_noi_v1.
@@ -60,7 +68,7 @@ import c8b_u_imu_v3 as v3                                                # noqa:
 
 VERSION = 'c8b_d2_hang_v1'
 COLS = ('luot', 'tap', 'id', 'nut', 'x_m', 'y_m', 'psi_rad', 'u_mps', 'lan_lap_id', 'd_rad', 'U_psi_rad', 'U_imu_rad',
-        'controller', 'ly_do')
+        'mien_hop', 'controller', 'ly_do')
 TOL_C_RAD = 1e-9
 
 
@@ -120,6 +128,12 @@ class TurnSums:
             sel = (tg >= a - per) & (tg <= b + per)
             sel[j0:j1 + 1] = True
             extra[k] = float(np.max(np.abs(gz[sel]))) * (b - a)
+        # Codex D2-12: a step or an extra that is not finite (a NaN gyro report in a suspect pair) would poison every
+        # later prefix sum, also for windows that do not hold the pair: kept out of the sums, an error of ITS pair
+        bad = ~(np.isfinite(d) & np.isfinite(extra))
+        err |= bad
+        d = np.where(bad, 0.0, d)
+        extra = np.where(bad, 0.0, extra)
         self.cP = np.concatenate([[0.0], np.cumsum(np.where(d > 0, d, 0.0) + extra)])
         self.cN = np.concatenate([[0.0], np.cumsum(np.where(d > 0, 0.0, -d) + extra)])
         self.cE = np.concatenate([[0], np.cumsum(err)])
@@ -196,7 +210,10 @@ class UNode:
         parts.update(P_bar=Pb, N_bar=Nb, t_bar_W=self.tb)
         if why:
             return None, parts, why
-        return float(sum(parts[k] for k in ('thang', 'troi', 'q', 'tre', 'tre_W', 'noi', 'noi_W', 'chuyen'))), parts, []
+        U = float(sum(parts[k] for k in ('thang', 'troi', 'q', 'tre', 'tre_W', 'noi', 'noi_W', 'chuyen')))
+        if not math.isfinite(U):                         # D2-12: never a bound that is not a number
+            return None, parts, ['U_IMU,D not finite (a term is not a number)']
+        return U, parts, []
 
 
 # ── camera frames ────────────────────────────────────────────────────────────────────────────────
@@ -267,14 +284,17 @@ def hang(a):
     for k in range(len(gio.get('nodes_s') or [])):
         sp = os.path.join(a.luoi_dir, f'nut_{k:03d}.json')
         rp = os.path.join(a.luoi_dir, f'nut_{k:03d}_rows.csv')
-        if not (os.path.isfile(sp) and os.path.isfile(rp)):
-            nodes.append(dict(nut=k, dung=False, ly_do='no score or rows file'))
+        if not os.path.isfile(sp):
+            nodes.append(dict(nut=k, dung=False, cham=False, ly_do='no score file'))
             continue
         sc = _read_json(sp)
         g = sc.get('gate_v3')
         if sc.get('outcome') == 'hong_he_do' or not isinstance(g, dict):
-            nodes.append(dict(nut=k, dung=False, ly_do=f'node not scored ({sc.get("outcome")})'))
+            nodes.append(dict(nut=k, dung=False, cham=False, ly_do=f'node not scored ({sc.get("outcome")})'))
             continue
+        # Codex D2-8: a scored node decides on its frames; without its rows file they are not known
+        if not os.path.isfile(rp):
+            raise D2Error(f'node {k}: scored, but no rows file {rp}: its deciding frames cannot be listed')
         if sc.get('frames_sha256') != sha['frames'] or sc.get('esp32_sha256') != sha['esp32'] \
                 or (sc.get('gio_c8b') or {}).get('sha256') != sha['gio'] \
                 or (sc.get('hang_so') or {}).get('sha256') != sha['hang_so']:
@@ -282,6 +302,9 @@ def hang(a):
         ktd = sc.get('khung_tuong_doi_v1') or {}
         if ((ktd.get('nguon') or {}).get('tham_chieu_v1') or {}).get('sha256') != sha['tham_chieu']:
             raise D2Error(f'node {k}: scored with another tham_chieu_v1 than {a.tham_chieu}')
+        rows_sha = cu.sha256(rp)
+        if ktd.get('rows_sha256') != rows_sha:           # Codex D2-6
+            raise D2Error(f'node {k}: {rp} is not the rows file the scorer wrote (rows_sha256 of the node score)')
         D = _f(sc['gio_c8b'].get('D'))
         t0 = _f(sc.get('t0_log_us')) * 1e-6
         if not (math.isfinite(D) and math.isfinite(t0)):
@@ -296,24 +319,30 @@ def hang(a):
         psi_tc = _f(ktd.get('psi_tc_rad'))
         t_W = np.array([cam['t_of'][i] for i in W]) + D
         pw = cu.interp_yaw(S, t_W)
-        if not np.all(np.isfinite(pw)) or not yc.get('compared'):
-            nodes.append(dict(nut=k, dung=False, ly_do='IMU yaw missing at a W frame or the yaw not compared'))
-            continue
-        m_W = ck.trung_binh_go_vong(pw)
-        c = float(_wrap(psi_tc - m_W))
-        c_sc = math.radians(_f(yc.get('align_c_deg')))
-        if not abs(float(_wrap(c - c_sc))) <= TOL_C_RAD:
-            raise D2Error(f'node {k}: wrap(psi_tc - m_W) {c!r} is not the scorer alignment {c_sc!r} (self-check)')
-        u_imu_sc = math.radians(_f(yc.get('U_IMU_deg')))
-        u_psi = math.radians(_f(g.get('u_psi_deg')))
+        # a scored node that cannot compare gives its rows with d and the bounds empty (D2-8)
+        so = bool(np.all(np.isfinite(pw)) and yc.get('compared'))
+        khong_so = None if so else 'IMU yaw missing at a W frame or the yaw not compared at this node'
         u_t = _f(sc.get('U_t_s'))
-        if not (math.isfinite(u_psi) and math.isfinite(u_t) and u_t >= 0):
-            raise D2Error(f'node {k}: gate u_psi_deg or U_t_s not finite')
-        UN = UNode(P3, S, t_W, [cam['om'].get(i, math.nan) for i in W], [cam['al'].get(i, math.nan) for i in W],
-                   u_t, u_t, turns)
+        c = None
+        if so:
+            m_W = ck.trung_binh_go_vong(pw)
+            c = float(_wrap(psi_tc - m_W))
+            c_sc = math.radians(_f(yc.get('align_c_deg')))
+            if not abs(float(_wrap(c - c_sc))) <= TOL_C_RAD:
+                raise D2Error(f'node {k}: wrap(psi_tc - m_W) {c!r} is not the scorer alignment {c_sc!r} (self-check)')
+            u_imu_sc = math.radians(_f(yc.get('U_IMU_deg')))
+            u_psi = math.radians(_f(g.get('u_psi_deg')))
+            if not (math.isfinite(u_psi) and math.isfinite(u_t) and u_t >= 0):
+                raise D2Error(f'node {k}: gate u_psi_deg or U_t_s not finite')
+            UN = UNode(P3, S, t_W, [cam['om'].get(i, math.nan) for i in W],
+                       [cam['al'].get(i, math.nan) for i in W], u_t, u_t, turns)
         with open(rp, newline='', encoding='utf-8') as f:
             rows = list(csv.DictReader(f))
-        nk = dict(nut=k, dung=True, D_s=D, U_t_s=u_t, align_c_rad=c, n_hang=0, n_d=0, n_U=0)
+        if rows and 'mien_hop' not in rows[0]:
+            raise D2Error(f'node {k}: rows without mien_hop (the deciding domain of the frames, D2-8)')
+        nk = dict(nut=k, dung=so, cham=True, D_s=D, U_t_s=u_t if math.isfinite(u_t) else None, align_c_rad=c,
+                  n_hang=0, n_d=0, n_U=0,
+                  score_sha256=cu.sha256(sp), rows_sha256=rows_sha, **({} if so else dict(ly_do=khong_so)))
         for r in rows:
             fid = _f(r.get('frame_id'))
             tcam = _f(r.get('t_cam_s'))
@@ -331,6 +360,14 @@ def hang(a):
             t_log = tcam + D
             if abs((t_log - t0) - _f(r.get('t'))) > 1e-6:
                 raise D2Error(f'node {k} frame {fid}: rows t is not t_cam + D - t0')
+            if r['mien_hop'] not in ('0', '1'):
+                raise D2Error(f'node {k} frame {fid}: mien_hop {r["mien_hop"]!r}')
+            if not so:
+                out.append(dict(luot=a.luot, tap='dich', id=fid, nut=k, x_m=repr(x), y_m=repr(y), psi_rad=repr(psi),
+                                u_mps=repr(abs(u)), lan_lap_id=a.lan_lap, d_rad='', U_psi_rad='', U_imu_rad='',
+                                mien_hop=r['mien_hop'], controller=gio.get('controller') or '', ly_do=khong_so))
+                nk['n_hang'] += 1
+                continue
             why = []
             pk = float(cu.interp_yaw(S, np.array([t_log]))[0])
             dm = _f(r.get('dpsi_ma'))
@@ -349,7 +386,7 @@ def hang(a):
             out.append(dict(luot=a.luot, tap='dich', id=fid, nut=k, x_m=repr(x), y_m=repr(y), psi_rad=repr(psi),
                             u_mps=repr(abs(u)), lan_lap_id=a.lan_lap, d_rad='' if d is None else repr(d),
                             U_psi_rad='' if up_ is None else repr(up_), U_imu_rad='' if Ui is None else repr(Ui),
-                            controller=gio.get('controller') or '', ly_do='; '.join(why)))
+                            mien_hop=r['mien_hop'], controller=gio.get('controller') or '', ly_do='; '.join(why)))
             nk['n_hang'] += 1
             nk['n_d'] += d is not None
             nk['n_U'] += Ui is not None
@@ -437,7 +474,8 @@ def main(argv=None):
     h = sub.add_parser('hang')
     for k in ('--luot', '--luoi-dir', '--gio', '--frames', '--esp32', '--hang-so', '--tham-chieu', '--u-imu', '--out'):
         h.add_argument(k, required=True)
-    h.add_argument('--lan-lap', default='L0')
+    h.add_argument('--lan-lap', required=True,
+                   help='mounting id of the run, one name per mounting over the whole C8 (e.g. <session>/L0)')
     n = sub.add_parser('noi-loo')
     n.add_argument('--cap', action='append', required=True, help='frames.csv,log.csv,offset_s,run')
     n.add_argument('--dich', action='append', required=True)
@@ -469,6 +507,12 @@ def main(argv=None):
                 src.append(dict(luot=parts[3], frames=os.path.abspath(parts[0]), frames_sha256=cu.sha256(parts[0]),
                                 log=os.path.abspath(parts[1]), log_sha256=cu.sha256(parts[1]),
                                 offset_s=float(parts[2])))
+            for key in ('frames_sha256', 'log_sha256'):      # Codex D2-13: one capture under two run names would
+                seen = {}                                    # stay in the table that leaves 'its' run out
+                for x in src:
+                    if seen.setdefault(x[key], x['luot']) != x['luot']:
+                        raise D2Error(f'--cap: runs {seen[x[key]]} and {x["luot"]} have the same {key[:-7]} file: '
+                                      'leaving one out would keep its data under the other name')
             os.makedirs(a.out_dir, exist_ok=True)
             for r, tb in noi_loo(caps, a.dich, P).items():
                 tb.update(nguon=[x for x in src if x['luot'] != r],

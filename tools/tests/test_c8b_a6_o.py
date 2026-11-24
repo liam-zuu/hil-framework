@@ -160,3 +160,88 @@ def test_d2_mask_cells_not_whole_file(tmp_path):
     assert ok['trang_thai'] == 'truot' and 'mat_na' not in ok
     assert O.build(_parse(_rows(n=3, tap='khop', luot='c1') + _rows(n=3, tap='kiem', luot='c2'), tmp_path, 'e.csv'),
                    'd2', 'cho', KHOA, CHO)['trang_thai'] == 'thieu'           # no target run, no cell
+
+
+# ── Codex D2 round 1 (24/11 khuya): the cells on the deciding frames, every deciding node compares (D2-8) ─────────
+
+def _parse_mh(rows, tmp_path, name='rows_mh.csv'):
+    p = tmp_path / name
+    with open(p, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['mien_hop', 'controller'])
+        w.writeheader()
+        w.writerows(rows)
+    return O.read_rows(str(p))
+
+
+def _dich(mh=None, **kw):
+    """Target rows with mien_hop 1 everywhere; mh {(i, node): '0' | '1'} overrides."""
+    kw.setdefault('s0', 100)
+    rows = _rows(tap='dich', luot='r1', **kw)
+    for r in rows:
+        r['mien_hop'] = (mh or {}).get((int(r['id']) - kw['s0'], r['nut']), '1')
+    return rows
+
+
+def _d2(tmp_path, dich, name='rows_mh.csv'):
+    rows = _parse_mh(dich + _rows(n=3, tap='khop', luot='c1') + _rows(n=3, tap='kiem', luot='c2'), tmp_path, name)
+    return O.build(rows, 'd2', 'cho', KHOA, CHO)
+
+
+def test_d2_counts_only_frames_that_can_decide(tmp_path):
+    # ten ids, one of them in no deciding domain at any node: nine ids, the cell is short of samples
+    o = _d2(tmp_path, _dich(n=10, mh={(9, '0'): '0', (9, '1'): '0'}))
+    c = o['o'][0]
+    assert c['n_id'] == 9 and c['n_tho'] == 9 and not c['dat']
+    m = o['mat_na']
+    assert m['o_dat'] == [] and m['khung_mo'] == [] and m['n_ngoai_mien_quyet'] == 1 and m['ngoai_dai_u'] == []
+    assert m['o_thieu'][0]['ly_do'] == ['thieu_mau']
+    # ten deciding ids: dat; the id that decides nowhere is not in the mask either
+    o = _d2(tmp_path, _dich(n=11, mh={(10, '0'): '0', (10, '1'): '0'}), 'b.csv')
+    assert o['o'][0]['dat'] and o['o'][0]['n_id'] == 10
+    assert o['mat_na']['khung_mo'] == [['r1', 100 + i] for i in range(10)]
+
+
+def test_d2_every_deciding_node_must_compare(tmp_path):
+    # id 3 has no comparison at node 1: where it cannot decide there, it is still comparable; where it can, thieu
+    o = _d2(tmp_path, _dich(n=12, missing={(3, '1')}, mh={(3, '1'): '0'}))
+    assert o['o'][0]['dat'] and o['o'][0]['n_id'] == 12 and o['o'][0]['n_thieu'] == 0
+    o = _d2(tmp_path, _dich(n=12, missing={(3, '1')}), 'b.csv')
+    c = o['o'][0]
+    assert not c['dat'] and c['n_id'] == 11 and c['n_thieu'] == 1 and c['thieu_ids'] == [['r1', 103]]
+    assert o['mat_na']['o_thieu'][0]['ly_do'] == ['thieu_id'] and o['mat_na']['khung_mo'] == []
+    # the A6 held-out rows have no mien_hop column: every node counts, as before
+    r = _all(tmp_path, _rows(missing={(3, '1')}))
+    assert O.build(r, 'giu_ngoai_a6', 'cho', KHOA, CHO)['o'][0]['n_thieu'] == 1
+
+
+def test_d2_worst_node_over_every_comparison(tmp_path):
+    # id 5 is over the bound at node 1, where it cannot decide: the comparison still counts (the largest |d|)
+    rows = _dich(n=12, mh={(5, '1'): '0'})
+    for r in rows:
+        if r['id'] == '105' and r['nut'] == '1':
+            r['d_rad'] = 0.006
+    o = _d2(tmp_path, rows)
+    c = o['o'][0]
+    assert not c['dat'] and c['ty_le_max'] == pytest.approx(1.2) and c['id_xau'] == ['r1', 105, '1']
+    assert o['mat_na']['o_thieu'][0]['ly_do'] == ['vuot']
+
+
+def test_d2_mien_hop_values_and_bands_of_the_code(tmp_path):
+    rows = _dich(n=12)
+    rows[0]['mien_hop'] = 'x'
+    with pytest.raises(O.OError, match='mien_hop'):
+        _d2(tmp_path, rows)
+    # D2-15: the D2 bands are those of the code, not of the command line
+    p = tmp_path / 'r.csv'
+    with open(p, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['mien_hop', 'controller'])
+        w.writeheader()
+        w.writerows(_dich(n=12) + _rows(n=3, tap='khop', luot='c1') + _rows(n=3, tap='kiem', luot='c2'))
+    k = tmp_path / 'khoa.json'
+    k.write_text(json.dumps(LOCK), encoding='utf-8')
+    base = ['--rows', str(p), '--muc-dich', 'd2', '--giu-ngoai-theo', 'cho', '--khoa-truoc', str(k)]
+    assert O.main(base + ['--dai-u', '0,0.4,1.5', '--out', str(tmp_path / 'o1.json')]) == 2
+    assert O.main(base + ['--dai-u', '0,0.3,0.6,1.0,1.5', '--out', str(tmp_path / 'o2.json')]) == 0
+    assert O.main(base + ['--out', str(tmp_path / 'o3.json')]) == 0
+    assert O.main(['--rows', str(p), '--muc-dich', 'giu_ngoai_a6', '--giu-ngoai-theo', 'cho', '--khoa-truoc', str(k),
+                   '--dai-u', '0,0.4,1.5', '--out', str(tmp_path / 'o4.json')]) == 0     # the A6 check may set them

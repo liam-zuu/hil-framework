@@ -89,3 +89,69 @@ def test_noi_loo_leaves_the_target_out(tmp_path):
             pytest.approx({k: v['max_rad'] for k, v in want['bang'].items()})
     with pytest.raises(DH.D2Error):
         DH.noi_loo(caps, ['r7'], P)                                    # a target without its capture
+
+
+# ── Codex D2 round 1 (24/11 khuya) ───────────────────────────────────────────────────────────────────────────────
+
+def test_turn_sums_nan_gyro_outside_the_window(tmp_path):
+    """D2-12: a NaN gyro report inside a suspect pair must not reach the totals of a window that does not hold the
+    pair (the prefix sums carried it into every later window); a window holding the pair is an error, not a NaN."""
+    p = str(tmp_path / 'd.csv')
+    TV.T.make_log(p, TV._rate, TV.A + 9.0, run=(TV.A, TV.A + 8.0), miss=[100, 101, 150], gyro_miss=())
+    S = V.rv_samples_age(U.load_log(p))
+    ta, tr, na = S['t_all'], S['t_recv'], S['n_all']
+    k = int(np.argmax(np.diff(na) > 1))                             # the first suspect pair
+    a, b = min(ta[k], tr[k]), max(ta[k + 1], tr[k + 1])
+    j = int(np.searchsorted(S['tg'], 0.5 * (a + b)))
+    S2 = dict(S, gz=S['gz'].copy())
+    S2['gz'][j] = np.nan
+    ts = DH.TurnSums(S2)
+    assert ts.mono
+    for w0, w1 in ((b + 0.2, b + 1.0), (b + 0.3, S['t_all'][-1] - 0.1)):   # after the pair
+        got = ts(w0, w1)
+        assert all(math.isfinite(x) for x in got) and got == pytest.approx(U.turn_totals(S, w0, w1), abs=1e-12)
+    with pytest.raises(U.InputError):
+        ts(a - 0.1, b + 0.1)
+
+
+def test_unode_never_gives_a_bound_that_is_not_a_number(tmp_path):
+    """D2-12: a term that is not finite gives no bound (None with a reason), never NaN in the rows."""
+    S, _ = TV._S(tmp_path)
+    t_W = np.array([TV.A - 1.0, TV.A - 0.95, TV.A - 0.9, TV.A - 0.85])
+    P3 = dict(TV._P3())
+    assert DH.UNode(P3, S, t_W, np.zeros(4), np.zeros(4), 0.01, 0.01)(TV.A + 2.0, 1.0, 0.0)[0] is not None
+    P3['q'] = math.nan
+    U_, _, why = DH.UNode(P3, S, t_W, np.zeros(4), np.zeros(4), 0.01, 0.01)(TV.A + 2.0, 1.0, 0.0)
+    assert U_ is None and any('not finite' in w for w in why)
+
+
+def test_noi_loo_one_capture_under_two_names_refused(tmp_path):
+    """D2-13: the same frames or log file given as two runs would stay in the table that leaves 'its' run out."""
+    import json
+    fps, lps = [], []
+    for i, w in enumerate((0.5, 1.0)):
+        p = str(tmp_path / f'l{i}.csv')
+        TV.T.make_log(p, lambda t, w=w: w if TV.A <= t < TV.A + 3.0 else 0.0, TV.A + 6.0, run=(TV.A, TV.A + 5.0))
+        fp = str(tmp_path / f'f{i}.csv')
+        TV.T.write_frames(fp, lambda t, w=w: w if TV.A <= t < TV.A + 3.0 else 0.0, 10.0, TV.A + 6.0, offset=0.5,
+                          psi0=0.0)
+        fps.append(fp)
+        lps.append(p)
+    th, tr = tmp_path / 'thang.json', tmp_path / 'tre.json'
+    th.write_text(json.dumps(dict(s_plus=0.0, s_minus=0.0)), encoding='utf-8')
+    tr.write_text(json.dumps(dict(tau_hat_s=0.0)), encoding='utf-8')
+
+    def chay(caps, out):
+        return DH.main(['noi-loo'] + sum((['--cap', c] for c in caps), []) + ['--dich', 'r0', '--thang', str(th),
+                                                                             '--tre', str(tr), '--out-dir', str(out)])
+    assert chay([f'{fps[0]},{lps[0]},0.5,r0', f'{fps[1]},{lps[1]},0.5,r1'], tmp_path / 'a') == 0
+    assert chay([f'{fps[0]},{lps[0]},0.5,r0', f'{fps[0]},{lps[0]},0.5,r0_alias'], tmp_path / 'b') == 2
+    assert chay([f'{fps[0]},{lps[0]},0.5,r0', f'{fps[1]},{lps[0]},0.5,r1'], tmp_path / 'c') == 2     # the same log
+
+
+def test_hang_needs_a_mounting_name():
+    """D2-15: no default mounting id (two mountings under one name would be counted in one cell)."""
+    with pytest.raises(SystemExit):
+        DH.main(['hang', '--luot', 'R', '--luoi-dir', 'x', '--gio', 'g', '--frames', 'f', '--esp32', 'e',
+                 '--hang-so', 'h', '--tham-chieu', 't', '--u-imu', 'u', '--out', 'o'])
+    assert 'mien_hop' in DH.COLS

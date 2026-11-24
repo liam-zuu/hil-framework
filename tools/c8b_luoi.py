@@ -664,6 +664,12 @@ def main(argv=None):
             res['mat_na_d2'] = mn_d2                     # None when the clock file is not bounded (no node used)
         res.update(version=VERSION, task=task, nodes_s=gio.get('nodes_s', []), gio_sha256=cu.sha256(a.gio),
                    gate_file_sha256=gsha, script=c8b_gio.repo_state(), scorer=prov_scorer)
+        if a.mat_na_d2:
+            # Codex D2-1, D2-2 (C8B 24/11 khuya): the masked grid against luoi.json of the same folder: the same chain
+            # fields, and no conclusion made by the mask; luoi.json named with its sha
+            import c8b_mat_na_d2 as md2
+            goc = md2.goc_luoi(os.path.join(a.out_dir, 'luoi.json'), _clean(res))
+            res['luoi_goc'] = goc
         os.makedirs(a.out_dir, exist_ok=True)
         out = os.path.join(a.out_dir, 'luoi_d2.json' if a.mat_na_d2 else 'luoi.json')
         with open(out, 'x', encoding='utf-8') as f:

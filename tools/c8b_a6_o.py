@@ -96,11 +96,20 @@ def read_rows(path):
         ui = _f(r['U_imu_rad'], f'{w} U_imu_rad', empty_ok=True)
         if (up is not None and up < 0) or (ui is not None and ui < 0):
             raise OError(f'{w}: negative bound')
+        # mien_hop (optional column, c8b_d2_hang; Codex D2-8): 1 = the frame is in the deciding (union) domain of
+        # that node; without the column every row counts as deciding (the A6 held-out rows)
+        mh = r.get('mien_hop')
+        if mh not in (None, '', '0', '1'):
+            raise OError(f'{w}: mien_hop {mh!r}')
         out.append(dict(luot=r['luot'], tap=r['tap'], id=int(r['id']), nut=r['nut'], x=_f(r['x_m'], f'{w} x_m'),
                         y=_f(r['y_m'], f'{w} y_m'), psi=_f(r['psi_rad'], f'{w} psi_rad'),
                         u=_f(r['u_mps'], f'{w} u_mps'), lan=r['lan_lap_id'], d=d, up=up, ui=ui,
-                        ctrl=r.get('controller') or ''))
+                        ctrl=r.get('controller') or '', mh=mh != '0'))
     return out
+
+
+def _so_duoc(x):
+    return x['d'] is not None and x['up'] is not None and x['ui'] is not None and x['up'] + x['ui'] > 0
 
 
 def cell_of(x, y, psi, u, lan, dai_u=DAI_U):
@@ -135,27 +144,35 @@ def build(rows, muc_dich, giu_ngoai_theo, khoa_sha, cho_sha, dai_u=DAI_U):
         if r['tap'] != use:
             continue
         per.setdefault((r['luot'], r['id']), []).append(r)
-    cells, outside = {}, 0
-    for (luot, fid), rs in per.items():
+    cells, outside, ngoai_mien = {}, 0, 0
+    for (luot, fid), rs in list(per.items()):
         c0 = rs[0]
         if any((x['x'], x['y'], x['psi'], x['u'], x['lan']) != (c0['x'], c0['y'], c0['psi'], c0['u'], c0['lan'])
                for x in rs):
             raise OError(f'run {luot} id {fid}: pose / u / mounting differ between nodes (one frame, one pose)')
+        # D2 (design 0.4 "tren toan mien quyet", 7c "khung co the quyet"; Codex D2-8): the cells are built on the
+        # frames that can decide at some node; such a frame is comparable only when EVERY node where it can decide
+        # compares it (a node where it cannot decide need not); its worst node is over every node that compares it.
+        # A frame that can decide nowhere is in no cell and not in the mask (masking it changes nothing).
+        need = [x for x in rs if x['mh']] if muc_dich == 'd2' else rs
+        if not need:
+            ngoai_mien += 1
+            del per[(luot, fid)]
+            continue
         key = cell_of(c0['x'], c0['y'], c0['psi'], c0['u'], c0['lan'], dai_u)
         if key is None:
             outside += 1
             continue
         c = cells.setdefault(key, dict(ids=[], thieu=[], ctrl={}))
-        comp = all(x['d'] is not None and x['up'] is not None and x['ui'] is not None and x['up'] + x['ui'] > 0
-                   for x in rs)
-        if not comp:
+        if not all(_so_duoc(x) for x in need):
             c['thieu'].append([luot, fid])
             continue
-        worst = max(rs, key=lambda x: abs(x['d']) / (x['up'] + x['ui']))
+        co = [x for x in rs if _so_duoc(x)]
+        worst = max(co, key=lambda x: abs(x['d']) / (x['up'] + x['ui']))
         ratio = abs(worst['d']) / (worst['up'] + worst['ui'])
         c['ids'].append(dict(luot=luot, id=fid, ratio=ratio, d=worst['d'], up=worst['up'], ui=worst['ui'],
                              nut=worst['nut']))
-        c['ctrl'].setdefault(c0['ctrl'], []).append(max((x['d'] for x in rs), key=abs))
+        c['ctrl'].setdefault(c0['ctrl'], []).append(max((x['d'] for x in co), key=abs))
     o = []
     for key, c in sorted(cells.items(), key=lambda kv: str(kv[0])):
         w = max(c['ids'], key=lambda z: z['ratio']) if c['ids'] else None
@@ -199,10 +216,12 @@ def build(rows, muc_dich, giu_ngoai_theo, khoa_sha, cho_sha, dai_u=DAI_U):
         mo.sort()
         mat_na = dict(o_dat=[c['o_id'] for c in o if c['dat']], khung_mo=mo,
                       o_thieu=[dict(o_id=c['o_id'], ly_do=ly_do(c)) for c in o if not c['dat']],
-                      ngoai_dai_u=ngoai,
+                      ngoai_dai_u=ngoai, n_ngoai_mien_quyet=ngoai_mien,
                       quy_tac='khung co o khong nam trong o_dat (o vuot, thieu mau, thieu id) hay ngoai dai u -> '
                               'n_undef cho G4, G5 va moi dai luong vi tri qua q (thiet ke C8b v7 7c dong 166); o cua '
-                              'khung theo cell_of (x, y, psi, u, lan_lap_id) va khoa_o')
+                              'khung theo cell_of (x, y, psi, u, lan_lap_id) va khoa_o; o dung tren khung nam trong '
+                              'mien hop o it nhat mot nut (mien_hop), ID so duoc khi moi nut ma khung nam trong mien '
+                              'hop deu so duoc (D2-8)')
         st = 'dat' if o else 'thieu'
     elif not o:
         st = 'thieu'
@@ -237,6 +256,10 @@ def main(argv=None):
         dai = DAI_U if a.dai_u is None else tuple(float(x) for x in a.dai_u.split(','))
         if len(dai) < 2 or any(b <= x for x, b in zip(dai, dai[1:])):
             raise OError(f'--dai-u {a.dai_u!r}: increasing edges')
+        if a.muc_dich == 'd2' and tuple(dai) != DAI_U:
+            # Codex D2-15 (D1: the cell rule locked before the data is seen): the D2 cells are those of this file at
+            # the scoring commit (O_M, CUNG_DEG, DAI_U, N_ID_MIN in khoa_o), never chosen on the command line
+            raise OError(f'--dai-u {a.dai_u!r} with d2: the D2 bands are {DAI_U} of the code at the scoring commit')
         cu.check_path(a.khoa_truoc)
         rows = read_rows(a.rows)
         out = build(rows, a.muc_dich, a.giu_ngoai_theo, cu.sha256(a.khoa_truoc), [cu.sha256(p) for p in a.cho_file],
