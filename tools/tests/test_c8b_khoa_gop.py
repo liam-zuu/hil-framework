@@ -77,6 +77,10 @@ def test_largest_terms_states_hull_sources():
     assert k['u_beta_cam_deg'] == dict(goc=1.174, K1=None, K2=None)
     assert k['u_beta_cam_trang_thai'] == dict(goc='dat', K1='thieu', K2='thieu')     # what c7_score reads
     assert k['mien_car_pose']['kappa'] == [0.0413, 0.0531]
+    mb = k['mien_car_pose_theo_buoi']                       # KG-5: per session, keyed by the gate's session id
+    assert sorted(mb) == ['C8_2026-11-20_run02', 'C8_2026-11-23_run03']
+    assert mb['C8_2026-11-23_run03']['kappa'] == [0.0414, 0.0530] and set(mb['C8_2026-11-20_run02']) == {
+        'side_m', 'phien_ban', 'h_m', 'kappa'}
     assert k['trang_thai'] == 'khoa' and k['version'] == K.VERSION and k['commit_hil'] == CH
     vai = [n['vai'] for n in k['khoa_truoc']['nguon']]
     assert vai.count('a6') == 1 and vai.count('ke_hoach_c8') == 1 and vai.count('session') == 2

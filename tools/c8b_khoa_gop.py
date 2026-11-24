@@ -22,7 +22,9 @@ Rules (a field not named here must be the same in every session lock, else refus
            a6, one ke_hoach_c8, one truc_xe (the F7 whose u_phi_hat the scorer reads: Codex KG-2, KG-3).
   limits   the largest of each band field is taken alone: the merged P4_m bounds every session's P4_m (the number
            the gate copies), but P6_rieng_ii_m, P4_tay_don_m of the merged band need not add up to it (Codex KG-4).
-           The kappa hull admits a camera setting inside the hull but outside one session's range (Codex KG-5).
+           The kappa hull admits a camera setting inside the hull but outside one session's range (Codex KG-5): the
+           per-session domains are kept as mien_car_pose_theo_buoi {C8_<session>: {side_m, phien_ban, h_m, kappa}}
+           for the gate (CODE 24/11 khuya).
   hull     mien_car_pose.kappa = [min lo, max hi] (each session's frames lie in its own range; an intersection would
            drop valid frames at the edges) [DE XUAT, CODE chot]; side_m, phien_ban, h_m the same.
   per      fields that only explain a session's numbers (muc.<lv>.hang_dong_thanh_phan, hang_dong_ly_do,
@@ -262,6 +264,11 @@ def gop(khoa_buoi, commit_hil, script=None, nguon_khoa=None):
         else:
             mc[q] = _same(qv, f'mien_car_pose.{q}')
     out['mien_car_pose'] = mc
+    # KG-5 (CODE 24/11 khuya): the domain of EACH session, keyed by the gate's session id (C8_<session folder>), so the
+    # gate checks a camera setting against the domain of its own session too
+    out['mien_car_pose_theo_buoi'] = {f'C8_{b}': {q: copy.deepcopy(k['mien_car_pose'][q])
+                                                 for q in ('side_m', 'phien_ban', 'h_m', 'kappa')}
+                                      for b, k in khoa_buoi}
     # sources: one A6, one plan
     src, seen = [], set()
     for b, k in khoa_buoi:
