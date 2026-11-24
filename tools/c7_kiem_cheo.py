@@ -3076,6 +3076,8 @@ def e_hieu(a):
          f"{sum(x['trang_thai'] == 'dat' for x in legs)} doan dat; trang_thai {out['trang_thai']}")
 
 
+KHUNG_CSV_COLS = ('luot_id', 'khung', 't_s', 'la_W', 'sau_W', 'trang_thai', 'dx_m', 'dy_m', 'dpsi_rad', 'n_R',
+                  'ly_do')                      # neo_luot --khung-csv (C8B D3 replay_neo, CODE 24/11)
 NEO_LUOT_SCHEMA = 'c7_neo_luot_v1'            # P_neo / A_neo (S7-13 KS7B-3, S7-14.5; CODE 23/11 T12 chot section 5)
 GATE_KEYS = ('min_marks', 'rms_extra_px', 'car_res_sim_m', 'scale_rel', 'scale_win_s', 'scale_min')
 RATIO_WHY = ('ti_le', 'ti_le_it_lan_can')      # (2b) verdicts of c7_measure.apply_gates: a frame failing only these is
@@ -3120,7 +3122,7 @@ def _gate12(r, gates, rms_h):
     return why
 
 
-def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms_h, t_ref=None, kt=None):
+def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms_h, t_ref=None, kt=None, khung=None):
     """P_neo / A_neo of one C8 run (S7-14.5; CODE 23/11: the bound of hang_m covers EVERY frame t of the run). W = pre.
     For every valid frame t of the run (frames.csv valid with a tag pose, from the first W frame to the last post
     frame), R_t = (anchors common to every W frame) & S_t; the replay deviation of a frame f on R_t is e_f = TAG pose
@@ -3135,7 +3137,10 @@ def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms
     (c7_tuong_doi.mot_phia); R_t is usable only when EVERY W id of F2 replays, passes and the replayed W is still
     (c7_tuong_doi._stillness, F2 thresholds). The caller requires the F2 pre conclusion du_mau and dat (KCP4V4-1).
     A valid frame whose R_t is not usable makes the run not concluded (KCP4V4-2, diagnostic max kept). KCP4-2: at
-    least one valid replayed frame AFTER the last W frame. Returns (dict, reason)."""
+    least one valid replayed frame AFTER the last W frame. Returns (dict, reason).
+    khung (C8B D3 replay_neo, CODE 24/11): a dict filled IN PLACE, without changing the result, with one record per
+    frame of the run reached by the frame loop: hop_le (the signed e_t - mean_W: dx_m, dy_m, dpsi_rad wrapped, whose
+    hypot / abs are the values maximised), mat_W (valid but no W on R_t, reason) or khong_hop_le (reason)."""
     import c7_tuong_doi as td                      # CAM: one-sided gate of the reference window
     if not ids_w or not ids_post:
         return None, 'cua so khong co khung'
@@ -3285,15 +3290,24 @@ def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms
         if isinstance(m, str):
             bad[t] = m
             mat_w.append(t)
+            if khung is not None:
+                khung[t] = dict(trang_thai='mat_W', n_R=len(ref), ly_do=m)
             continue
         dd = et - m
         p, ang = float(math.hypot(dd[0], dd[1])), abs(float(cm.cp_wrap(dd[2])))
+        if khung is not None:
+            khung[t] = dict(trang_thai='hop_le', dx_m=float(dd[0]), dy_m=float(dd[1]),
+                            dpsi_rad=float(cm.cp_wrap(dd[2])), n_R=len(ref))
         n_ok += 1
         n_sau += t > wmax
         if f_p is None or p > best_p:
             best_p, f_p = p, t
         if f_a is None or ang > best_a:
             best_a, f_a = ang, t
+    if khung is not None:                           # D3: every run frame gets a record; time and window role added
+        for t in run:
+            khung.setdefault(t, dict(trang_thai='khong_hop_le', ly_do=bad.get(t, '')))
+            khung[t].update(t_s=t_csv.get(t, float('nan')), la_W=t in W_ids, sau_W=t > wmax)
     info = dict(n_khung=len(run), n_khung_hop_le=n_ok, n_khung_sau_W=n_sau, n_khung_khong_hop_le=len(bad),
                 khong_hop_le=[dict(khung=k, ly_do=v) for k, v in sorted(bad.items())], n_khung_lan_can=len(ctx),
                 n_tap_chung=len(cache), tap_W=sorted(W), lech_phat_lai_max_m=rep_dev,
@@ -3347,7 +3361,13 @@ def neo_luot(a):
     P_neo_m / A_neo_rad = max over the valid frames t of the run of |replay deviation at t - mean replay deviation
     over W = pre| (position / heading), before margin; info.hai_dau keeps post - pre (iii_leg). A run whose replay
     cannot be made: chua_ket_luan + reason (the other runs kept). theo_cho: max over the runs of each place; not dat
-    when a run of the place is not."""
+    when a run of the place is not.
+    --khung-csv (C8B D3 replay_neo, CODE 24/11): also writes one row per frame of every replayed run (KHUNG_CSV_COLS:
+    signed deviation of the hop_le frames, reason of the others); the JSON result is the same bytes with or without."""
+    kh_csv = getattr(a, 'khung_csv', None)
+    if kh_csv and os.path.exists(kh_csv):
+        raise KCError(f'{kh_csv} exists: not replaced')
+    kh_rows = []
     with open(a.cua_so, 'rb') as f:
         cb = f.read()
     cs_sha = hashlib.sha256(cb).hexdigest()                     # KCF1-7: hash of the bytes parsed
@@ -3442,8 +3462,11 @@ def neo_luot(a):
                         raise KCError(f'{lid}: track.json without the gates {GATE_KEYS}')
                     gates = cm.check_gates({k: g_tr[k] for k in GATE_KEYS})
                     fp_ = FramePoses(s, pc)
+                    kh = {} if kh_csv else None
                     res, w3 = neo_run(fp_, rows, dets, ids['pre'], ids['post'], *cfg, gates, float(s['rms_px_H']),
-                                      t_ref=pre.get('t_canh_s'), kt=pre.get('nguong'))
+                                      t_ref=pre.get('t_canh_s'), kt=pre.get('nguong'), khung=kh)
+                    for t_, v_ in sorted((kh or {}).items()):
+                        kh_rows.append(dict(v_, luot_id=lid, khung=t_))
                     if w3:
                         why.append(w3)
                         rec['info'] = (res or {}).get('info')
@@ -3503,6 +3526,13 @@ def neo_luot(a):
                          'info.hai_dau: so hai dau post - pre nhu e_hieu (iii), chi de doi chieu'],
                commit_hil=commit_hil())
     write_new(a.out, out)
+    if kh_csv:
+        def _w(f):
+            w = csv.DictWriter(f, fieldnames=KHUNG_CSV_COLS, extrasaction='raise', lineterminator='\n')
+            w.writeheader()
+            for r in kh_rows:
+                w.writerow({k: r.get(k, '') for k in KHUNG_CSV_COLS})
+        publish_new(kh_csv, _w)
     _say(f"neo_luot: {len(out_l)} luot, {sum(v['trang_thai'] == 'dat' for v in out_l.values())} dat; theo_cho "
          + ', '.join(f"{c} {v['trang_thai']}: P "
                      f"{'-' if v['P_neo_m'] is None else round(v['P_neo_m'] * 1000, 3)} mm, A "
@@ -3646,6 +3676,8 @@ def main(argv=None):
                    help='final track dir of a run (track.json, frames.csv; dets_file of track.json), repeated')
     n.add_argument('--session', action='append', required=True, help='scoring session(s) of the windows, repeated')
     n.add_argument('--out', required=True)
+    n.add_argument('--khung-csv', dest='khung_csv', default=None,
+                   help='also write the per-frame signed replay deviations (C8B D3 replay_neo); JSON unchanged')
     a = ap.parse_args(argv)
     try:
         {'phan_tich': phan_tich, 'xuat': xuat, 'kiem_h': kiem_h_cli, 'tung_khung': tung_khung, 'tien_de': tien_de,
