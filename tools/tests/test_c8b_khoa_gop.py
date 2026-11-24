@@ -27,9 +27,10 @@ def _khoa(s, ub_goc, kap=(0.0413, 0.0531), sess='d' * 64, buoi='x'):
                   hang_rad=K.LE * tr['hang_rad'], u_phi_rad=K.LE * UPH + math.radians(ub_goc))
         muc[lv] = dict(can_quay=dict(trang_thai='dat', p_m=0.004, psi_deg=0.6), man_trap=dict(nhanh='mot_khung'),
                        so_do=['g5'] if lv == 'O1-F08' else [],
-                       hang_theo_u=[dict(u_lo_m_s=0.0, u_hi_m_s=0.358, dai='B1', P4_m=0.007 * s, A4_deg=0.65,
+                       hang_theo_u=[dict(u_lo_m_s=0.0, u_hi_m_s=0.358, dai='B1', A4_deg=0.6,
+                                         P4_m=0.004 + K.LE * 0.003 * s + 0.04 * math.radians(0.6),   # Codex KG7-1
                                          P6_rieng_ii_m=0.003 * s, trang_thai='gioi_han',
-                                         P4_tay_don_m=0.04 * math.radians(0.65))],
+                                         P4_tay_don_m=0.04 * math.radians(0.6))],
                        hang_theo_u_ly_do=[], hang_dong=hd, hang_dong_truoc_le=tr,
                        hang_dong_thanh_phan=dict(W_n_luot=int(10 * s)), P4_tay_don=dict(L_m=0.04, ly_do=None),
                        hang_dong_ly_do=dict(a_m=None, hang_m=None, he_so_r=None, u_phi_rad=None, hang_rad=None),
@@ -50,8 +51,8 @@ def _khoa(s, ub_goc, kap=(0.0413, 0.0531), sess='d' * 64, buoi='x'):
                                        dict(vai='3b O1-F02', file='3b.json', sha256='5' * 64),
                                        dict(vai='truc_xe', file='tx.json', sha256='6' * 64),
                                        dict(vai='session', file='session.json', sha256=sess),
-                                       dict(vai='kiem_cheo', file='kc.json', sha256=sess[:-1] + 'k'),
-                                       dict(vai='tham_chieu goc', file='tc.json', sha256=sess[:-1] + 't')],
+                                       dict(vai='kiem_cheo', file='kc.json', sha256=sess[:-1] + 'a'),
+                                       dict(vai='tham_chieu goc', file='tc.json', sha256=sess[:-1] + 'b')],
                                 script=dict(commit=CH, dirty=False), commit_hil=CH, luc='2026-11-24T19:00:00+07:00'),
                 trang_thai='khoa', ly_do_chua_khoa=None)
 
@@ -70,7 +71,7 @@ def test_largest_terms_states_hull_sources():
     m = k['muc']['O1-F05']
     assert m['hang_dong']['hang_m'] == pytest.approx(K.LE * 0.019 * 1.02, rel=1e-12)
     assert m['hang_dong']['u_phi_rad'] == pytest.approx(K.LE * UPH + math.radians(1.174), rel=1e-12)
-    assert m['hang_theo_u'][0]['P4_m'] == pytest.approx(0.007 * 1.02)
+    assert m['hang_theo_u'][0]['P4_m'] == pytest.approx(0.004 + K.LE * 0.003 * 1.02 + 0.04 * math.radians(0.6))
     assert m['hang_theo_u'][0]['trang_thai'] == 'gioi_han'
     assert m['hang_dong_thanh_phan'] == dict(theo_buoi={'2026-11-20_run02': dict(W_n_luot=10),
                                                         '2026-11-23_run03': dict(W_n_luot=2)})

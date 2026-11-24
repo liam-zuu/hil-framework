@@ -958,6 +958,42 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
     return out
 
 
+def nguon_cheo(nguon, extra):
+    """Codex KG2-1, KG3-1 (24/11 khuya): the per-session files name the common sources they were made from; each must
+    be the one this lock uses, else the lock (and the combined lock) would hold numbers made from another threshold,
+    A6, xoay or F7 than the ones it names: tham_chieu_v1 xoay_sha256 = --xoay, truc_xe_sha256 (when written) = the F7
+    of its place (--truc-xe goc, --truc-xe-cho K1/K2); u_moc a6_sha256 = --a6; p6_dong nguon 'nguong' = --nguong and
+    its 'session' one of --session."""
+    sha = {}
+    for n in nguon:
+        sha.setdefault(n['vai'], set()).add(n['sha256'])
+
+    def one(vai):
+        s = sha.get(vai) or set()
+        return next(iter(s)) if len(s) == 1 else None
+    for cho, ds in (extra.get('tham_chieu') or {}).items():
+        f7 = one('truc_xe' if cho == 'goc' else f'truc_xe {cho}')
+        for d in ds:
+            if 'xoay' in sha and d.get('xoay_sha256') != one('xoay'):
+                raise KhoaError(f'--tham-chieu {cho}: xoay_sha256 {d.get("xoay_sha256")!r} is not the --xoay file')
+            if d.get('truc_xe_sha256') is not None and d.get('truc_xe_sha256') != f7:
+                raise KhoaError(f'--tham-chieu {cho}: truc_xe_sha256 {d.get("truc_xe_sha256")!r} is not the F7 of '
+                                f'{cho} of this lock ({f7!r}): the scorer would use another u_phi_hat')
+    for d in extra.get('u_moc') or []:
+        if 'a6' in sha and isinstance(d, dict) and d.get('a6_sha256') != one('a6'):
+            raise KhoaError(f'--u-moc: a6_sha256 {d.get("a6_sha256")!r} is not the --a6 file')
+    p6 = extra.get('p6_dong')
+    if isinstance(p6, dict):
+        src = {}
+        for n in p6.get('nguon') or []:
+            if isinstance(n, dict):
+                src.setdefault(n.get('vai'), set()).add(n.get('sha256'))
+        if 'nguong' in sha and src.get('nguong') != sha['nguong']:
+            raise KhoaError(f'--p6-dong: made with nguong {sorted(src.get("nguong") or [])}, not the --nguong file')
+        if 'session' in sha and not (src.get('session') or set()) <= sha['session']:
+            raise KhoaError('--p6-dong: made with a camera session that is not a --session of this lock')
+
+
 def script_state():
     import subprocess
     try:
@@ -1194,6 +1230,7 @@ def main(argv=None):
             txc[cho] = d
             nguon.append(dict(vai=f'truc_xe {cho}', file=os.path.basename(pth), duong_dan=os.path.abspath(pth),
                               sha256=cu.sha256(pth)))
+        nguon_cheo(nguon, extra)
         co_dd = any(isinstance(v.get('dau_doan'), list) and v['dau_doan'] for v in txc.values())
         if a.khung_12b or co_dd or any(v.get('trang_thai') != 'khoa' for v in txc.values()):
             extra['truc_xe_cho'] = txc

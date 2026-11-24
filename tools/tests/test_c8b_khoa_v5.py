@@ -891,3 +891,29 @@ def test_u_beta_cam_cho_rho_outside_a6_domain(monkeypatch):
     v, why, _ = K.u_beta_cam_cho(A6R, [], dict(doan1='kc1', doan2='kc2'), 'T1',
                                  dict(ref=dict(ref, rho_m=None), W=[dict(far, T_m=[0, 0], rho_m=0.5)]), 'goc')
     assert v is None and 'ref rho None' in why[0]
+
+
+def test_nguon_cheo_per_session_files_name_the_common_sources():
+    """Codex KG2-1, KG3-1 (24/11 khuya): a per-session file made from another threshold, A6, xoay or F7 is refused."""
+    ng = [dict(vai='nguong', sha256='n' * 64), dict(vai='a6', sha256='a' * 64), dict(vai='xoay', sha256='x' * 64),
+          dict(vai='truc_xe', sha256='f' * 64), dict(vai='session', sha256='s' * 64)]
+    ok = dict(tham_chieu=dict(goc=[dict(xoay_sha256='x' * 64, truc_xe_sha256=None)]),
+              u_moc=[dict(a6_sha256='a' * 64)],
+              p6_dong=dict(nguon=[dict(vai='nguong', sha256='n' * 64), dict(vai='session', sha256='s' * 64)]))
+    K.nguon_cheo(ng, ok)
+    ok['tham_chieu']['goc'][0]['truc_xe_sha256'] = 'f' * 64
+    K.nguon_cheo(ng, ok)
+    for bad in ('tc_xoay', 'tc_f7', 'u_moc', 'p6_nguong', 'p6_session'):
+        e = __import__('copy').deepcopy(ok)
+        if bad == 'tc_xoay':
+            e['tham_chieu']['goc'][0]['xoay_sha256'] = 'y' * 64
+        elif bad == 'tc_f7':
+            e['tham_chieu']['goc'][0]['truc_xe_sha256'] = 'g' * 64
+        elif bad == 'u_moc':
+            e['u_moc'][0]['a6_sha256'] = 'b' * 64
+        elif bad == 'p6_nguong':
+            e['p6_dong']['nguon'][0]['sha256'] = 'm' * 64
+        else:
+            e['p6_dong']['nguon'][1]['sha256'] = 't' * 64
+        with pytest.raises(K.KhoaError):
+            K.nguon_cheo(ng, e)
