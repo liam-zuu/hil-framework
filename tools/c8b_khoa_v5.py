@@ -278,7 +278,7 @@ def hang_dong_tinh(src, side):
     hs = src.get('he_so_giu_ngoai')
     if isinstance(hs, dict) and hs:
         # Codex D3-5: also on a direct call (the CLI reads the file through doc_he_so): a factor only makes U larger
-        if set(hs) - set(HE_SO_HANG) or any(_num(v) is None or float(v) < 1.0 for v in hs.values()):
+        if set(hs) - set(HE_SO_HANG) or any(not _la_so(v) or v < 1.0 for v in hs.values()):
             raise KhoaError(f'he_so_giu_ngoai {hs!r}: factors >= 1 of {HE_SO_HANG} only')
         for name in sorted(hs):
             if name in part:
@@ -577,8 +577,7 @@ def trang_thai_khoa(out, muc_kha_thi):
                 or all(b.get('khong_khung') is True for b in bs):
             why.append(f'{lv}: hang_theo_u thieu')
         # Codex D3-11: a band whose state says it has a number must carry P4_m and A4_deg
-        elif any(b['trang_thai'] != 'thieu' and (_num(b.get('P4_m')) is None or _num(b.get('A4_deg')) is None)
-                 for b in bs):
+        elif any(b['trang_thai'] != 'thieu' and not (_la_so(b.get('P4_m')) and _la_so(b.get('A4_deg'))) for b in bs):
             why.append(f'{lv}: hang_theo_u co dai trang thai khong thieu ma P4_m / A4_deg khong phai so')
     return ('khoa', None) if not why else ('chua_khoa', '; '.join(why))
 
@@ -593,6 +592,11 @@ def _num(x):
     except (TypeError, ValueError):
         return None
     return v if math.isfinite(v) else None
+
+
+def _la_so(x):
+    """A finite JSON number (not a string, not true / false): _num takes '1.2' and True as numbers."""
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
 def can_quay(tb, level):

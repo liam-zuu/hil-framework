@@ -241,6 +241,9 @@ def test_rows_file_must_be_the_scorers(tmp_path):
     mp = mask_file(tmp_path, range(100, 106))
     assert run(d, gp, mp)[0] == 2
     resha(d, 0)
+    assert run(d, gp, mp)[0] == 2                    # the node score changed: luoi.json is of the old one (D2v2-1)
+    os.remove(os.path.join(d, 'luoi.json'))
+    assert run(d, gp)[0] == 0
     assert run(d, gp, mp)[0] == 0                                       # only the sha stood in the way
     sp = os.path.join(d, 'nut_000.json')
     sc = json.load(open(sp, encoding='utf-8'))
