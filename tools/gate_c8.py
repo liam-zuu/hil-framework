@@ -2170,6 +2170,30 @@ def luoi_commit(x: dict) -> Optional[str]:
     return sc.get('commit') if isinstance(sc, dict) else None
 
 
+def _check_mien_theo_buoi(d: dict, khoa: dict, elig_seg: dict) -> None:
+    """KG-5 (Codex N1 + merged lock round 1; C8B 24/11: c8b_khoa_gop 887c109 writes mien_car_pose_theo_buoi
+    {session id: {side_m, phien_ban, h_m, kappa}}, mien_car_pose being their hull): with several C8 sessions the lock
+    names the camera domain of each session of the gate, and the car pose of the U manifests (one for every scoring)
+    lies in the domain of every session that has an eligible scoring, not only in the hull."""
+    mcb = khoa.get('mien_car_pose_theo_buoi')
+    buois = [t['buoi'] for t in d['tien_de_c8']]
+    if mcb is None and len(buois) == 1:
+        return                                          # one session: its domain is mien_car_pose itself
+    if not isinstance(mcb, dict) or set(mcb) != set(buois):
+        raise GateFileError(f'khoa_c8b.mien_car_pose_theo_buoi: the camera domain of each C8 session of the gate '
+                            f'{buois}, keyed by session id (KG-5)')
+    cp = car_pose_v2_of(d['camera']['c8b']['moc_dich']['nguon']['car_pose'], 'camera.c8b.moc_dich.nguon')
+    for b in sorted({seg['buoi'] for seg in elig_seg.values()}):
+        w = f'khoa_c8b.mien_car_pose_theo_buoi.{b}'
+        m = _obj(mcb[b], ('side_m', 'phien_ban', 'h_m', 'kappa'), w)
+        hl, hh = _range(m['h_m'], f'{w}.h_m')
+        kl, kh = _range(m['kappa'], f'{w}.kappa')
+        if m['side_m'] != cp['side_m'] or m['phien_ban'] != cp['phien_ban'] or not hl <= cp['h_m'] <= hh \
+                or not kl <= cp['kappa'] <= kh:
+            raise GateFileError(f'camera.c8b.moc_dich.nguon.car_pose: outside the camera domain of session {b} '
+                                '(inside the hull of the merged lock only; KG-5)')
+
+
 def scorings_dropped(goc: str, commit: Optional[str]) -> List[dict]:
     """KG-6 (Codex 24/11; CODE 24/11, Liam A2 "Một khóa, lấy lớn nhất"): with a bo_tick lock (commit = its
     commit_hil), the c8b_luoi luoi.json files under the C8 folder (also in folders _...) made at another commit: the
@@ -2619,6 +2643,7 @@ def check_nguon(d: dict, goc: str) -> dict:
     # KG-6 (CODE 24/11): the scorings dropped (made at another commit than commit_hil) recomputed from the folder; the
     # dossier lists them, with Liam's record when there is one
     kl = _open_ref(goc, d['khoa_c8b'], 'khoa_c8b')
+    _check_mien_theo_buoi(d, kl, elig_seg)              # KG-5
     bo_want = scorings_dropped(goc, kl.get('commit_hil') if kl.get('nhanh_tick') == 'bo_tick' else None)
     cb = _obj(hs.get('cham_cu_bo'), ('luoi', 'liam'), 'chuan_u.ho_so_c8.cham_cu_bo')
     if cb['luoi'] != bo_want:

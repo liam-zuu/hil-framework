@@ -2670,6 +2670,8 @@ def _buoi3(goc, d, o):
     hs0 = json.load(open(os.path.join(goc, d['chuan_u']['ho_so_c8']['duong_dan']), encoding='utf-8'))
     k0 = hs0['khoa_kiem_luc'][0]                     # CODE 24/11: the S7 lock of session b3 (the same manifest)
     _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: y['khoa_kiem_luc'].append(dict(k0, buoi='C8_buoi3', kiem_cheo=kc)))
+    _rewrite_khoa(goc, d, lambda k: k.update(mien_car_pose_theo_buoi={   # KG-5: the merged lock's domain per session
+        b: {q: k['mien_car_pose'][q] for q in ('side_m', 'phien_ban', 'h_m', 'kappa')} for b in ('C8_buoi2', 'C8_buoi3')}))
     return x
 
 
@@ -3183,3 +3185,23 @@ def test_kg_6_scorings_before_the_merged_lock_are_dropped(tmp_path):
     hs = json.load(open(os.path.join(goc, 'chuan_u/ho_so_kg6b.json'), encoding='utf-8'))
     assert hs['cham_cu_bo'] == dict(luoi=GC.scorings_dropped(goc, '5' * 40), liam=rec)
     assert g['o_c8'][0]['chuoi'][0]['file_cham']['sha256'] == x['file_cham']['sha256']
+
+
+def test_kg_5_camera_domain_per_session(tmp_path):
+    """KG-5: with two sessions the lock names each session's camera domain; the car pose of the manifests lies in the
+    domain of each session with an eligible run, not only in the hull."""
+    d, goc = build_c8(tmp_path / 'a', sub='b2')
+    _buoi3(goc, d, 'O1-F08_PID')
+    GC.check_nguon(d, goc)
+    cp = d['camera']['c8b']['moc_dich']['nguon']['car_pose']
+    k_c = cp['kappa'] if isinstance(cp, dict) else None
+    for name, edit, msg in [
+            ('b', lambda k: k.pop('mien_car_pose_theo_buoi'), 'KG-5'),
+            ('c', lambda k: k['mien_car_pose_theo_buoi'].pop('C8_buoi3'), 'KG-5'),
+            ('d', lambda k: k['mien_car_pose_theo_buoi']['C8_buoi3'].update(kappa=[k_c + 1.0, k_c + 2.0]),
+             'outside the camera domain of session C8_buoi3')]:
+        d, goc = build_c8(tmp_path / name, sub='b2')
+        _buoi3(goc, d, 'O1-F08_PID')
+        _rewrite_khoa(goc, d, edit)
+        with pytest.raises(GC.GateFileError, match=msg):
+            GC.check_nguon(d, goc)
