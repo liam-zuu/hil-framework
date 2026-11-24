@@ -151,24 +151,31 @@ LOG_COLS = ('timestamp_us', 'fl_count', 'fr_count', 'rl_count', 'rr_count', 'sp_
 
 def _segment_marks(path, n_lines):
     """(status rows of <log>.segments.csv of agv_logger (row, log_seq, timestamp_us, segment, status), its sha256,
-    sha256 the logger summary names for it) or (None, None, None) without that file. A file whose rows do not
-    match the data lines one by one, or that cannot be read as CSV: AError (HCD1-8)."""
+    sha256 the logger summary names for it, sum of the summary's segments[].duplicates) or (None, None, None, None)
+    without that file. The file is read once: the rows and the sha256 come from the same bytes (Codex vong 2). A file
+    whose rows do not match the data lines one by one, or that cannot be read as CSV: AError (HCD1-8)."""
+    import io
     seg = path + '.segments.csv'
     if not os.path.isfile(seg):
-        return None, None, None
+        return None, None, None, None
+    with open(seg, 'rb') as f:
+        blob = f.read()
     try:
-        with open(seg, newline='', encoding='utf-8') as f:
-            marks = list(csv.DictReader(f))
+        marks = list(csv.DictReader(io.StringIO(blob.decode('utf-8'), newline='')))
     except (csv.Error, UnicodeDecodeError) as exc:
         raise AError(f'{seg}: {type(exc).__name__}: {exc}')
     if len(marks) != n_lines:
         raise AError(f'{seg}: {len(marks)} rows for {n_lines} data lines')
+    named = n_dup = None
     try:
         s = json.load(open(path + '.summary.json', encoding='utf-8'))
         named = ((s.get('files') or {}).get('segments') or {}).get('sha256')
+        g = s.get('segments')
+        if isinstance(g, list) and g and all(isinstance(x, dict) and type(x.get('duplicates')) is int for x in g):
+            n_dup = sum(x['duplicates'] for x in g)
     except (OSError, ValueError, AttributeError):
-        named = None
-    return marks, sha256(seg), named if isinstance(named, str) else None
+        pass
+    return marks, hashlib.sha256(blob).hexdigest(), named if isinstance(named, str) else None, n_dup
 
 
 def load_log(path):
@@ -197,7 +204,7 @@ def load_log(path):
         raise AError(f'{path}: missing columns {miss}')
     if len(parsed) != len(data):
         raise AError(f'{path}: {len(parsed)} CSV rows for {len(data)} data lines')
-    marks, seg_sha, seg_named = _segment_marks(path, len(data))
+    marks, seg_sha, seg_named, seg_ndup = _segment_marks(path, len(data))
     if seg_named is not None and seg_named != seg_sha:
         raise AError(f'{path}.segments.csv: sha256 khac sha256 logger summary ghi')
     rows, kept_raw, seq_bo = [], None, []
@@ -210,12 +217,19 @@ def load_log(path):
             if kept_raw is None or b != kept_raw:
                 raise AError(f'{path}: line {i} marked duplicate (log_seq {row.get("log_seq")}) but not byte-equal '
                              'to the line before')
-            seq_bo.append(int(float(row['log_seq'])))
+            try:
+                seq_bo.append(int(float(row['log_seq'])))
+            except (TypeError, ValueError, OverflowError) as exc:            # Codex vong 2: 'inf' -> traceback
+                raise AError(f'{path}: line {i}: log_seq {row.get("log_seq")!r}: {type(exc).__name__}')
             continue
         rows.append(row)
         kept_raw = b
     if seq_bo and seg_named is None:
         raise AError(f'{path}: bo {len(seq_bo)} dong theo segments.csv ma logger summary khong ghi sha256 file do')
+    # Codex vong 2: agv_logger counts one 'duplicates' per line it marks 'duplicate' (agv_logger.py, g.dup += 1),
+    # so the lines dropped must be that count of its summary; a summary without the counters cannot back a drop
+    if marks is not None and (seq_bo or seg_ndup) and seg_ndup != len(seq_bo):
+        raise AError(f'{path}: bo {len(seq_bo)} dong, logger summary dem duplicates {seg_ndup}')
     if not rows:
         raise AError(f'{path}: no data rows')
     try:

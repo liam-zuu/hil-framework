@@ -2534,13 +2534,49 @@ def write_segments(d, status=None):
     name_segments(d)
 
 
-def name_segments(d, sha=None):
-    """The logger summary names the segments file and its sha256 (agv_logger writes files.segments)."""
+def name_segments(d, sha=None, n_dup=None):
+    """The logger summary names the segments file and its sha256 (agv_logger writes files.segments) and counts
+    the lines it marked 'duplicate' (segments[].duplicates; n_dup overrides)."""
     p = os.path.join(d, 'log.csv')
     s = json.load(open(p + '.summary.json', encoding='utf-8'))
     s.setdefault('files', {})['segments'] = dict(file='log.csv.segments.csv',
                                                  sha256=sha or ca.sha256(p + '.segments.csv'))
+    marks = open(p + '.segments.csv', encoding='utf-8').read().splitlines()[1:]
+    s['segments'] = [dict(segment=0, duplicates=sum(1 for m in marks if m.endswith(',duplicate'))
+                          if n_dup is None else n_dup)]
     write_json(p + '.summary.json', s)
+
+
+def test_drop_count_must_be_the_logger_summary_duplicates(tmp_path):
+    """Codex vong 2: the summary counts one 'duplicates' per marked line; another count (or no counter) -> AError."""
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+    line = insert_after(d, 400)
+    write_segments(d, {line: 'duplicate'})
+    assert ca.load_log(os.path.join(d, 'log.csv'))['n_dong_trung_bo'] == 1
+    name_segments(d, n_dup=0)
+    with pytest.raises(ca.AError, match='dem duplicates 0'):
+        ca.load_log(os.path.join(d, 'log.csv'))
+    d2, _ = make(tmp_path, 'HC_goc_2', cho='goc')
+    write_segments(d2)
+    name_segments(d2, n_dup=2)                                               # counter says 2, nothing marked
+    with pytest.raises(ca.AError, match='dem duplicates 2'):
+        ca.load_log(os.path.join(d2, 'log.csv'))
+
+
+def test_duplicate_with_unreadable_log_seq_is_code_2(tmp_path):
+    """Codex vong 2: a marked duplicate whose log_seq is 'inf' gave OverflowError (traceback); now AError."""
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+
+    def fn(hdr, body):
+        i0, _ = run_rows(hdr, body)
+        body[i0 + 400][col(hdr, 'log_seq')] = 'inf'
+        body.insert(i0 + 401, list(body[i0 + 400]))
+    edit_log(d, fn)
+    body = open(os.path.join(d, 'log.csv'), encoding='utf-8').read().splitlines()
+    line = next(i for i in range(2, len(body)) if body[i] == body[i - 1])     # 1-based data line of the copy
+    write_segments(d, {line: 'duplicate'})
+    with pytest.raises(ca.AError, match='OverflowError'):
+        ca.load_log(os.path.join(d, 'log.csv'))
 
 
 def insert_after(d, k_from_run0, copy_of=None, change=None):
