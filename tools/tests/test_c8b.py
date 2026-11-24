@@ -492,7 +492,7 @@ def node(states, rows=None, nums=None, ok=True, u_t=0.03, kind='hong', cat=False
         hi = (LU.THRESHOLDS[c] + 0.05 if st[c] != 'dat' else max(lo + 0.02, 0.06)) if lo <= LU.THRESHOLDS[c] \
             else lo + 0.02
         nm[c] = dict(q=lo + 0.01, lo=lo, hi=hi, n_undef=0, q_chung=lo + 0.01, lo_chung=lo, hi_chung=hi,
-                     n_undef_chung=0)
+                     n_undef_chung=0, q_sd=lo + 0.01, q_sd_chung=lo + 0.01)    # every frame defined (SD1-1)
     gate = {c: dict(state=st[c]) for c in LU.CONDS}
     gate['g1'] = dict(state=st['g1'], t_done=[1.0, 1.0])
     return dict(ok=True, kind='ok', outcome='x', states=st, nums=nm, rows=rows or {}, u_t_s=u_t, cat=cat, gate=gate,
@@ -653,7 +653,7 @@ def _so_do_nodes(q_mid, n_nodes=3, mid_ok=True, other_ok=True):
         x = node(st, rows_with(0.2, c='g5', lo=8.0), ok=ok, kind='loi')
         if ok:
             q = q_mid if i == n_nodes // 2 else 9.0
-            x['nums']['g5'].update(q=q, q_chung=q)
+            x['nums']['g5'].update(q=q, q_chung=q, q_sd=q, q_sd_chung=q)   # SD1-1: defined frames
         out.append(x)
     return out
 
@@ -736,7 +736,7 @@ def _write_node(d, k, states, rows, u_t=0.031, so_do=(), sha=None):
         hi = lo + 0.02 if s != 'dat' else min(lo + 0.02, LU.THRESHOLDS[c])
         g[c] = dict(state=s, q=lo + 0.01, lo=lo, hi=hi, n_undef=0, chung=dict(q=lo + 0.01, lo=lo, hi=hi, n_undef=0))
     for c in so_do:                                      # a node scored with so_do (CODE 23/11): c7_score's block
-        g[c].update(state_ba_nhanh=g[c]['state'], nhanh='so_do',
+        g[c].update(state_ba_nhanh=g[c]['state'], nhanh='so_do', q_so_do=dict(nut=None, q=g[c]['q'], q_chung=g[c]['q']),
                     state=gate_c8.so_do_state(g[c]['q'], g[c]['q'], 0, LU.THRESHOLDS[c]))
     if so_do:
         g.update(version='gate_v3.4', so_do=list(so_do), gate_file_sha256=sha)

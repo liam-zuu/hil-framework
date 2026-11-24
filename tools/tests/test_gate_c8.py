@@ -564,6 +564,9 @@ def _nodes(goc, rid, cell, base=0, fg_obj=None, gio_sha=None, lost=False, ops=()
             sc['khung_tuong_doi_v1'] = dict(mien_phai_phu=m, gio_sha256=gio_sha)
             sc.update(U_t_s=u_t, gate_v3={c: dict(state='dat') for c in o1_gate.CONDS}, session_sha256=session)
             sc['gate_v3']['g5'].update(q=5.0, chung=dict(q=5.0))          # the middle node q of a so_do G5 (CODE 23/11)
+            if cell['muc'] == 'O1-F08':                                     # SD1-6: the node block of J's so_do
+                sc['gate_v3'].update(version=GC.GATE_VERSION_SO_DO, so_do=['g5'], gate_file_sha256=GC.J_V6_SHA256)
+                sc['gate_v3']['g5'].update(q_so_do=dict(nut=None, q=5.0, q_chung=5.0), nhanh='so_do')
         r = _jw(goc, f'luot/{rid}/nut_{k:03d}.json', sc)
         nn.append(dict(nut=k, **r))
         mpp.append(m)
@@ -755,8 +758,8 @@ def build_c8(tmp_path, levels=LEVELS, u_t=0.014, two=False, sub=''):
     hs = _jw(goc, 'chuan_u/ho_so_c8.json', dict(format=GC.HO_SO_FORMAT, bang_chung={k: v['sha256'] for k, v in bc.items()},
                                                 ke_hoach_c8_sha256=kh['sha256'], khoa_c8b_sha256=kv5['sha256'],
                                                 giu_ngoai=all_runs, cham_luc={r: LUC_CHAM for r in all_runs},
-                                                khoa_kiem_luc=dict(kiem_cheo=kc, khoa_s7=ks, git_commit=commit,
-                                                                   git_time=when)))
+                                                khoa_kiem_luc=[dict(buoi='C8_buoi2', kiem_cheo=kc, khoa_s7=ks,
+                                                                    git_commit=commit, git_time=when)]))
     td = _jw(goc, 'tien_de_c8.json', dict(format=GC.TIEN_DE_FORMAT, ket_qua='dat', session_id='C8_buoi2',
                                           doan=dict(ten='doan2'), vai_tro_clip_h=dict(zip(names, GC.TD_ROLES)),
                                           sha256=dict(sessions={n: c['sha256'] for n, c in zip(names, clips)},
@@ -1000,10 +1003,10 @@ def _s7_commit(goc, d, when, stated=None):
     c = subprocess.run(['git', '-C', goc, 'rev-parse', 'HEAD'], check=True, capture_output=True).stdout.decode().strip()
     t = stated or subprocess.run(['git', '-C', goc, 'show', '-s', '--format=%cI', c], check=True,
                                  capture_output=True).stdout.decode().strip()
-    kk = json.load(open(os.path.join(goc, d['chuan_u']['ho_so_c8']['duong_dan']), encoding='utf-8'))['khoa_kiem_luc']
+    kk = json.load(open(os.path.join(goc, d['chuan_u']['ho_so_c8']['duong_dan']), encoding='utf-8'))['khoa_kiem_luc'][0]
     kc = dict(kk['kiem_cheo'])
     _rewrite(goc, kc, lambda y: y['khoa_s7'].update(git_commit=c, git_time=t))
-    _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: y['khoa_kiem_luc'].update(kiem_cheo=kc, git_commit=c, git_time=t))
+    _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: y['khoa_kiem_luc'][0].update(kiem_cheo=kc, git_commit=c, git_time=t))
 
 
 def test_round3_s7_lock_read_back_from_git(tmp_path):
@@ -1017,11 +1020,11 @@ def test_round3_s7_lock_read_back_from_git(tmp_path):
     with pytest.raises(GC.GateFileError, match='not the time of its commit'):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'c')                                  # the manifest changed after its commit
-    kk = json.load(open(os.path.join(goc, d['chuan_u']['ho_so_c8']['duong_dan']), encoding='utf-8'))['khoa_kiem_luc']
+    kk = json.load(open(os.path.join(goc, d['chuan_u']['ho_so_c8']['duong_dan']), encoding='utf-8'))['khoa_kiem_luc'][0]
     ks, kc = dict(kk['khoa_s7']), dict(kk['kiem_cheo'])
     _rewrite(goc, ks, lambda y: y.update(hang_so_s7={'n': 1}))
     _rewrite(goc, kc, lambda y: y['khoa_s7'].update(sha256=ks['sha256']))
-    _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: y['khoa_kiem_luc'].update(kiem_cheo=kc, khoa_s7=ks))
+    _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: y['khoa_kiem_luc'][0].update(kiem_cheo=kc, khoa_s7=ks))
     with pytest.raises(GC.GateFileError, match='committed unchanged'):
         GC.check_nguon(d, goc)
 
@@ -2663,12 +2666,16 @@ def _buoi3(goc, d, o):
                                                             kiem_cheo=kc)]))
     d['o_c8'][ci]['chuoi'].append(x)
     _fix_ho_so(goc, d)
+    hs0 = json.load(open(os.path.join(goc, d['chuan_u']['ho_so_c8']['duong_dan']), encoding='utf-8'))
+    k0 = hs0['khoa_kiem_luc'][0]                     # CODE 24/11: the S7 lock of session b3 (the same manifest)
+    _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: y['khoa_kiem_luc'].append(dict(k0, buoi='C8_buoi3', kiem_cheo=kc)))
     return x
 
 
 def _ghep_hai_buoi(goc, tt=('b2/thu_tu_clip.csv', 'b3/thu_tu_clip.csv'),
                    td=('b3/tien_de_c8.json', 'b2/tien_de_c8.json'), ho_so='b2/chuan_u/ho_so_ghep.json'):
-    return GC.ghep(goc, 'b2/ke_hoach_c8.json', list(tt), 'b2/c8b_khoa_v5.json', list(td), 'b2/kiem_cheo.json',
+    kc = [t.split('/')[0] + '/kiem_cheo.json' for t in tt]          # CODE 24/11: one per session
+    return GC.ghep(goc, 'b2/ke_hoach_c8.json', list(tt), 'b2/c8b_khoa_v5.json', list(td), kc,
                    {k: 'b2/' + v for k, v in BANG_CHUNG.items()}, ho_so)
 
 
@@ -2963,7 +2970,7 @@ def test_code_23_11_grid_so_do_state_from_its_numbers(tmp_path):
     GC.check_nguon(d, goc)
     cell = next(c for c in d['o_c8'] if c['muc'] == 'O1-F08')
     for name, edit, msg in [
-            ('b', lambda y: y['q_so_do']['g5'].update(q=8.0, q_chung=8.0), 'not the q, chung.q of node 0'),
+            ('b', lambda y: y['q_so_do']['g5'].update(q=8.0, q_chung=8.0), 'not the q_so_do .* of node 0'),
             ('f', lambda y: y['q_so_do']['g5'].update(nut=1), 'the node is 0'),
             ('g', lambda y: (y['states'].update(g5='chua_ket_luan'), y.update(outcome='chua_ket_luan')),
              'so_do from the middle node'),
@@ -3017,3 +3024,120 @@ def test_code_24_11_ghep_writes_both_choices_of_a_boundary_case(tmp_path, monkey
     assert GC.main(args + ['--liam', lp]) == 0
     gf = GC.read_gate_c8(out)
     assert 'g5' in gf.so_do('O1-F02') and gf.data['dieu_2b']['per_level']['O1-F02']['ly_do_so_do']['g5'] == ['quyet_liam']
+
+
+# ── Codex package 1 round 1 (SD1-n, 24/11; Liam at CODE_GATE "Sửa theo bảng (Recommended)") ──
+
+def test_sd1_2_middle_node_tie_to_one_microsecond():
+    import c8b_luoi as LU
+    ns, ok = [511.9998, 512.0, 512.0002], [True, False, True]       # 0 and 2 the same distance from 512.0
+    assert GC._nut_giua(ns, ok) == 0 == LU.nut_giua(ns, ok)
+    assert GC._nut_giua([0.1, 0.3], [True, True]) == 0              # 0.2 - 0.1 vs 0.3 - 0.2 in float
+
+
+def test_sd1_3_q_so_do_required_and_bounded():
+    g = _gate_v32(theta=7.4, u_t=0.015)
+    a = GC.apply_so_do(g, ['g5'], 'O1-F08', 'a' * 64)
+    assert a['g5']['q_so_do'] == dict(nut=None, q=a['g5']['q'], q_chung=a['g5']['chung']['q'])
+    for edit, msg in [(lambda x: x['g5'].pop('q_so_do'), 'q_so_do'),
+                      (lambda x: x['g5']['q_so_do'].update(q_chung=7.45, q=7.42), 'q_chung'),
+                      (lambda x: x['g5']['q_so_do'].update(q=9.0), 'above'),
+                      (lambda x: x['g5']['q_so_do'].update(nut=2), 'nut')]:
+        y = json.loads(json.dumps(a))
+        edit(y)
+        with pytest.raises(rl.LogError, match=msg):
+            rl.validate_gate(y, 'HW', ('g5',))
+    # SD1-1: frames not all defined, no frame data (o1_gate block): q unknown, chua_ket_luan, never khong_dat
+    u = json.loads(json.dumps(_gate_v32(theta=8.0)))
+    u['g5']['n_undef'] = u['g5']['chung']['n_undef'] = 3
+    b = GC.apply_so_do(u, ['g5'], 'O1-F08', 'a' * 64)
+    assert b['g5']['q_so_do']['q'] is None and b['g5']['state'] == 'chua_ket_luan'
+
+
+def test_sd1_4_every_node_with_the_exception_is_khong_dat():
+    g = {'luoi': dict(cat_nut=[True, True, True]), 'decide': list(o1_gate.CONDS)}
+    ev = dict(outcome_decide='chua_ket_luan', complete=True)
+    assert rl.outcome_vs_gate('khong_dat', ev, g['decide'], rl.VIOL_BEFORE, g) is None
+    assert rl.outcome_vs_gate('khong_dat', ev, g['decide'], '', g) == 'gate outcome chua_ket_luan'
+    g['luoi']['cat_nut'] = [True, False, True]
+    assert rl.outcome_vs_gate('khong_dat', ev, g['decide'], rl.VIOL_BEFORE, g) == 'gate outcome chua_ket_luan'
+
+
+def test_sd1_6_every_scored_node_carries_the_so_do_of_j(tmp_path):
+    for name, edit in [('a', lambda y: y['gate_v3'].update(gate_file_sha256='b' * 64)),
+                       ('b', lambda y: y['gate_v3'].update(so_do=[])),
+                       ('c', lambda y: y.update(report_only=['g5']))]:
+        d, goc = build_c8(tmp_path / name)
+        x = next(c for c in d['o_c8'] if c['muc'] == 'O1-F08')['chuoi'][0]
+        _rewrite_nodes(goc, d, x, edit)
+        with pytest.raises(GC.GateFileError, match='SD1-6'):
+            GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'd')                                  # a node of F05 with a so_do it has not
+    x = next(c for c in d['o_c8'] if c['muc'] == 'O1-F05')['chuoi'][0]
+    _rewrite_nodes(goc, d, x, lambda y: y['gate_v3'].update(so_do=['g5'], version=GC.GATE_VERSION_SO_DO,
+                                                           gate_file_sha256=GC.J_V6_SHA256))
+    with pytest.raises(GC.GateFileError, match='SD1-6'):
+        GC.check_nguon(d, goc)
+
+
+def test_sd1_7_a_row_with_the_old_column_is_refused():
+    cols = rl.gate_columns(GC.apply_so_do(_gate_v32(), ['g5'], 'O1-F08', 'a' * 64), 'a' * 64)
+    rl.gate_from_row(dict(cols, run_uid='X', trajectory='O1-F08'))
+    with pytest.raises(rl.LogError, match='gate_report_only'):
+        rl.gate_from_row(dict(cols, run_uid='X', trajectory='O1-F08', gate_report_only='g5'))
+
+
+def test_sd1_9_decision_sheet_with_two_open_cases_of_a_level():
+    uh = {c: dict(uhat=None, uhat_duoi=0.04, delta_cuoi_s=GC.DELTA0_S, so_lan_tinh=1, trang_thai='bien_nguong')
+          for c in ('g2', 'g5')}
+    uh['g3'] = dict(uhat=0.03, uhat_duoi=0.02, delta_cuoi_s=GC.DELTA0_S, so_lan_tinh=1, trang_thai='quyet')
+    base = dict(muc='O1-F02', uhat=uh, u_t=0.05, a_m=0.1, u_p={}, u_psi={}, runs=[], quyet_khac={})
+    ph = GC.phieu_chon([dict(base, dieu_kien='g2', mo_khac=['g5']), dict(base, dieu_kien='g5', mo_khac=['g2'])])
+    for ca in ph['ca']:
+        assert ca['gia_dinh'] and ca['so_do_muc_moi_ca_bien_so_do'] == ['g2', 'g5']
+        assert ca['lua_chon']['so_do']['so_do_muc'] == [ca['dieu_kien']] and ca['lua_chon']['quyet']['so_do_muc'] == []
+
+
+def test_code_24_11_s7_lock_per_session(tmp_path):
+    """CODE 24/11 (FABLE_C8 V2; GATE (d)): one khoa_s7 per C8 session in the dossier, its kiem_cheo of that session,
+    the S7 numbers the same in every session, each lock before the first held-out scoring of its session."""
+    o = 'O1-F08_PID'
+    d, goc = build_c8(tmp_path / 'a', sub='b2')
+    _buoi3(goc, d, o)
+    GC.check_nguon(d, goc)
+    _ghep_hai_buoi(goc)
+    hs = json.load(open(os.path.join(goc, 'b2/chuan_u/ho_so_ghep.json'), encoding='utf-8'))
+    assert hs['format'] == 'ho_so_c8_v2' and [k['buoi'] for k in hs['khoa_kiem_luc']] == ['C8_buoi2', 'C8_buoi3']
+    assert hs['khoa_kiem_luc'][1]['kiem_cheo']['duong_dan'].startswith('b3/')
+    bc = {k: 'b2/' + v for k, v in BANG_CHUNG.items()}
+    tt, td = ['b2/thu_tu_clip.csv', 'b3/thu_tu_clip.csv'], ['b3/tien_de_c8.json', 'b2/tien_de_c8.json']
+    with pytest.raises(GC.GateFileError, match='one per session'):        # one kiem_cheo for two sessions
+        GC.ghep(goc, 'b2/ke_hoach_c8.json', tt, 'b2/c8b_khoa_v5.json', td, 'b2/kiem_cheo.json', bc,
+                'b2/chuan_u/ho_so_x.json')
+    with pytest.raises(GC.GateFileError, match='not in the folder of session'):   # a session's kiem_cheo elsewhere
+        GC.ghep(goc, 'b2/ke_hoach_c8.json', tt, 'b2/c8b_khoa_v5.json', td, ['b2/kiem_cheo.json', 'b2/kiem_cheo.json'],
+                bc, 'b2/chuan_u/ho_so_y.json')
+    for edit, msg in [(lambda y: y['khoa_kiem_luc'][1].update(buoi='C8_buoi2'), 'session 1 is'),
+                      (lambda y: y['khoa_kiem_luc'].pop(), 'one entry per C8 session')]:
+        h = copy.deepcopy(d)
+        _rewrite(goc, h['chuan_u']['ho_so_c8'], edit)
+        with pytest.raises(GC.GateFileError, match=msg):
+            GC.check_nguon(h, goc)
+    # another S7 lock in session b3: other S7 numbers refused, the same numbers accepted
+    for name, hang, ok in (('b', {'n': 2}, False), ('c', {}, True)):
+        d, goc = build_c8(tmp_path / name, sub='b2')
+        _buoi3(goc, d, o)
+        ks = _jw(goc, 'khoa_s7_b3.json', dict(schema='c7_khoa_s7_v1', hang_so_s7=hang, commit_hil='e' * 40))
+        c, t = _git_commit(goc, ks['duong_dan'], LUC_S7)
+        kc = dict(d['tien_de_c8'][1]['doan'][0]['kiem_cheo'])
+        _rewrite(goc, kc, lambda y: y['khoa_s7'].update(file=ks['duong_dan'], sha256=ks['sha256'], git_commit=c,
+                                                         git_time=t))
+        _rewrite(goc, d['tien_de_c8'][1]['doan'][0]['file'], lambda y: y['sha256'].update(kiem_cheo=kc['sha256']))
+        d['tien_de_c8'][1]['doan'][0]['kiem_cheo'] = kc
+        _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: y['khoa_kiem_luc'][1].update(kiem_cheo=kc, khoa_s7=ks,
+                                                                                    git_commit=c, git_time=t))
+        if ok:
+            GC.check_nguon(d, goc)
+        else:
+            with pytest.raises(GC.GateFileError, match='differ from those of session 0'):
+                GC.check_nguon(d, goc)
