@@ -1705,6 +1705,9 @@ def check_gate_rows(tun: List[dict], gate_file=None) -> None:
     O1 v11.33: gate_file (gate_c8.GateC8, the summary's --gate-file) gives the so_do set of every gate row
     (row_so_do) and the SHA its gate must carry (gate_file_problem)."""
     for r in tun:
+        if r.get('gate_report_only'):                   # SD1-7 (Codex 24/11 round 2): on every row, also one that
+            raise LogError(f"{r.get('run_uid')}: gate_report_only {r.get('gate_report_only')!r}: report only is no "
+                           'rule since 23/11; the column of before is refused on every row (SD1-7)')   # has no gate
         judged = r.get('run_outcome') in VALID
         camp = r.get('campaign') in CAMPAIGNS           # [CACH HIEU] historic rows (no campaign): SC3-2 note above
         # R134 (b); B81-2: a judged car / final_hil campaign row needs both boots, given or not

@@ -616,10 +616,13 @@ def so_do_state(q_common, q_union, n_undef_union, threshold: float) -> str:
     return 'dat'
 
 
+TIE_S = 1e-9                      # two node distances to the middle of the grid within 1 ns are equal (float equality)
+
+
 def _nut_giua(nodes_s, ok) -> Optional[int]:
     """CODE 23/11 (2): the node of a so_do condition on a C8b grid, the scored node nearest the middle of the grid
-    ((first + last offset) / 2, distances to 1 us, the lower index on a tie; c8b_luoi.nut_giua, a test keeps the two
-    equal)."""
+    ((first + last offset) / 2; the lower index on a tie, two distances within TIE_S being a tie; c8b_luoi.nut_giua, a
+    test keeps the two equal)."""
     scored = [i for i in range(len(ok or [])) if ok[i]]
     if not scored:
         return None
@@ -627,9 +630,12 @@ def _nut_giua(nodes_s, ok) -> Optional[int]:
         c = len(ok) // 2
         return min(scored, key=lambda i: (abs(i - c), i))
     mid = 0.5 * (float(nodes_s[0]) + float(nodes_s[-1]))
-    # SD1-2 (Codex 24/11): distances rounded to 1 us, so two nodes the same distance from the middle tie and the lower
-    # index is taken whatever the float rounding (c8b_luoi KEY_DEC)
-    return min(scored, key=lambda i: (round(abs(float(nodes_s[i]) - mid), 6), i))
+    # SD1-2 (Codex 24/11, rounds 1 and 2): a tie is two distances equal within TIE_S (the float noise of the node
+    # offsets, about 1e-16 s, is far below it; the node spacing, about 1 ms, far above); rounding the distances
+    # (round 1) still split a tie that fell on the rounding edge
+    d = {i: abs(float(nodes_s[i]) - mid) for i in scored}
+    dmin = min(d.values())
+    return min(i for i in scored if d[i] <= dmin + TIE_S)
 
 
 def q_common_of(b: dict):
@@ -652,10 +658,13 @@ def q_so_do_default(b: dict) -> dict:
 def check_q_so_do(x, b: dict, w: str, grid: bool) -> dict:
     """A q_so_do block {nut, q, q_chung} of a so_do condition checked against its condition block b (SD1-3): nut a
     whole number on a grid, null without; q, q_chung null or finite; q_chung <= q <= the q of the block, q_chung <=
-    the q of its common domain, when the two are numbers (the defined frames are some of the frames)."""
+    the q of its common domain, when the two are numbers (the defined frames are some of the frames; the numbers are
+    copies, compared without a tolerance: SD2-2). Without a grid (one scoring) a domain with no undefined frame has
+    every frame defined, so its q_so_do number is the q of that domain, never null or another number (SD1-3, SD2-1;
+    on a grid the block holds the maxima over the nodes and q_so_do the middle node's, so this is checked per node)."""
     if not isinstance(x, dict) or set(x) != set(SO_DO_KEYS):
         raise GateFileError(f'{w}.q_so_do {x!r}: an object {{nut, q, q_chung}} (SD1-3)')
-    if grid != (type(x['nut']) is int):
+    if not ((type(x['nut']) is int) if grid else (x['nut'] is None)):     # SD1-3: null, nothing else, without a grid
         raise GateFileError(f'{w}.q_so_do.nut {x["nut"]!r}: a node index on a C8b grid, null without one')
     for k in ('q', 'q_chung'):
         if x[k] is not None and not _fin(x[k]):
@@ -663,8 +672,15 @@ def check_q_so_do(x, b: dict, w: str, grid: bool) -> dict:
     ch = b.get('chung') if isinstance(b.get('chung'), dict) else b
     for lo_k, hi_v, what in (('q_chung', x['q'], 'q'), ('q', b.get('q'), 'q of the block'),
                              ('q_chung', ch.get('q'), 'q of the common domain')):
-        if _fin(x[lo_k]) and _fin(hi_v) and float(x[lo_k]) > float(hi_v) * (1 + REL_TOL):
+        if _fin(x[lo_k]) and _fin(hi_v) and float(x[lo_k]) > float(hi_v):
             raise GateFileError(f'{w}.q_so_do.{lo_k} {x[lo_k]!r} above {what} {hi_v!r} (SD1-3)')
+    if not grid:
+        for k, dom, what in (('q', b, 'the block'), ('q_chung', ch, 'the common domain')):
+            nu = dom.get('n_undef')
+            all_defined = isinstance(nu, int) and not isinstance(nu, bool) and nu == 0 and _fin(dom.get('q'))
+            if all_defined and not (_fin(x[k]) and float(x[k]) == float(dom['q'])):
+                raise GateFileError(f'{w}.q_so_do.{k} {x[k]!r}: no frame of {what} is undefined, so it is its q '
+                                    f'{dom["q"]!r} (SD1-3, SD2-1)')
     return x
 
 
@@ -1694,6 +1710,12 @@ def _grid_states(fc: dict, idx: list, cell: dict, w: str) -> None:
             raise GateFileError(f'{w}: node {k} scored with so_do {got[1]} (source {got[2]}, version {g.get("version")!r}'
                                 f'{", report_only" if "report_only" in g or "report_only" in sc else ""}); the cell '
                                 f'needs {sd} from J v6 (SD1-6)')
+        for c in sd:                                     # SD2-1 (Codex 24/11 round 2): the node's own q_so_do and state
+            nb = g.get(c) if isinstance(g.get(c), dict) else {}
+            nq = check_q_so_do(nb.get('q_so_do'), nb, f'{w}: node {k} gate_v3.{c}', grid=False)
+            if nb.get('state') != so_do_state(nq['q_chung'], nq['q'], nb.get('n_undef'), o1_gate.THRESHOLDS[c]):
+                raise GateFileError(f'{w}: node {k} gate_v3.{c} state {nb.get("state")!r}: so_do from its q_so_do and '
+                                    'n_undef gives another (SD2-1)')
     node_st = {}
     for c in o1_gate.CONDS:
         v = []

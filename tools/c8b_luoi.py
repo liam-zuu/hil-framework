@@ -215,6 +215,9 @@ def g1_rule(node_st):
     return 'chua_ket_luan'
 
 
+TIE_S = 1e-9                      # node distances to the middle of the grid within 1 ns are equal (= gate_c8.TIE_S)
+
+
 def nut_giua(nodes_s, ok):
     """CODE 23/11 (2): the node of a so_do condition, the scored node nearest the middle of the time grid
     ((first + last node offset) / 2; the lower index on a tie); None when no node is scored."""
@@ -225,8 +228,11 @@ def nut_giua(nodes_s, ok):
         c = len(ok) // 2
         return min(scored, key=lambda i: (abs(i - c), i))
     mid = 0.5 * (float(nodes_s[0]) + float(nodes_s[-1]))
-    # SD1-2 (Codex 24/11): distances to 1 us (KEY_DEC), so two nodes the same distance from the middle tie
-    return min(scored, key=lambda i: (round(abs(float(nodes_s[i]) - mid), KEY_DEC), i))
+    # SD1-2 (Codex 24/11, rounds 1 and 2): a tie is two distances equal within TIE_S (float noise of the offsets is
+    # far below it, the node spacing far above); rounding the distances still split a tie on the rounding edge
+    d = {i: abs(float(nodes_s[i]) - mid) for i in scored}
+    dmin = min(d.values())
+    return min(i for i in scored if d[i] <= dmin + TIE_S)
 
 
 def combine(nodes, so_do=frozenset(), nodes_s=None):

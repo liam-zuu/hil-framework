@@ -563,7 +563,7 @@ def _nodes(goc, rid, cell, base=0, fg_obj=None, gio_sha=None, lost=False, ops=()
         if not lost:
             sc['khung_tuong_doi_v1'] = dict(mien_phai_phu=m, gio_sha256=gio_sha)
             sc.update(U_t_s=u_t, gate_v3={c: dict(state='dat') for c in o1_gate.CONDS}, session_sha256=session)
-            sc['gate_v3']['g5'].update(q=5.0, chung=dict(q=5.0))          # the middle node q of a so_do G5 (CODE 23/11)
+            sc['gate_v3']['g5'].update(q=5.0, n_undef=0, chung=dict(q=5.0, n_undef=0))   # middle node q of a so_do G5
             if cell['muc'] == 'O1-F08':                                     # SD1-6: the node block of J's so_do
                 sc['gate_v3'].update(version=GC.GATE_VERSION_SO_DO, so_do=['g5'], gate_file_sha256=GC.J_V6_SHA256)
                 sc['gate_v3']['g5'].update(q_so_do=dict(nut=None, q=5.0, q_chung=5.0), nhanh='so_do')
@@ -3041,6 +3041,13 @@ def test_sd1_2_middle_node_tie_to_one_microsecond():
     ns, ok = [511.9998, 512.0, 512.0002], [True, False, True]       # 0 and 2 the same distance from 512.0
     assert GC._nut_giua(ns, ok) == 0 == LU.nut_giua(ns, ok)
     assert GC._nut_giua([0.1, 0.3], [True, True]) == 0              # 0.2 - 0.1 vs 0.3 - 0.2 in float
+    # round 2 (Codex): a tie on the edge of a rounding step (333.5 us each side on this c8b_gio lattice)
+    import c8b_gio
+    ns = c8b_gio.nodes(0.0012, 0.0010005)
+    assert len(ns) == 4 and GC._nut_giua(ns, [True] * 4) == 1 == LU.nut_giua(ns, [True] * 4)
+    assert GC._nut_giua(ns, [True, False, True, True]) == 2 == LU.nut_giua(ns, [True, False, True, True])
+    assert GC.TIE_S == LU.TIE_S
+    assert GC._nut_giua([0.0, 0.0010, 0.0011, 0.003], [True] * 4) == 2   # a real difference (0.1 ms) is no tie
 
 
 def test_sd1_3_q_so_do_required_and_bounded():
@@ -3050,11 +3057,27 @@ def test_sd1_3_q_so_do_required_and_bounded():
     for edit, msg in [(lambda x: x['g5'].pop('q_so_do'), 'q_so_do'),
                       (lambda x: x['g5']['q_so_do'].update(q_chung=7.45, q=7.42), 'q_chung'),
                       (lambda x: x['g5']['q_so_do'].update(q=9.0), 'above'),
-                      (lambda x: x['g5']['q_so_do'].update(nut=2), 'nut')]:
+                      (lambda x: x['g5']['q_so_do'].update(nut=2), 'nut'),
+                      # round 2 (Codex): nut is null without a grid, nothing else; with no undefined frame q_so_do is
+                      # the q of the domain (not null, not another number); no tolerance on the bounds (SD2-2)
+                      (lambda x: x['g5']['q_so_do'].update(nut='x'), 'nut'),
+                      (lambda x: (x['g5']['q_so_do'].update(q=None, q_chung=None),
+                                  x['g5'].update(state='chua_ket_luan')), 'is undefined'),
+                      (lambda x: (x['g5']['q_so_do'].update(q=7.3, q_chung=7.3)), 'is undefined'),
+                      (lambda x: x['g5']['q_so_do'].update(q=x['g5']['q'] * (1 + 5e-10)), 'above')]:
         y = json.loads(json.dumps(a))
         edit(y)
+        y.update(o1_gate.evaluate_outcomes(y, y['decide'], None))
         with pytest.raises(rl.LogError, match=msg):
             rl.validate_gate(y, 'HW', ('g5',))
+    # the same on a logged row: the two q cells of the so_do condition emptied, the state turned chua_ket_luan
+    cols = rl.gate_columns(a, 'a' * 64)
+    back = rl.gate_from_row(dict(cols, run_uid='X', trajectory='O1-F08'))
+    rl._recompute(back, 'HW', ('g5',))
+    back = rl.gate_from_row(dict(cols, run_uid='X', trajectory='O1-F08', g5_so_do_q='', g5_so_do_q_chung='',
+                                 g5_state='chua_ket_luan'))
+    with pytest.raises(rl.LogError, match='is undefined'):
+        rl._recompute(back, 'HW', ('g5',))
     # SD1-1: frames not all defined, no frame data (o1_gate block): q unknown, chua_ket_luan, never khong_dat
     u = json.loads(json.dumps(_gate_v32(theta=8.0)))
     u['g5']['n_undef'] = u['g5']['chung']['n_undef'] = 3
@@ -3093,6 +3116,25 @@ def test_sd1_7_a_row_with_the_old_column_is_refused():
     rl.gate_from_row(dict(cols, run_uid='X', trajectory='O1-F08'))
     with pytest.raises(rl.LogError, match='gate_report_only'):
         rl.gate_from_row(dict(cols, run_uid='X', trajectory='O1-F08', gate_report_only='g5'))
+    # round 2 (Codex): also on a row without a gate (a lost run), where no gate is read back
+    lost = dict(run_uid='L', run_outcome='hong_he_do', platform='HW', fail_cause='he_do')
+    rl.check_gate_rows([dict(lost)])
+    with pytest.raises(rl.LogError, match='gate_report_only'):
+        rl.check_gate_rows([dict(lost, gate_report_only='g5')])
+
+
+def test_sd2_1_node_q_so_do_tied_to_the_node_numbers(tmp_path):
+    # Codex round 2: a node with no undefined frame and q 8 deg writing q_so_do 7.4 (and the grid copying it) was
+    # accepted as dat: the node's q_so_do is its q when no frame is undefined, and its state follows it
+    for name, edit, msg in [
+            ('a', lambda y: y['gate_v3']['g5'].update(q=8.0, chung=dict(q=8.0, n_undef=0)), 'is undefined'),
+            ('b', lambda y: y['gate_v3']['g5'].update(state='khong_dat'), 'SD2-1'),
+            ('c', lambda y: y['gate_v3']['g5'].update(q_so_do=dict(nut=0, q=5.0, q_chung=5.0)), 'nut')]:
+        d, goc = build_c8(tmp_path / name)
+        x = next(c for c in d['o_c8'] if c['muc'] == 'O1-F08')['chuoi'][0]
+        _rewrite_nodes(goc, d, x, edit)
+        with pytest.raises(GC.GateFileError, match=msg):
+            GC.check_nguon(d, goc)
 
 
 def test_sd1_9_decision_sheet_with_two_open_cases_of_a_level():
