@@ -263,6 +263,7 @@ def hang(a):
                tham_chieu=cu.sha256(a.tham_chieu), hang_so=cu.sha256(a.hang_so), u_imu=cu.sha256(a.u_imu))
     S, turns, t0_seen = None, None, None
     out, nodes, n_left = [], [], 0
+    pose_of = {}                       # frame id -> (x, y, psi, u) of the first node holding it (one frame, one pose)
     for k in range(len(gio.get('nodes_s') or [])):
         sp = os.path.join(a.luoi_dir, f'nut_{k:03d}.json')
         rp = os.path.join(a.luoi_dir, f'nut_{k:03d}_rows.csv')
@@ -321,6 +322,12 @@ def hang(a):
                 n_left += 1
                 continue
             fid = int(fid)
+            # real data 24/11: the scorer's speed of a frame differs between nodes at the 1e-13 level (its time base
+            # moves with D); c8b_a6_o needs one pose per frame: the first node's values, the others within 1e-9
+            p0 = pose_of.setdefault(fid, (x, y, psi, u))
+            if max(abs(a_ - b_) for a_, b_ in zip(p0, (x, y, psi, u))) > 1e-9:
+                raise D2Error(f'node {k} frame {fid}: pose / speed differ between nodes by more than 1e-9')
+            x, y, psi, u = p0
             t_log = tcam + D
             if abs((t_log - t0) - _f(r.get('t'))) > 1e-6:
                 raise D2Error(f'node {k} frame {fid}: rows t is not t_cam + D - t0')
