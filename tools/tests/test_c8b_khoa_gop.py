@@ -28,7 +28,8 @@ def _khoa(s, ub_goc, kap=(0.0413, 0.0531), sess='d' * 64, buoi='x'):
         muc[lv] = dict(can_quay=dict(trang_thai='dat', p_m=0.004, psi_deg=0.6), man_trap=dict(nhanh='mot_khung'),
                        so_do=['g5'] if lv == 'O1-F08' else [],
                        hang_theo_u=[dict(u_lo_m_s=0.0, u_hi_m_s=0.358, dai='B1', P4_m=0.007 * s, A4_deg=0.65,
-                                         P6_rieng_ii_m=0.003 * s, trang_thai='gioi_han', P4_tay_don_m=2.6e-5)],
+                                         P6_rieng_ii_m=0.003 * s, trang_thai='gioi_han',
+                                         P4_tay_don_m=0.04 * math.radians(0.65))],
                        hang_theo_u_ly_do=[], hang_dong=hd, hang_dong_truoc_le=tr,
                        hang_dong_thanh_phan=dict(W_n_luot=int(10 * s)), P4_tay_don=dict(L_m=0.04, ly_do=None),
                        hang_dong_ly_do=dict(a_m=None, hang_m=None, he_so_r=None, u_phi_rad=None, hang_rad=None),
@@ -45,7 +46,12 @@ def _khoa(s, ub_goc, kap=(0.0413, 0.0531), sess='d' * 64, buoi='x'):
                 lan_lap_E=dict(goc=dict(trang_thai='dat')), lan_lap_E_trang_thai='dat', lan_lap_E_ly_do=[],
                 khoa_truoc=dict(nguon=[dict(vai='a6', file='a6.json', sha256=A6),
                                        dict(vai='ke_hoach_c8', file='kh.json', sha256=KH),
-                                       dict(vai='session', file='session.json', sha256=sess)],
+                                       dict(vai='nguong', file='ng.json', sha256='4' * 64),
+                                       dict(vai='3b O1-F02', file='3b.json', sha256='5' * 64),
+                                       dict(vai='truc_xe', file='tx.json', sha256='6' * 64),
+                                       dict(vai='session', file='session.json', sha256=sess),
+                                       dict(vai='kiem_cheo', file='kc.json', sha256=sess[:-1] + 'k'),
+                                       dict(vai='tham_chieu goc', file='tc.json', sha256=sess[:-1] + 't')],
                                 script=dict(commit=CH, dirty=False), commit_hil=CH, luc='2026-11-24T19:00:00+07:00'),
                 trang_thai='khoa', ly_do_chua_khoa=None)
 
@@ -101,7 +107,8 @@ def test_per_session_reasons_prefixed():
                                      '2026-11-23_run03: K2: khac']
 
 
-@pytest.mark.parametrize('bad', ['bang', 'eps', 'a6', 'plan', 'band', 'top'])
+@pytest.mark.parametrize('bad', ['bang', 'eps', 'a6', 'plan', 'band', 'top', 'nguong', '3b', 'truc_xe', 'a6_xoa',
+                                 'them_vai'])
 def test_must_agree(bad):
     kb = _two()
     k = kb[1][1]
@@ -115,6 +122,13 @@ def test_must_agree(bad):
         k['khoa_truoc']['nguon'][1]['sha256'] = 'e' * 64
     elif bad == 'band':
         k['muc']['O1-F05']['hang_theo_u'][0]['u_hi_m_s'] = 0.4
+    elif bad in ('nguong', '3b', 'truc_xe'):       # Codex KG-2, KG-3: same numbers, another common source
+        i = {'nguong': 2, '3b': 3, 'truc_xe': 4}[bad]
+        k['khoa_truoc']['nguon'][i]['sha256'] = 'e' * 64
+    elif bad == 'a6_xoa':                          # KG-2: one lock without its A6 entry (the other has it)
+        del k['khoa_truoc']['nguon'][0]
+    elif bad == 'them_vai':
+        k['khoa_truoc']['nguon'].append(dict(vai='xoay', file='x.json', sha256='7' * 64))
     else:
         k['them'] = 1
     with pytest.raises(G.GopError):
@@ -180,3 +194,25 @@ def test_cli(tmp_path, capsys):
     assert all(len(v['sha256']) == 64 for v in k['gop']['khoa_buoi'].values())
     assert G.main(argv) == 2                                              # never overwrites
     assert G.main(argv[:-4] + ['--commit-hil', 'xyz', '--out', str(tmp_path / 'b.json')]) == 2
+
+
+@pytest.mark.parametrize('f', ['band', 'u_beta', 'mien'])
+def test_states_only_accepted(f):
+    """Codex KG-8: a state the gate / scorer does not accept for that field is refused, even if the same in both."""
+    kb = _two()
+    for _, k in kb:
+        if f == 'band':
+            k['muc']['O1-F05']['hang_theo_u'][0]['trang_thai'] = 'chua_ket_luan'
+        elif f == 'u_beta':
+            k['u_beta_cam_trang_thai']['goc'] = 'gioi_han'
+        else:
+            k['mien_car_pose']['trang_thai'] = 'chua_ket_luan'
+    with pytest.raises(G.GopError, match='accepted'):
+        G.gop(kb, CH)
+
+
+def test_per_session_sources_may_differ():
+    kb = _two()
+    vai = [n['vai'] for n in G.gop(kb, CH)['khoa_truoc']['nguon']]
+    assert vai.count('session') == 2 and vai.count('kiem_cheo') == 2 and vai.count('tham_chieu goc') == 2
+    assert vai.count('truc_xe') == 1 and vai.count('nguong') == 1

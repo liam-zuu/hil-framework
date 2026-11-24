@@ -14,8 +14,15 @@ Rules (a field not named here must be the same in every session lock, else refus
            muc.<lv>.hang_theo_u[i] {P4_m, A4_deg, P6_rieng_ii_m, P4_tay_don_m} (band edges u_lo_m_s, u_hi_m_s, dai the
            same); u_beta_cam_deg[cho]. A null in one session -> null (a term not concluded in one session is not
            concluded).
-  state    worst over the sessions: hang_theo_u[i].trang_thai, u_beta_cam_trang_thai[cho] (per place, the field
-           c7_score reads), u_beta_cam_trang_thai_cho, u_beta_cam_trang_thai_chung, mien_car_pose.trang_thai.
+  state    worst over the sessions, only the states accepted for the field (Codex KG-8): hang_theo_u[i].trang_thai
+           in {thieu, gioi_han, dat}; u_beta_cam_trang_thai[cho] (per place, the field c7_score reads),
+           u_beta_cam_trang_thai_cho, u_beta_cam_trang_thai_chung, mien_car_pose.trang_thai in {thieu, dat}.
+  sources  every role of khoa_truoc.nguon that is not per session (per session: session, camera, kiem_cheo, neo,
+           u_moc, p6_dong, lan_lap, tham_chieu <cho>) names the SAME sha256 set in every session lock, with exactly one
+           a6, one ke_hoach_c8, one truc_xe (the F7 whose u_phi_hat the scorer reads: Codex KG-2, KG-3).
+  limits   the largest of each band field is taken alone: the merged P4_m bounds every session's P4_m (the number
+           the gate copies), but P6_rieng_ii_m, P4_tay_don_m of the merged band need not add up to it (Codex KG-4).
+           The kappa hull admits a camera setting inside the hull but outside one session's range (Codex KG-5).
   hull     mien_car_pose.kappa = [min lo, max hi] (each session's frames lie in its own range; an intersection would
            drop valid frames at the edges) [DE XUAT, CODE chot]; side_m, phien_ban, h_m the same.
   per      fields that only explain a session's numbers (muc.<lv>.hang_dong_thanh_phan, hang_dong_ly_do,
@@ -59,8 +66,13 @@ BAND_SAME = ('u_lo_m_s', 'u_hi_m_s', 'dai')
 MUC_PER_BUOI = ('hang_dong_thanh_phan', 'hang_dong_ly_do', 'hang_theo_u_ly_do', 'P4_tay_don')
 TOP_PER_BUOI = ('u_beta_cam_dau_chan', 'u_beta_cam_gia_dinh', 'u_beta_cam_ly_do')
 ST_FIELDS = ('u_beta_cam_trang_thai', 'u_beta_cam_trang_thai_cho')
-# worst first; a state outside this list must be the same in every session
-WORST = ('thieu', 'khong_dat', 'chua_ket_luan', 'gioi_han', 'dat')
+# worst first, per field (Codex KG-8: only the states the gate / scorer accept for that field)
+ST_BAND = ('thieu', 'gioi_han', 'dat')               # hang_theo_u[i].trang_thai (gate _check_khoa_c8b bands)
+ST_DAT_THIEU = ('thieu', 'dat')                      # u_beta_cam per place, _chung, mien_car_pose
+# sources (khoa_truoc.nguon vai) that are per session; every other role must name the SAME sha256 set in every
+# session lock (Codex KG-2, KG-3: A6, plan, thresholds, 3b, xoay, u_h, the F7 truc_xe of u_phi_hat, ...)
+VAI_THEO_BUOI = ('session', 'camera', 'kiem_cheo', 'neo', 'u_moc', 'p6_dong', 'lan_lap')
+VAI_THEO_BUOI_DAU = ('tham_chieu ',)
 TOP_HANDLED = {'muc', 'khoa_truoc', 'mien_car_pose', 'u_beta_cam_deg', 'u_beta_cam_trang_thai_chung', 'trang_thai',
                'ly_do_chua_khoa', 'commit_hil', 'version'} | set(TOP_PER_BUOI) | set(ST_FIELDS)
 MUC_HANDLED = {'hang_dong', 'hang_dong_truoc_le', 'hang_theo_u'} | set(MUC_PER_BUOI)
@@ -87,14 +99,40 @@ def _lon_nhat(vals, w, nguon):
     return float(v), b
 
 
-def _te_nhat(vals, w):
-    """Worst state over the sessions (WORST order); states outside WORST must agree."""
+def _te_nhat(vals, w, allowed):
+    """Worst state over the sessions in the order `allowed` (worst first); a state outside it is refused."""
     s = [v for _, v in vals]
-    if all(x in WORST for x in s):
-        return min(s, key=WORST.index)
-    if len(set(map(json.dumps, s))) != 1:
-        raise GopError(f'{w}: states {dict(vals)} not in {WORST} and not the same')
-    return s[0]
+    bad = [x for x in s if x not in allowed]
+    if bad:
+        raise GopError(f'{w}: states {dict(vals)}; only {allowed} accepted for this field')
+    return min(s, key=allowed.index)
+
+
+def _vai_chung(khoa_buoi):
+    """Every role not per session names the same sha256 set in every session lock (KG-2, KG-3)."""
+    def theo_buoi(v):
+        return v in VAI_THEO_BUOI or any(str(v).startswith(p) for p in VAI_THEO_BUOI_DAU)
+    sets = []
+    for b, k in khoa_buoi:
+        kt = k.get('khoa_truoc')
+        if not isinstance(kt, dict) or not isinstance(kt.get('nguon'), list):
+            raise GopError(f'{b}: khoa_truoc.nguon missing')
+        m = {}
+        for n in kt['nguon']:
+            if not isinstance(n, dict) or not n.get('vai') or not n.get('sha256'):
+                raise GopError(f'{b}: a khoa_truoc.nguon entry without vai / sha256: {n!r}')
+            if not theo_buoi(n['vai']):
+                m.setdefault(n['vai'], set()).add(n['sha256'])
+        sets.append((b, m))
+    b0, m0 = sets[0]
+    for b, m in sets[1:]:
+        if m != m0:
+            diff = sorted(v for v in set(m) | set(m0) if m.get(v) != m0.get(v))
+            raise GopError(f'common sources differ between {b0} and {b} (roles {diff}): the session locks must be made '
+                           'from the same A6, plan, thresholds, 3b, xoay, u_h and F7 (Codex KG-2, KG-3)')
+    for vai in ('a6', 'ke_hoach_c8', 'truc_xe'):
+        if len(m0.get(vai, ())) != 1:
+            raise GopError(f'{len(m0.get(vai, ()))} {vai} source(s) in each session lock; exactly one needed')
 
 
 def _same(vals, w):
@@ -139,6 +177,7 @@ def gop(khoa_buoi, commit_hil, script=None, nguon_khoa=None):
                            'commit for every session lock and the combined lock; gate bo_tick)')
         if 'u_beta_cam_trang_thai_chung' not in k or not isinstance(k.get('u_beta_cam_trang_thai'), dict):
             raise GopError(f'{b}: made before N1 (u_beta_cam_trang_thai not per place); make it again at {commit_hil}')
+    _vai_chung(khoa_buoi)
     nguon_max = {}
     out = {}
     tops = [set(k) for _, k in khoa_buoi]
@@ -181,7 +220,7 @@ def gop(khoa_buoi, commit_hil, script=None, nguon_khoa=None):
                         if q in BAND_MAX:
                             band[q] = _lon_nhat(qv, w, nguon_max)[0]
                         elif q == 'trang_thai':
-                            band[q] = _te_nhat(qv, w)
+                            band[q] = _te_nhat(qv, w, ST_BAND)
                         else:
                             band[q] = _same(qv, w)
                     bands.append(band)
@@ -198,12 +237,12 @@ def gop(khoa_buoi, commit_hil, script=None, nguon_khoa=None):
                                           f'u_beta_cam_deg.{c}', nguon_max)[0] for c in cho}
     for f in ST_FIELDS:
         ck = _keys_same([(b, k[f]) for b, k in khoa_buoi], f)
-        out[f] = {c: _te_nhat([(b, k[f][c]) for b, k in khoa_buoi], f'{f}.{c}') for c in ck}
+        out[f] = {c: _te_nhat([(b, k[f][c]) for b, k in khoa_buoi], f'{f}.{c}', ST_DAT_THIEU) for c in ck}
         for c in ck:                         # a number from every session or none: the state follows the value
             if out[f][c] == 'dat' and out['u_beta_cam_deg'].get(c) is None:
                 raise GopError(f'{f}.{c} dat with u_beta_cam_deg.{c} null')
     out['u_beta_cam_trang_thai_chung'] = _te_nhat([(b, k['u_beta_cam_trang_thai_chung']) for b, k in khoa_buoi],
-                                                  'u_beta_cam_trang_thai_chung')
+                                                  'u_beta_cam_trang_thai_chung', ST_DAT_THIEU)
     for f in TOP_PER_BUOI:
         out[f] = _theo_buoi([(b, k[f]) for b, k in khoa_buoi], f)
     # camera domain: hull of kappa
@@ -217,7 +256,7 @@ def gop(khoa_buoi, commit_hil, script=None, nguon_khoa=None):
                 raise GopError(f'mien_car_pose.kappa: not [lo, hi] in every session lock ({dict(qv)})')
             mc[q] = [min(v[0] for _, v in qv), max(v[1] for _, v in qv)]
         elif q == 'trang_thai':
-            mc[q] = _te_nhat(qv, 'mien_car_pose.trang_thai')
+            mc[q] = _te_nhat(qv, 'mien_car_pose.trang_thai', ST_DAT_THIEU)
         elif q == 'ly_do':
             mc[q] = _theo_buoi(qv, 'mien_car_pose.ly_do')
         else:
