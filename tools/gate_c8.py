@@ -178,6 +178,14 @@ def _isnum(x) -> bool:
     return not isinstance(x, bool) and isinstance(x, (int, float))
 
 
+def _same(a, b) -> bool:
+    """Two copies of one number: both null, or both JSON numbers (not bool) of the same value; no tolerance (SD2-1,
+    SD3-1, Codex round 3: a number copied from another file is that number)."""
+    if a is None or b is None:
+        return a is None and b is None
+    return _isnum(a) and _isnum(b) and float(a) == float(b)
+
+
 def _close(a, b) -> bool:
     """Equal within REL_TOL, both finite (GC1-2: inf never matches); two nulls are equal. GC6-15: both JSON numbers
     (not bool, not text) before the tolerance; anything else never matches."""
@@ -683,7 +691,7 @@ def check_q_so_do(x, b: dict, w: str, grid: bool) -> dict:
     if not grid:
         for k, dom, what in (('q', b, 'the block'), ('q_chung', ch, 'the common domain')):
             nu = dom.get('n_undef')
-            all_defined = isinstance(nu, int) and not isinstance(nu, bool) and nu == 0 and _fin(dom.get('q'))
+            all_defined = _isnum(nu) and float(nu) == 0 and _fin(dom.get('q'))    # 0 or 0.0 (SD1-3, round 3)
             if all_defined and not (_fin(x[k]) and float(x[k]) == float(dom['q'])):
                 raise GateFileError(f'{w}.q_so_do.{k} {x[k]!r}: no frame of {what} is undefined, so it is its q '
                                     f'{dom["q"]!r} (SD1-3, SD2-1)')
@@ -1532,7 +1540,8 @@ def _node_scores(goc: str, fc: dict, w: str, cell: dict, fg: Optional[dict]) -> 
     scored (nodes_ok false) and relies on no frame. Returns (node scores, mien_phai_phu of the kept nodes)."""
     nn, nd, hn, ok = fc.get('nguon_nut'), fc.get('nodes_s'), fc.get('hong_nut'), fc.get('nodes_ok')
     if fg is not None and (not isinstance(nd, list) or not isinstance(fg.get('nodes_s'), list)
-                           or len(nd) != len(fg['nodes_s']) or any(not _close(a, b) for a, b in zip(nd, fg['nodes_s']))):
+                           or len(nd) != len(fg['nodes_s']) or any(not _same(a, b) for a, b in zip(nd, fg['nodes_s']))):
+        # SD3-1 (Codex round 3): a copy, compared without a tolerance (the middle node is taken from these offsets)
         raise GateFileError(f'{w}: luoi.json nodes_s {nd!r} is not nodes_s of its time file (GC6-6)')
     if nn == [] and fc['trang_thai_luot'] != 'cham':
         return [], [], []
@@ -1696,8 +1705,8 @@ def _grid_states(fc: dict, idx: list, cell: dict, w: str) -> None:
                                 'of the grid (CODE 23/11 (2))')
         nb = (idx[m].get('gate_v3') or {}).get(c) if m is not None and isinstance(idx[m], dict) else None
         nq = nb.get('q_so_do') if isinstance(nb, dict) else None
-        if m is not None and (not isinstance(nq, dict) or not _close(x.get('q'), nq.get('q'))
-                              or not _close(x.get('q_chung'), nq.get('q_chung'))):
+        if m is not None and (not isinstance(nq, dict) or not _same(x.get('q'), nq.get('q'))
+                              or not _same(x.get('q_chung'), nq.get('q_chung'))):       # copies (SD2-1, round 3)
             raise GateFileError(f'{w}: luoi.json q_so_do.{c} {x!r}: not the q_so_do (q, q_chung of the defined '
                                 f'frames) of node {m} (its score file; SD1-1)')
         if not isinstance(b, dict) or st[c] != so_do_state(x.get('q_chung'), x.get('q'), b.get('n_undef'),

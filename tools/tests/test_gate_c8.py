@@ -3060,6 +3060,21 @@ def test_sd1_2_middle_node_tie_to_one_microsecond():
     assert GC._nut_giua([0.0, 0.3999999995, 0.6, 1.0], [True] * 4) == 1
 
 
+def test_sd3_1_grid_offsets_are_those_of_the_time_file_exactly():
+    # Codex round 3: nodes(10.0, 0.0012); the middle node 1 moved by 5 ns in luoi.json passed the comparison with the
+    # time file (a tolerance) and the gate then took node 2 as the middle one
+    import c8b_gio
+    ns = c8b_gio.nodes(10.0, 0.0012)
+    assert len(ns) == 4 and GC._nut_giua(ns, [True] * 4) == 1
+    moved = [ns[0], ns[1] - 5e-9, ns[2], ns[3]]
+    assert GC._nut_giua(moved, [True] * 4) == 2                       # what the tolerance let through
+    cell = dict(muc='O1-F08')
+    with pytest.raises(GC.GateFileError, match='GC6-6'):
+        GC._node_scores('.', dict(nodes_s=moved, trang_thai_luot='cham'), 'w', cell, dict(nodes_s=ns))
+    with pytest.raises(GC.GateFileError, match='names the node scores'):    # the same offsets: past that check
+        GC._node_scores('.', dict(nodes_s=list(ns), trang_thai_luot='cham'), 'w', cell, dict(nodes_s=ns))
+
+
 def test_sd1_3_q_so_do_required_and_bounded():
     g = _gate_v32(theta=7.4, u_t=0.015)
     a = GC.apply_so_do(g, ['g5'], 'O1-F08', 'a' * 64)
@@ -3074,6 +3089,9 @@ def test_sd1_3_q_so_do_required_and_bounded():
                       (lambda x: (x['g5']['q_so_do'].update(q=None, q_chung=None),
                                   x['g5'].update(state='chua_ket_luan')), 'is undefined'),
                       (lambda x: (x['g5']['q_so_do'].update(q=7.3, q_chung=7.3)), 'is undefined'),
+                      # round 3 (Codex): the count written 0.0 is still no undefined frame
+                      (lambda x: (x['g5'].update(n_undef=0.0), x['g5']['chung'].update(n_undef=0.0),
+                                  x['g5']['q_so_do'].update(q=7.3, q_chung=7.3)), 'is undefined'),
                       (lambda x: x['g5']['q_so_do'].update(q=x['g5']['q'] * (1 + 5e-10)), 'above')]:
         y = json.loads(json.dumps(a))
         edit(y)
@@ -3139,7 +3157,13 @@ def test_sd2_1_node_q_so_do_tied_to_the_node_numbers(tmp_path):
     for name, edit, msg in [
             ('a', lambda y: y['gate_v3']['g5'].update(q=8.0, chung=dict(q=8.0, n_undef=0)), 'is undefined'),
             ('b', lambda y: y['gate_v3']['g5'].update(state='khong_dat'), 'SD2-1'),
-            ('c', lambda y: y['gate_v3']['g5'].update(q_so_do=dict(nut=0, q=5.0, q_chung=5.0)), 'nut')]:
+            ('c', lambda y: y['gate_v3']['g5'].update(q_so_do=dict(nut=0, q=5.0, q_chung=5.0)), 'nut'),
+            # round 3 (Codex): the grid copies the node's q_so_do, no tolerance (a node 1e-9 above, the grid below)
+            ('d', lambda y: y['gate_v3']['g5'].update(q=5.000000001, chung=dict(q=5.000000001, n_undef=0),
+                                                     q_so_do=dict(nut=None, q=5.000000001, q_chung=5.000000001)),
+             'not the q_so_do'),
+            ('e', lambda y: y['gate_v3']['g5'].update(n_undef=0.0, q=8.0, chung=dict(q=8.0, n_undef=0.0)),
+             'is undefined')]:
         d, goc = build_c8(tmp_path / name)
         x = next(c for c in d['o_c8'] if c['muc'] == 'O1-F08')['chuoi'][0]
         _rewrite_nodes(goc, d, x, edit)
