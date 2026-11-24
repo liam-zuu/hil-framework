@@ -816,3 +816,69 @@ def test_gate_reads_the_p6_bands(tmp_path):
         bs = k['muc'][lv]['hang_theo_u']
         got = g.check_bands([dict(u_lo=b['u_lo_m_s'], u_hi=b['u_hi_m_s'], gia_tri=b['P4_m']) for b in bs], lv)
         assert len(got) == len(bs) and all(q in b for b in bs for q in g.BAND_KEYS_C8B)
+
+
+# ── run03 lock (CODE 24/11 to C8B): a camera segment is a doanN of ONE floor session ─────────────────────────────
+
+def test_khoa_doan_and_kc_doan_of_two_sessions():
+    """The same 'doanN' in two session folders is two segments; twice in one session is still refused; a path without
+    a session folder keeps 'doanN' (as before)."""
+    assert K.khoa_doan(None, 'doan1') == 'doan1' and K.khoa_doan('2026-11-23_run03', 'doan1') == '2026-11-23_run03/doan1'
+    assert K.khoa_doan('2026-11-23_run03', None) is None
+    two = K.kc_doan_of(['D:/x/C8/2026-11-20_run02/kiem_cheo/doan1/luot1/k.json',
+                        'D:/x/C8/2026-11-23_run03/kiem_cheo/doan1/luot1/k.json'], [1, 2])
+    assert two == {'2026-11-20_run02/doan1': 1, '2026-11-23_run03/doan1': 2}
+    with pytest.raises(K.KhoaError):
+        K.kc_doan_of(['D:/x/C8/2026-11-23_run03/kiem_cheo/doan1/a/k.json',
+                      'D:/x/C8/2026-11-23_run03/kiem_cheo/doan1/b/k.json'], [1, 2])
+
+
+def test_cua_so_khung_buoi(tmp_path):
+    import c8_u_imu as cu
+    d = tmp_path / '2026-11-23_run03' / 'track33' / 'doan1' / 'L1'
+    d.mkdir(parents=True)
+    f = d / 'frames.csv'
+    f.write_text('idx,valid,tag_x,tag_y,psi\n1,1,0.3,0.4,0.1\n2,1,0.3,0.4,0.1\n', encoding='utf-8')
+    w = K.cua_so_khung(str(f), [1, 2], cu.sha256(str(f)), [0.0, 0.0])
+    assert w['doan'] == 'doan1' and w['buoi'] == '2026-11-23_run03'
+
+
+def test_u_beta_cam_cho_two_sessions_same_doan_name(monkeypatch):
+    """Leg start in 2026-11-20_run02/doan1 and W in 2026-11-23_run03/doan1: NOT one segment (no joint pair, which
+    would cancel the camera error across two cameras): the two-end bound, each end with the kiem_cheo of its own
+    session segment; the same session and doanN still pairs."""
+    import c8b_a6 as a6m
+    monkeypatch.setattr(K, 'a6_hieu_replay', lambda a6, ref, W, eps, cr, cw: (1e-4, [[8, 1e-4]]))
+    pair = []
+    monkeypatch.setattr(a6m, 'u_psi_hai_dau_rad',
+                        lambda a6, kc, p1, p2, tam: (pair.append(kc) or dict(trang_thai='dat',
+                                                     ghep='replay_chung_theo_ca', phan=dict(ca_rad=0.001))))
+    used = []
+    monkeypatch.setattr(a6m, '_a3_rad', lambda kc, p, pl: (used.append(kc) or (0.002 if kc == 'kc2' else 0.003),
+                                                           '', 'goc'))
+    ref = _win(0.0, 0.0, 0.8, tan=3e-4, doan='doan1', buoi='2026-11-20_run02')
+    W3 = _win(0.0, 0.0, 0.8, doan='doan1', buoi='2026-11-23_run03', psi_tan_rad=5e-4)
+    kcd = {'2026-11-20_run02/doan1': 'kc2', '2026-11-23_run03/doan1': 'kc3'}
+    v, why, parts = K.u_beta_cam_cho(A6R, [], kcd, 'T1', dict(ref=ref, W=[W3]), 'goc')
+    assert not why and not pair and used == ['kc2', 'kc3']
+    assert parts[0]['A3_cach'] == 'bao_hai_dau_theo_vi_tri (rieng, rieng)'
+    assert v == pytest.approx(0.002 + 0.003 + 1e-4 + 5e-4 + 3e-4)
+    W2 = dict(W3, buoi='2026-11-20_run02')
+    v, why, parts = K.u_beta_cam_cho(A6R, [], kcd, 'T1', dict(ref=ref, W=[W2]), 'goc')
+    assert pair == ['kc2'] and parts[0]['A3_cach'] == 'cap_replay_chung_theo_ca'
+
+
+def test_u_beta_cam_cho_rho_outside_a6_domain(monkeypatch):
+    """A window whose tag centre + side / sqrt 2 is beyond mien.rho_max_m (c8b_a6._rho_ok): no u_beta_cam at that
+    place (reason 'ngoai mien A6'), not a number from an A6 replay outside its domain."""
+    import c8b_a6 as a6m
+    monkeypatch.setattr(K, 'a6_hieu_replay', lambda a6, ref, W, eps, cr, cw: (1e-4, [[8, 1e-4]]))
+    monkeypatch.setattr(a6m, '_a3_rad', lambda kc, p, pl: (0.002, '', 'goc'))
+    ref = _win(0.0, 0.0, 0.8, doan='doan1')
+    far = _win(1.2, 0.9, 0.8, doan='doan2', psi_tan_rad=5e-4)
+    assert not a6m._rho_ok(A6R, far['rho_m'])
+    v, why, _ = K.u_beta_cam_cho(A6R, [], dict(doan1='kc1', doan2='kc2'), 'T1', dict(ref=ref, W=[far]), 'goc')
+    assert v is None and 'ngoai mien A6' in why[0] and 'W rho' in why[0]
+    v, why, _ = K.u_beta_cam_cho(A6R, [], dict(doan1='kc1', doan2='kc2'), 'T1',
+                                 dict(ref=dict(ref, rho_m=None), W=[dict(far, T_m=[0, 0], rho_m=0.5)]), 'goc')
+    assert v is None and 'ref rho None' in why[0]

@@ -621,9 +621,22 @@ def cua_so_khung(path, ids, sha, plumb):
     S = math.atan2(sum(math.sin(p) for _, _, p in v), sum(math.cos(p) for _, _, p in v))
     d = [math.atan2(math.sin(p - S), math.cos(p - S)) for _, _, p in v]
     m = re.search(r'[\\/](doan\d+)[\\/]', os.path.abspath(path))
+    b = re.search(BUOI_RE, os.path.abspath(path))
     return dict(rho_m=max(math.hypot(x - C[0], y - C[1]) for x, y, _ in v),
                 T_m=[sum(x for x, _, _ in v) / len(v), sum(y for _, y, _ in v) / len(v)], S_rad=S,
-                tan_rad=max(d) - min(d), doan=m.group(1) if m else None, n=len(v))
+                tan_rad=max(d) - min(d), doan=m.group(1) if m else None, buoi=b.group(1) if b else None, n=len(v))
+
+
+# A camera segment is a 'doanN' of ONE floor session: the same 'doanN' name in two session folders
+# (YYYY-MM-DD_runNN, e.g. 2026-11-20_run02/.../doan1 and 2026-11-23_run03/.../doan1) is two cameras (CODE 24/11 to
+# C8B: the run03 lock, plan (a) Liam 24/11 "Dung so buoi 2 (Recommended)", the leg starts of buoi 2 and the W of run03
+# must take the two-end bound, e580587). Key 'buoi/doanN'; a path without a session folder keeps 'doanN' (as before).
+BUOI_RE = r'[\\/](\d{4}-\d{2}-\d{2}_run\d+)[\\/]'
+
+
+def khoa_doan(buoi, doan):
+    """Segment key of a window or a kiem_cheo file: None without doanN, 'buoi/doanN' or 'doanN'."""
+    return None if not doan else (f'{buoi}/{doan}' if buoi else doan)
 
 
 def _a6_du_cua_so(a6, T, S, G, V, DH, cam):
@@ -719,7 +732,15 @@ def u_beta_cam_cho(a6, kcs, kc_doan, tam_id, dc, cho):
         p = dict(doan_ref=ref.get('doan'), doan_W=w.get('doan'), loai_ref=loai, ref=ref.get('luot_id'),
                  ref_i=ref.get('doan_i'), W=w.get('frames'))
         a3p, eps, cach = None, a6.get('eps_g'), 'bao_hai_dau'
-        kc = (kc_doan or {}).get(w.get('doan')) if ref.get('doan') and ref.get('doan') == w.get('doan') else None
+        # CODE 24/11 (run03 lock, plan (a)): both windows of the pair inside the A6 domain (c8b_a6._rho_ok: centre +
+        # side / sqrt 2 <= mien.rho_max_m), else this place has no u_beta_cam (the A6 replay is not claimed outside)
+        out_d = [f'{nm} rho {e.get("rho_m")!r} m' for nm, e in (('ref', ref), ('W', w))
+                 if _num(e.get('rho_m')) is None or not a6m._rho_ok(a6, float(e['rho_m']))]
+        if out_d:
+            why.append(f'ngoai mien A6 (rho_max_m {(a6.get("mien") or {}).get("rho_max_m")!r}): ' + '; '.join(out_d))
+            continue
+        kr, kw = khoa_doan(ref.get('buoi'), ref.get('doan')), khoa_doan(w.get('buoi'), w.get('doan'))
+        kc = (kc_doan or {}).get(kw) if kr and kr == kw else None
         if kc is not None:
             r = a6m.u_psi_hai_dau_rad(a6, kc, ref['T_m'], w['T_m'], tam_id)
             if r.get('trang_thai') == 'dat' and r.get('ghep') == 'replay_chung_theo_ca':
@@ -733,7 +754,7 @@ def u_beta_cam_cho(a6, kcs, kc_doan, tam_id, dc, cho):
             # segment (c8b_a6._a3_rad); an end in a segment without kiem_cheo takes the largest of the others (stand-in)
             ends = []
             for nm, e in (('ref', ref), ('W', w)):
-                own = kc_doan.get(e.get('doan'))
+                own = kc_doan.get(khoa_doan(e.get('buoi'), e.get('doan')))
                 tries = [(own, 'rieng')] if own is not None else [(x, 'thay_the') for x in kc_doan.values()]
                 got = [(a6m._a3_rad(x, e['T_m'], a6['plumb_xy_m']), how) for x, how in tries]
                 ok = [(r3[0], how) for r3, how in got if r3[0] is not None]
@@ -1025,15 +1046,18 @@ def dau_chan_of(a, extra, nguon):
 
 
 def kc_doan_of(paths, kcs):
-    """{doanN: kiem_cheo dict} from the --kiem-cheo paths (segment = the 'doanN' directory of the path)."""
+    """{segment key: kiem_cheo dict} from the --kiem-cheo paths (segment = the 'doanN' directory of the path, of the
+    session folder YYYY-MM-DD_runNN when the path has one: khoa_doan, CODE 24/11)."""
     import re
     out = {}
     for p, k in zip(paths or [], kcs or []):
         m = re.search(r'[\\/](doan\d+)[\\/]', os.path.abspath(p))
         if m:
-            if m.group(1) in out:
-                raise KhoaError(f'--kiem-cheo: two files of {m.group(1)}')
-            out[m.group(1)] = k
+            b = re.search(BUOI_RE, os.path.abspath(p))
+            key = khoa_doan(b.group(1) if b else None, m.group(1))
+            if key in out:
+                raise KhoaError(f'--kiem-cheo: two files of {key}')
+            out[key] = k
     return out
 
 
