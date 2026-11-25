@@ -3101,7 +3101,7 @@ def test_round4_copies_and_numbers_of_the_files(tmp_path):
     _rewrite_nodes(goc, d, x, lambda y: y['khung_tuong_doi_v1']['mien_phai_phu'].update(
         D_s=y['khung_tuong_doi_v1']['mien_phai_phu']['D_s'] + 5e-13)
         if y['khung_tuong_doi_v1']['mien_phai_phu']['nut'] == 1 else None)
-    with pytest.raises(GC.GateFileError, match='mien_phai_phu'):
+    with pytest.raises(GC.GateFileError, match=r'D_s = nodes_s\[1\]'):     # this check, not the U manifest's one
         GC.check_nguon(d, goc)
 
 
