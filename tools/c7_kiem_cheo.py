@@ -68,6 +68,7 @@ VERSION = 'c7_kiem_cheo_v7'                  # v7: relative scoring S7, video pa
 U_SO_VERSION = 'c7_u_so_v4'
 TUNG_KHUNG_VERSION = 'c7_tung_khung_v4'      # v4: contradictions per run, unique frames, thieu_du_lieu_neo (S6-9, S6-10b)
 CAM_U_VERSION = 'c8_cam_u_vao_v3'           # c8b_u v3 198d2e9 (moc_dich = U_moc of CODE_CAM + tien_de_buoi)
+THAY_THE_FORMAT = 'c8_h_cuoi_thay_the_v1'       # L170 (GATE gate_c8, Liam 25/11): declared clip H for the end clip
 TIEN_DE_FORMAT = 'tien_de_buoi_v1'           # design S6 (approved: Liam 18/11 at CODE_KIEMCHEO, "Duyet (Recommended)")
 E_HIEU_SCHEMA = 'c7_e_hieu_v1'               # F9 (contract 2026-11-19 v1): read by c8_hc_a.read_e_hieu (CODE_HIEUCHUAN)
 DOAN_SCHEMA = 'c8_hc_doan_12b_v1'            # F5 (CODE_HIEUCHUAN), confirmed 19/11
@@ -2661,9 +2662,38 @@ def full_sets_ok(chain, tap_tinh, kc):
     return True
 
 
-def tien_de_eval(kc, us, tk, sha_kc, sha_us, sha_tk):
+def thay_l170_ok(thay, kc):
+    """L170: True when thay (the checked c8_h_cuoi_thay_the_v1 declaration of tien_de --h-cuoi-thay-the) covers the
+    camera segment of kc and its clip H_z is the declared clip (video file stem <...>_<clip_thay> or <clip_thay>)."""
+    if not thay:
+        return False
+    dn = (kc.get('doan') or {}).get('ten')
+    vid = os.path.splitext(os.path.basename(str(((kc.get('sessions') or {}).get('H_z') or {}).get('video') or '')))[0]
+    return dn in thay['doan'] and vid.split('_')[-1] == thay['clip_thay']
+
+
+def read_thay_l170(path, buoi):
+    """L170: the c8_h_cuoi_thay_the_v1 declaration (GATE format) of session buoi: {format, buoi, quyet_dinh {ngay,
+    phien, nguyen_van}, clip_thay, doan [{ten, ...}]}; KCError when it is not one. Returns the parts tien_de uses."""
+    d, sha = load_json_sha(path)
+    q = d.get('quyet_dinh') if isinstance(d, dict) else None
+    if not isinstance(d, dict) or d.get('format') != THAY_THE_FORMAT or d.get('buoi') != buoi:
+        raise KCError(f'{path}: not a {THAY_THE_FORMAT} declaration of session {buoi} (L170)')
+    if not (isinstance(q, dict) and all(isinstance(q.get(k), str) and q[k] for k in ('ngay', 'phien', 'nguyen_van'))):
+        raise KCError(f'{path}: quyet_dinh needs ngay, phien, nguyen_van (L170, A1)')
+    ct, dn = d.get('clip_thay'), d.get('doan')
+    if not (isinstance(ct, str) and ct and isinstance(dn, list) and dn
+            and all(isinstance(e, dict) and isinstance(e.get('ten'), str) and e['ten'] for e in dn)):
+        raise KCError(f'{path}: clip_thay and doan [{{ten}}] needed (L170)')
+    return dict(clip_thay=ct, doan=sorted(e['ten'] for e in dn), quyet_dinh=q,
+                file=dict(duong_dan=os.path.abspath(path), sha256=sha))
+
+
+def tien_de_eval(kc, us, tk, sha_kc, sha_us, sha_tk, thay=None):
     """S6-4 grading of one session (pure: no file read). kc, us, tk: the three results (tk None without
-    --tung-khung). Returns the tien_de_buoi_v1 dict without nguon / ngay. Raises KCError on identity faults (code 2)."""
+    --tung-khung). Returns the tien_de_buoi_v1 dict without nguon / ngay. Raises KCError on identity faults (code 2).
+    thay: read_thay_l170 of --h-cuoi-thay-the or None; L170: the declared clip H_z of a declared segment does not
+    make the result thieu_du_lieu through its kiem_h share alone (kiem_h_duoi_nguong_L170 written)."""
     sid = kc.get('buoi')
     if us.get('version') != U_SO_VERSION or us.get('buoi') != sid:
         raise KCError(f'u_so.json: not a {U_SO_VERSION} of session {sid}')
@@ -2711,9 +2741,18 @@ def tien_de_eval(kc, us, tk, sha_kc, sha_us, sha_tk):
         bad('thieu_du_lieu', 'khong_co_clip_kiem_troi')
     if tk is not None and tk.get('luot') and 'H_z' not in roles:   # KCP4-10: a segment with runs needs its H_z
         bad('thieu_du_lieu', 'doan_co_luot_khong_co_H_z')
+    duoi_l170 = None
     for n, r in (kc.get('kiem_h') or {}).items():
         v = r.get('ti_le_cung_luc')                 # KCJ1-2: NaN, inf, missing or not a number fails too
         if not _fin01(v) or not v >= KIEM_H_MIN:
+            if n == 'H_z' and _fin01(v) and thay_l170_ok(thay, kc):
+                # L170 (Liam 25/11, run07): the declared clip H standing for the end clip passes with its share
+                # below KIEM_H_MIN; the true value and the marks below 1 are written, the threshold is unchanged
+                duoi_l170 = dict(clip='H_z', clip_thay=thay['clip_thay'], ti_le_cung_luc=v, nguong=KIEM_H_MIN,
+                                 n_khung=r.get('n_khung'), khung_loai=r.get('khung_loai'),
+                                 moc_duoi_1={m: x for m, x in (r.get('ti_le_moc') or {}).items() if x < 1},
+                                 file=thay['file'], quyet_dinh=thay['quyet_dinh'])
+                continue
             bad('thieu_du_lieu', f'kiem_h:{n}')
     for n in sess:
         if n not in (kc.get('kiem_h') or {}):
@@ -2797,7 +2836,8 @@ def tien_de_eval(kc, us, tk, sha_kc, sha_us, sha_tk):
                           '(g) C33-12 (tu choi track thu, cham_lai 2 moi luot, lich_sha256, ket_luan) chua co: ban nay '
                           'khong dung cho buoi that (thiet ke v6 S8-3)']
                 + ([DOAN_GIOI_HAN] if kc.get('doan') else [])
-                + ([DOAN_KHONG_CUOI] if kc.get('doan') and 'H_z' not in roles else []))
+                + ([DOAN_KHONG_CUOI] if kc.get('doan') and 'H_z' not in roles else []),
+                **({} if duoi_l170 is None else dict(kiem_h_duoi_nguong_L170=duoi_l170)))
 
 
 def tien_de(a):
@@ -2810,7 +2850,8 @@ def tien_de(a):
     tk, sha_tk = load_json_sha(a.tung_khung) if a.tung_khung else (None, None)
     if tk is not None and tk.get('buoi') != a.session_id:
         raise KCError(f'{a.tung_khung}: buoi {tk.get("buoi")!r} is not {a.session_id!r} (TD1-4)')
-    out = tien_de_eval(kc, us, tk, sha_kc, sha_us, sha_tk)
+    thay = read_thay_l170(a.h_cuoi_thay_the, a.session_id) if getattr(a, 'h_cuoi_thay_the', None) else None
+    out = tien_de_eval(kc, us, tk, sha_kc, sha_us, sha_tk, thay=thay)
     # TD3-2: every hashed source by its path, SHA from the evidence that made the result, re-hashed to check
     nguon = [dict(vai_tro='kiem_cheo', duong_dan=os.path.abspath(a.kiem_cheo), sha256=sha_kc),
              _rehash(a.u_so, kc['u_so_sha256'], 'u_so')]
@@ -2828,6 +2869,8 @@ def tien_de(a):
             nguon.append(_rehash(dd.get('track'), v['nguon']['track_sha256'], f'track_{rid}'))
             nguon.append(_rehash(dd.get('frames'), v['nguon']['frames_sha256'], f'frames_{rid}'))
             nguon.append(_rehash(dd.get('kiem_cheo_khung'), v['nguon']['kiem_cheo_khung_sha256'], f'kiem_cheo_khung_{rid}'))
+    if thay is not None:                            # L170: the declaration read, whether it applied or not
+        nguon.append(dict(vai_tro='h_cuoi_thay_the', **thay['file']))
     out.update(ngay=a.ngay, buoi=a.session_id, nguon=nguon)
     write_new(a.out, out)
     _say(f"tien_de_buoi {a.session_id}: {out['ket_qua']} ({', '.join(out['ly_do']) or 'khong ly do'}); "
@@ -3651,6 +3694,9 @@ def main(argv=None):
     d.add_argument('--u-so', dest='u_so', required=True)
     d.add_argument('--tung-khung', dest='tung_khung')
     d.add_argument('--out', required=True)
+    d.add_argument('--h-cuoi-thay-the', dest='h_cuoi_thay_the', default=None,
+                   help='L170: c8_h_cuoi_thay_the_v1 declaration of the session (GATE); the declared clip H_z of a '
+                        'declared segment does not fail tien_de by its kiem_h share alone (value and flag written)')
     e = sub.add_parser('e_hieu')
     e.add_argument('--kiem-cheo', dest='kiem_cheo', required=True)
     e.add_argument('--doan', required=True, help='doan_12b_v1.json of CODE_HIEUCHUAN (F5)')

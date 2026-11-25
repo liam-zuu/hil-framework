@@ -3275,3 +3275,72 @@ def test_meo_bang_reads_the_sessions_list_of_nhactam(tmp_path, scene, monkeypatc
     assert {m['session_sha256'] for m in r['theo_cho']['K1']['muc']} == {s2}
     p3 = _second_session(tmp_path, sp, ghi_chu='khac')
     assert kc.main(base + ['--session', str(p3), '--out', str(tmp_path / 'b2.json')]) == 2
+
+
+# ---------------------------------------------------------------- L170 (Liam 25/11, run07): declared clip H at the end
+def _thay(doan=('doan2',), clip='KZWX6664'):
+    return dict(clip_thay=clip, doan=sorted(doan), quyet_dinh=dict(ngay='2026-11-25', phien='CODE x', nguyen_van='y'),
+                file=dict(duong_dan='/x/c8_h_cuoi_thay_the_v1.json', sha256='7' * 64))
+
+
+def _l170_low(k, u, t, vid='/x/run22_KZWX6664.MOV', clip='H_z'):
+    _doan(k, u, t)
+    k['sessions']['H_z']['video'] = vid
+    k['kiem_h'][clip].update(ti_le_cung_luc=286 / 336, n_khung=336, khung_loai=dict(n=49, ly_do='thieu_moc'),
+                             ti_le_moc={'12': 286 / 336, '1': 1.0})
+
+
+@pytest.mark.parametrize('thay, f, ket, why', [
+    (None, _l170_low, 'thieu_du_lieu', 'kiem_h:H_z'),                       # no declaration: the old rule
+    (_thay(), _l170_low, 'dat', None),                                      # declared segment and clip: passes
+    (_thay(clip='SMGJ0073'), _l170_low, 'thieu_du_lieu', 'kiem_h:H_z'),     # another clip declared
+    (_thay(doan=('doan1',)), _l170_low, 'thieu_du_lieu', 'kiem_h:H_z'),     # segment not declared
+    (_thay(), lambda k, u, t: _l170_low(k, u, t, vid='/x/run22_KZWX66641.MOV'), 'thieu_du_lieu', 'kiem_h:H_z'),
+    (_thay(), lambda k, u, t: (_l170_low(k, u, t), k['kiem_h']['H_b'].update(ti_le_cung_luc=0.9)), 'thieu_du_lieu',
+     'kiem_h:H_b'),                                                          # only H_z, only its share
+    (_thay(), lambda k, u, t: (_l170_low(k, u, t), k['kiem_h']['H_z'].update(ti_le_cung_luc=float('nan'))),
+     'thieu_du_lieu', 'kiem_h:H_z'),                                         # a value that is not a share still fails
+])
+def test_tien_de_l170_declared_end_clip_kiem_h(monkeypatch, thay, f, ket, why):
+    """L170 (Liam 25/11 at CODE local_4932073c, run07; CODE 26/11 to KIEMCHEO): with the c8_h_cuoi_thay_the_v1
+    declaration, the declared clip H_z of a declared segment does not make tien_de thieu_du_lieu by its kiem_h share
+    below KIEM_H_MIN; the true value, the marks below 1 and the declaration are written. Without it, for another clip,
+    another segment or another role, the 0.95 rule is unchanged."""
+    monkeypatch.setattr(kc, 'ID_KHOA', tuple(ALL8))
+    kcr, us, tk = _td_inputs()
+    kcr['id_khoa'] = ALL8
+    kcr['theo_thoi_gian'] = {n: dict(rieng_m={str(i): 0.0002 for i in ALL8}) for n in ('H_b', 'H_m', 'H_z')}
+    f(kcr, us, tk)
+    r = kc.tien_de_eval(kcr, us, tk, 'k' * 64, 'd' * 64, 'g' * 64, thay=thay)
+    assert r['ket_qua'] == ket and (why is None and r['ly_do'] == [] or why in r['ly_do'])
+    if ket == 'dat':
+        x = r['kiem_h_duoi_nguong_L170']
+        assert x['clip'] == 'H_z' and x['clip_thay'] == 'KZWX6664' and x['ti_le_cung_luc'] == 286 / 336
+        assert x['nguong'] == kc.KIEM_H_MIN == 0.95 and x['moc_duoi_1'] == {'12': 286 / 336}
+        assert x['khung_loai'] == dict(n=49, ly_do='thieu_moc') and x['file']['sha256'] == '7' * 64
+    else:                                           # the flag exactly when the declared H_z passed through L170
+        assert ('kiem_h_duoi_nguong_L170' in r) == ('kiem_h:H_z' not in r['ly_do'])
+
+
+def test_tien_de_without_declaration_writes_no_l170_key(monkeypatch):
+    """A session without the declaration grades and writes as before (no new key)."""
+    monkeypatch.setattr(kc, 'ID_KHOA', tuple(ALL8))
+    r = _td_full(_doan)
+    assert r['ket_qua'] == 'dat' and 'kiem_h_duoi_nguong_L170' not in r
+
+
+def test_read_thay_l170_checks_the_declaration(tmp_path):
+    good = dict(format='c8_h_cuoi_thay_the_v1', buoi='C8_x', clip_thay='KZWX6664',
+                quyet_dinh=dict(ngay='2026-11-25', phien='CODE local_4932073c', nguyen_van='cho dot do dat luon di'),
+                doan=[dict(ten='doan1', cuoi_goc='SMGJ0073', luot=['R1']), dict(ten='doan2', cuoi_goc='LEUW3347',
+                                                                              luot=['R2'])])
+    p = tmp_path / 'd.json'
+    p.write_text(json.dumps(good), encoding='utf-8')
+    t = kc.read_thay_l170(str(p), 'C8_x')
+    assert t['clip_thay'] == 'KZWX6664' and t['doan'] == ['doan1', 'doan2']
+    assert t['file']['sha256'] == kc.sha256_file(str(p)) and t['quyet_dinh']['nguyen_van'] == 'cho dot do dat luon di'
+    for bad_ in (dict(good, buoi='C8_y'), dict(good, format='x'), dict(good, quyet_dinh=dict(ngay='d', phien='p')),
+                 dict(good, clip_thay=''), dict(good, doan=[])):
+        p.write_text(json.dumps(bad_), encoding='utf-8')
+        with pytest.raises(kc.KCError):
+            kc.read_thay_l170(str(p), 'C8_x')
