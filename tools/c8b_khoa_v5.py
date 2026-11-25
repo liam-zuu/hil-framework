@@ -91,6 +91,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import c8_u_imu as cu                                                    # noqa: E402
+import c8b_p6_muon as pm                                                 # noqa: E402
 
 VERSION = 'c8b_khoa_v5'
 LE = 1.25
@@ -1003,6 +1004,8 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
         lb = [u.get('luot_id') if isinstance(u, dict) else None for u in (u_moc or [])]
         bands, bwhy = hang_theo_u(cq, lv, a_m, p6_dong, p6_he_so(a6),
                                   lb if lb and all(isinstance(x, str) and x for x in lb) else False)
+        if isinstance(p6_dong, dict) and 'muon' in p6_dong:   # L172: a borrowed P6 file, said in the lock
+            bwhy = '; '.join(x for x in (bwhy, pm.ghi_chu(p6_dong)) if x)
         if lever is not None:                                 # (|q_hat| + dq) A4(u) into P4 (v7 10, GATE RT4-3)
             for b in bands:
                 if b.get('P4_m') is not None and b.get('A4_deg') is not None:
@@ -1253,7 +1256,7 @@ def main(argv=None):
     ap.add_argument('--he-so-giu-ngoai', default=None,
                     help='c8b_he_so_giu_ngoai_v1 (factors >= 1 of P1, P_neo, A_neo held out by session); without '
                          'it nothing changes')
-    ap.add_argument('--p6-dong', default=None,
+    ap.add_argument('--p6-dong', default=None,   # or a c8b_p6_muon file (block muon; L172), checked by pm.kiem
                     help='c8b_p6_ngang tinh output (c8b_P6_rieng_ii_v2): B0 into hang_m, the bands of u into P4_m')
     ap.add_argument('--u-moc', action='append', default=None,
                     help='CAM U_moc file with U_moc_hieu_xy_m, U_moc_hieu_psi_rad; repeat (largest used)')
@@ -1370,6 +1373,14 @@ def main(argv=None):
             extra['kc_doan'] = kc_doan_of(a.kiem_cheo, extra.get('kiem_cheo'))
         if 'p6_dong' in extra and (not isinstance(extra['p6_dong'], dict) or extra['p6_dong'].get('schema') != P6_VERSION):
             raise KhoaError(f'--p6-dong: not a {P6_VERSION} file')
+        if 'p6_dong' in extra and 'muon' in extra['p6_dong']:
+            # L172 (Liam 25/11 ~23:45 at CODE; c8b_p6_muon): a session with one run has no P6 of its own; the
+            # file borrowed from other sessions is taken only when made for exactly the --session of this lock
+            try:
+                pm.kiem(extra['p6_dong'], {n['sha256'] for n in nguon if n['vai'] == 'session'},
+                        {n['sha256'] for n in nguon if n['vai'] == 'nguong'})
+            except pm.MuonError as exc:
+                raise KhoaError(f'--p6-dong (P6 muon, c8b_p6_muon): {exc}')
         out = build(tbs, ll, nguon, script_state(), a.canh_ma_m, nt, mk, commit_hil=a.commit_hil, **extra)
         with open(a.out, 'x', encoding='utf-8') as f:
             f.write(json.dumps(_clean(out), indent=1, ensure_ascii=False, allow_nan=False))
