@@ -4184,7 +4184,7 @@ def test_l172_lost_runs_after_the_run_of_the_cell(tmp_path):
     c[GC.SAU_HONG_KEY] = dict(LIAM_L172)
     _rewrite_khoa(goc, d, lambda k: k.update(
         muc_du_dai_theo_buoi={d['tien_de_c8'][0]['buoi']: [lv for lv in LEVELS if lv != c['muc']]}))
-    with pytest.raises(GC.GateFileError, match='has no frame of its own in some band of level'):
+    with pytest.raises(GC.GateFileError, match=f'cell {c["o"]}: its eligible run was made in session'):
         GC.check_nguon(d, goc)
 
 
