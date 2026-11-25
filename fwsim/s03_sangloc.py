@@ -531,17 +531,9 @@ def check_kep_rows(ctrl, rows):
     """C3-48 (S03 v8.6 2.1, 11 item 6 (c)): a PID run without the clamp indicator stops S03 —
     a completed first-attempt PID evaluation needs an empty kep_note and a value in every
     kep_frac_* column. NaN is accepted."""
-    if ctrl != 'PID':
-        return
     for r in rows:
-        if r.get('attempt') != 1 or r.get('status') in ('run_error', 'not_run'):
-            continue
-        if r.get('kep_note', '') not in ('', None) or \
-                any(r.get(k, '') in ('', None) for k in s3.KEP_FRAC_COLS):
-            raise s3.S03Stop(
-                f"{ctrl} row {r.get('cand_id')}: {r.get('kep_note') or 'no kep_frac value'} "
-                '(S03 v8.6 2.1, 11 item 6 (c); Codex C3-48: a DLL without the kep channel or '
-                'a failed kep_indicator self-check stops S03)')
+        if r.get('attempt') == 1:
+            s4.check_attempt_clamp(ctrl, r, r.get('cand_id'))
 
 
 def _diagnose(job, g, v, mu, row_no, timeout=None):
@@ -562,25 +554,33 @@ def do_job(job, bao=None):
     dll, ctrl, speeds, mu_levels = job['dll'], job['controller'], job['speeds'], job['mu_levels']
     mu_mid = mu_levels[len(mu_levels) // 2]
     fw, path = _firmware(dll), s3.o1.Path8()
+    resume = job.get('resume', {})
 
-    def run_levels(g, row_no, levels, rows):
+    def record(row_no, rows, result):
+        if bao is not None:
+            bao('ket_qua', row_no, result)
+        rows.append(result)
+
+    def run_levels(g, row_no, levels, rows, recorded):
         for mu in levels:
             for v in speeds:
-                if bao is not None:
-                    bao('bat_dau', row_no, (v, mu, 1))
-                row, log = s4.safe_run_gate(fw, path, ctrl, g, v, mu)
-                row = s4.tv_duty_run_error(row)
-                first = _eval_rec(ctrl, row_no, v, mu, 1, row, s4.log_sha(log))
-                if bao is not None:
-                    bao('ket_qua', row_no, first)
-                rows.append(first)
-                if first['status'] == 'run_error':
+                first = recorded.get((v, mu, 1))
+                if first is None:
+                    if bao is not None:
+                        bao('bat_dau', row_no, (v, mu, 1))
+                    row, log = s4.safe_run_gate(fw, path, ctrl, g, v, mu)
+                    digest = s4.log_sha(log)
+                    try:
+                        row = s4.validate_attempt_one(ctrl, row, row_no)
+                    except s4.ClampStop:
+                        record(row_no, rows, _eval_rec(ctrl, row_no, v, mu, 1, row, digest))
+                        raise
+                    first = _eval_rec(ctrl, row_no, v, mu, 1, row, digest)
+                    record(row_no, rows, first)
+                if first['status'] == 'run_error' and (v, mu, 2) not in recorded:
                     if bao is not None:
                         bao('bat_dau', row_no, (v, mu, 2))
-                    second = _diagnose(job, g, v, mu, row_no)
-                    if bao is not None:
-                        bao('ket_qua', row_no, second)
-                    rows.append(second)
+                    record(row_no, rows, _diagnose(job, g, v, mu, row_no))
 
     out = []
     for row_no, g in job['rows']:
@@ -591,14 +591,15 @@ def do_job(job, bao=None):
         if tri:
             raise s3.S03Stop(f'{ctrl} row {row_no}: a ngoai_bang set reached a worker '
                              '(S03 3.1b item 5: tool error — the parent filters those sets)')
-        rows = []
-        run_levels(g, row_no, [mu_mid], rows)
+        rows = list(resume.get(row_no, []))
+        check_kep_rows(ctrl, rows)
+        recorded = {(r['v'], r['mu'], r['attempt']): r for r in rows}
+        run_levels(g, row_no, [mu_mid], rows, recorded)
         if not rows:
             raise s3.S03Stop(f'{ctrl} row {row_no}: the evaluator appended no run '
                              '(S03 3.1b item 5: tool error)')
         if mid_feasible(rows, mu_mid):
-            run_levels(g, row_no, [m for m in mu_levels if m != mu_mid], rows)
-        check_kep_rows(ctrl, rows)
+            run_levels(g, row_no, [m for m in mu_levels if m != mu_mid], rows, recorded)
         out.append((row_no, rows))
         if bao is not None:
             bao('xong', row_no, None)
@@ -620,7 +621,7 @@ def job_main(path):
                 job = pickle.load(f)
             res = dict(ok=True, rows=do_job(job, bao))
         except s3.S03Stop as exc:
-            bao('bo', None, None)                # orderly tool stop, with no result for the current attempt
+            bao('bo', None, None)                # orderly tool stop, with no recovery of the gain set
             res = dict(ok=False, stop=str(exc))
     with open(path + '.out', 'wb') as f:
         pickle.dump(res, f)
@@ -631,13 +632,14 @@ def _worker_cmd(path):
     return [sys.executable, os.path.abspath(__file__), '--job', path]
 
 
-def _read_part(path):
-    """Return finished gain sets, the partial set's rows and its in-flight attempt key."""
-    done, partial, active = [], [], None
+def _read_part(path, resume=None):
+    """Read finished sets, the partial rows, the in-flight attempt and the open gain set."""
+    resume = resume or {}
+    done, partial, active, open_row = [], [], None, None
     try:
         f = open(path + '.part', 'rb')
     except FileNotFoundError:
-        return done, partial, active
+        return done, partial, active, open_row
     with f:
         while True:
             try:
@@ -645,18 +647,21 @@ def _read_part(path):
             except (EOFError, pickle.UnpicklingError, TypeError, ValueError):
                 break                           # a dead worker can leave a cut record at EOF
             if kind == 'bat_dau':
+                open_row = row_no
                 active = (row_no, *payload)
             elif kind == 'ket_qua':
                 partial.append(payload)
                 active = None
             elif kind == 'xong':
-                done.append((row_no, partial))
+                done.append((row_no, resume.get(row_no, []) + partial))
                 partial = []
+                open_row = None
             elif kind == 'bo':
                 active = None
+                open_row = None
             else:
                 break
-    return done, partial, active
+    return done, resume.get(open_row, []) + partial, active, open_row
 
 
 def _eval_rec(ctrl, row_no, v, mu, attempt, row, log_sha256=''):
@@ -827,9 +832,9 @@ def _reap_worker(worker):
 def run_jobs(jobs, work, n_parallel, log_path):
     """Run the screening pool and return each job's rows in input order.
 
-    Recover a crashed in-flight evaluation from its checkpoints and dispatch the later gain sets
-    in a new worker. A death between evaluations is a tool error. Attach attempt counts to errors
-    before removing the journals. Collect logs only after every worker tree has stopped.
+    Recover an interrupted evaluation or resume an open gain set from its results. A death
+    between gain sets is a tool error. Count attempts from the journals before removing them,
+    and collect logs only after every worker tree has stopped.
     """
     os.makedirs(work, exist_ok=True)
     all_jobs, orig = list(jobs), list(range(len(jobs)))
@@ -895,7 +900,7 @@ def run_jobs(jobs, work, n_parallel, log_path):
     def n_luot():
         counts = Counter({2: n_recovery_diag})
         for p in started_paths:
-            done, partial, active = _read_part(p)
+            done, partial, active, _ = _read_part(p)     # only attempts recorded by this worker
             counts.update(e['attempt'] for _, rows in done for e in rows)
             counts.update(e['attempt'] for e in partial)
             if active is not None:
@@ -922,27 +927,34 @@ def run_jobs(jobs, work, n_parallel, log_path):
                     try:
                         with open(r['path'] + '.out', 'rb') as f:
                             res = pickle.load(f)
+                    except FileNotFoundError:
+                        pass                         # a worker can exit without finishing its job
                     except (OSError, EOFError, pickle.UnpicklingError) as exc:
                         raise worker_failed() from exc
-                    if not res.get('ok'):
-                        raise s3.S03Stop(res.get('stop', 'a worker stopped without a reason'))
-                    have.update(res['rows'])
-                    continue
-                done, partial, active = _read_part(r['path'])
-                if active is None:
+                    else:
+                        if not res.get('ok'):
+                            raise s3.S03Stop(res.get('stop', 'a worker stopped without a reason'))
+                        have.update(res['rows'])
+                        continue
+                job = all_jobs[i]
+                done, partial, active, open_row = _read_part(r['path'], job.get('resume'))
+                if open_row is None:
                     raise worker_failed()
                 have.update(done)
-                why = (f'worker process exceeded the wait limit of {JOB_WAIT_MAX_S:g} s and was killed'
-                       if late else f'worker process died (exit code {rc})')
-                why += ' during this attempt (S03 3.1b item 5)'
-                crashed.append((have, all_jobs[i], partial, active, why))
-                rows = all_jobs[i]['rows']
-                k = [rn for rn, _g in rows].index(active[0])
-                rest = rows[k + 1:]
+                rows = job['rows']
+                k = [rn for rn, _g in rows].index(open_row)
+                if active is None:
+                    rest, resume = rows[k:], {open_row: partial}
+                else:
+                    why = (f'worker process exceeded the wait limit of {JOB_WAIT_MAX_S:g} s and was killed'
+                           if late else f'worker process died (exit code {rc})')
+                    why += ' during this attempt (S03 3.1b item 5)'
+                    crashed.append((have, job, partial, active, why))
+                    rest, resume = rows[k + 1:], {}
                 if rest:
                     oi = orig[i]
                     n_tiep[oi] = n_tiep.get(oi, 0) + 1
-                    all_jobs.append(dict(all_jobs[i], rows=rest,
+                    all_jobs.append(dict(job, rows=rest, resume=resume,
                                          name=f"{all_jobs[oi]['name']}_tiep{n_tiep[oi]}"))
                     orig.append(oi)
                     pending.insert(0, len(all_jobs) - 1)

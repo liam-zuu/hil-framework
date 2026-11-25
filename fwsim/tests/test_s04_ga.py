@@ -9,8 +9,10 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 import types
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -1846,12 +1848,14 @@ _DIG = {'t': ['float64', [3], 'ab' * 32]}   # a fixed log digest the stubbed run
 
 
 def _fake_post(tmp_path, monkeypatch, gains=G_PID, ctrl='PID', eval_mu=(0.5,), levels=(0.4, 0.5, 0.6),
-               tool_check=False, mu3_mod=None, sens_mod=None, det_mod=None, evals_mod=None):
+               tool_check=False, mu3_mod=None, sens_mod=None, det_mod=None, evals_mod=None,
+               use_real_determinism=False):
     """The real s4.post through s4.main() without a DLL: GA outputs (lock.yaml with the REAL fingerprint
     and the real S03 fixture, selected.csv with one send_to_HIL row, evals.csv attempt-1 rows with a
     valid log_sha256) and every sim call is stubbed; write_root_meta and log_phase run for real.
     mu3_mod(row, v, mu) modifies a three-mu run row; sens_mod(row, kind, factor, v, mu) modifies a
-    b0/R run row; det_mod(jobs, res) -> res replaces the new-process result list (C3-46);
+    b0/R run row; det_mod(jobs, res) -> res replaces the new-process result list (C3-46),
+    unless use_real_determinism leaves the launcher in place;
     evals_mod(rows) -> rows replaces the GA evals rows before they are written. Returns (return code,
     notes.json, out, selected.csv bytes before post)."""
     out = tmp_path / 'run'
@@ -1901,7 +1905,8 @@ def _fake_post(tmp_path, monkeypatch, gains=G_PID, ctrl='PID', eval_mu=(0.5,), l
         return det_mod(jobs, res) if det_mod else res
 
     monkeypatch.setattr(fwsim, 'FirmwareSim', lambda dll_: None)
-    monkeypatch.setattr(s4, 'run_determinism', fake_new)
+    if not use_real_determinism:
+        monkeypatch.setattr(s4, 'run_determinism', fake_new)
     monkeypatch.setattr(s4, 'run_custom', fake_custom)
     monkeypatch.setattr(s3, 'safe_run', fake_safe)
     sel = (out / 'selected.csv').read_bytes()
@@ -3237,6 +3242,36 @@ def test_c3_46_determinism_all_equal(tmp_path, monkeypatch):
     assert notes['notes']['PID determinism']['n_runs'] == 2
     det = list(csv.DictReader(open(out / 'post_checks' / 'determinism.csv', encoding='utf-8')))
     assert len(det) == 2 and all(r['equal'] == 'true' for r in det)
+
+
+@pytest.mark.parametrize('case, error_type', [('exit', 'S03Stop'), ('missing', 'FileNotFoundError'),
+                                            ('bad_pickle', 'UnpicklingError')])
+def test_c3_46_determinism_launch_failure_waits_for_liam(tmp_path, monkeypatch, capsys, case, error_type):
+    real_run = subprocess.run
+    secret = 'private determinism child stderr'
+
+    def run(cmd, *args, **kwargs):
+        if '--determinism-child' not in cmd:
+            return real_run(cmd, *args, **kwargs)
+        if case == 'bad_pickle':
+            Path(cmd[-1] + '.out').write_bytes(b'\xff')
+        return subprocess.CompletedProcess(cmd, 7 if case == 'exit' else 0, '', secret)
+
+    monkeypatch.setattr(subprocess, 'run', run)
+    rc, notes, out, selected = _fake_post(tmp_path, monkeypatch, tool_check=True, use_real_determinism=True)
+    assert rc == 2 and notes['post_trang_thai'] == s4.POST_DONE
+    assert notes['determinism_all_equal'] is False
+    check = notes['notes']['PID determinism']
+    assert check['all_equal'] is False and check['n_runs'] == 2
+    assert check['reasons'][0] == f'PID: determinism worker failed ({error_type})'
+    assert notes['cho_liam'] == [dict(controller='PID', check='determinism', reasons=check['reasons'])]
+    with (out / 'post_checks' / 'determinism.csv').open(encoding='utf-8') as f:
+        det = list(csv.DictReader(f))
+    assert len(det) == 2 and all(r['equal'] == 'false' for r in det)
+    assert (out / 'selected.csv').read_bytes() == selected
+    captured = capsys.readouterr()
+    assert 'TELL LIAM' in captured.out
+    assert secret not in captured.out + captured.err + json.dumps(notes)
 
 
 def _c3_det_case(case):

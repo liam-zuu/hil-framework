@@ -721,6 +721,25 @@ class ClampStop(s3.S03Stop):
     """The PID clamp channel is unavailable or failed validation."""
 
 
+def check_attempt_clamp(ctrl, row, row_no=None, *, require_fractions=True):
+    if ctrl != 'PID':
+        return
+    note = row.get('kep_note')
+    if (require_fractions and not note and row.get('status') not in ('run_error', 'not_run')
+            and any(row.get(k) in ('', None) for k in KEP_FRAC_COLS)):
+        note = 'no kep_frac value'
+    if note:
+        if row_no is not None:
+            note = f'{ctrl} row {row_no}: {note}'
+        raise ClampStop(note)
+
+
+def validate_attempt_one(ctrl, row, row_no=None, *, require_fractions=True):
+    """A clamp failure stops the phase before TV can turn the row into a run error."""
+    check_attempt_clamp(ctrl, row, row_no, require_fractions=require_fractions)
+    return tv_duty_run_error(row)
+
+
 class Evaluator:
     """Runs one candidate on every (mu, v) of the evaluation; keeps every run (evals.csv)."""
 
@@ -748,9 +767,7 @@ class Evaluator:
         for mu in self.mus:
             for v in self.speeds:
                 row, log = safe_run_gate(self.fw, self.path, self.ctrl, g, v, mu)
-                if row.get('kep_note'):
-                    raise ClampStop(row['kep_note'])
-                row = tv_duty_run_error(row)         # S04 v6.7 section 3: at the run level, before the row is kept
+                row = validate_attempt_one(self.ctrl, row, require_fractions=False)
                 self._rec(ga_seed, gen, cand, v, mu, 1, row, log, **run_values(row)[1])
                 rows.append((mu, v, row))
                 if row['status'] == 'run_error':
@@ -1419,12 +1436,18 @@ def post(a):
                                           f'range table: {ph["spectral_radius_note"]}']))
         mus, speeds = L['eval_mu'], L['speeds']
         jobs = [(ctrl, g, v, mu) for mu in mus for v in speeds]
-        res = run_determinism(a.dll, jobs, os.path.join(pc, '_work'))
+        launch_reasons = []
+        try:
+            res = run_determinism(a.dll, jobs, os.path.join(pc, '_work'))
+        except Exception as exc:               # launcher diagnostics can contain raw child stderr
+            launch_reasons.append(f'{ctrl}: determinism worker failed ({type(exc).__name__})')
+            res = []
         key = (s['ga_seed'], s['gen'], s['cand_id'])
         ga_rows = [e for e in evals
                    if e['controller'] == ctrl and (e['ga_seed'], e['gen'], e['cand_id']) == key
                    and e['attempt'] == '1']
         rows_, why = determinism_rows(ctrl, tc, jobs, res, ga_rows)     # C3-46: key by key
+        why = launch_reasons + why
         det += rows_
         all_equal = not why
         det_checks.append(all_equal)

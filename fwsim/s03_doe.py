@@ -2209,19 +2209,14 @@ files:
                         pass
         # the test-set stop is not printed: after the sweep the console prints one line when
         # S03 ends (v8.5 3.1b item 13); the status string carries the phase
+    meta_failed = False
     try:
         write_meta(final=True)
-    except Exception as exc:                    # keep the last complete meta and the fixed end line
-        if not (stop_before or stop_public or stop_sealed or stop_test):
-            stop_test = f'writing final meta.yaml failed: {type(exc).__name__}: {exc}'
-            traceback.print_exc(file=diag)
-            with contextlib.suppress(Exception):
-                put('stop.json', lambda f_: json.dump(dict(stop=stop_test), f_, indent=1))
-                put('diag.txt', lambda f_: f_.write(diag_text()))
-                write_test_manifest()
-        meta_state['status'] = final_status()
+    except Exception:                           # keep the last complete meta and the sealed phases
+        meta_failed = True
+        meta_state['status'] = 'failed to write final meta.yaml'
     print(f'S03 finished -> {a.out}; status: {meta_state["status"]}')
-    return 0 if not (stop_before or stop_public or stop_sealed or stop_test
+    return 0 if not (stop_before or stop_public or stop_sealed or stop_test or meta_failed
                      or meta_state['src_changed']) else 2
 
 

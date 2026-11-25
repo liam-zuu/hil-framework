@@ -15,6 +15,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -1075,6 +1076,42 @@ def test_c3_48_check_kep_rows():
             sl.check_kep_rows('PID', [bad])
 
 
+@pytest.mark.parametrize('tv_duty', [0.4, float('nan')], ids=['finite', 'nan'])
+def test_c3_55_clamp_stop_precedes_tv_and_later_evaluations(tmp_path, monkeypatch, tv_duty):
+    calls, checkpoints, tv_checks = [], [], []
+    fake_gate = _fake_gate()
+
+    def gate(fw, path, ctrl, g, v, mu):
+        calls.append((v, mu))
+        row, log = fake_gate(fw, path, ctrl, g, v, mu)
+        if (v, mu) == (0.2, MU_MID):
+            row.update(kep_note='kep_lech set', tv_duty=tv_duty)
+        return row, log
+
+    convert_tv = s4.tv_duty_run_error
+
+    def convert(row):
+        tv_checks.append(row)
+        return convert_tv(row)
+
+    monkeypatch.setattr(s4, 'safe_run_gate', gate)
+    monkeypatch.setattr(s4, 'tv_duty_run_error', convert)
+    monkeypatch.setattr(sl, '_firmware', lambda _: None)
+    job = _job_pid('J', tmp_path, _five_rows(1), speeds=(0.2, 0.5))
+    with pytest.raises(s4.ClampStop, match='kep_lech set'):
+        sl.do_job(job, lambda *entry: checkpoints.append(entry))
+    assert calls == [(0.2, MU_MID)]
+    assert [(kind, row_no) for kind, row_no, _ in checkpoints] == [('bat_dau', 1), ('ket_qua', 1)]
+    first = checkpoints[-1][2]
+    assert (first['attempt'], first['status'], first['kep_note']) == (1, 'ok', 'kep_lech set')
+
+    calls.clear()
+    ev = s4.Evaluator(None, 'fake.dll', 'PID', job['speeds'], [MU_MID, MU[0], MU[2]], str(tmp_path))
+    with pytest.raises(s4.ClampStop, match='kep_lech set'):
+        ev.candidate(job['rows'][0][1], 1, 1, 1)
+    assert calls == [(0.2, MU_MID)] and not ev.evals and not tv_checks
+
+
 # ── C3-39 / D2A-2: live phase entries ───────────────────────────────────────────
 
 def test_c3_39_pha_notes_on_stop(tmp_path, monkeypatch):
@@ -1395,16 +1432,50 @@ def test_c3_40_read_part_cut_record(tmp_path):
     row = dict(attempt=1, status='ok')
     p = str(tmp_path / 'job_X')
 
-    def build(tail):
+    def build(tail=None):
         with open(p + '.part', 'wb') as f:
+            _pkl.dump(('bat_dau', 1, (0.5, MU_MID, 1)), f)
             _pkl.dump(('ket_qua', 1, row), f)
             _pkl.dump(('xong', 1, None), f)
-            _pkl.dump(('ket_qua', 2, row), f)
-            _pkl.dump(('bat_dau', 2, (0.8, MU_MID, 1)), f)
-            f.write(tail)
+            if tail is not None:
+                _pkl.dump(('bat_dau', 2, (0.5, MU_MID, 1)), f)
+                _pkl.dump(('ket_qua', 2, row), f)
+                _pkl.dump(('bat_dau', 2, (0.8, MU_MID, 1)), f)
+                f.write(tail)
 
     rec = _pkl.dumps(('ket_qua', 2, row))
     for tail in (rec[:len(rec) // 2], b'\x80\x05garbage', _pkl.dumps('x')):
         build(tail)
-        assert sl._read_part(p) == ([(1, [row])], [row], (2, 0.8, MU_MID, 1))
-    assert sl._read_part(str(tmp_path / 'none')) == ([], [], None)
+        assert sl._read_part(p) == ([(1, [row])], [row], (2, 0.8, MU_MID, 1), 2)
+    build()
+    assert sl._read_part(p) == ([(1, [row])], [], None, None)
+    assert sl._read_part(str(tmp_path / 'none')) == ([], [], None, None)
+
+
+def test_c3_51_reap_worker_times_out_on_active_tree(monkeypatch):
+    events = []
+    now = 0.0
+
+    def sleep(seconds):
+        nonlocal now
+        now += seconds
+
+    class Job:
+        def active(self):
+            events.append(('active', now))
+            return True
+
+        def terminate(self):
+            events.append(('terminate', now))
+
+        def close(self):
+            events.append(('close', now))
+
+    proc = SimpleNamespace(args=['worker'], wait=lambda timeout: events.append(('wait', timeout)))
+    monkeypatch.setattr(sl, 'time', SimpleNamespace(monotonic=lambda: now, sleep=sleep))
+    monkeypatch.setattr(sl, 'KILL_WAIT_S', 2.0)
+    monkeypatch.setattr(sl, 'POLL_S', 1.0)
+    with pytest.raises(sl.WorkerTreeStop, match='within 2 s'):
+        sl._reap_worker(dict(proc=proc, job_object=Job(), attached=True))
+    assert events == [('active', 0), ('terminate', 0), ('wait', 2),
+                      ('active', 0), ('active', 1), ('active', 2), ('close', 2)]

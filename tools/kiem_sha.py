@@ -314,7 +314,10 @@ def _xu_sha(k, v, D, path, cap, kh, st):
 
 
 def _duyet(v, path, cap, kh, st, *, ban_do_sha=False):
-    if isinstance(v, dict):
+    if ban_do_sha and not isinstance(v, dict):
+        kh.append({'khoa': path, 'gia_tri': 'null' if v is None else str(v)[:200],
+                   'ly_do': 'kieu_khong_ho_tro'})
+    elif isinstance(v, dict):
         if _la_manifest(v):
             for k2, v2 in v.items():
                 cap.append({'khoa': _manifest_con(path, k2),

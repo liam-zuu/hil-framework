@@ -3528,7 +3528,8 @@ def _fake_worker(tmp_path):
     firmware; environment variables make it os._exit(9) at a gain set (S03_TEST_KILL=<k_psi
     repr>, matched when abs(g['k_psi'] / k - 1) < 1e-12 on a PID run), sleep
     (S03_TEST_SLEEP=<k_psi>:<seconds>), raise S03Stop (S03_TEST_STOP=<k_psi>) or exit before
-    job_main (S03_TEST_EXIT_AT_START=1)."""
+    job_main (S03_TEST_EXIT_AT_START=1). S03_TEST_KILL_AFTER_RESULT moves the targeted death
+    to just after flushing an ok or run_error result in the initial S0 PID worker."""
     script = tmp_path / 'fake_worker.py'
     fwsim_dir = os.path.abspath(os.path.join(HERE, '..'))
     script.write_text(textwrap.dedent('''\
@@ -3541,6 +3542,7 @@ def _fake_worker(tmp_path):
 
         KILL = os.environ.get('S03_TEST_KILL')
         KILL_POINT = os.environ.get('S03_TEST_KILL_POINT')
+        KILL_AFTER = os.environ.get('S03_TEST_KILL_AFTER_RESULT')
         SLEEP = os.environ.get('S03_TEST_SLEEP')
         STOP = os.environ.get('S03_TEST_STOP')
         DIAG = os.environ.get('S03_TEST_DIAG')
@@ -3551,7 +3553,12 @@ def _fake_worker(tmp_path):
         def gate(fw, path, ctrl, g, v, mu):
             if ctrl == 'PID':
                 if _match(KILL, g) and (KILL_POINT is None or (v, mu) == tuple(map(float, KILL_POINT.split(',')))):
-                    os._exit(9)
+                    if not KILL_AFTER:
+                        os._exit(9)
+                    if os.path.basename(_p).startswith('job_S0_PID_'):
+                        print('evaluated crash target', flush=True)
+                        if KILL_AFTER == 'run_error':
+                            return dict(status='run_error', completed='', error='recorded test error'), None
                 if DIAG:
                     return dict(status='run_error', completed='', error='fake error before diagnosis'), None
                 if SLEEP is not None:
@@ -3580,6 +3587,19 @@ def _fake_worker(tmp_path):
             s3.run_in_new_process = diagnosis
         if os.environ.get('S03_TEST_EXIT_AT_START'):
             os._exit(5)
+        if KILL_AFTER:
+            real_do_job = sl.do_job
+
+            def do_job(job, bao):
+                def checkpoint(kind, row_no, payload):
+                    bao(kind, row_no, payload)
+                    if (job['name'] == 'S0_PID_00000' and kind == 'ket_qua' and row_no == 3
+                            and payload['attempt'] == 1
+                            and (payload['v'], payload['mu']) == tuple(map(float, KILL_POINT.split(',')))):
+                        os._exit(9)
+                return real_do_job(job, checkpoint)
+
+            sl.do_job = do_job
         _p = sys.argv[sys.argv.index('--job') + 1]
         print('worker job file', os.path.basename(_p), flush=True)
         sl.job_main(_p)
@@ -3859,9 +3879,13 @@ def test_c3_38_no_writes_under_sealed(tmp_path, monkeypatch, capsys):
 @needs_dll
 @pytest.mark.parametrize('sealed_write_fails', [False, True])
 def test_c3_38_final_meta_replace_failure(tmp_path, monkeypatch, capsys, sealed_write_fails):
+    import json
+    from pathlib import Path
+
     real_write = s3.write_csv
     real_replace = os.replace
     meta_before = []
+    test_writes_after_failure = []
 
     def write_csv(path, rows, cols=None):
         if sealed_write_fails and str(path).endswith(os.path.join('sealed', 'runs.csv')):
@@ -3869,24 +3893,35 @@ def test_c3_38_final_meta_replace_failure(tmp_path, monkeypatch, capsys, sealed_
         return real_write(path, rows, cols)
 
     def replace(src, dst):
-        from pathlib import Path
         if Path(dst).name == 'meta.yaml' and 'status: "running:' not in Path(src).read_text(encoding='utf-8'):
             meta_before.append(Path(dst).read_bytes())
             raise OSError('final meta output failed 93.721')
         return real_replace(src, dst)
 
+    def watch_open(path, mode='r', *args, **kwargs):
+        if meta_before and Path(path).parent.name == 'sealed_test' and 'w' in mode:
+            test_writes_after_failure.append(Path(path).name)
+        return open(path, mode, *args, **kwargs)
+
     monkeypatch.setattr(s3, 'write_csv', write_csv)
     monkeypatch.setattr(os, 'replace', replace)
+    monkeypatch.setattr(s3, 'open', watch_open, raising=False)
     code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys)
     assert code == 2
-    phase, folder, secret = (('after the sweep', 'sealed', '71.392') if sealed_write_fails
-                             else ('in the test set', 'sealed_test', '93.721'))
-    assert console.splitlines()[-1] == (
-        f'S03 finished -> {out}; status: stopped {phase} (the reason is in {folder}/stop.json)')
+    assert console.splitlines()[-1] == f'S03 finished -> {out}; status: failed to write final meta.yaml'
     assert len(meta_before) == 1 and b'status: "running: the sweep is done' in meta_before[0]
     assert (out / 'meta.yaml').read_bytes() == meta_before[0]
     assert not list(out.glob('.meta.yaml.*'))
-    assert secret in (out / folder / 'stop.json').read_text(encoding='utf-8')
+    assert not test_writes_after_failure
+    test = out / 'sealed_test'
+    assert not (test / 'stop.json').exists()
+    if sealed_write_fails:
+        assert '71.392' in (out / 'sealed' / 'stop.json').read_text(encoding='utf-8')
+        assert not test.exists()
+    else:
+        manifest = json.loads((test / 'manifest.json').read_text(encoding='utf-8'))['files']
+        assert set(manifest) == {'runs_test.csv', 'notes.json', 'diag.txt'}
+        assert all(sha == s3.sha256_file(test / name) for name, sha in manifest.items())
     for text in (console, calls.seen['stderr'], *(_public_text(out).values())):
         assert all(secret not in text for secret in ('71.392', '93.721', 'Traceback'))
 
@@ -4159,6 +4194,51 @@ def test_c3_50_main_worker_death_at_low_mu(tmp_path, monkeypatch, capsys):
     notes = json.loads((out / 'sealed' / 'notes.json').read_text(encoding='utf-8'))
     phase = next(p for p in notes['pha'] if p['pha'] == 'S0')
     assert (phase['n_luot_thuc'], phase['n_chay_lai_chan_doan'], phase['n_luot_tong']) == (176, 1, 177)
+
+
+@needs_dll
+@pytest.mark.parametrize('status', ['ok', 'run_error'])
+def test_c3_56_main_worker_death_after_result(tmp_path, monkeypatch, capsys, status):
+    import csv
+    import json
+
+    _popen_fake_worker(monkeypatch, _fake_worker(tmp_path))
+    loader, g3, argv = _s0_kill_setup(tmp_path, monkeypatch, n0='10')
+    speed = s3.SPEEDS[1]
+    monkeypatch.setenv('S03_TEST_KILL', repr(g3['k_psi']))
+    monkeypatch.setenv('S03_TEST_KILL_POINT', f'{speed},0.5')
+    monkeypatch.setenv('S03_TEST_KILL_AFTER_RESULT', status)
+    code, out, _, _, _ = _run_main(tmp_path, monkeypatch, capsys, run_step=sl.run_step,
+                                   load_screen=loader, argv=argv + ['--jobs', '2'])
+    assert code == 0 and not (out / 'sealed' / 'stop.json').exists()
+    s0 = out / 'sealed' / 'sangloc_thu'
+    with (s0 / 'evals_S0.csv').open(encoding='utf-8') as f:
+        rows = [r for r in csv.DictReader(f) if r['controller'] == 'PID']
+    first = [r for r in rows if r['row'] == '3' and r['attempt'] == '1']
+    planned = [(v, 0.5) for v in s3.SPEEDS]
+    if status == 'ok':
+        planned += [(v, mu) for mu in (0.4, 0.6) for v in s3.SPEEDS]
+    assert [(float(r['v']), float(r['mu'])) for r in first] == planned
+    assert [r['status'] for r in first] == ['ok', status] + ['ok'] * (len(planned) - 2)
+    diagnoses = [r for r in rows if r['attempt'] == '2']
+    if status == 'run_error':
+        assert first[1]['error'] == 'recorded test error'
+        [diagnosis] = diagnoses
+        assert (diagnosis['row'], float(diagnosis['v']), float(diagnosis['mu'])) == ('3', speed, 0.5)
+        assert diagnosis['log_sha256']
+    else:
+        assert not diagnoses
+    for rn in ('1', '2', '4', '10'):
+        others = [r for r in rows if r['row'] == rn]
+        assert len(others) == 9 and all(r['status'] == 'ok' for r in others)
+    log = (s0 / 'tien_trinh_S0.log').read_text(encoding='utf-8')
+    assert log.count('evaluated crash target') == 1
+    assert 'job_S0_PID_00000_tiep1.pkl' in log
+    notes = json.loads((out / 'sealed' / 'notes.json').read_text(encoding='utf-8'))
+    phase = next(p for p in notes['pha'] if p['pha'] == 'S0')
+    n_first, n_diag = (174, 1) if status == 'run_error' else (180, 0)
+    assert (phase['n_luot_thuc'], phase['n_chay_lai_chan_doan'], phase['n_luot_tong']) == (
+        n_first, n_diag, n_first + n_diag)
 
 
 @needs_dll

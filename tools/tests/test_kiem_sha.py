@@ -1319,6 +1319,19 @@ def test_c3_22_outputs_toan_sha_sai_kieu(tmp_path):
         (f'outputs["{ten}.png"]', 'sha_khong_hop_le') for ten in ('x', 'y', 'z')]
 
 
+@pytest.mark.parametrize('outputs', [None, 5, 'a.png', [{'a.png': sha(b'cu')}]])
+def test_c3_59_cli_outputs_sai_kieu(tmp_path, outputs):
+    repo, goc = _lam_repo(tmp_path)
+    (goc / 'a.png').write_bytes(b'cu')
+    (goc / 'r.json').write_text(json.dumps(
+        {'anh': {'a.png': sha(b'cu')}, 'outputs': outputs}), encoding='utf-8')
+
+    ma, rows, kh = _chay(goc, repo, tmp_path / 'out')
+    assert ma == 3
+    assert [(r['khoa'], r['ket_qua']) for r in rows] == [('anh["a.png"]', 'tho')]
+    assert [(e['khoa'], e['ly_do']) for e in kh] == [('outputs', 'kieu_khong_ho_tro')]
+
+
 @pytest.mark.parametrize('sai', [
     5, 0, 1.5, True, False, {'x': 1}, {}, [H_B], [], 'b/c.csv',
     'z' * 64, 'a' * 63, 'a' * 65, ' ' + 'a' * 64, ''])
