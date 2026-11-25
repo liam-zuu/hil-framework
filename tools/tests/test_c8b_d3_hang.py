@@ -231,6 +231,32 @@ def test_he_so_giu_ngoai_from_the_ratios(tmp_path):
     assert json.load(open(tmp_path / 'h2.json', encoding='utf-8'))['trang_thai'] == 'thieu'    # A3 0.3 / 0.21 > 1.25
 
 
+def test_he_so_loai_khoi_max_l175(tmp_path):
+    """--loai-khoi-max: the files of the session are named in nguon (its lock can read the factors) but take no part
+    in the ratios; the result equals the file made without that session."""
+    import c8b_he_so_giu_ngoai as HS
+    k1, _ = _kc(tmp_path, '2026-11-20_run02/doan2', 0.003, 0.2, [(0.003, 0.0), (0.0, -0.002)], [0.2])
+    k2, _ = _kc(tmp_path, '2026-11-23_run03/doan1', 0.0045, 0.21, [(0.0045, 0.0)], [0.21])
+    k7, _ = _kc(tmp_path, '2026-11-25_run07/doan2', 0.009, 0.22, [(0.009, 0.0)], [0.22])
+    n1, _, c1 = _neo(tmp_path, '2026-11-20_run02', 3e-5, 1e-5, [('hop_le', 3e-5, 0.0, 1e-5)])
+    n2, _, c2 = _neo(tmp_path, '2026-11-23_run03', 3.3e-5, 2e-5, [('hop_le', 0.0, 3.3e-5, -2e-5)])
+    n7, _, c7 = _neo(tmp_path, '2026-11-25_run07', 9e-5, 9e-5, [('hop_le', 9e-5, 0.0, 9e-5)])
+    hai = ['--kiem-cheo', f'2026-11-20_run02/doan2={k1}', '--kiem-cheo', f'2026-11-23_run03/doan1={k2}',
+           '--neo', f'2026-11-20_run02={n1},{c1}', '--neo', f'2026-11-23_run03={n2},{c2}']
+    ba = hai + ['--kiem-cheo', f'2026-11-25_run07/doan2={k7}', '--neo', f'2026-11-25_run07={n7},{c7}']
+    assert HS.main(hai + ['--out', str(tmp_path / 'h2.json')]) == 0
+    assert HS.main(ba + ['--loai-khoi-max', '2026-11-25_run07=L175', '--out', str(tmp_path / 'h3.json')]) == 0
+    d2 = json.load(open(tmp_path / 'h2.json', encoding='utf-8'))
+    d3_ = json.load(open(tmp_path / 'h3.json', encoding='utf-8'))
+    assert d3_['hang'] == d2['hang'] and d3_['ti_le'] == d2['ti_le'] and d3_['loai_khoi_max'] == {'2026-11-25_run07': 'L175'}
+    import c8b_khoa_v5 as K
+    ng7 = [dict(vai='neo', file='n', sha256=H.cu.sha256(n7)), dict(vai='kiem_cheo', file='k', sha256=H.cu.sha256(k7))]
+    assert K.doc_he_so(d3_, ng7) == d3_['hang']                    # the run07 lock can read it
+    for bad in (['--loai-khoi-max', 'run99=x'], ['--loai-khoi-max', '2026-11-25_run07='],
+                ['--loai-khoi-max', '2026-11-25_run07=a', '--loai-khoi-max', '2026-11-25_run07=b']):
+        assert HS.main(ba + bad + ['--out', str(tmp_path / 'hx.json')]) == 2
+
+
 def test_l155_factor_file_of_the_lock(tmp_path):
     """L155: a lock that names a he_so_giu_ngoai source needs --he-so (that file); the index of a scaled term is the
     other sessions' index x le x factor, so the largest error of the trial session is inside it."""

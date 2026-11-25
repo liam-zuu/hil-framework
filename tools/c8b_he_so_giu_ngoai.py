@@ -104,9 +104,18 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--kiem-cheo', action='append', required=True, help='BUOI/doanN=kiem_cheo.json, repeat')
     ap.add_argument('--neo', action='append', required=True, help='BUOI=neo_luot.json,khung.csv, repeat')
+    ap.add_argument('--loai-khoi-max', action='append', default=[],
+                    help='BUOI=LY_DO: the files of that session are read and named in nguon (its lock needs them) but '
+                         'take no part in the ratios, neither as the session held out nor as another session (L175)')
     ap.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
+        loai = {}
+        for s in a.loai_khoi_max:
+            b, sep, y = s.partition('=')
+            if not sep or not b or b in loai or not y.strip():
+                raise HeSoError(f'--loai-khoi-max {s!r}: BUOI=LY_DO, once per session')
+            loai[b] = y
         segs, neo, src = [], [], []
         for x in a.kiem_cheo:
             seg, sep, p = x.partition('=')
@@ -131,7 +140,11 @@ def main(argv=None):
         # Codex D3-4: one file under two session labels would be 'another session' of itself
         d3.khong_lap([(x['vai'], x['sha256']) for x in src if x['vai'].startswith('kiem_cheo ')], '--kiem-cheo')
         d3.khong_lap([(x['vai'], x['sha256']) for x in src if x['vai'].startswith('neo ')], '--neo')
-        out = build(segs, neo)
+        bn = {s.split('/')[0] for s, *_ in segs} | {b for b, *_ in neo}
+        if any(b not in bn for b in loai):
+            raise HeSoError(f'--loai-khoi-max {sorted(loai)}: not a session of --kiem-cheo / --neo')
+        out = build([x for x in segs if x[0].split('/')[0] not in loai], [x for x in neo if x[0] not in loai])
+        out['loai_khoi_max'] = loai
         c = subprocess.run(['git', '-C', HERE, 'rev-parse', 'HEAD'], capture_output=True, text=True)
         st = subprocess.run(['git', '-C', HERE, 'status', '--porcelain', '--', 'c8b_he_so_giu_ngoai.py',
                              'c8b_d3_hang.py', 'c8b_khoa_v5.py'], capture_output=True, text=True)

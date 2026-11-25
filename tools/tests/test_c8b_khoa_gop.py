@@ -328,3 +328,23 @@ def test_band_refusals_say_why():
     del kb[2][1]['muc']['O1-F08']['hang_theo_u'][1]['khong_khung']
     with pytest.raises(G.GopError, match='khong_khung'):
         G.gop(kb, CH)
+
+def test_loai_khoi_max_l175():
+    """L175 as CODE applied it 26/11: a left-out session stays in the lock (domains, levels, sources) but gives no
+    number to the largest; refused when it would leave no session, names an unknown session or has no reason."""
+    kb = _two() + [('2026-11-25_run07', _khoa(3.0, 2.5, sess='7' * 64))]
+    k_all = G.gop(copy.deepcopy(kb), CH)
+    k = G.gop(copy.deepcopy(kb), CH, loai={'2026-11-25_run07': 'L175'})
+    k2 = G.gop(copy.deepcopy(kb[:2]), CH)
+    assert k_all['muc']['O1-F05']['hang_dong']['hang_m'] == pytest.approx(K.LE * 0.019 * 3.0, rel=1e-12)
+    for lv in K.LEVELS:
+        assert k['muc'][lv]['hang_dong'] == k2['muc'][lv]['hang_dong']
+        assert k['muc'][lv]['hang_theo_u'] == k2['muc'][lv]['hang_theo_u']
+    assert k['u_beta_cam_deg'] == k2['u_beta_cam_deg'] and k['trang_thai'] == 'khoa'
+    assert 'C8_2026-11-25_run07' in k['mien_car_pose_theo_buoi'] and 'C8_2026-11-25_run07' in k['muc_du_dai_theo_buoi']
+    assert k['gop']['loai_khoi_max'] == {'2026-11-25_run07': 'L175'} and k2['gop']['loai_khoi_max'] == {}
+    assert '2026-11-25_run07' not in k['gop']['lon_nhat_tu'].values()
+    for bad in ({'2026-11-25_run07': 'L175', '2026-11-20_run02': 'x', '2026-11-23_run03': 'y'},
+                {'run99': 'x'}, {'2026-11-25_run07': ' '}):
+        with pytest.raises(G.GopError):
+            G.gop(copy.deepcopy(kb), CH, loai=bad)

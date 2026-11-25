@@ -172,13 +172,24 @@ def _keys_same(vals, w):
     return ks[0]
 
 
-def gop(khoa_buoi, commit_hil, script=None, nguon_khoa=None):
-    """khoa_buoi: [(buoi, lock dict)], nguon_khoa: {buoi: dict(file, duong_dan, sha256)}. Returns the combined lock."""
+def gop(khoa_buoi, commit_hil, script=None, nguon_khoa=None, loai=None):
+    """khoa_buoi: [(buoi, lock dict)], nguon_khoa: {buoi: dict(file, duong_dan, sha256)}. Returns the combined lock.
+    loai {buoi: ly_do} (L175 as CODE applied it 26/11, history_CODE 'CODE chot (theo L175 ...)'): those sessions stay in
+    the lock (sources, states, domains, muc_du_dai_theo_buoi) but give no number to the largest of a term."""
     if not khoa_buoi:
         raise GopError('no session lock')
     names = [b for b, _ in khoa_buoi]
     if len(set(names)) != len(names) or any(not b or '=' in b for b in names):
         raise GopError(f'session names {names}: one lock per session, names non-empty and distinct')
+    loai = dict(loai or {})
+    if any(b not in names or not isinstance(y, str) or not y.strip() for b, y in loai.items())             or len(loai) >= len(names):
+        raise GopError(f'loai_khoi_max {loai}: sessions of --khoa-buoi with a reason, at least one session kept')
+
+    def _lon(qv, w):                                  # the largest over the sessions not left out
+        qk = [(b, v) for b, v in qv if b not in loai]
+        if not qk:
+            raise GopError(f'{w}: only left-out sessions ({sorted(loai)}) give this term')
+        return _lon_nhat(qk, w, nguon_max)[0]
     for b, k in khoa_buoi:
         if not isinstance(k, dict) or k.get('version') != kv.VERSION:
             raise GopError(f'{b}: not a {kv.VERSION} lock')
@@ -217,7 +228,7 @@ def gop(khoa_buoi, commit_hil, script=None, nguon_khoa=None):
                 m[f] = {}
                 for q in hk:
                     qv = [(b, x[q]) for b, x in vals]
-                    m[f][q] = (_lon_nhat(qv, f'muc.{lv}.{f}.{q}', nguon_max)[0] if q in HD_MAX
+                    m[f][q] = (_lon(qv, f'muc.{lv}.{f}.{q}') if q in HD_MAX
                                else _same(qv, f'muc.{lv}.{f}.{q}'))
             elif f == 'hang_theo_u':
                 n = {len(x) for _, x in vals if isinstance(x, list)}
@@ -247,7 +258,7 @@ def gop(khoa_buoi, commit_hil, script=None, nguon_khoa=None):
                         if q in BAND_SAME:
                             band[q] = same[q]
                         elif q in BAND_MAX and co:
-                            band[q] = _lon_nhat(qv, w, nguon_max)[0]
+                            band[q] = _lon(qv, w)
                         elif q == 'trang_thai' and co:
                             band[q] = _te_nhat(qv, w, ST_BAND)
                         else:
@@ -268,8 +279,8 @@ def gop(khoa_buoi, commit_hil, script=None, nguon_khoa=None):
                     and not any(x[KK] for x in k['muc'][lv]['hang_theo_u'])] for b, k in khoa_buoi}
     # u_beta_cam per place
     cho = _keys_same([(b, k['u_beta_cam_deg']) for b, k in khoa_buoi], 'u_beta_cam_deg')
-    out['u_beta_cam_deg'] = {c: _lon_nhat([(b, k['u_beta_cam_deg'][c]) for b, k in khoa_buoi],
-                                          f'u_beta_cam_deg.{c}', nguon_max)[0] for c in cho}
+    out['u_beta_cam_deg'] = {c: _lon([(b, k['u_beta_cam_deg'][c]) for b, k in khoa_buoi], f'u_beta_cam_deg.{c}')
+                             for c in cho}
     for f in ST_FIELDS:
         ck = _keys_same([(b, k[f]) for b, k in khoa_buoi], f)
         out[f] = {c: _te_nhat([(b, k[f][c]) for b, k in khoa_buoi], f'{f}.{c}', ST_DAT_THIEU) for c in ck}
@@ -350,7 +361,7 @@ def gop(khoa_buoi, commit_hil, script=None, nguon_khoa=None):
                            'there, so no session gives a number; null as before)')
     out.update(trang_thai=st, ly_do_chua_khoa=why,
                gop=dict(version=GOP_VERSION, buoi=names, khoa_buoi=nguon_khoa or {},
-                        lon_nhat_tu=nguon_max, dai_theo_buoi=dai_buoi,
+                        lon_nhat_tu=nguon_max, dai_theo_buoi=dai_buoi, loai_khoi_max=loai,
                         quy_tac='hang so: lon nhat qua cac buoi (Liam 24/11 o CODE local_42161302, hop chon A2, nguyen '
                                 'van: "Mot khoa, lay lon nhat (Recommended)"); trang thai: te nhat; '
                                 'mien_car_pose.kappa: bao [min lo, max hi]; cac truong khac phai trung; hang theo dai '
@@ -375,9 +386,17 @@ def main(argv=None):
     ap.add_argument('--khoa-buoi', action='append', required=True,
                     help='BUOI=c8b_khoa_v5.json of one session (BUOI: the session folder, e.g. 2026-11-23_run03)')
     ap.add_argument('--commit-hil', required=True, help='the scoring commit (40 hex) of every session lock')
+    ap.add_argument('--loai-khoi-max', action='append', default=[],
+                    help='BUOI=LY_DO: the session stays in the lock but gives no number to the largest (L175)')
     ap.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
+        loai = {}
+        for s in a.loai_khoi_max:
+            b, sep, y = s.partition('=')
+            if not sep or not b or b in loai:
+                raise GopError(f'--loai-khoi-max {s!r}: BUOI=LY_DO, once per session')
+            loai[b] = y
         if not kv._hex40(a.commit_hil):
             raise GopError(f'--commit-hil {a.commit_hil!r} is not 40 hex')
         kb, nk = [], {}
@@ -389,7 +408,7 @@ def main(argv=None):
             with open(pth, encoding='utf-8') as f:
                 kb.append((b, json.load(f)))
             nk[b] = dict(file=os.path.basename(pth), duong_dan=os.path.abspath(pth), sha256=cu.sha256(pth))
-        out = gop(kb, a.commit_hil, script_state(), nk)
+        out = gop(kb, a.commit_hil, script_state(), nk, loai)
         with open(a.out, 'x', encoding='utf-8') as f:
             f.write(json.dumps(kv._clean(out), indent=1, ensure_ascii=False, allow_nan=False))
     except (GopError, kv.KhoaError, cu.InputError, OSError, ValueError) as exc:
