@@ -376,7 +376,7 @@ def test_startup_intersection_counterexample(base_run, monkeypatch, lo, hi, want
     # C8BS-4, C8BS-17: L = 1.002, U~ = 1.018 -> scoring interval exactly [1.000, 1.020]; drift 0
     D = dict(speed_cnt=1.002, wz_cnt=1.002, gyro_rx=1.018, rv_rx=1.018)
 
-    def fake_match(t_cam, v_cam, valid, t_log, v_log, window_log, coarse):
+    def fake_match(t_cam, v_cam, valid, t_log, v_log, window_log, coarse, kiem=None):     # kiem: L157 (25/11)
         ch = fake_match.order.pop(0)
         return dict(D_s=D[ch], corr=0.99, window_cam_s=[3.0, 20.0], window_log_s=[4.0, 21.0], short=False,
                     D_start_s=D[ch], D_end_s=D[ch], corr_start=0.99, corr_end=0.99, rate=0.0, ok=True, why='')
