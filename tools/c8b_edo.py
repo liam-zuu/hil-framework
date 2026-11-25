@@ -90,6 +90,9 @@ def read_log(path):
     with open(path, newline='', encoding='utf-8') as f:
         rows = [r for r in csv.DictReader(l for l in f if not l.startswith('#'))]
     rows = [r for r in rows if r.get('timestamp_us') not in (None, '')]
+    # the lines the logger marked duplicate in <log>.segments.csv are dropped first, the rule of c8b_gio / c7_score
+    # (c8_u_imu._drop_duplicates; C8B 26/11: run05, run06 logs carry such lines and were refused here)
+    rows, _ = cu._drop_duplicates(path, rows)
     need = ('timestamp_us', 'pos_x', 'pos_y', 'run_active')
     if not rows or any(c not in rows[0] for c in need):
         raise EdoError(f'{path}: no data line or no column {[c for c in need if not rows or c not in rows[0]]}')
