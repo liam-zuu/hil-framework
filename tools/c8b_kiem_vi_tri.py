@@ -144,9 +144,18 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--rows', required=True)
     ap.add_argument('--khoa', required=True, help='c8b_khoa_v5 file (the C8b lock of the gate)')
+    ap.add_argument('--loai-khoi-max', action='append', default=[],
+                    help='BUOI=LY_DO: the replay_neo rows of that session (domains BUOI:<place>) are not tested; the '
+                         'other rows unchanged (L175 as CODE applied it 26/11; the lock and its factors leave it out)')
     ap.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
+        loai = {}
+        for x in a.loai_khoi_max:
+            b, sep, y = x.partition('=')
+            if not sep or not b or b in loai or not y.strip():
+                raise ViTriError(f'--loai-khoi-max {x!r}: BUOI=LY_DO, once per session')
+            loai[b] = y
         cu.check_path(a.khoa)
         with open(a.khoa, encoding='utf-8') as f:
             khoa = json.load(f)
@@ -164,7 +173,12 @@ def main(argv=None):
                 or ks != {cu.sha256(a.khoa)}:
             raise ViTriError(f'{a.rows}: not the rows c8b_d3_hang wrote for the lock {a.khoa} (its .nguon.json: '
                              'version, sha256 of the rows, sha256 of the lock)')
-        out = build(read_rows(a.rows), khoa, cu.sha256(a.khoa))
+        rows = read_rows(a.rows)
+        bo = {b: [r for r in rows if r['nguon'] == 'replay_neo' and r['mien'].startswith(b + ':')] for b in loai}
+        if any(not v for v in bo.values()):
+            raise ViTriError(f'--loai-khoi-max: no replay_neo row of {[b for b, v in bo.items() if not v]}')
+        out = build([r for r in rows if not any(r in v for v in bo.values())], khoa, cu.sha256(a.khoa))
+        out['loai_khoi_max'] = {b: dict(ly_do=loai[b], n_hang_bo=len(v), nguon='replay_neo') for b, v in bo.items()}
         # L165 (Liam 25/11 at CODE, "Bo kiem, ghi gioi han (Recommended)"): the places of one session only, which
         # c8b_d3_hang left out of the replay_neo rows (no other session to be held out against), are written here
         # as limits; the file state does not change (they are not rows, not mien_thieu)

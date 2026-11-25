@@ -121,3 +121,27 @@ def test_cli(tmp_path):
     import c8_u_imu as cu
     assert d['khoa_truoc_sha256'] == cu.sha256(str(k)) and d['trang_thai'] == 'dat'
     assert V.main(['--rows', str(p), '--khoa', str(k), '--out', str(out)]) == 2          # never overwritten
+
+
+def test_loai_khoi_max_l175(tmp_path):
+    """--loai-khoi-max BUOI=LY_DO: the replay_neo rows of that session (domain BUOI:<place>) are not tested, the
+    other rows unchanged; a session without such rows, or a reason missing, is refused."""
+    b7 = '2026-11-25_run07'
+    extra = [dict(nguon='replay_neo', tap='kiem', dai_luong=dl, mien=b7 + ':goc', sai_m='0.009', chi_so_m='0.002',
+                  co_chuan_dong='1') for dl in V.NGUON_DL['replay_neo']]
+    _, p = _parse(_rows(extra), tmp_path)
+    k = tmp_path / 'khoa.json'
+    k.write_text(json.dumps(KHOA), encoding='utf-8')
+    _nguon(p, k)
+    arg = ['--rows', str(p), '--khoa', str(k)]
+    assert V.main(arg + ['--out', str(tmp_path / 'a.json')]) == 0
+    a = json.load(open(tmp_path / 'a.json', encoding='utf-8'))
+    assert a['trang_thai'] == 'thieu' and {m['mien'] for m in a['mien_thieu']} == {b7 + ':goc'}
+    assert V.main(arg + ['--loai-khoi-max', b7 + '=L175', '--out', str(tmp_path / 'b.json')]) == 0
+    b = json.load(open(tmp_path / 'b.json', encoding='utf-8'))
+    assert b['trang_thai'] == 'dat' and not b['mien_thieu']
+    assert b['loai_khoi_max'] == {b7: dict(ly_do='L175', n_hang_bo=len(V.NGUON_DL['replay_neo']), nguon='replay_neo')}
+    assert all(not r['mien'].startswith(b7) for r in b['bang'])
+    for bad in (['--loai-khoi-max', 'run99=x'], ['--loai-khoi-max', b7 + '='],
+                ['--loai-khoi-max', b7 + '=a', '--loai-khoi-max', b7 + '=b']):
+        assert V.main(arg + bad + ['--out', str(tmp_path / 'x.json')]) == 2
