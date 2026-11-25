@@ -146,6 +146,13 @@ TD_ROLES = ('dau1', 'dau2', 'cuoi')
 THAY_THE_KEY = 'thay_the_h_cuoi'
 THAY_THE_FORMAT = 'c8_h_cuoi_thay_the_v1'
 THAY_THE_DOAN = ('ten', 'cuoi_goc', 'clip_thay_trong_doan', 'luot', 'luot_sau_clip_thay')
+# L172 (Liam 25/11/2026 ~23:45 at CODE local_4932073c; docs/archive/history_CODE.md line "L172"; run07: the rerun
+# C8-L-F02-2_lai2 lost every frame to the camera, the run before it C8-L-F02-2_lai1 is good): by Liam's record in the
+# cell (luot_sau_hong_theo_liam {ngay, phien, nguyen_van}) the runs AFTER the run that is not lost are runs lost to the
+# measurement (he_do, no operation); they stay in the chain and are checked by their sources as any lost run; the run
+# the cell counts with (eligible_run) is then the run that is not lost, not the last of the chain. Without the record
+# the rule stands: a run that is not lost ends the chain.
+SAU_HONG_KEY = 'luot_sau_hong_theo_liam'
 BAND_KEYS_C8B = ('u_lo_m_s', 'u_hi_m_s', 'P4_m', 'A4_deg', 'trang_thai')   # c8b_khoa_v5 M5b (CODE 19/11)
 BAND_STATES_C8B = ('dat', 'gioi_han', 'thieu')           # C8B term states (data contract 2.G (3))
 DRIFT_KIND = 'c7_calib_drift'                            # F18 (2): drift.json of c7_calib_drift so (CODE 19/11)
@@ -902,7 +909,8 @@ def _chain_entry(x, w: str) -> dict:
     return x
 
 
-def count_chain(chain: list, hong_theo_liam: bool = False) -> Tuple[str, Dict[str, int]]:
+def count_chain(chain: list, hong_theo_liam: bool = False, sau_hong_theo_liam: bool = False
+                ) -> Tuple[str, Dict[str, int]]:
     """The reruns cap of one C8 cell (J v6 section 5, O1 3.5 line 342, M2 in force): two counters in chain order,
     never reset: time check (a lost run whose time file says dem_truot_kiem_gio: a slip, not lost by a boot unless
     the locked check slipped on the whole window before the boot; CODE_C8B design v7 7a, counted by the field, not
@@ -911,10 +919,21 @@ def count_chain(chain: list, hong_theo_liam: bool = False) -> Tuple[str, Dict[st
     hong_theo_liam (Liam 22/11, C8 contract section 3 (a): PID F08-1, F08-2 of session 2 recorded lost, not saved):
     the cell's last run is lost to the measurement (he_do, no operation) and Liam's recorded choice keeps it so, not
     rerun (hong_theo_liam: no eligible run in the cell); the chain is checked as above, the flag on a cell whose last
-    run is not lost is refused."""
+    run is not lost is refused.
+    sau_hong_theo_liam (L172, Liam 25/11): the runs after the run that is not lost are all lost to the measurement
+    (he_do, no operation) and set aside by Liam's record; the cell has its run (co_luot). The record on a chain
+    without such runs is refused."""
     n = {'kiem_gio': 0, 'cua_so': 0}
     for i, x in enumerate(chain):
         if x['ket_qua'] != 'hong':
+            if i != len(chain) - 1 and sau_hong_theo_liam:
+                bad = [y['run_id'] for y in chain[i + 1:]
+                       if y['ket_qua'] != 'hong' or 'he_do' not in y['loai_hong'] or 'thao_tac' in y['loai_hong']]
+                if bad:
+                    raise GateFileError(f'Liam\'s record sets aside the runs after run {x["run_id"]!r} ({SAU_HONG_KEY}) '
+                                        f'but {bad} are not lost to the measurement (he_do, no operation): only such '
+                                        'runs stay after a run that is not lost (L172)')
+                return 'co_luot', n
             if i != len(chain) - 1:
                 # GC6-1 (J v6 section 4 rule 2b): a rerun only replaces a LOST run; a run that is not lost ends the chain
                 raise GateFileError(f'run {chain[i + 1]["run_id"]!r} after run {x["run_id"]!r} which is not lost '
@@ -931,6 +950,9 @@ def count_chain(chain: list, hong_theo_liam: bool = False) -> Tuple[str, Dict[st
                                     f'{RERUNS_MAX + 1}th lost run of one kind ({x["run_id"]!r}; J v6 section 5)')
             return 'dong_tran', n
     x = chain[-1]
+    if sau_hong_theo_liam:
+        raise GateFileError(f'Liam\'s record {SAU_HONG_KEY} on a chain with no run after a run that is not lost: the '
+                            'record is only for runs lost to the measurement after the run the cell counts with (L172)')
     if hong_theo_liam:
         if x['ket_qua'] != 'hong' or 'he_do' not in x['loai_hong'] or 'thao_tac' in x['loai_hong']:
             raise GateFileError(f'Liam\'s record keeps the cell lost (hong_theo_liam) but its last run {x["run_id"]!r} '
@@ -971,12 +993,20 @@ def evidence_of(runs: list) -> dict:
                     for c in CONTROLLERS})
 
 
+def eligible_run(c: dict) -> dict:
+    """The run a co_luot cell counts with: the last run of its chain; with Liam's record luot_sau_hong_theo_liam (L172)
+    the run that is not lost (the runs after it are lost to the measurement, count_chain)."""
+    if SAU_HONG_KEY in c:
+        return next((x for x in c['chuoi'] if x['ket_qua'] != 'hong'), c['chuoi'][-1])
+    return c['chuoi'][-1]
+
+
 def _runs_from_cells(cells: list, levels: list) -> Dict[str, list]:
-    """{level: [(cell, last run)]} for the co_luot cells of each level."""
+    """{level: [(cell, its run: eligible_run)]} for the co_luot cells of each level."""
     out = {lv: [] for lv in levels}
     for c in cells:
         if c['trang_thai'] == 'co_luot':
-            out[c['muc']].append((c, c['chuoi'][-1]))
+            out[c['muc']].append((c, eligible_run(c)))
     return out
 
 
@@ -988,9 +1018,13 @@ def _check_cells(d: dict) -> list:
     for i, c in enumerate(cells):
         w = f'o_c8[{i}]'
         liam = isinstance(c, dict) and c.get('trang_thai') == 'hong_theo_liam'     # Liam 22/11: his record in the cell
-        _obj(c, ('o', 'muc', 'controller', 'trang_thai', 'chuoi') + (('liam',) if liam else ()), w)
+        sau = isinstance(c, dict) and SAU_HONG_KEY in c  # L172: Liam's record for the lost runs after the cell's run
+        _obj(c, ('o', 'muc', 'controller', 'trang_thai', 'chuoi') + (('liam',) if liam else ())
+             + ((SAU_HONG_KEY,) if sau else ()), w)
         if liam:
             _liam(c['liam'], f'{w}.liam')
+        if sau:
+            _liam(c[SAU_HONG_KEY], f'{w}.{SAU_HONG_KEY}')
         _text(c['o'], f'{w}.o')
         if c['o'] in seen:
             raise GateFileError(f'{w}.o {c["o"]!r}: each cell once')
@@ -1019,10 +1053,13 @@ def _check_cells(d: dict) -> list:
                                         'files of a run belong to that run only (GC6-1)')
                 files_seen[h] = f'{c["o"]} run {x["run_id"]} {k}'
         try:
-            st, _ = count_chain(ch, hong_theo_liam=liam)
+            st, _ = count_chain(ch, hong_theo_liam=liam, sau_hong_theo_liam=sau)
         except GateFileError as exc:
             raise GateFileError(f'{w} ({c["o"]}): {exc}')
-        if st == 'co_luot' and ch[-1]['thieu_u_t'] and ch[-1]['ket_qua'] != 'hong':
+        if sau and st != 'co_luot':
+            raise GateFileError(f'{w} ({c["o"]}): {SAU_HONG_KEY} on a cell whose chain gives {st!r}: the record is for '
+                                'a cell that has its run (L172)')
+        if st == 'co_luot' and eligible_run(c)['thieu_u_t'] and eligible_run(c)['ket_qua'] != 'hong':
             st = 'thieu_u_t'                             # GC9-6: no eligible run in the cell
         if c['trang_thai'] != st:
             raise GateFileError(f'{w}.trang_thai {c["trang_thai"]!r}: the chain recounted gives {st!r} (KT6-11, M2)')
@@ -2472,7 +2509,7 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
                     raise GateFileError(f'{w}: ket_qua {x["ket_qua"]!r}, after the clip H comparison the outcome is '
                                         f'{final!r} (first {fx["outcome"]!r}, second '
                                         f'{None if fc1 is None else fc1["outcome"]!r}; GC6-3)')
-            if c['chuoi'][-1] is x and c['trang_thai'] == 'co_luot':
+            if eligible_run(c) is x and c['trang_thai'] == 'co_luot':
                 r = next(r for r in d['runs_c8'][c['muc']] if r['run_id'] == x['run_id'])
                 if not _close(fg.get('h_s'), r['h_s']) or not _close(fx.get('u_max_s'), r['u_max_s']):
                     raise GateFileError(f'{w}: h_s / u_max_s {r["h_s"]!r} / {r["u_max_s"]!r}, the time file says h_s '
@@ -2675,7 +2712,7 @@ def _check_muc_du_dai(d: dict, khoa: dict, elig_seg: dict, k_cham: dict) -> None
     for c in d['o_c8']:
         if c['trang_thai'] != 'co_luot':
             continue
-        seg = elig_seg.get(c['chuoi'][-1]['file_cham']['sha256'])
+        seg = elig_seg.get(eligible_run(c)['file_cham']['sha256'])
         if seg is None:
             continue
         if c['muc'] not in mdb[seg['buoi']]:
@@ -3749,7 +3786,8 @@ def ghep_va_ghi(out: str, goc: str, *args, **kw) -> str:
 def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem_cheo,
          bang_chung: Dict[str, str], ho_so: str, muc_bo_theo_liam: Optional[dict] = None,
          quyet_liam: Optional[dict] = None, o_hong_theo_liam: Optional[dict] = None,
-         bo_cham_cu: Optional[dict] = None, thay_the_h_cuoi=None) -> dict:
+         bo_cham_cu: Optional[dict] = None, thay_the_h_cuoi=None,
+         luot_sau_hong_theo_liam: Optional[dict] = None) -> dict:
     """The gate content of C8 assembled from its sources under the C8 folder goc (paths relative to it; F10-F19, the
     contract of 19/11 with C8B: the gate reads the C8B files, C8B does not call the gate):
       sessions     thu_tu_clip: the thu_tu_clip.csv of one C8 session (a path) or of each, in session order (a list;
@@ -3766,6 +3804,8 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
       kept lost    o_hong_theo_liam {cell: Liam's record}: the cells whose last run is lost to the measurement and Liam
                    keeps lost without a rerun (Liam 22/11, C8 contract section 3 (a)); hong_theo_liam, the record in
                    the cell, no eligible run there (a level then lacks that controller unless Liam drops it)
+      set aside    luot_sau_hong_theo_liam {cell: Liam's record} (L172, Liam 25/11): the runs of the cell after its run
+                   that is not lost are lost to the measurement and set aside; the cell counts with that run
       U standard   the four evidence files (bang_chung {condition: path}) and the dossier ho_so_c8_v2 written to ho_so
                    (cham_luc = the first scoring time of every run, _scoring_times; giu_ngoai = every C8 run, CODE
                    20/11, GC9-2; khoa_kiem_luc = per C8 session, in session order, the khoa_s7 record of the
@@ -3809,6 +3849,12 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
         raise GateFileError(f'ghep: o_hong_theo_liam {giu_hong!r}: an object keyed by cells of the plan')
     for o, x in giu_hong.items():
         _liam(x, f'ghep: o_hong_theo_liam.{o}')
+    sau_hong = luot_sau_hong_theo_liam or {}             # L172
+    if not isinstance(sau_hong, dict) or any(o not in plan or o in giu_hong for o in sau_hong):
+        raise GateFileError(f'ghep: {SAU_HONG_KEY} {sau_hong!r}: an object keyed by cells of the plan, none of them '
+                            'kept lost by o_hong_theo_liam')
+    for o, x in sau_hong.items():
+        _liam(x, f'ghep: {SAU_HONG_KEY}.{o}')
     order = {o: [] for o in plan}
     for r in rows:
         b = re.sub(r'_lai\d+$', '', (r.get('buoc') or '').strip())
@@ -3900,19 +3946,21 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
             chain.append(ent)
             cham_luc[ent['run_id']] = min(t for s in (fc, fc1) if s is not None for t in _scoring_times(s, w)
                                           ).isoformat()
-            last = (ent, fc, fg, cc_ref)
+            if o not in sau_hong or kq != 'hong' or last is None:    # L172: with the record, the run not lost
+                last = (ent, fc, fg, cc_ref)
         if not chain:
             raise GateFileError(f'ghep: cell {o}: no run in thu_tu_clip.csv')
         try:
-            st, _ = count_chain(chain, hong_theo_liam=o in giu_hong)
+            st, _ = count_chain(chain, hong_theo_liam=o in giu_hong, sau_hong_theo_liam=o in sau_hong)
         except GateFileError as exc:
             raise GateFileError(f'ghep: cell {o}: {exc}')
         if o in giu_hong and st != 'hong_theo_liam':
             raise GateFileError(f'ghep: cell {o}: Liam\'s record keeps it lost but the chain gives {st!r}')
-        if st == 'co_luot' and chain[-1]['thieu_u_t']:
+        if st == 'co_luot' and last[0]['thieu_u_t']:
             st = 'thieu_u_t'                                  # GC9-6: no eligible run in the cell
         cells.append(dict(o=o, muc=x['muc'], controller=x['controller'], trang_thai=st, chuoi=chain,
-                          **({'liam': dict(giu_hong[o])} if o in giu_hong else {})))
+                          **({'liam': dict(giu_hong[o])} if o in giu_hong else {}),
+                          **({SAU_HONG_KEY: dict(sau_hong[o])} if o in sau_hong else {})))
         if st == 'co_luot':
             ent, fc, fg, cc_ref = last
             if fg is None or cc_ref is None:
@@ -4156,14 +4204,15 @@ def main(argv=None) -> int:
         if a.liam:
             with open(a.liam, encoding='utf-8') as f:
                 liam = json.load(f)
-            keys = ('muc_bo_theo_liam', 'quyet_liam', 'o_hong_theo_liam', 'bo_cham_cu')
+            keys = ('muc_bo_theo_liam', 'quyet_liam', 'o_hong_theo_liam', 'bo_cham_cu', SAU_HONG_KEY)
             if not isinstance(liam, dict) or not set(liam) <= set(keys):
                 raise GateFileError(f'--liam {a.liam}: a JSON object with keys among {list(keys)}')
         try:
             sha = ghep_va_ghi(a.out, a.goc, a.ke_hoach, a.thu_tu_clip, a.khoa_c8b, a.tien_de, a.kiem_cheo, bc,
                               a.ho_so, liam.get('muc_bo_theo_liam'), liam.get('quyet_liam'),
                               liam.get('o_hong_theo_liam'), liam.get('bo_cham_cu'),
-                              thay_the_h_cuoi=a.thay_the_h_cuoi)
+                              thay_the_h_cuoi=a.thay_the_h_cuoi,
+                              luot_sau_hong_theo_liam=liam.get(SAU_HONG_KEY))
         except CanLiamChon as exc:
             # CODE 24/11: the decision sheet beside --out (never replaced), no gate file; exit 3
             sp = os.path.splitext(a.out)[0] + '_phieu_chon.json'

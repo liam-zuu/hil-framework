@@ -4114,3 +4114,124 @@ def test_l170_the_declared_clip_only_where_declared(tmp_path):
         GC._thay_the_shape(dict(file=dict(duong_dan='b3/thay_the.json', sha256='a' * 64), clip_thay='IMG_1',
                                 doan=[dict(ten='d', cuoi_goc='IMG_2', clip_thay_trong_doan=False, luot=[],
                                            luot_sau_clip_thay=[])]), 'w', 'b2')
+
+
+# ── L172 (Liam 25/11 ~23:45 at CODE local_4932073c; run07): lost runs after the run of the cell, set aside ─────────────
+LIAM_L172 = dict(ngay='2026-11-25', phien='local_4932073c', nguyen_van='dung F02 khac thay the di chu')
+
+
+def _l172(goc, d, ci=0):
+    """A run lost to the measurement AFTER the good run of cell ci (run07: C8-L-F02-2_lai2 after _lai1)."""
+    c = d['o_c8'][ci]
+    _add_lost(goc, d, ci, 7, ['he_do'], luoi_kw=dict(loai_hong=['he_do']))
+    c['chuoi'].append(c['chuoi'].pop(0))
+    _write_csv(goc, d)
+    _fix_ho_so(goc, d)
+    _d2_all(goc, d)
+    return c
+
+
+def test_l172_lost_runs_after_the_run_of_the_cell(tmp_path):
+    """L172: without Liam's record a run after a run that is not lost is refused, as before; with the record in the
+    cell the lost run stays in the chain (checked by its sources) and the cell counts with the run that is not lost."""
+    d, goc = build_c8(tmp_path / 'a')
+    c = _l172(goc, d)
+    with pytest.raises(GC.GateFileError, match='a rerun replaces a lost run only'):
+        GC.check(d)
+    with pytest.raises(GC.GateFileError, match='a rerun replaces a lost run only'):
+        _ghep(goc)
+    c[GC.SAU_HONG_KEY] = dict(LIAM_L172)
+    GC.check(d)
+    GC.check_nguon(d, goc)
+    assert c['trang_thai'] == 'co_luot' and GC.eligible_run(c) is c['chuoi'][0] and c['chuoi'][1]['ket_qua'] == 'hong'
+    g = _ghep(goc, luot_sau_hong_theo_liam={c['o']: dict(LIAM_L172)})
+    gc_ = next(x for x in g['o_c8'] if x['o'] == c['o'])
+    assert gc_['trang_thai'] == 'co_luot' and gc_[GC.SAU_HONG_KEY] == LIAM_L172
+    assert [x['ket_qua'] for x in gc_['chuoi']] == [c['chuoi'][0]['ket_qua'], 'hong']
+    assert [r['run_id'] for r in g['runs_c8'][c['muc']] if r['o'] == c['o']] == [gc_['chuoi'][0]['run_id']]
+    assert all(SK not in x for x in g['o_c8'] if x['o'] != c['o'] for SK in [GC.SAU_HONG_KEY])
+    GC.write_gate(str(tmp_path / 'g.json'), g, goc)
+    lp = str(tmp_path / 'liam.json')                                   # the command line: --liam carries the record
+    with open(lp, 'w', encoding='utf-8') as f:
+        json.dump({GC.SAU_HONG_KEY: {c['o']: LIAM_L172}}, f)
+    out = str(tmp_path / 'gate_cli.json')
+    args = ['ghep', '--goc', goc, '--ke-hoach', 'ke_hoach_c8.json', '--thu-tu-clip', 'thu_tu_clip.csv',
+            '--khoa-c8b', 'c8b_khoa_v5.json', '--tien-de', 'tien_de_c8.json', '--kiem-cheo', 'kiem_cheo.json',
+            '--ho-so', 'chuan_u/ho_so_cli.json', '--liam', lp, '--out', out] + \
+        sum((['--bang-chung', f'{k}={p}'] for k, p in BANG_CHUNG.items()), [])
+    assert GC.main(args) == 0
+    assert next(x for x in json.load(open(out, encoding='utf-8'))['o_c8'] if x['o'] == c['o'])[GC.SAU_HONG_KEY] \
+        == LIAM_L172
+    # the lost run is still checked by its sources: its log changed
+    with open(os.path.join(goc, c['chuoi'][1]['file_log']['duong_dan']), 'ab') as f:
+        f.write(b'x')
+    with pytest.raises(GC.GateFileError):
+        GC.check_nguon(d, goc)
+    # ghep: the record only for a cell of the plan, not one kept lost, with Liam's words, and only where it is needed
+    d, goc = build_c8(tmp_path / 'b')
+    c = _l172(goc, d)
+    for kw, match in [(dict(luot_sau_hong_theo_liam={'O1-F11_PID': LIAM_L172}), 'keyed by cells of the plan'),
+                      (dict(luot_sau_hong_theo_liam={c['o']: LIAM_L172}, o_hong_theo_liam={c['o']: LIAM_L172}),
+                       'keyed by cells of the plan'),
+                      (dict(luot_sau_hong_theo_liam={c['o']: dict(LIAM_L172, ngay='25/11')}), 'YYYY-MM-DD'),
+                      (dict(luot_sau_hong_theo_liam={c['o']: LIAM_L172, d['o_c8'][1]['o']: LIAM_L172}),
+                       'no run after a run that is not lost')]:
+        with pytest.raises(GC.GateFileError, match=match):
+            _ghep(goc, **kw)
+    # D3-1 takes the session of the run the cell counts with
+    d, goc = build_c8(tmp_path / 'c')
+    c = _l172(goc, d)
+    c[GC.SAU_HONG_KEY] = dict(LIAM_L172)
+    _rewrite_khoa(goc, d, lambda k: k.update(
+        muc_du_dai_theo_buoi={d['tien_de_c8'][0]['buoi']: [lv for lv in LEVELS if lv != c['muc']]}))
+    with pytest.raises(GC.GateFileError, match=f'cell {c["o"]}: its eligible run was made in session'):
+        GC.check_nguon(d, goc)
+
+
+def test_l172_the_record_and_the_chain():
+    a, b = _e('a'), _e('b', 'hong', ['he_do'])
+    assert GC.count_chain([a, b], sau_hong_theo_liam=True)[0] == 'co_luot'
+    assert GC.count_chain([_e('z', 'hong', ['he_do']), a, b, _e('c', 'hong', ['he_do', 'cua_so_tham_chieu'])],
+                          sau_hong_theo_liam=True)[0] == 'co_luot'
+    with pytest.raises(GC.GateFileError, match='a rerun replaces a lost run only'):
+        GC.count_chain([a, b])
+    for ch in ([a, _e('b')], [a, _e('b', 'hong', ['he_do', 'thao_tac'])], [a, _e('b', 'hong', ['cua_so_tham_chieu'])],
+               [a, b, _e('c', 'chua_ket_luan')]):
+        with pytest.raises(GC.GateFileError, match='not lost to the measurement'):
+            GC.count_chain(ch, sau_hong_theo_liam=True)
+    for ch in ([a], [b, a], [b]):
+        with pytest.raises(GC.GateFileError, match='no run after a run that is not lost'):
+            GC.count_chain(ch, sau_hong_theo_liam=True)
+    with pytest.raises(GC.GateFileError, match='no run after a run that is not lost'):
+        GC.count_chain([b], hong_theo_liam=True, sau_hong_theo_liam=True)
+    # the gate file: the record is Liam's words, on a cell that needs it; the cell's run is the one that is not lost
+    d = GC.fake_gate(LEVELS)
+    c = d['o_c8'][0]
+    good = c['chuoi'][-1]
+    lost = dict(_e('them', 'hong', ['he_do']))
+    c['chuoi'].append(lost)
+    with pytest.raises(GC.GateFileError, match='a rerun replaces a lost run only'):
+        GC._check_cells(d)
+    c[GC.SAU_HONG_KEY] = dict(LIAM_L172)
+    GC._check_cells(d)
+    assert GC.eligible_run(c) is good and [x for _, x in GC._runs_from_cells(d['o_c8'], list(LEVELS))[c['muc']]
+                                           if x is good]
+    GC.check(d)
+    kq = good['ket_qua']
+    good.update(thieu_u_t=True, ket_qua='chua_ket_luan')               # GC9-6 on the run the cell counts with
+    with pytest.raises(GC.GateFileError, match="recounted gives 'thieu_u_t'"):
+        GC._check_cells(d)
+    good.update(thieu_u_t=False, ket_qua=kq)
+    c[GC.SAU_HONG_KEY] = dict(ngay='2026-11-25', phien='x')
+    with pytest.raises(GC.GateFileError, match='nguyen_van'):
+        GC._check_cells(d)
+    c[GC.SAU_HONG_KEY] = dict(LIAM_L172)
+    c['chuoi'].pop()
+    with pytest.raises(GC.GateFileError, match='no run after a run that is not lost'):
+        GC._check_cells(d)
+    c['chuoi'] = [_e(f'tr{k}', 'hong', ['he_do'], d1='truot') for k in range(GC.RERUNS_MAX + 1)]   # closed at its cap
+    c['trang_thai'] = 'dong_tran'
+    with pytest.raises(GC.GateFileError, match='on a cell whose chain gives'):
+        GC._check_cells(d)
+    del c[GC.SAU_HONG_KEY]
+    GC._check_cells(d)
