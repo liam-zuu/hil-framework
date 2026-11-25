@@ -107,6 +107,14 @@ main design starts, and the inner box always runs (L41). Every spec stop ends S0
 for both controllers (S3C-9). The sweep (section 3.1) is a source of campaign A's domain and
 is printed.
 
+Codex round 3: the screening numbers file is regenerated in memory and checked bit for bit
+against its generation source at the start (C3-36); a run with the screening step needs both
+controllers once and three finite, distinct mu levels (C3-37); the closing of sealed/ is
+guarded so an output error becomes a sealed stop, never a 'running' meta.yaml (C3-38); the
+sealed phase notes exist from each phase start and the elapsed fields are split
+(elapsed_s_sang_loc, elapsed_s_main_design; C3-39, D2A-2); a PID run on a DLL without the kep
+channel, or a failed clamp-indicator self-check, stops S03 (C3-48).
+
   python fwsim/s03_doe.py --out 05_DATA/results/S03/<date>_runNN --mu 0.5 --trial
   python fwsim/s03_doe.py --out ... --mu LOW MID HIGH --mu-source "MU_FLOOR/<run>: min, mean, max"
 
@@ -166,6 +174,7 @@ SEED = 1                                      # plant seed (no random plant inpu
 # S03/2026-11-09_run01 is dict(rate_hz=20.0, boot_reset=-1.0): re-run it from script 6f93607.
 IMU = dict(rate_hz=20.0, boot_reset=-1.0, noise='replay', noise_seed=SEED)
 DET_SEED = 20261106                           # S03 section 3.4: seed that draws the 3 corners, fixed before running
+_mono = time.monotonic   # monotonic clock of the phase seconds of sealed/notes.json, replaceable by the tests
 Y3_ABS = 0.4            # s^-1, S03 v8.6 section 5.2: four wheels one PWM step (1/1000) per 10 ms tick,
                         # 4 x 0.001 x 100; every speed, every mu, worst, range
 THRESH = {'e_perp_max': 0.01, 'e_perp_max_cens': 0.01, 'sat_frac': 0.01, 'tv_duty': Y3_ABS}   # S03 5.2
@@ -977,12 +986,16 @@ def kep_frac_fields(ctrl, row, log):
     """{kep_frac_vx, kep_frac_vy, kep_frac_wz} of one run (S03 v8.6 section 2.1 last item, 7,
     11 item 6 (c)): for PID with a log holding the 'kep' channel, the fractions of
     fwsim.kep_indicator on the O1 window up to row['t_end'] (ticks at the PID integral clamp over
-    ticks with the motor on; NaN when no such tick). ADRC, a run_error row (log None) and a DLL
-    without the kep channel: the three columns stay empty. A ValueError of the indicator
-    (kep_lech set, a bad flag) is a tool error: S03Stop."""
+    ticks with the motor on; NaN when no such tick). ADRC and a run_error row (log None): the
+    three columns stay empty. A PID log without the 'kep' channel (C3-48: a DLL without the
+    clamp export cannot run S03) or a ValueError of the indicator (kep_lech set, a bad flag) is
+    a tool error: S03Stop."""
     out = dict.fromkeys(KEP_FRAC_COLS, '')
-    if ctrl == 'ADRC' or log is None or 'kep' not in log:
+    if ctrl == 'ADRC' or log is None:
         return out
+    if 'kep' not in log:
+        raise S03Stop(f'{ctrl}: the log has no kep channel: a DLL without the clamp export '
+                      'cannot run S03 (S03 v8.6 2.1, 11 item 6 (c); Codex C3-48)')
     try:
         ind = fwsim.kep_indicator(log, row['t_end'])
     except ValueError as exc:
@@ -1081,17 +1094,18 @@ def child_main(job_path):
         pickle.dump(out, f)
 
 
-def run_in_new_process(dll, runs, work):
+def run_in_new_process(dll, runs, work, timeout=None):
     """Run (ctrl, gains, v, mu) jobs in a fresh Python process (DLL loaded again). work must be
     a folder under sealed/ when the runs belong to the main design (S3C-2); the job files are
-    removed in every case."""
+    removed in every case. timeout: seconds for subprocess.run (None: no limit, as before); a
+    subprocess.TimeoutExpired goes up to the caller."""
     os.makedirs(work, exist_ok=True)
     job = os.path.join(work, f'job_{time.time_ns()}.pkl')
     try:
         with open(job, 'wb') as f:
             pickle.dump(dict(dll=dll, runs=runs), f)
         r = subprocess.run([sys.executable, os.path.abspath(__file__), '--child', job], capture_output=True,
-                           text=True)
+                           text=True, timeout=timeout)
         if r.returncode != 0:
             raise S03Stop(f'child process failed ({r.returncode}): {r.stderr[-2000:]}')
         with open(job + '.out', 'rb') as f:
@@ -1340,7 +1354,8 @@ def main():
     ap.add_argument('--screen-u', default=None,
                     help='screening numbers file (S03 v8.5 8.9); default the committed fwsim/s03_screen_u.csv')
     ap.add_argument('--screen-r', type=int, default=0,
-                    help='rerun index r of the numbers file (S03 3.1b item 3), recorded only')
+                    help='rerun index r of the numbers file (S03 3.1b item 3): checked, the file '
+                    'must be the numbers of seed 2026112100 + 10 r + t')
     ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 2) - 2),
                     help='worker processes of the screening step (S03 3.1b item 5)')
     ap.add_argument('--sangloc-thu', action='store_true',
@@ -1394,6 +1409,15 @@ def main():
                 os.path.abspath(a.screen_u) == os.path.abspath(sl.SCREEN_U):
             sys.exit('--screen-r >= 1 --screen-u must be another file than '
                      'fwsim/s03_screen_u.csv (S03 3.1b item 3)')
+    # C3-37: a run WITH the screening step ('chinh' and the tool check 'thu'; --trial keeps its
+    # own rule) needs both controllers once and three finite, distinct mu levels
+    if screening is not None:
+        if sorted(a.controllers) != sorted(CONTROLLERS):
+            sys.exit('a run with the screening step needs both controllers PID and ADRC, each once '
+                     '(S03 3.1b items 1, 10; Codex C3-37); --trial keeps its own rule')
+        if not all(math.isfinite(m) for m in a.mu) or len(set(a.mu)) != 3:
+            sys.exit('a run with the screening step needs three finite, distinct mu levels '
+                     '(S03 2.2, 3.1b item 5; Codex C3-37)')
     if os.path.isdir(a.out) and os.listdir(a.out):
         sys.exit(f'{a.out} already holds data: use a new folder.')
     sealed = os.path.join(a.out, 'sealed')
@@ -1428,6 +1452,8 @@ def main():
     stop_before, stop_public, stop_sealed = None, None, None   # before the sweep / sweep / sealed window
     stop_test, test_rows, test_notes, test_s = None, [], [], None
     t_sweep_end = None
+    t_sl0 = t_sl1 = t_md0 = t_md1 = None        # _mono() bounds of the screening step and main design
+    pha_live = None                           # the live per-controller phase entry of step 4e
     tp_info, test_pts = None, []                      # S3V8-3: the test file is read once, at the start
     screen, screen_info = None, None                  # S03 3.1b: sets and info of the numbers file
     pha_notes, sweep_planned = [], None               # sealed/notes.json 'pha' (section 7 [v8.5])
@@ -1521,7 +1547,9 @@ def main():
                                       '10 % unclassifiable gain sets in a controller and mode '
                                       '(S03 3.1b item 10)'),
                          ti_le_khong_phan_loai_toi_da=0.1, so_tien_trinh=a.jobs,
-                         seed='2026112100 + 10 r + t', r=a.screen_r, file_so=screen_info,
+                         seed='2026112100 + 10 r + t (tool check: 2026112105 + t); checked bit '
+                              'for bit, see file_so.nguon_sinh',
+                         r=a.screen_r, file_so=screen_info,
                          kiem_cong_cu=(dict(n0=a.sangloc_thu_n0, n=a.sangloc_thu_n)
                                        if screening == 'thu' else None))
         kep_channel = bool(getattr(fw, 'kep_cols', 0))
@@ -1601,9 +1629,15 @@ interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THES
   - "--trial (mu 0.5, one level): section 3.1b needs three mu levels and does not run; sealed/levels_sangloc.csv holds the sweep levels with nguon_mien du_phong and sealed/sangloc/ket_qua.json says khong_chay_sang_loc with that reason"
   - "--sangloc-thu (S03 section 8 condition 11): tool check of section 3.1b with the three measured mu levels, its own numbers file (another name and content than fwsim/s03_screen_u.csv, seeds 2026112105..09 when made by make_s03_screen_u.py --thu), S0 on the first n0 rows and N given by --sangloc-thu-n; the formula of N is computed and kept in sealed/sangloc_thu/so_dem.json but does not set N; trial: true"
   - "the main design decodes its points from sealed/levels_sangloc.csv read back from disk (S03 3.2 'Nguon muc'); levels.csv keeps the sweep levels"
-  - "kep_frac_vx, kep_frac_vy, kep_frac_wz (runs.csv, runs_test.csv; S03 2.1, 7, 11 item 6 (c)): fwsim.kep_indicator on the O1 window up to the t_end of the run, ticks at the PID integral clamp over ticks with the motor on, one column per axis as section 2.1 asks; empty for LADRC, for a run_error row and when the DLL has no kep channel; a failed self-check of the indicator stops S03"
+  - "kep_frac_vx, kep_frac_vy, kep_frac_wz (runs.csv, runs_test.csv; S03 2.1, 7, 11 item 6 (c)): fwsim.kep_indicator on the O1 window up to the t_end of the run, ticks at the PID integral clamp over ticks with the motor on, one column per axis as section 2.1 asks; empty for LADRC and for a run_error row only; a PID run on a DLL without the kep channel, or a failed self-check of the indicator, stops S03 (Codex C3-48)"
   - "screening files: evals_<set>.csv has the columns of the S04 evals.csv after controller, set, row (ga_seed, gen, cand_id empty); the ba_mu record of a gain set not feasible at the middle mu has no score numbers (step b not run); S0, S1, S2, S2b run both controllers in one worker pool, so sealed/notes.json has one common total per phase (controller all)"
   - "sealed/notes.json pha: no entry with the label 'bo' (this script cannot resume a run; a new run needs a new folder)"
+  - "the --sangloc-thu numbers file must be committed and is checked bit for bit against the seeds 2026112105..09; every numbers file is regenerated in memory by (mode, r, t) and compared bit for bit and as the canonical text before the sweep (S03 3.1b item 3, 8.11; Codex C3-36)"
+  - "a run with the screening step needs both controllers PID and ADRC, each once, and three finite, distinct mu levels (exact binary64 comparison); --trial keeps its own rule (S03 2.2, 3.1b items 1, 5, 10; Codex C3-37)"
+  - "the closing of sealed/ is guarded (Codex C3-38): stop.json is written first when a stop is pending; a failure while writing the sealed outputs becomes a 'dong_niem_phong' stop and stop.json / diag.txt / manifest.json are rewritten best effort — meta.yaml never stays at 'running'"
+  - "sealed/notes.json: every phase entry exists from the phase start with trang_thai, moc_bat_dau, moc_ket_thuc and n_luot_tong (Codex C3-39, D2A-2); t_S0 of sangloc_thu/so_dem.json is the monotonic time of the whole S0 phase; elapsed_s_main_design is the main design only and elapsed_s_sang_loc the screening step (the field rsm_compare.shared_cost_rows reads keeps its name)"
+  - "a worker of the screening pool that dies while running a gain set makes that set a run_error of the gain set (one diagnosis rerun in a new process at the middle mu, never replacing it), the rest of the job runs in a new worker and S03 goes on; a worker dead before or between gain sets is a tool error; wait limits 7200 s per job, 600 s per diagnosis rerun, 30 s to end a killed worker (S03 3.1b item 5; Codex C3-40)"
+  - "sealed/sangloc_thu/loi_S0.json holds only the number of unclassifiable S0 gain sets per controller and mode and the error text of the S0 error runs (first attempt and diagnosis), and is the one sealed file the CODE session may read before campaign A ends (S03 3.1b items 5, 13; D2A-3)"
   - "v8.2: the public sweep carries the G columns too (Liam 14/11 CODE_FEAS 'Co, mot cach cham'); G3-G5 are not responses of section 5"
 elapsed_s: {sweep_s}
 file_sha256: {json.dumps(files)}
@@ -1621,16 +1655,14 @@ files:
     # are read ONCE, before any run; a failed check is a public stop BEFORE the sweep (no result
     # exists yet): no firmware call is made for it.
     try:
+        if 'PID' in a.controllers and not getattr(fw, 'kep_cols', 0):
+            raise S03Stop('the DLL has no kep channel (fwsim_kep_cols = 0): S03 v8.6 2.1 and '
+                          '11 item 6 (c) ask the PID clamp indicator of every run; a DLL without '
+                          'the clamp export cannot run S03, rebuild it (Codex C3-48)')
         test_pts, tp_info = load_test_points(a.test_points, trial=is_trial)   # section 8 condition 7
         if screening is not None:
-            screen, screen_info = sl.load_screen_u(a.screen_u or sl.SCREEN_U,
-                                                   trial=(screening == 'thu'))   # 8.9
-            if screening == 'thu' and os.path.isfile(sl.SCREEN_U):
-                with open(sl.SCREEN_U, 'rb') as f:
-                    ref_lf = hashlib.sha256(f.read().replace(b'\r\n', b'\n')).hexdigest()
-                if screen_info['sha256_lf'] == ref_lf:
-                    raise S03Stop('the --sangloc-thu numbers file has the same content as '
-                                  'fwsim/s03_screen_u.csv after CRLF -> LF (S03 8.11)')
+            screen, screen_info = sl.load_screen_u(a.screen_u or sl.SCREEN_U, trial=False,
+                                                   r=a.screen_r, che_do=screening)   # 8.9, C3-36
     except S03Stop as exc:
         stop_before = f'before the sweep: {exc}'
         tp_info = getattr(exc, 'tp_info', tp_info)
@@ -1763,6 +1795,24 @@ files:
         write_csv(p, rows, cols)
         files[name] = sha256_file(p)
 
+    def pha_open(name, ctrl, planned):
+        """Append the live notes entry of a main-design phase at its start (C3-39, D2A-2):
+        trang_thai 'dung_giua_pha', moc_bat_dau; returns the live record pha_close fills."""
+        e = dict(pha=name, controller=ctrl, n_luot_ke_hoach=planned, n_luot_thuc=0,
+                 n_chay_lai_chan_doan=0, n_luot_tong=0, giay_may=None, so_tien_trinh=1,
+                 trang_thai='dung_giua_pha', moc_bat_dau=sl._stamp(), moc_ket_thuc=None)
+        pha_notes.append(e)
+        return dict(e=e, n=len(all_runs), rr=len(rerun_notes), t=_mono(), n_thuc=None)
+
+    def pha_close(live, state='xong'):
+        """Close a phase entry of pha_open: run/diagnosis counts from the all_runs /
+        rerun_notes deltas (or live['n_thuc'] when set), giay_may, moc_ket_thuc."""
+        e = live['e']
+        n1 = len(all_runs) - live['n'] if live['n_thuc'] is None else live['n_thuc']
+        n2 = len(rerun_notes) - live['rr']
+        e.update(n_luot_thuc=n1, n_chay_lai_chan_doan=n2, n_luot_tong=n1 + n2,
+                 giay_may=_mono() - live['t'], trang_thai=state, moc_ket_thuc=sl._stamp())
+
     # step 4: the SEALED WINDOW (v8.5 section 7 'Thứ tự chạy khóa', 3.1b item 13): from the end of
     # the sweep until sealed/ is closed nothing of these phases prints to the console; every stop
     # reason goes to sealed/stop.json with its phase, prints, warnings and tracebacks to
@@ -1788,15 +1838,19 @@ files:
                         W[ctrl][name] = w_nodes(ctrl, name, dflts[ctrl][name], lo_b[j], hi_b[j])
                 quet = {ctrl: {n: lv[:2] for n, lv in levels[ctrl].items()}
                         for ctrl in a.controllers}
-                if screening is not None:
-                    tool = dict(n0=a.sangloc_thu_n0, n=a.sangloc_thu_n) \
-                        if screening == 'thu' else None
-                    res = sl.run_step(sealed, a.dll, a.controllers, gate, mu_levels, W, quet,
-                                      screen, a.jobs, tool_check=tool)
-                else:
-                    res = sl.skip_step(sealed, a.controllers,
-                                       'khong_chay_sang_loc: --trial with one mu level (S03 2.2); '
-                                       'section 3.1b needs three mu levels')
+                t_sl0 = _mono()
+                try:
+                    if screening is not None:
+                        tool = dict(n0=a.sangloc_thu_n0, n=a.sangloc_thu_n) \
+                            if screening == 'thu' else None
+                        res = sl.run_step(sealed, a.dll, a.controllers, gate, mu_levels, W, quet,
+                                          screen, a.jobs, tool_check=tool)
+                    else:
+                        res = sl.skip_step(sealed, a.controllers,
+                                           'khong_chay_sang_loc: --trial with one mu level (S03 2.2); '
+                                           'section 3.1b needs three mu levels')
+                finally:
+                    t_sl1 = _mono()
                 pha_notes += res['pha']
                 # 4c 'mien': sealed/levels_sangloc.csv — the accepted box or the sweep levels
                 pha_name = 'mien'
@@ -1838,6 +1892,7 @@ files:
                           cols=design_cols(design_rows))                 # before the first main run
                 # 4e 'thiet_ke_chinh': the main design of every controller
                 pha_name = 'thiet_ke_chinh'
+                t_md0 = _mono()
                 for ctrl in a.controllers:
                     gains_at, centre_codes, outer, inner, axial, _test = plan[ctrl]
                     runs, keep_logs = {}, {}
@@ -1868,26 +1923,18 @@ files:
                                     data = npz_bytes(log)    # S3E-1: compressed for every run, same work
                                     if box == 'centre' or row['completed'] != 'true':
                                         save_log(sealed_logs, name, log, data)
-                    n_mark, rr_mark, t_mark = len(all_runs), len(rerun_notes), time.time()
+                    pha_live = pha_open('tam_va_hai_hop', ctrl, 257 * len(mu_levels) * len(SPEEDS))
                     run_points(todo)
                     # L41 (Liam 06/11, 'Chot B'): the inner box always runs, so the run time does not
                     # tell whether the rule of S03 3.2 is on; it enters the analysis only when the
                     # rule is on
                     run_points([(p, 'inner', c) for p, c in inner])
-                    pha_notes.append(dict(pha='tam_va_hai_hop', controller=ctrl,
-                                          n_luot_ke_hoach=257 * len(mu_levels) * len(SPEEDS),
-                                          n_luot_thuc=len(all_runs) - n_mark,
-                                          n_chay_lai_chan_doan=len(rerun_notes) - rr_mark,
-                                          giay_may=time.time() - t_mark, so_tien_trinh=1))
+                    pha_close(pha_live); pha_live = None
                     # v8 (L67): axial points always run too, 3 mu x 3 speeds, sealed; S03 does not
                     # analyse them (section 5 and the rule of 3.2 use the outer / inner / centre runs)
-                    n_mark, rr_mark, t_mark = len(all_runs), len(rerun_notes), time.time()
+                    pha_live = pha_open('truc', ctrl, 14 * len(mu_levels) * len(SPEEDS))
                     run_points([(p, 'axial', c) for p, c in axial])
-                    pha_notes.append(dict(pha='truc', controller=ctrl,
-                                          n_luot_ke_hoach=14 * len(mu_levels) * len(SPEEDS),
-                                          n_luot_thuc=len(all_runs) - n_mark,
-                                          n_chay_lai_chan_doan=len(rerun_notes) - rr_mark,
-                                          giay_may=time.time() - t_mark, so_tien_trinh=1))
+                    pha_close(pha_live); pha_live = None
                     corner_ids = [p for p, _ in outer]
                     need_inner = [v for v in SPEEDS
                                   if sum(runs[(i, mu_mid, v)]['completed'] == 'false'
@@ -1900,10 +1947,12 @@ files:
                                              for p, _ in inner) > 64]
 
                     # 3.4 determinism in a new process (job files under sealed/, S3C-2)
-                    n_mark, rr_mark, t_mark = len(all_runs), len(rerun_notes), time.time()
+                    pha_live = pha_open('kiem_tat_dinh_3_4', ctrl,
+                                        4 * len(mu_levels) * len(SPEEDS))
                     jobs = sorted(keep_logs)
                     det_res = run_in_new_process(
                         a.dll, [(ctrl, keep_logs[j][0], j[2], j[1]) for j in jobs], work_sealed)
+                    pha_live['n_thuc'] = len(det_res)
                     for j, r in zip(jobs, det_res):
                         g, box, row0, dig0 = keep_logs[j]
                         ids = (ctrl, j[0], box, j[1], j[2])
@@ -1912,11 +1961,7 @@ files:
                                              runs_fields_equal=row_text(r['row'], ids)
                                              == row_text(row0, ids),
                                              n_arrays=len(dig0)))
-                    pha_notes.append(dict(pha='kiem_tat_dinh_3_4', controller=ctrl,
-                                          n_luot_ke_hoach=4 * len(mu_levels) * len(SPEEDS),
-                                          n_luot_thuc=len(det_res),
-                                          n_chay_lai_chan_doan=len(rerun_notes) - rr_mark,
-                                          giay_may=time.time() - t_mark, so_tien_trinh=1))
+                    pha_close(pha_live); pha_live = None
                     if not all(d['log_arrays_equal'] and d['runs_fields_equal'] for d in det_rows):
                         raise S03Stop('determinism check failed (S03 3.4): stop, tell CODE and THESIS')
 
@@ -1934,74 +1979,125 @@ files:
                         ver_rows += [r for r in vr if r['v'] not in nc]
                         fail_rows += f
             except S03Stop as exc:
+                pha_notes += getattr(exc, 'pha_notes', [])        # run_step's phase notes (C3-39)
                 stop_sealed = dict(pha=pha_name, ly_do=str(exc))
             except Exception as exc:            # noqa: BLE001 (item 13: any failure stays sealed)
+                pha_notes += getattr(exc, 'pha_notes', [])
                 stop_sealed = dict(pha=pha_name, ly_do=f'{type(exc).__name__}: {exc}')
                 traceback.print_exc(file=diag)
+            if pha_live is not None:
+                pha_close(pha_live, 'dung_giua_pha')
+            if t_md0 is not None:
+                t_md1 = _mono()
 
     t_end = time.time()
-    # S3V8-1: the empty work folders of the sweep, of the main design and of the screening worker
-    # pools are removed BEFORE sealed/ is written and closed; after the manifest only sealed_test/
-    # changes
-    for d in (work_pub, work_sealed, os.path.join(sealed, 'sangloc', '_work'),
-              os.path.join(sealed, 'sangloc_thu', '_work')):
-        if os.path.isdir(d) and not os.listdir(d):
-            os.rmdir(d)
-    # sealed outputs, with their own manifest (no hash of a sealed file outside sealed/, S3C-1)
-    sealed_files = {}
-    for name, rows, cols in (('runs.csv', all_runs, RUNS_FILE_COLS), ('effects.csv', eff_rows, None),
-                             ('curvature.csv', curv_rows, None), ('y2_versions.csv', ver_rows, None),
-                             ('fail_counts.csv', fail_rows, None), ('determinism_check.csv', det_rows, None)):
-        p = os.path.join(sealed, name)
-        write_csv(p, rows, cols)
-        sealed_files[name] = sha256_file(p)
-    for name in ('levels_sangloc.csv', 'design.csv'):          # written inside the window, step 4c/4d
-        p = os.path.join(sealed, name)
-        if os.path.isfile(p):
-            sealed_files[name] = sha256_file(p)
-    quet_entry = dict(pha='quet', controller='all', n_luot_ke_hoach=sweep_planned,
-                      n_luot_thuc=len(sweep_rows),
-                      n_chay_lai_chan_doan=sum(1 for n in rerun_notes if n['point'] is None),
-                      giay_may=(t_sweep_end or t_end) - t0, so_tien_trinh=1)
-    kep_note = ('PID: fwsim.kep_indicator on the O1 window up to the t_end of the run (ticks at '
-                'the PID integral clamp over ticks with the motor on); empty for ADRC, run_error '
-                'rows and a DLL without the channel' if bool(getattr(fw, 'kep_cols', 0))
-                else 'empty: the DLL has no kep channel')
-    with open(os.path.join(sealed, 'notes.json'), 'w', encoding='utf-8') as f:
-        json.dump(dict(inner_rule_speeds=inner_rule, no_conclusion_speeds=no_concl,
-                       stop=stop_sealed['ly_do'] if stop_sealed else None,
-                       run_error_reruns=[n for n in rerun_notes if n['point'] is not None],
-                       ngoai_tam_giac_points=({c: sum(1 for r in design_rows
-                                                     if r['controller'] == c
-                                                     and r['box'] in ('centre', 'outer', 'inner', 'axial')
-                                                     and r[TRIANGLE_COL])
-                                              for c in a.controllers} if design_rows else {}),
-                       elapsed_s_total=round(t_end - t0),
-                       elapsed_s_main_design=round(t_end - t_sweep_end) if t_sweep_end else None,
-                       pha=[quet_entry] + pha_notes,          # S03 v8.5 section 7: one entry per phase
-                       kep_frac=kep_note),
-                  f, indent=1, default=str)
-    sealed_files['notes.json'] = sha256_file(os.path.join(sealed, 'notes.json'))
-    # sealed/diag.txt (item 13): every print, warning and traceback of the sealed phases; empty
-    # when nothing was captured
-    diag_text = diag.getvalue() + ''.join(f'warning: {w_.category.__name__}: {w_.message} '
-                                          f'({w_.filename}:{w_.lineno})\n' for w_ in caught)
-    with open(os.path.join(sealed, 'diag.txt'), 'w', encoding='utf-8') as f:
-        f.write(diag_text)
-    sealed_files['diag.txt'] = sha256_file(os.path.join(sealed, 'diag.txt'))
-    if stop_sealed:
-        with open(os.path.join(sealed, 'stop.json'), 'w', encoding='utf-8') as f:
-            json.dump(dict(stop=stop_sealed['ly_do'], pha=stop_sealed['pha']), f, indent=1)
-        sealed_files['stop.json'] = sha256_file(os.path.join(sealed, 'stop.json'))
-    for sub in ('sangloc', 'sangloc_thu'):          # every file the screening step wrote
-        root_dir = os.path.join(sealed, sub)
-        if os.path.isdir(root_dir):
-            for root, _dirs, fnames in os.walk(root_dir):
-                for fn in sorted(fnames):
-                    p = os.path.join(root, fn)
-                    sealed_files[os.path.relpath(p, sealed).replace(os.sep, '/')] = sha256_file(p)
-    with open(os.path.join(sealed, 'manifest.json'), 'w', encoding='utf-8') as f:
-        json.dump(dict(files=sealed_files), f, indent=1)
+    # C3-38 (v8.5 3.1b item 13): the closing of sealed/ — stop.json first when a stop is pending,
+    # the work folders, the six CSVs, notes.json, diag.txt, the manifest — runs inside ONE guard
+    # with prints, warnings and tracebacks in the same diag StringIO; an output error becomes a
+    # 'dong_niem_phong' stop and stop.json / diag.txt / manifest.json are rewritten best effort
+    with warnings.catch_warnings(record=True) as caught_close, contextlib.redirect_stdout(diag), \
+            contextlib.redirect_stderr(diag):
+
+        def _manifest():
+            """sealed/manifest.json from the files ON DISK: the six CSVs, levels_sangloc.csv,
+            design.csv, notes.json, diag.txt, stop.json (each when it exists) and every file
+            under sangloc/ and sangloc_thu/ (relative name with '/')."""
+            sfiles = {}
+            for name in ('runs.csv', 'effects.csv', 'curvature.csv', 'y2_versions.csv',
+                         'fail_counts.csv', 'determinism_check.csv', 'levels_sangloc.csv',
+                         'design.csv', 'notes.json', 'diag.txt', 'stop.json'):
+                p = os.path.join(sealed, name)
+                if os.path.isfile(p):
+                    sfiles[name] = sha256_file(p)
+            for sub in ('sangloc', 'sangloc_thu'):      # every file the screening step wrote
+                root_dir = os.path.join(sealed, sub)
+                if os.path.isdir(root_dir):
+                    for root, _dirs, fnames in os.walk(root_dir):
+                        for fn in sorted(fnames):
+                            p = os.path.join(root, fn)
+                            sfiles[os.path.relpath(p, sealed).replace(os.sep, '/')] = sha256_file(p)
+            with open(os.path.join(sealed, 'manifest.json'), 'w', encoding='utf-8') as f:
+                json.dump(dict(files=sfiles), f, indent=1)
+
+        def _diag_text():
+            """sealed/diag.txt: every print, warning and traceback of the sealed phases (item 13);
+            empty when nothing was captured."""
+            return diag.getvalue() + ''.join(f'warning: {w_.category.__name__}: {w_.message} '
+                                             f'({w_.filename}:{w_.lineno})\n'
+                                             for w_ in itertools.chain(caught, caught_close))
+        try:
+            if stop_sealed:
+                with open(os.path.join(sealed, 'stop.json'), 'w', encoding='utf-8') as f:
+                    json.dump(dict(stop=stop_sealed['ly_do'], pha=stop_sealed['pha']), f, indent=1)
+            # S3V8-1: the empty work folders of the sweep, of the main design and of the screening
+            # worker pools are removed BEFORE sealed/ is written and closed; after the manifest
+            # only sealed_test/ changes
+            for d in (work_pub, work_sealed, os.path.join(sealed, 'sangloc', '_work'),
+                      os.path.join(sealed, 'sangloc_thu', '_work')):
+                if os.path.isdir(d) and not os.listdir(d):
+                    os.rmdir(d)
+            # sealed outputs, with their own manifest (no hash of a sealed file outside sealed/, S3C-1)
+            for name, rows, cols in (('runs.csv', all_runs, RUNS_FILE_COLS),
+                                     ('effects.csv', eff_rows, None),
+                                     ('curvature.csv', curv_rows, None),
+                                     ('y2_versions.csv', ver_rows, None),
+                                     ('fail_counts.csv', fail_rows, None),
+                                     ('determinism_check.csv', det_rows, None)):
+                write_csv(os.path.join(sealed, name), rows, cols)
+            quet_entry = dict(pha='quet', controller='all', n_luot_ke_hoach=sweep_planned,
+                              n_luot_thuc=len(sweep_rows),
+                              n_chay_lai_chan_doan=sum(1 for n in rerun_notes if n['point'] is None),
+                              giay_may=(t_sweep_end or t_end) - t0, so_tien_trinh=1,
+                              n_luot_tong=(len(sweep_rows)
+                                           + sum(1 for n in rerun_notes if n['point'] is None)),
+                              trang_thai='xong' if t_sweep_end else 'dung_giua_pha',
+                              moc_bat_dau=sl._stamp(t0), moc_ket_thuc=sl._stamp(t_sweep_end or t_end))
+            kep_note = ('PID: fwsim.kep_indicator on the O1 window up to the t_end of the run '
+                        '(ticks at the PID integral clamp over ticks with the motor on); empty '
+                        'only for ADRC and run_error rows: a PID run without the channel or with '
+                        'a failed self-check stops S03 (Codex C3-48)'
+                        if bool(getattr(fw, 'kep_cols', 0))
+                        else 'a DLL without the kep channel cannot run S03 with PID (Codex C3-48)')
+            with open(os.path.join(sealed, 'notes.json'), 'w', encoding='utf-8') as f:
+                json.dump(dict(inner_rule_speeds=inner_rule, no_conclusion_speeds=no_concl,
+                               stop=stop_sealed['ly_do'] if stop_sealed else None,
+                               run_error_reruns=[n for n in rerun_notes if n['point'] is not None],
+                               ngoai_tam_giac_points=({c: sum(1 for r in design_rows
+                                                             if r['controller'] == c
+                                                             and r['box'] in ('centre', 'outer', 'inner',
+                                                                            'axial')
+                                                             and r[TRIANGLE_COL])
+                                                      for c in a.controllers} if design_rows else {}),
+                               elapsed_s_total=round(t_end - t0),
+                               elapsed_s_main_design=(round(t_md1 - t_md0)
+                                                      if t_md0 is not None else None),
+                               elapsed_s_sang_loc=(round(t_sl1 - t_sl0)
+                                                   if t_sl0 is not None else None),
+                               pha=[quet_entry] + pha_notes,   # S03 v8.5 section 7: one entry per phase
+                               kep_frac=kep_note),
+                          f, indent=1, default=str)
+            with open(os.path.join(sealed, 'diag.txt'), 'w', encoding='utf-8') as f:
+                f.write(_diag_text())
+            _manifest()
+        except Exception as exc:        # noqa: BLE001 (an output error is a stop, kept sealed)
+            out_error = f'{type(exc).__name__}: {exc}'
+            traceback.print_exc(file=diag)
+            if stop_sealed is None:
+                stop_sealed = dict(pha='dong_niem_phong',
+                                   ly_do=f'writing the sealed outputs failed: {out_error}')
+            for name, text in (('stop.json', lambda: json.dumps(
+                    dict(stop=stop_sealed['ly_do'], pha=stop_sealed['pha'],
+                         output_error=out_error), indent=1)),
+                               ('diag.txt', _diag_text)):
+                try:                    # best effort; a failure here leaves only the public line
+                    with open(os.path.join(sealed, name), 'w', encoding='utf-8') as f_:
+                        f_.write(text())
+                except Exception:       # noqa: BLE001,S110
+                    pass
+            try:
+                _manifest()
+            except Exception:           # noqa: BLE001,S110
+                pass
     # sealed/ is closed here: nothing below writes in it (S03 v8 section 7)
 
     # v8 (L67, S38-8): the test set of both controllers runs only now, after sealed/ is written,

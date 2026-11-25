@@ -11,7 +11,10 @@ import json
 import math
 import os
 import struct
+import subprocess
 import sys
+import textwrap
+import time
 
 import numpy as np
 import pytest
@@ -115,6 +118,10 @@ def test_load_screen_u_git_checks(tmp_path, monkeypatch):
     a file not tracked/clean in git, or differing from its HEAD blob after CRLF->LF, is a
     S03Stop unless trial (then only recorded, .screen_info carries what was read)."""
     monkeypatch.setattr(sl, 'parse_screen_u', lambda t: {'S0': np.zeros((2, 7))})
+    # C3-36: parse_screen_u is faked, so the source check is faked too (it would reject the
+    # two-row arrays the fake returns)
+    monkeypatch.setattr(sl, 'verify_screen_source',
+                        lambda sets, sha256_lf, che_do='chinh', r=0: (dict(che_do=che_do, r=r), []))
     raw = b'a,b\r\n1,2\r\n'
     p = tmp_path / 'u.csv'
     p.write_bytes(raw)
@@ -407,19 +414,21 @@ def _fake_gate(e_mid=0.05, e_rest=None, bad=None, second_e=None, second_err=Fals
         if bad is not None and bad(g, v, mu):
             return dict(status='run_error', completed='', error='fake run_error'), None
         tv = float('nan') if tv_nan is not None and tv_nan(g, v, mu) else 0.4
+        kep = dict(kep_frac_vx=0.0, kep_frac_vy=0.0, kep_frac_wz=0.0, kep_note='') \
+            if ctrl == 'PID' else dict(kep_frac_vx='', kep_frac_vy='', kep_frac_wz='', kep_note='')
         return dict(status='ok', completed='true', e_perp_max=e, tv_duty=tv, sat_frac=0.0,
                     t_end=1.0, e_theta_lane_max_deg=0.5, e_theta_cmd_max_deg=0.5, ds_absmax=1.0,
-                    e_trk_max=0.05, e_bao_max=0.02), {'t': np.arange(3.0)}
+                    e_trk_max=0.05, e_bao_max=0.02, **kep), {'t': np.arange(3.0)}  # C3-48
     gate.second = False
     return gate
 
 
-def _fake_new_process(dll, runs, work):
+def _fake_new_process(dll, runs, work, timeout=None):     # C3-40: run_in_new_process takes timeout
     os.makedirs(work, exist_ok=True)
     return [dict(row=dict(status='ok', completed='true', e_perp_max=0.05, tv_duty=0.4,
                           sat_frac=0.0, t_end=1.0, e_theta_lane_max_deg=0.5,
                           e_theta_cmd_max_deg=0.5, ds_absmax=1.0, e_trk_max=0.05, e_bao_max=0.02),
-                 digest={'fake': 1}) for _ in runs]
+                 digest=s3.log_digest({'t': np.arange(3.0)})) for _ in runs]
 
 
 def _patch(monkeypatch, gate, check=None):
@@ -954,3 +963,436 @@ def test_run_set_real_runs_deterministic(tmp_path):
         for e1, e2 in zip(a, b):
             assert e1['log_sha256'] == e2['log_sha256']
             assert all(s3._bits(e1.get(k)) == s3._bits(e2.get(k)) for k in sl.EVAL_SL_COLS)
+
+
+# ── C3-36: the numbers file is checked against its generation source ─────────────
+
+def test_c3_36_verify_screen_source_unit(monkeypatch):
+    """C3-36: generate_sets / canonical_text / verify_screen_source — the generated sets pass
+    (bit for bit and as text); one ulp moved, a sign-of-zero, a missing set, or a non-canonical
+    text is reported; 'thu' checks the TRIAL_SEED_BASE seeds."""
+    sets = sl.generate_sets(0)
+    sha = hashlib.sha256(sl.canonical_text(sets).encode('utf-8')).hexdigest()
+    rec, probs = sl.verify_screen_source(sets, sha)
+    assert probs == [] and rec['khop_tung_bit'] and rec['khop_van_ban']
+    assert rec['seed_base'] == sl.SEED_BASE
+    assert rec['seeds'] == {s: sl.SEED_BASE + t for t, s in enumerate(sl.SETS)}
+    bad = {s: np.array(a, copy=True) for s, a in sets.items()}          # one ulp moved in S3
+    bad['S3'][0, 0] = np.nextafter(bad['S3'][0, 0], 1.0)
+    rec, probs = sl.verify_screen_source(bad, sha)
+    assert rec['tap_lech'] == ['S3'] and not rec['khop_tung_bit'] and len(probs) == 1
+    bad = {s: np.array(a, copy=True) for s, a in sets.items()}          # S1 only
+    bad['S1'][5, 3] = np.nextafter(bad['S1'][5, 3], 0.0)
+    rec, _ = sl.verify_screen_source(bad, sha)
+    assert rec['tap_lech'] == ['S1']
+    small = {s: np.zeros((sl.SET_ROWS[s], 7)) for s in sl.SETS}         # -0.0 vs 0.0: same by ==
+
+    def fake_gen(r=0, base=sl.SEED_BASE):
+        out = {s: np.array(a, copy=True) for s, a in small.items()}
+        out['S0'][0, 0] = -0.0
+        return out
+    monkeypatch.setattr(sl, 'generate_sets', fake_gen)
+    rec, probs = sl.verify_screen_source(small, sha)
+    assert 'S0' in rec['tap_lech'] and probs
+    monkeypatch.undo()
+    rec, probs = sl.verify_screen_source(sets, '0' * 64)                # right bits, wrong text
+    assert rec['khop_tung_bit'] and not rec['khop_van_ban'] and len(probs) == 1
+    assert 'text' in probs[0] and 'canonical' in probs[0]
+    thu = sl.generate_sets(0, sl.TRIAL_SEED_BASE)                       # the tool-check family
+    sha_thu = hashlib.sha256(sl.canonical_text(thu).encode('utf-8')).hexdigest()
+    rec, probs = sl.verify_screen_source(thu, sha_thu, che_do='thu')
+    assert probs == [] and rec['khop_tung_bit'] and rec['khop_van_ban']
+    assert rec['seeds']['S0'] == sl.TRIAL_SEED_BASE
+    rec, probs = sl.verify_screen_source(sets, sha, che_do='thu')       # main sets, thu seeds
+    assert rec['tap_lech'] == list(sl.SETS)
+    rec, probs = sl.verify_screen_source(thu, sha_thu)                  # thu sets, main seeds
+    assert rec['tap_lech'] == list(sl.SETS)
+    miss = {s: a for s, a in sets.items() if s != 'S2'}                 # a missing set
+    rec, _ = sl.verify_screen_source(miss, sha)
+    assert rec['tap_lech'] == ['S2']
+
+
+def test_c3_36_source_seeds_validation():
+    """C3-36: source_seeds refuses an unknown mode, a bad r (bool included) and 'thu' with
+    r != 0; the seeds of ('chinh', 2) are SEED_BASE + 20 + t."""
+    for bad in (('thu', 1), ('x', 0), ('chinh', -1), ('chinh', True)):
+        with pytest.raises(ValueError):
+            sl.source_seeds(*bad)
+    base, seeds = sl.source_seeds('chinh', 2)
+    assert base == sl.SEED_BASE
+    assert seeds == {s: sl.SEED_BASE + 20 + t for t, s in enumerate(sl.SETS)}
+    base, seeds = sl.source_seeds('thu', 0)
+    assert base == sl.TRIAL_SEED_BASE and seeds['S0'] == sl.TRIAL_SEED_BASE
+
+
+def test_c3_36_committed_files_bit_exact():
+    """C3-36: the committed main file is generate_sets(0) bit for bit and canonical text; the
+    committed tool-check file (make_s03_screen_u --thu) is the TRIAL_SEED_BASE family."""
+    sets, info = sl.load_screen_u(sl.SCREEN_U, trial=True)
+    gen = sl.generate_sets(0)
+    assert hashlib.sha256(sl.canonical_text(gen).encode('utf-8')).hexdigest() == \
+        info['sha256_lf']
+    assert info['nguon_sinh']['khop_tung_bit'] and info['nguon_sinh']['khop_van_ban']
+    sets, info = sl.load_screen_u(sl.SCREEN_U_THU, trial=True, che_do='thu')
+    gen = sl.generate_sets(0, sl.TRIAL_SEED_BASE)
+    assert hashlib.sha256(sl.canonical_text(gen).encode('utf-8')).hexdigest() == \
+        info['sha256_lf']
+    assert info['nguon_sinh']['khop_tung_bit'] and info['nguon_sinh']['khop_van_ban']
+    assert info['nguon_sinh']['seeds']['S0'] == sl.TRIAL_SEED_BASE
+
+
+# ── C3-48: a PID run without the clamp indicator stops the step ─────────────────
+
+def test_c3_48_check_kep_rows():
+    """C3-48: ADRC, attempt-2 and run_error rows are exempt; NaN fractions are values; a missing
+    key, '' or None kep_frac or a non-empty kep_note of a first-attempt PID row stops S03."""
+    good = dict(attempt=1, status='ok', cand_id=7, kep_frac_vx=0.5, kep_frac_vy=0.0,
+                kep_frac_wz=float('nan'), kep_note='')
+    sl.check_kep_rows('ADRC', [dict(attempt=1, status='ok')])            # ADRC exempt
+    sl.check_kep_rows('PID', [good])                                     # NaN is a value
+    sl.check_kep_rows('PID', [dict(good, attempt=2, kep_note='kep_lech set', kep_frac_vx='')])
+    sl.check_kep_rows('PID', [dict(good, status='run_error', kep_note='', kep_frac_vx='')])
+    for bad in (dict(good, kep_frac_vx=''), dict(good, kep_frac_vx=None),
+                {k: v for k, v in good.items() if k != 'kep_frac_vx'},
+                dict(good, kep_note='kep_lech set')):
+        with pytest.raises(s3.S03Stop, match='7'):
+            sl.check_kep_rows('PID', [bad])
+
+
+# ── C3-39 / D2A-2: live phase entries ───────────────────────────────────────────
+
+def test_c3_39_pha_notes_on_stop(tmp_path, monkeypatch):
+    """C3-39 / D2A-2: a run_jobs stop inside S1 leaves .pha_notes on the exception: S1
+    'dung_giua_pha' carrying the .n_luot counts of run_jobs, S0 'xong'."""
+    def jobs(jobs_, work, n, lp):
+        if any(j['name'].startswith('S1_') for j in jobs_):
+            exc = s3.S03Stop('boom')
+            exc.n_luot = (7, 2)
+            raise exc
+        return [sl.do_job(j) for j in jobs_]
+    _patch(monkeypatch, _fake_gate())
+    monkeypatch.setattr(sl, 'run_jobs', jobs)
+    screen = _screen(40, 100, dict(S1=0.5, S2=0.5, S2b=0.5))
+    W = _W()
+    with pytest.raises(s3.S03Stop) as ei:
+        sl.run_step(str(tmp_path), 'd.dll', s3.CONTROLLERS, [0.5], MU, W, _quet(W), screen, 2,
+                    tool_check=dict(n0=40, n=100))
+    pha = {p['pha']: p for p in ei.value.pha_notes}
+    s1 = pha['S1']
+    assert s1['n_luot_thuc'] == 7 and s1['n_chay_lai_chan_doan'] == 2
+    assert s1['n_luot_tong'] == 9 and s1['trang_thai'] == 'dung_giua_pha'
+    assert isinstance(s1['giay_may'], (int, float)) and isinstance(s1['moc_ket_thuc'], str)
+    assert pha['S0']['trang_thai'] == 'xong' and 'S2' not in pha
+
+
+def test_c3_39_s0_giay_may_is_t_s0(tmp_path, monkeypatch):
+    """C3-39: giay_may of the S0 phase entry equals t_S0 of so_dem.json (the whole phase)."""
+    res, W = _run(tmp_path, monkeypatch, _screen(40, 100, dict(S1=0.5, S2=0.5, S2b=0.5)),
+                  _fake_gate())
+    sd = json.load(open(tmp_path / 'sangloc_thu' / 'so_dem.json', encoding='utf-8'))
+    pha = {p['pha']: p for p in res['pha']}
+    assert pha['S0']['giay_may'] == sd['t_S0']
+    for p in res['pha']:
+        assert p['trang_thai'] == 'xong' and p['n_luot_tong'] == \
+            p['n_luot_thuc'] + p['n_chay_lai_chan_doan']
+        assert isinstance(p['moc_bat_dau'], str) and isinstance(p['moc_ket_thuc'], str)
+
+
+# ── D2A-3: sealed/sangloc_thu/loi_S0.json ────────────────────────────────────────
+
+def test_d2a_3_loi_s0(tmp_path, monkeypatch):
+    """D2A-3: loi_S0.json is written always when S0 ended — the keys of LOI_S0_KEYS /
+    LOI_LUOT_KEYS only, the unclassifiable counts of so_dem.json, one 'lan_1' entry per
+    attempt-1 run_error of evals_S0.csv and a 'chan_doan' entry per attempt-2 row; a run
+    without errors has zero counts and an empty list."""
+    u_s0 = np.full((40, 7), 0.5)
+    u_s0[:3] = 0.9                                   # pos_kp ~91: run_error rows 1-3
+    _run(tmp_path, monkeypatch,
+         dict(S0=u_s0, S1=np.full((100, 7), 0.5), S2=np.full((100, 7), 0.5),
+              S2b=np.full((100, 7), 0.5)),
+         _fake_gate(bad=lambda g, v, mu: 60.0 < g['pos_kp'] < 100.0),
+         tool=dict(n0=40, n=100))
+    doc = json.load(open(tmp_path / 'sangloc_thu' / 'loi_S0.json', encoding='utf-8'))
+    assert list(doc) == list(sl.LOI_S0_KEYS)
+    sd = json.load(open(tmp_path / 'sangloc_thu' / 'so_dem.json', encoding='utf-8'))
+    assert set(doc['n_bo_khong_phan_loai']) == set(s3.CONTROLLERS)
+    for ctrl in s3.CONTROLLERS:
+        assert set(doc['n_bo_khong_phan_loai'][ctrl]) == set(sl.MODES)
+        for m in sl.MODES:
+            assert doc['n_bo_khong_phan_loai'][ctrl][m] == \
+                sd['dem'][ctrl]['che_do'][m]['n_khong_phan_loai']
+    for e in doc['luot_loi']:
+        assert set(e) == set(sl.LOI_LUOT_KEYS) and e['pha'] in ('lan_1', 'chan_doan')
+    ev = _read_csv(tmp_path / 'sangloc_thu' / 'evals_S0.csv')
+    n_lan1 = sum(r['attempt'] == '1' and r['status'] == 'run_error' for r in ev)
+    n_cd = sum(r['attempt'] == '2' for r in ev)
+    assert sum(e['pha'] == 'lan_1' for e in doc['luot_loi']) == n_lan1 > 0
+    assert sum(e['pha'] == 'chan_doan' for e in doc['luot_loi']) == n_cd
+    txt = json.dumps(doc)
+    for word in ('e_perp', 'omega', 'kp_xy', 'pos_kp', '0.9'):
+        assert word not in txt
+    _run(tmp_path / 'b', monkeypatch, _screen(40, 100, dict(S1=0.5, S2=0.5, S2b=0.5)),
+         _fake_gate())
+    doc = json.load(open(tmp_path / 'b' / 'sangloc_thu' / 'loi_S0.json', encoding='utf-8'))
+    assert doc['luot_loi'] == []
+    assert all(v == 0 for c in doc['n_bo_khong_phan_loai'].values() for v in c.values())
+
+
+# ── C3-40 / D2A-4: worker death, the diagnosis rerun and the wait limits ────────
+
+def _fake_worker(tmp_path):
+    """A worker-process script (C3-40 tests): the real sl.job_main with a fake gate and
+    firmware; environment variables make it os._exit(9) at a gain set (S03_TEST_KILL=<k_psi
+    repr>, matched when abs(g['k_psi'] / k - 1) < 1e-12 on a PID run), sleep
+    (S03_TEST_SLEEP=<k_psi>:<seconds>), raise S03Stop (S03_TEST_STOP=<k_psi>) or exit before
+    job_main (S03_TEST_EXIT_AT_START=1)."""
+    script = tmp_path / 'fake_worker.py'
+    fwsim_dir = os.path.abspath(os.path.join(HERE, '..'))
+    script.write_text(textwrap.dedent('''\
+        import os, sys, time
+        sys.path.insert(0, {fwsim!r})
+        import s03_doe as s3
+        import s03_sangloc as sl
+        import s04_ga as s4
+
+        KILL = os.environ.get('S03_TEST_KILL')
+        SLEEP = os.environ.get('S03_TEST_SLEEP')
+        STOP = os.environ.get('S03_TEST_STOP')
+
+        def _match(k_psi_text, g):
+            return k_psi_text is not None and abs(g['k_psi'] / float(k_psi_text) - 1) < 1e-12
+
+        def gate(fw, path, ctrl, g, v, mu):
+            if ctrl == 'PID':
+                if _match(KILL, g):
+                    os._exit(9)
+                if SLEEP is not None:
+                    k_, s_ = SLEEP.split(':')
+                    if _match(k_, g):
+                        time.sleep(float(s_))
+                if _match(STOP, g):
+                    raise s3.S03Stop('fake tool stop')
+            kep = dict(kep_frac_vx=0.0, kep_frac_vy=0.0, kep_frac_wz=0.0, kep_note='') \\
+                if ctrl == 'PID' else \\
+                dict(kep_frac_vx='', kep_frac_vy='', kep_frac_wz='', kep_note='')
+            return dict(status='ok', completed='true', e_perp_max=0.05, tv_duty=0.4,
+                        sat_frac=0.0, t_end=1.0, e_theta_lane_max_deg=0.5,
+                        e_theta_cmd_max_deg=0.5, ds_absmax=1.0, e_trk_max=0.05,
+                        e_bao_max=0.02, **kep), {{'t': [0.0]}}
+
+        s4.safe_run_gate = gate
+        sl._firmware = lambda dll: object()
+        if os.environ.get('S03_TEST_EXIT_AT_START'):
+            os._exit(5)
+        _p = sys.argv[sys.argv.index('--job') + 1]
+        print('worker job file', os.path.basename(_p), flush=True)
+        sl.job_main(_p)
+        '''.format(fwsim=fwsim_dir)), encoding='utf-8')
+    return str(script)
+
+
+def _popen_fake_worker(monkeypatch, script, fail_at=None, procs=None):
+    """subprocess.Popen: real for every command without '--job'; the n-th '--job' spawn raises
+    OSError('FakeSpawnError') when n == fail_at, else runs the fake-worker script with the same
+    '--job <path>' arguments and appends the process to procs (works on the original code too)."""
+    real = subprocess.Popen
+    count = [0]
+
+    def popen(cmd, *a, **k):
+        if '--job' not in list(cmd):
+            return real(cmd, *a, **k)
+        count[0] += 1
+        if count[0] == fail_at:
+            raise OSError('FakeSpawnError')
+        p = real([cmd[0], script] + list(cmd[2:]), *a, **k)
+        if procs is not None:
+            procs.append(p)
+        return p
+    monkeypatch.setattr(subprocess, 'Popen', popen)
+    return count
+
+
+def _job_pid(name, work, rows, speeds=(0.5,), mu=MU):
+    return dict(name=name, dll='fake.dll', controller='PID', speeds=list(speeds),
+                mu_levels=list(mu), rows=rows, work=os.path.join(str(work), name))
+
+
+def _five_rows(n=5):
+    return [(i + 1, dict(FAKE_DEFAULTS['PID'], k_psi=1.0 + i)) for i in range(n)]
+
+
+@pytest.mark.parametrize('k', [1, 3, 5])
+def test_c3_40_worker_dies_mid_set(tmp_path, monkeypatch, k):
+    """C3-40 / D2A-4: a worker that dies while running gain set k: the sets it reported 'xong'
+    are kept, set k is a run_error (the death in 'error') with ONE diagnosis rerun in a new
+    process (attempt 2, never replacing), the rest of the job runs in a '<name>_tiep1' worker;
+    run_jobs returns, no worker is alive, no job file is left."""
+    script = _fake_worker(tmp_path)
+    work = str(tmp_path / 'wk')
+    log_path = str(tmp_path / 'tien_trinh.log')
+    procs = []
+    _popen_fake_worker(monkeypatch, script, procs=procs)
+    monkeypatch.setenv('S03_TEST_KILL', repr(1.0 + (k - 1)))
+    calls = []
+
+    def diag(dll, runs, w, timeout=None):
+        calls.append((len(runs), timeout))
+        return _fake_new_process(dll, runs, w, timeout=timeout)
+    monkeypatch.setattr(s3, 'run_in_new_process', diag)
+    jobs = [_job_pid('J', work, _five_rows())]
+    res = sl.run_jobs(jobs, work, 2, log_path)
+    assert len(procs) == (1 if k == 5 else 2)
+    assert calls == [(1, sl.DIAG_WAIT_MAX_S)]            # ONE diagnosis of the 1 speed at mu_mid
+    by_row = {rn: rows for rn, rows in res[0]}
+    for rn, rows in by_row.items():
+        if rn != k:
+            assert [e['status'] for e in rows] == ['ok'] * 3
+            assert all(e['attempt'] == 1 for e in rows)
+        else:
+            assert len(rows) == 2
+            assert rows[0]['attempt'] == 1 and rows[0]['status'] == 'run_error'
+            assert 'worker process died (exit code 9)' in rows[0]['error']
+            assert rows[1]['attempt'] == 2
+            sc = sl.score_modes(rows, 'ok', [0.5], MU)
+            assert all(not sc[m]['phan_loai_duoc'] for m in sl.MODES)
+    assert not os.path.exists(work) or not os.listdir(work)
+    log = open(log_path, encoding='utf-8', errors='replace').read()
+    assert 'job J' in log and ('job J_tiep1' in log) == (k < 5)
+
+
+def test_c3_40_diagnosis_fails(tmp_path, monkeypatch):
+    """C3-40: when the diagnosis rerun itself raises, the attempt-2 row of every speed is
+    'diagnosis_failed' with the exception text; the attempt-1 run_error rows stay."""
+    script = _fake_worker(tmp_path)
+    work = str(tmp_path / 'wk')
+    log_path = str(tmp_path / 'tien_trinh.log')
+    _popen_fake_worker(monkeypatch, script)
+    monkeypatch.setenv('S03_TEST_KILL', repr(2.0))
+    monkeypatch.setattr(s3, 'run_in_new_process',
+                        lambda *a, **k: (_ for _ in ()).throw(s3.S03Stop('child process failed (9)')))
+    jobs = [_job_pid('J', work, _five_rows())]
+    res = sl.run_jobs(jobs, work, 2, log_path)
+    rows = dict(res[0])[2]
+    assert rows[0]['status'] == 'run_error' and 'worker process died' in rows[0]['error']
+    assert rows[1]['attempt'] == 2 and rows[1]['status'] == 'diagnosis_failed'
+    assert 'child process failed (9)' in rows[1]['error']
+
+
+def test_c3_40_exit_at_start_is_a_tool_error(tmp_path, monkeypatch):
+    """C3-40: a worker dead before any 'bat_dau' (os._exit at start) is the existing tool
+    error, not a run_error set."""
+    script = _fake_worker(tmp_path)
+    work = str(tmp_path / 'wk')
+    log_path = str(tmp_path / 'tien_trinh.log')
+    _popen_fake_worker(monkeypatch, script)
+    monkeypatch.setenv('S03_TEST_EXIT_AT_START', '1')
+    jobs = [_job_pid('J', work, _five_rows())]
+    with pytest.raises(s3.S03Stop, match='worker'):
+        sl.run_jobs(jobs, work, 2, log_path)
+    assert not os.path.exists(work) or not os.listdir(work)
+
+
+def test_c3_40_wait_limit(tmp_path, monkeypatch):
+    """C3-40: a worker over JOB_WAIT_MAX_S is killed (the set it was running is a run_error
+    with the wait-limit text), the rest runs in a continuation; the call returns far below
+    the sleep length."""
+    script = _fake_worker(tmp_path)
+    work = str(tmp_path / 'wk')
+    log_path = str(tmp_path / 'tien_trinh.log')
+    procs = []
+    _popen_fake_worker(monkeypatch, script, procs=procs)
+    monkeypatch.setenv('S03_TEST_SLEEP', f'{2.0!r}:40')
+    monkeypatch.setattr(sl, 'JOB_WAIT_MAX_S', 3.0, raising=False)
+    monkeypatch.setattr(s3, 'run_in_new_process', _fake_new_process)
+    jobs = [_job_pid('J', work, _five_rows(3))]
+    t0 = time.monotonic()
+    res = sl.run_jobs(jobs, work, 2, log_path)
+    assert time.monotonic() - t0 < 30
+    by_row = dict(res[0])
+    rows = by_row[2]
+    assert rows[0]['status'] == 'run_error' and 'wait limit' in rows[0]['error']
+    assert [e['status'] for e in by_row[1] + by_row[3]] == ['ok'] * 6
+    assert not os.path.exists(work) or not os.listdir(work)
+    for p in procs:
+        if p.poll() is None:                                   # nothing of run_jobs stays alive
+            p.kill()
+
+
+def test_c3_40_spawn_error_reaps_the_running_worker(tmp_path, monkeypatch):
+    """C3-40: a spawn failure (OSError) propagates but the running worker is killed and reaped
+    and no job file is left under work."""
+    script = _fake_worker(tmp_path)
+    work = str(tmp_path / 'wk')
+    log_path = str(tmp_path / 'tien_trinh.log')
+    procs = []
+    _popen_fake_worker(monkeypatch, script, fail_at=2, procs=procs)
+    monkeypatch.setenv('S03_TEST_SLEEP', f'{1.0!r}:60')
+    jobs = [_job_pid('A', work, _five_rows(3)), _job_pid('B', work, _five_rows(3))]
+    try:
+        with pytest.raises(OSError, match='FakeSpawnError'):
+            sl.run_jobs(jobs, work, 2, log_path)
+        assert procs[0].poll() is not None                     # reaped before run_jobs returned
+        assert not os.path.exists(work) or not os.listdir(work)
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+
+
+def test_c3_40_stop_carries_n_luot(tmp_path, monkeypatch):
+    """C3-40: a worker reporting ok=False raises its S03Stop carrying .n_luot — the finished
+    sets' attempt-1 / attempt-2 rows (here 2 sets x 3 attempt-1 runs = 6)."""
+    script = _fake_worker(tmp_path)
+    work = str(tmp_path / 'wk')
+    log_path = str(tmp_path / 'tien_trinh.log')
+    _popen_fake_worker(monkeypatch, script)
+    monkeypatch.setenv('S03_TEST_STOP', repr(3.0))
+    monkeypatch.setattr(s3, 'run_in_new_process', _fake_new_process)
+    jobs = [_job_pid('J', work, _five_rows())]
+    with pytest.raises(s3.S03Stop, match='fake tool stop') as ei:
+        sl.run_jobs(jobs, work, 2, log_path)
+    assert ei.value.n_luot[0] == 6
+
+
+def test_c3_40_n_luot_not_double_counted(tmp_path, monkeypatch):
+    """C3-40: the 'xong' sets of a worker that died while running a set are merged into the
+    result AND are not counted again in exc.n_luot when a later stop goes up: the first
+    worker finishes row 1 and dies in row 2, the continuation finishes row 3 and reports
+    the tool stop in row 4 -> n_luot == (6, 0) (with the double count it is 9)."""
+    script = _fake_worker(tmp_path)
+    work = str(tmp_path / 'wk')
+    log_path = str(tmp_path / 'tien_trinh.log')
+    _popen_fake_worker(monkeypatch, script)
+    monkeypatch.setenv('S03_TEST_KILL', repr(2.0))
+    monkeypatch.setenv('S03_TEST_STOP', repr(4.0))
+    monkeypatch.setattr(s3, 'run_in_new_process', _fake_new_process)
+    jobs = [_job_pid('J', work, _five_rows())]
+    with pytest.raises(s3.S03Stop, match='fake tool stop') as ei:
+        sl.run_jobs(jobs, work, 2, log_path)
+    assert ei.value.n_luot == (6, 0)
+    assert not os.path.exists(work) or not os.listdir(work)
+
+
+def test_c3_40_read_part_cut_record(tmp_path):
+    """C3-40: _read_part keeps the good records and stops at a record cut by the death of the
+    worker: a truncated pickle, a garbage tail and a complete pickle that is not a 3-tuple
+    each leave (done, started) = ([(1, rows)], 2); a missing file gives ([], None)."""
+    import pickle as _pkl
+    rows = [dict(attempt=1, status='ok')]
+    p = str(tmp_path / 'job_X')
+
+    def build(tail):
+        with open(p + '.part', 'wb') as f:
+            _pkl.dump(('bat_dau', 1, None), f)
+            _pkl.dump(('xong', 1, rows), f)
+            _pkl.dump(('bat_dau', 2, None), f)
+            f.write(tail)
+
+    rec = _pkl.dumps(('xong', 2, rows))
+    build(rec[:len(rec) // 2])                                     # a truncated pickle
+    assert sl._read_part(p) == ([(1, rows)], 2)
+    build(b'\x80\x05garbage')                                      # a garbage tail
+    assert sl._read_part(p) == ([(1, rows)], 2)
+    build(_pkl.dumps('x'))                                         # not a 3-tuple
+    assert sl._read_part(p) == ([(1, rows)], 2)
+    assert sl._read_part(str(tmp_path / 'none')) == ([], None)
