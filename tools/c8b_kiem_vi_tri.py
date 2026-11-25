@@ -10,15 +10,19 @@ Input: one CSV row per signed error of a position source on a set (upstream: KIE
 anchors / marks on real frames, 12b, E, the height sensitivity, the mounting ends of NHACTAM, the H drift; this tool
 does not compute them):
   nguon, tap (khop | kiem), dai_luong, mien, sai_m, chi_so_m, co_chuan_dong
-  sai_m signed (measured - reference); chi_so_m the index of that quantity in use (before the margin); co_chuan_dong
+  sai_m signed (measured - reference); chi_so_m the index of that quantity in use (before the margin; for the
+  sources held out by session, L155: the other sessions' index x the lock's margin x its held-out factor, written by
+  c8b_d3_hang); co_chuan_dong
   1 when the source has an independent dynamic reference, 0 when not (P4 combined motion, dynamic height).
 State rule (design 8): per (dai_luong, mien): every |sai| of the test set (kiem, after the lock) <= chi_so -> dat;
 one above -> that quantity thieu in that domain (listed in mien_thieu; the index is NOT raised after the lock); on the
 fit set (khop, before the lock) an excess raises the index to the largest |sai| seen (listed in chi_so_nang); a source
 without an independent dynamic reference -> gioi_han (usable, the assumption written). File trang_thai: dat when the
-lock is a c8b_khoa_v5 file with trang_thai khoa, every required source of design 8 (NGUON_CAN) has test rows, and every
-value is finite; else thieu with the reasons. A dat file may still carry mien_thieu: those domains are thieu in the
-scoring (n_undef), not the whole check (CACH HIEU, sent to CODE 20/11).
+lock is a c8b_khoa_v5 file with trang_thai khoa, every required source of design 8 (NGUON_CAN) has test rows, every
+value is finite, and mien_thieu is empty; else thieu with the reasons. mien_thieu not empty -> thieu (Codex D3-2; Liam
+25/11/2026 at CODE local_c65e48c9, L157 question 3, "Doi thanh thieu (Recommended)"): no tool reads mien_thieu (lock,
+scorer and gate do not; a domain listed there is NOT made n_undef in the scoring), so the gate must not lock C8 on a
+file that carries one until someone has decided on those domains.
 
   python tools/c8b_kiem_vi_tri.py --rows d3_rows.csv --khoa c8b_khoa_v5.json --out c8b_kiem_vi_tri.json
 Last line: #ket_qua,ma=0 written / 2 refused or error.
@@ -44,7 +48,10 @@ import c8b_a6 as a6m                                                     # noqa:
 VERSION = 'c8b_kiem_vi_tri_v1'
 KHOA_VERSION = 'c8b_khoa_v5'
 # design 8 (1)-(7): P1/A3 held-out H32, replay anchors / marks, 12b, E, height sensitivity, mounting ends, H drift
-NGUON_CAN = ('P1_A3_H32', 'replay_neo', '12b', 'E', 'do_nhay_cao', 'dau_cuoi_lan_lap', 'troi_H')   # [DE XUAT] names
+# 12b dropped 24/11 khuya (CODE applying C8B's recommendation, contract log C8: no signed position error of 12b; it is
+# in the F7 and in the angle a of dau_cuoi_lan_lap); dau_cuoi_lan_lap = the angle a between HC_goc (Liam 24/11 at CODE)
+NGUON_CAN = ('P1_A3_H32', 'replay_neo', 'E', 'do_nhay_cao', 'dau_cuoi_lan_lap', 'troi_H')   # [DE XUAT] names
+NGUON_DL = {'P1_A3_H32': ('P1', 'A3'), 'replay_neo': ('P_neo', 'A_neo')}   # the quantities c8b_d3_hang writes for them
 COLS = ('nguon', 'tap', 'dai_luong', 'mien', 'sai_m', 'chi_so_m', 'co_chuan_dong')
 
 
@@ -86,6 +93,11 @@ def build(rows, khoa, khoa_sha):
     miss = [n for n in NGUON_CAN if n not in have]
     if miss:
         why.append(f'required sources without test rows: {miss}')
+    # Codex D3-3: a source held out by session has two quantities; rows of one alone do not make the source
+    for ng, dls in NGUON_DL.items():
+        co = {r['dl'] for r in rows if r['tap'] == 'kiem' and r['nguon'] == ng}
+        if ng in have and not set(dls) <= co:
+            why.append(f'source {ng}: test rows of {sorted(set(dls) - co)} missing')
     groups = {}
     for r in rows:
         groups.setdefault((r['nguon'], r['dl'], r['mien']), []).append(r)
@@ -114,11 +126,18 @@ def build(rows, khoa, khoa_sha):
         bang.append(dict(nguon=ng, dai_luong=dl, mien=mien, n_khop=len(kh), n_kiem=len(ki),
                          sai_kiem_min_m=min(ki) if ki else None, sai_kiem_max_m=max(ki) if ki else None,
                          chi_so_m=c, chi_so_dung_m=c_moi, trang_thai=st))
+    if mien_thieu:
+        # Codex D3-2; Liam 25/11/2026 at CODE local_c65e48c9, L157 question 3, box choice "Doi thanh thieu
+        # (Recommended)": no tool reads mien_thieu (lock, scorer, gate), so a file that carries one is not dat: the
+        # gate does not lock C8 until someone has looked at the domains listed
+        why.append(f'mien_thieu: {len(mien_thieu)} quantity / domain of the test set above its index '
+                   f'({", ".join(sorted({m["nguon"] + "/" + m["dai_luong"] + "/" + m["mien"] for m in mien_thieu})[:6])})')
     return dict(version=VERSION, trang_thai='dat' if not why else 'thieu', ly_do=why, khoa_truoc_sha256=khoa_sha,
                 bang=bang, mien_thieu=mien_thieu, chi_so_nang=nang, gioi_han=gh, nguon_can=list(NGUON_CAN),
                 truoc_le=True,
                 quy_tac='kiem sau khoa: |sai| <= chi so -> dat, vuot -> dai luong thieu o mien do (khong nang); khop '
-                        'truoc khoa: vuot -> nang chi so toi cuc dai; khong chuan dong doc lap -> gioi_han')
+                        'truoc khoa: vuot -> nang chi so toi cuc dai; khong chuan dong doc lap -> gioi_han; file thieu '
+                        'khi mien_thieu khac rong (L157, Liam 25/11)')
 
 
 def main(argv=None):
@@ -131,6 +150,20 @@ def main(argv=None):
         cu.check_path(a.khoa)
         with open(a.khoa, encoding='utf-8') as f:
             khoa = json.load(f)
+        # Codex D3-3: the rows are those c8b_d3_hang wrote for THIS lock: its file <rows>.nguon.json names the rows
+        # file (sha256) and the lock (vai khoa, sha256); rows made by hand or for another lock are refused
+        cu.check_path(a.rows)                        # before any read of the rows (Codex round 2 D3v2-10)
+        try:
+            with open(a.rows + '.nguon.json', encoding='utf-8') as f:
+                ng = json.load(f)
+        except (OSError, ValueError) as exc:
+            raise ViTriError(f'{a.rows}.nguon.json (written by c8b_d3_hang beside the rows) cannot be read: {exc}')
+        ks = {n.get('sha256') for n in (ng.get('nguon') if isinstance(ng, dict) else None) or []
+              if isinstance(n, dict) and n.get('vai') == 'khoa'}
+        if not isinstance(ng, dict) or ng.get('version') != 'c8b_d3_hang_v1' or ng.get('sha256') != cu.sha256(a.rows) \
+                or ks != {cu.sha256(a.khoa)}:
+            raise ViTriError(f'{a.rows}: not the rows c8b_d3_hang wrote for the lock {a.khoa} (its .nguon.json: '
+                             'version, sha256 of the rows, sha256 of the lock)')
         out = build(read_rows(a.rows), khoa, cu.sha256(a.khoa))
         c = subprocess.run(['git', '-C', HERE, 'rev-parse', 'HEAD'], capture_output=True, text=True)
         s = subprocess.run(['git', '-C', HERE, 'status', '--porcelain', '--', 'c8b_kiem_vi_tri.py'],

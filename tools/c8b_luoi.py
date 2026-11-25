@@ -9,10 +9,11 @@ At every node D_n of the clock file the WHOLE camera scorer runs (frame set, com
 G1-G5) with U_t of section 3 (the node step 1 ms in it). Combination per condition (C8B4R2-2 rounds 3, 4; C8B4R5-1,
 R5-2):
   dat           dat at every node;
-  khong_dat     G2-G5: every grid cell (two adjacent nodes) has a violating frame (finite lo_k above the threshold,
-                lo_k of either node: each node's U_t holds the whole step, so it bounds the whole cell) that is in the
-                common domain at BOTH nodes of the cell (so in the domain all through the cell; two different frames
-                violating at the two nodes are not enough);
+  khong_dat     G2-G5: every grid cell (two adjacent nodes) has ONE frame that violates at BOTH nodes of the cell
+                (lo_k finite and above the threshold at each of the two nodes, the frame in the common domain at both;
+                J v6 section 5 line 112, design v7 0.2; two different frames violating at the two nodes are not
+                enough). Until Codex D2-16 (24/11) the lo of either node counted (v4: each node's U_t holds the whole
+                step); changed to the words of J v6 (L156, Liam 25/11 at CODE);
                 G1 (no lo_k): khong_dat at every node and the G1 state the same at the two nodes of every cell;
   chua_ket_luan otherwise. Zero-width interval (one node): the state of that node. A node not scored is never
                 dropped: every condition is chua_ket_luan at that node. Two kinds (hong_nut / loi_nut): the run lost to
@@ -39,6 +40,8 @@ lo_g5. Interface asked of CODE 17/11 (c7_score --gio-c8b FILE --nut K): see the 
   python tools/c8b_luoi.py --gio gio.json --frames frames.csv --esp32 run.csv --sender run_sender.txt --task O1-F08 \
       --hang-so hang_so.json --out-dir luoi/ [--gate-file gate_c8.json] [--scorer-arg ARG ...]
   python tools/c8b_luoi.py --gop-only --gio gio.json --out-dir luoi/ [--gate-file ...]   (combine node files again)
+  python tools/c8b_luoi.py --gop-only --gio gio.json --out-dir luoi/ --mat-na-d2 c8b_a6_o.json --luot RUN ...
+      (the D2 cell mask, tools/c8b_mat_na_d2.py; written to luoi/luoi_d2.json beside luoi.json, block mat_na_d2)
 Last line: #ket_qua,ma=0,outcome=... / 2 refused or error.
 """
 from __future__ import annotations
@@ -175,9 +178,9 @@ def domain_key(sc, gate):
 # ── combination ──────────────────────────────────────────────────────────────────────────────
 
 def cell_violation(a, b, c):
-    """Largest lo of condition c over the frames in the common domain (the domain before t1 on the cat_t1 branch)
-    at both nodes a, b (either node's lo: each node's U_t holds the whole step); NaN when a node is not scored or no
-    such frame has a finite lo."""
+    """Largest, over the frames in the common domain (the domain before t1 on the cat_t1 branch) at both nodes a, b
+    with a finite lo of condition c at BOTH, of the smaller of the two lo (the frame violates at both nodes exactly
+    when this is above the threshold: J v6 line 112, Codex D2-16); NaN when a node is not scored or no such frame."""
     if not (a['ok'] and b['ok']):
         return math.nan
     best = math.nan
@@ -185,9 +188,8 @@ def cell_violation(a, b, c):
         rb = b['rows'].get(k)
         if rb is None or not (ra['mien_chung'] and rb['mien_chung']):
             continue
-        vals = [v for v in (ra[c], rb[c]) if math.isfinite(v)]
-        if vals:
-            m = max(vals)
+        if math.isfinite(ra[c]) and math.isfinite(rb[c]):
+            m = min(ra[c], rb[c])
             best = m if not math.isfinite(best) else max(best, m)
     return best
 
@@ -583,6 +585,8 @@ def main(argv=None):
                          'before the middle H clip, (H giua, H cuoi) after')
     ap.add_argument('--file-cham-h1', default=None, help='score file of the scoring again with H1 (when done)')
     ap.add_argument('--file-gio-h1', default=None, help='clock file of the H1 scoring (H1 has its own clock file)')
+    ap.add_argument('--mat-na-d2', default=None, help='c8b_a6_o d2 file: the D2 cell mask (with --gop-only, --luot)')
+    ap.add_argument('--luot', default=None, help='run id of this grid in the D2 mask (target set)')
     a = ap.parse_args(argv)
     try:
         for p in (a.gio, a.out_dir):
@@ -594,6 +598,9 @@ def main(argv=None):
         task = a.task or gio['task']
         if task != gio['task']:
             raise LuoiError(f'--task {task} but the clock file is for {gio["task"]}')
+        if a.mat_na_d2 and not (a.gop_only and a.luot):
+            raise LuoiError('--mat-na-d2 goes with --gop-only and --luot (the mask is applied on node files)')
+        mn_d2, khong_che = None, None
         ro, gsha = so_do_of(a.gate_file, task)
         a.so_do_run, a.so_do_sha_run = ro, gsha          # the C8 gate file, or J v6 for G5 of F08 without one
         prov_scorer = None
@@ -609,6 +616,21 @@ def main(argv=None):
                 nodes = run_nodes(gio, a.gio, a, a.out_dir)
             else:
                 nodes = load_nodes(gio, a.out_dir)
+                if a.mat_na_d2:
+                    import inspect
+                    import c8b_mat_na_d2 as md2                  # C8B 24/11 khuya: the D2 cell mask (design 7c)
+                    # Codex round 2 D2v2-2: a so_do condition is decided on the q of the middle node; only the
+                    # combine of SD1-1 (the gate branch, q_sd over the defined frames) leaves a masked frame out
+                    if ro and 'q_sd' not in inspect.getsource(combine):
+                        raise LuoiError('--mat-na-d2 with a so_do condition needs the combine of SD1-1 (q_sd over '
+                                        'the defined frames; the merged scoring commit): this code would keep the '
+                                        'q of a masked frame')
+                    # D2v2-1: the grid of these node files without the mask, combined now (goc_luoi compares
+                    # luoi.json with it)
+                    r0 = combine(load_nodes(gio, a.out_dir), ro, gio.get('nodes_s'))
+                    khong_che = _clean(dict(states=r0['states'], nodes_ok=r0['nodes_ok']))
+                    nodes, mn_d2 = md2.ap_dung(nodes, a.out_dir, md2.doc_mat_na(a.mat_na_d2, a.luot),
+                                               _state_from_numbers, KEY_DEC)
             prov = node_provenance(gio, cu.sha256(a.gio), a.out_dir)
             commits = {x.get('commit') for x in prov}
             prov_scorer = dict(commit=commits.pop() if len(commits) == 1 else '',
@@ -649,13 +671,21 @@ def main(argv=None):
             kinds.add('he_do')
         res.update(nguon_nut=src, loai_hong_nut=kinds_nut, loai_hong=[x for x in LOAI_HONG if x in kinds])
         res.update(chain_files(a))
+        if a.mat_na_d2:
+            res['mat_na_d2'] = mn_d2                     # None when the clock file is not bounded (no node used)
         res.update(version=VERSION, task=task, nodes_s=gio.get('nodes_s', []), gio_sha256=cu.sha256(a.gio),
                    gate_file_sha256=gsha, script=c8b_gio.repo_state(), scorer=prov_scorer)
+        if a.mat_na_d2:
+            # Codex D2-1, D2-2 (C8B 24/11 khuya): the masked grid against luoi.json of the same folder: the same chain
+            # fields, and no conclusion made by the mask; luoi.json named with its sha
+            import c8b_mat_na_d2 as md2
+            goc = md2.goc_luoi(os.path.join(a.out_dir, 'luoi.json'), _clean(res), khong_che)
+            res['luoi_goc'] = goc
         os.makedirs(a.out_dir, exist_ok=True)
-        out = os.path.join(a.out_dir, 'luoi.json')
+        out = os.path.join(a.out_dir, 'luoi_d2.json' if a.mat_na_d2 else 'luoi.json')
         with open(out, 'x', encoding='utf-8') as f:
             f.write(json.dumps(_clean(res), indent=1, ensure_ascii=False, allow_nan=False))
-    except (LuoiError, cu.InputError, OSError, ValueError, KeyError) as exc:
+    except (LuoiError, cu.InputError, OSError, ValueError, KeyError) as exc:     # MatNaError is a ValueError
         print(f'c8b_luoi: {exc}', file=sys.stderr)
         print('#ket_qua,ma=2')
         return 2

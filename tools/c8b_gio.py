@@ -17,6 +17,18 @@ lost or rejected camera frame, a log hole, a non-consecutive or invalid count pa
   gyro_rx    gz_fused of each gyro report at its ESP32 RECEIVE time timestamp_us - age_g_ms (design 2: OG3-3 of O1)
   rv_rx      yaw rate of consecutive game-rotation-vector reports (yaw_rad) at the middle of their receive times
 The camera side is the frame speed / wz of frames.csv on the frame PTS.
+Correlation that is JUDGED, turn channels (Liam 25/11/2026 at CODE local_c65e48c9, L157 question 1, box choice "Sua phep
+kiem (Recommended)"; found on run06 C8-L-F02-2_lai1, 05_DATA/results/C8/2026-11-24_run06/c8b/
+T5_gio_so_bo_cuoi_chan_doan/ket_luan.md, option B1): the wz column of frames.csv is a quadratic-fit derivative of the
+heading over +-6 frames (c7_measure.sg_derivative, SG_HALF), the three log turn channels are not smoothed, so a real
+heading oscillation of a few Hz (LADRC, about 4.7 Hz) that the camera column smooths away lowers the correlation
+without any clock error. The check of MIN_CORR (whole window and each third) is therefore made on the log channel
+brought to the camera band: the same derivative over the same time span applied to the angle of the channel (wheel
+yaw from the counts, the gyro integrated by trapezoids, the RV yaw), within runs of samples without a break (nothing
+bridged), at the D the unsmoothed channel gave for that window. The threshold is unchanged; D, D_start, D_end, the
+rate, L, U~ and the nodes come from the unsmoothed channels exactly as before; corr, corr_start, corr_end keep the
+unsmoothed values, corr_kiem, corr_kiem_start, corr_kiem_end are the judged ones. speed_cnt is judged as before,
+and a channel that is not judged for the task (K) is matched and recorded as before (no corr_kiem).
 Interval (section 3): L = larger D of the two encoder channels (assumption: the body does not lead the wheels);
 U~ = smaller D of the two IMU channels (assumption: the IMU gives no apparent lead, F2). Centre (L + U~)/2,
 half width LE x (U~ - L)/2 (LE = 1.25, author's convention). An estimate with assumptions, not a proven bound.
@@ -99,6 +111,11 @@ STARTUP_MIN_PSI_DEG = 1.0  # [DE XUAT] upper estimate only with at least 1 deg t
 STARTUP_E_P_M = 0.005      # [DE XUAT] O1 v11.36: allowed error of a camera displacement before C8 (2 U_p after C8)
 STARTUP_E_PSI_DEG = 0.5    # [DE XUAT] O1 v11.36: allowed error of a camera angle change before C8 (2 U_psi after C8)
 PRE_S = (1.0, 0.1)         # s before t0: standing place from the frames in [t0 - 1.0, t0 - 0.1] (camera clock)
+KIEM_SG_HALF = 6           # frames: c7_measure.SG_HALF, the half window of the camera wz column (design 3.8; a test
+                           # holds the two equal). The judged correlation of the turn channels (L157)
+KIEM_KENH = ('wz_cnt', 'gyro_rx', 'rv_rx')
+KIEM_PAD_S = 10.0          # s around the log window where the smoothed channels are built (the search of D reaches
+                           # SEARCH_S x 2^WIDEN = 8 s from the coarse guess)
 CHANNELS = ('speed_cnt', 'wz_cnt', 'gyro_rx', 'rv_rx')
 LOWER, UPPER = ('speed_cnt', 'wz_cnt'), ('gyro_rx', 'rv_rx')
 # Channels judged per task, BY THE COMMAND OF THE TASK, not by the measured correlation (Liam 22/11 at CODE
@@ -328,8 +345,89 @@ def _fit(t_cam, v_cam, valid, t_log, v_log, t0, t1, guess, half=ts.SEARCH_S, wid
     return D, float(cs[k])
 
 
-def match(t_cam, v_cam, valid, t_log, v_log, window_log, coarse):
-    """D (t_log = t_cam + D) over the window, the start and end thirds, ok by the o1_time_sync limits."""
+def dao_ham_muot(t, x, half):
+    """Derivative by a quadratic fit over +-half samples on the real times, at least 5 samples (the very rule of
+    c7_measure.sg_derivative; a test holds the two equal)."""
+    t, x = np.asarray(t, float), np.asarray(x, float)
+    n = len(t)
+    v = np.full(n, np.nan)
+    for k in range(n):
+        a, b = max(0, k - half), min(n, k + half + 1)
+        if b - a < 5:
+            continue
+        v[k] = np.polyfit(t[a:b] - t[k], x[a:b], 2)[1]
+    return v
+
+
+def _muot_theo_doan(t, goc, breaks, half, lo, hi):
+    """Smoothed rate of an angle series (t, goc) per run of samples without a break (breaks[i]: between samples i
+    and i+1), only for the runs touching [lo, hi] and only at samples whose whole window of +-half samples lies
+    inside their run; a NaN sample between two runs (nothing bridged)."""
+    t, goc = np.asarray(t, float), np.asarray(goc, float)
+    edges = np.r_[0, np.flatnonzero(breaks) + 1, len(t)]
+    tt, vv = [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        if b - a < 2 * half + 1 or t[b - 1] < lo or t[a] > hi:
+            continue
+        i0 = max(a, int(np.searchsorted(t[a:b], lo)) + a - half)
+        i1 = min(b, int(np.searchsorted(t[a:b], hi, side='right')) + a + half)
+        if i1 - i0 < 2 * half + 1:
+            continue
+        d = dao_ham_muot(t[i0:i1], goc[i0:i1], half)
+        d[:half] = np.nan                            # only samples whose whole window lies inside their run
+        d[len(d) - half:] = np.nan
+        if tt:
+            tt.append(np.array([0.5 * (tt[-1][-1] + t[i0])]))
+            vv.append(np.array([np.nan]))
+        tt.append(t[i0:i1])
+        vv.append(d)
+    if not tt:
+        return np.zeros(0), np.zeros(0)
+    return np.concatenate(tt), np.concatenate(vv)
+
+
+def kenh_kiem(tl, ip, rate, tg, gz, tr, yru, frame_s, win):
+    """The three log turn channels brought to the band of the camera wz column (module text, L157): the camera
+    derivative (quadratic fit over +-KIEM_SG_HALF frames = +-H seconds) applied to the angle of each channel over the
+    same time span, per run of samples without a break. Returns ({channel: (t, v)}, description).
+      wz_cnt   wheel yaw at the log lines of consecutive valid pairs: the sum of the pair turns (fk of the count step)
+      gyro_rx  the gyro reports integrated by trapezoids (breaks: a report gap above IMU_GAP_S)
+      rv_rx    the unwrapped RV yaw at the receive times (same breaks)"""
+    H = KIEM_SG_HALF * float(frame_s)
+    half_w, half_i = max(2, int(round(H / LOG_P))), max(2, int(round(H / IMU_P)))
+    lo, hi = win[0] - KIEM_PAD_S, win[1] + KIEM_PAD_S
+    out = {}
+    if len(ip):
+        # pair k joins lines ip[k], ip[k] + 1; a run of pairs = consecutive ip; its lines are ip[k0] .. ip[k1] + 1
+        dth = fk(rate)[:, 2] * (tl[ip + 1] - tl[ip])
+        runs = np.r_[0, np.flatnonzero(np.diff(ip) != 1) + 1, len(ip)]
+        tt, gg, bb = [], [], []
+        for a, b in zip(runs[:-1], runs[1:]):
+            tt.append(tl[np.r_[ip[a:b], ip[b - 1] + 1]])
+            gg.append(np.r_[0.0, np.cumsum(dth[a:b])])
+            bb.append(np.r_[np.zeros(b - a, bool), True])
+        t_w, g_w, b_w = np.concatenate(tt), np.concatenate(gg), np.concatenate(bb)[:-1]
+        out['wz_cnt'] = _muot_theo_doan(t_w, g_w, b_w, half_w, lo, hi)
+    else:
+        out['wz_cnt'] = (np.zeros(0), np.zeros(0))
+    bg = np.diff(tg) > IMU_GAP_S
+    g_g = np.r_[0.0, np.cumsum(0.5 * (gz[1:] + gz[:-1]) * np.diff(tg))] if len(tg) else np.zeros(0)
+    out['gyro_rx'] = _muot_theo_doan(tg, g_g, bg, half_i, lo, hi)
+    out['rv_rx'] = _muot_theo_doan(tr, yru, np.diff(tr) > IMU_GAP_S, half_i, lo, hi)
+    mo_ta = dict(cach='tuong quan duoc XET cua ba kenh quay lay tren kenh log da lam muot nhu cot wz cua camera '
+                      '(dao ham khop bac hai tren goc, +-KIEM_SG_HALF khung), tai D cua kenh chua lam muot; nguong, '
+                      'D, L, U, nut khong doi',
+                 kenh=list(KIEM_KENH), sg_half_khung=KIEM_SG_HALF, nua_cua_so_s=H, nua_cua_so_mau_log=half_w,
+                 nua_cua_so_mau_imu=half_i,
+                 quyet='Liam 25/11/2026 phien CODE local_c65e48c9, L157 cau 1, hop chon "Sua phep kiem (Recommended)"')
+    return out, mo_ta
+
+
+def match(t_cam, v_cam, valid, t_log, v_log, window_log, coarse, kiem=None):
+    """D (t_log = t_cam + D) over the window, the start and end thirds, ok by the o1_time_sync limits. kiem: (t, v)
+    of the channel brought to the camera band (kenh_kiem): the correlations judged against MIN_CORR are then those of
+    kiem at the D of the unsmoothed channel (corr_kiem, corr_kiem_start, corr_kiem_end); everything else as without
+    it."""
     w0 = max(window_log[0] - coarse, float(t_cam[0]))
     w1 = min(window_log[1] - coarse, float(t_cam[-1]))
     if w1 - w0 < ts.MIN_OVERLAP_S:
@@ -338,6 +436,19 @@ def match(t_cam, v_cam, valid, t_log, v_log, window_log, coarse):
     out = dict(D_s=D, corr=c, window_cam_s=[w0, w1], window_log_s=[w0 + D, w1 + D], short=False,
                D_start_s=None, D_end_s=None, corr_start=None, corr_end=None, rate=None, ok=True, why='')
     why = []
+
+    def xet(D_, a, b, c_tho):
+        """The correlation judged over the camera window [a, b): of kiem at D_ (L157), else the unsmoothed one."""
+        if kiem is None:
+            return c_tho
+        if not len(kiem[0]):
+            return -np.inf
+        tg_, vg_ = cam_grid(t_cam, v_cam, valid, a, b)
+        return _corr_at(D_, tg_, vg_, kiem[0], kiem[1])
+    ten = ' (log smoothed as the camera)' if kiem is not None else ''
+    cx = xet(D, w0, w1, c)
+    if kiem is not None:
+        out.update(corr_kiem=cx if np.isfinite(cx) else None, corr_kiem_start=None, corr_kiem_end=None)
     if w1 - w0 < 3 * ts.MIN_OVERLAP_S:
         out['short'] = True                           # design 7: short runs handled apart (no thirds, no rate)
     else:
@@ -352,11 +463,19 @@ def match(t_cam, v_cam, valid, t_log, v_log, window_log, coarse):
                    rate=abs(De_ - Ds_) / (w1 - w0 - third))            # distance of the third centres
         if abs(D - 0.5 * (Ds_ + De_)) > ts.SPLIT_TOL_S:
             why.append(f'|D - mean(start, end)| > {ts.SPLIT_TOL_S * 1e3:.0f} ms')
-        for nm, cc in (('start', cs_), ('end', ce_)):         # design 7: each third well correlated (C8BS-1)
-            if cc < ts.MIN_CORR:
-                why.append(f'corr of the {nm} third {cc:.3f} < {ts.MIN_CORR}')
-    if c < ts.MIN_CORR:
-        why.append(f'corr {c:.3f} < {ts.MIN_CORR}')
+        csx, cex = xet(Ds_, w0, w0 + third, cs_), xet(De_, w1 - third, w1, ce_)
+        if kiem is not None:
+            out.update(corr_kiem_start=csx if np.isfinite(csx) else None,
+                       corr_kiem_end=cex if np.isfinite(cex) else None)
+        for nm, cc in (('start', csx), ('end', cex)):         # design 7: each third well correlated (C8BS-1)
+            if not np.isfinite(cc):
+                why.append(f'{nm} third{ten}: no overlap between the camera window and the log')
+            elif cc < ts.MIN_CORR:
+                why.append(f'corr of the {nm} third{ten} {cc:.3f} < {ts.MIN_CORR}')
+    if not np.isfinite(cx):
+        why.append(f'whole window{ten}: no overlap between the camera window and the log')
+    elif cx < ts.MIN_CORR:
+        why.append(f'corr{ten} {cx:.3f} < {ts.MIN_CORR}')
     out.update(ok=not why, why='; '.join(why))
     return out
 
@@ -613,6 +732,8 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S, thao_ta
         'rv_rx': _gapped(rv_t, rv_rate, np.r_[np.diff(rv_t) > IMU_GAP_S] if len(rv_t) > 1 else np.zeros(0, bool)),
     }
     cam = {'speed_cnt': F['speed'], 'wz_cnt': F['wz'], 'gyro_rx': F['wz'], 'rv_rx': F['wz']}
+    # L157: the judged correlation of the turn channels on the log brought to the camera band (module text)
+    kk, kk_mo_ta = kenh_kiem(tl, ip, rate, tg, gz, tr, yru, float(np.median(np.diff(F['t_s']))), win)
     try:
         coarse = _onset(tm, np.hypot(vel[:, 0], vel[:, 1])) - _onset(F['t_s'], F['speed'])
     except GioError as exc:
@@ -621,7 +742,8 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S, thao_ta
     xet = kenh_theo_bai(task)
     for ch in CHANNELS:
         try:
-            kenh[ch] = match(F['t_s'], cam[ch], F['valid'], series[ch][0], series[ch][1], win, coarse)
+            kenh[ch] = match(F['t_s'], cam[ch], F['valid'], series[ch][0], series[ch][1], win, coarse,
+                             kiem=kk.get(ch) if ch in xet else None)     # a channel not judged: as before
         except GioError as exc:
             kenh[ch] = dict(D_s=None, ok=False, why=str(exc))
         kenh[ch]['xet'] = ch in xet
@@ -632,7 +754,7 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S, thao_ta
             hong.append(f'{ch}: {kenh[ch]["why"]}')
             loai['kiem_gio_d1'].append(hong[-1])
     out = dict(format=FORMAT, task=task, t0_log_s=t0, window_log_s=list(win), coarse_s=coarse, kenh=kenh, kiem=kiem,
-               moc_mau=True, step_s=STEP_S, le=LE, kenh_xet=list(xet))
+               moc_mau=True, step_s=STEP_S, le=LE, kenh_xet=list(xet), kiem_tuong_quan=kk_mo_ta)
     if any(kenh[c]['D_s'] is None for c in xet):
         out.update(ok=False, ly_do=hong + fails, ly_do_hong=hong, ly_do_chua=fails, nodes_s=[],
                    ket_luan='hong_he_do' if hong else 'chua_ket_luan')

@@ -579,13 +579,63 @@ F8_RONG_GIA_DINH = ('mot lan lap tam (khong thao tam giua cac luot): beta = wrap
                     'ma xoay), u_beta = can lech tam buoi 1 (A2)')
 
 
+REF_12B_CUA_SO = 'cua_so_v1'
+REF_12B_TU_F7 = 'ref_12b_tu_F7_buoi_khac'
+
+
+def ref_12b_nguon(co_ref_12b, truc_xe=None, a6_sha256=None, cho=None):
+    """Where the 12b reference of the place comes from, for the identity check of f8_rong: REF_12B_CUA_SO when the
+    window file has a ref_12b window of the place (co_ref_12b True, as before); REF_12B_TU_F7 when it has none but
+    truc_xe_v1 (F7) is 'khoa' with leg-start windows dau_doan: in cach A every number of the 12b reference comes from
+    that F7 (beta = psi'_tc - psi_chuan_k of F7; the run's own ref_12b window is not read), so a floor session
+    without a 12b clip scores on the F7 of another session (Liam 24/11 tonight at CODE local_42161302, box choice,
+    verbatim: "Sua 1 dieu kien (Recommended)"; plate "Chua thao, chua cham" from session 2 to run05; contract C8
+    log 24/11). None otherwise (no 12b reference: not the F8 rong case).
+    The F7 used instead of the window (Codex F8R-1, F8R-2, round 1 24/11): schema truc_xe_v1; its place (cho and
+    mien_hieu_luc.cho, the same where both are written) = cho (the place of the F8 record) when given; its A6 source
+    (nguon vai_tro c8b_a6_v2) = a6_sha256, the A6 the run is scored with; every dau_doan entry a leg-start window
+    (thu_id, frames_sha256 of 64 hex, a non-empty ids list). The plate and mounting from the F7 session to the run
+    are not checked by data here: the one-mounting assumption of cach A (F8_RONG_GIA_DINH), Liam's word for run05."""
+    if co_ref_12b is True:
+        return REF_12B_CUA_SO
+    return REF_12B_TU_F7 if f7_thay_ref_12b(truc_xe, a6_sha256, cho) else None
+
+
+def _hex64(v):
+    return isinstance(v, str) and len(v) == 64 and all(c in '0123456789abcdef' for c in v)
+
+
+def f7_thay_ref_12b(truc_xe, a6_sha256=None, cho=None):
+    """True when truc_xe_v1 may stand for the missing ref_12b window (see ref_12b_nguon)."""
+    if not isinstance(truc_xe, dict) or truc_xe.get('schema') != TRUC_XE_SCHEMA or truc_xe.get('trang_thai') != 'khoa':
+        return False
+    m = truc_xe.get('mien_hieu_luc') if isinstance(truc_xe.get('mien_hieu_luc'), dict) else {}
+    places = {v for v in (truc_xe.get('cho'), m.get('cho')) if v is not None}
+    if len(places) != 1 or (cho is not None and places != {cho}):
+        return False
+    a6s = [n.get('sha256') for n in truc_xe.get('nguon') or [] if isinstance(n, dict) and n.get('vai_tro') == 'c8b_a6_v2']
+    if not a6_sha256 or a6s != [a6_sha256]:
+        return False
+    dd = truc_xe.get('dau_doan')
+    # Codex F8R2 (round 2, F8R-2): each entry names a trial of the F7 whose frames source (nguon '<thu_id>:frames')
+    # has that frames_sha256, a leg index doan_i and integer frame ids
+    fr = {n.get('vai_tro'): n.get('sha256') for n in truc_xe.get('nguon') or [] if isinstance(n, dict)}
+    return isinstance(dd, list) and bool(dd) and all(
+        isinstance(e, dict) and isinstance(e.get('thu_id'), str) and e['thu_id'] and _hex64(e.get('frames_sha256'))
+        and fr.get(e['thu_id'] + ':frames') == e['frames_sha256']
+        and isinstance(e.get('doan_i'), int) and not isinstance(e.get('doan_i'), bool)
+        and isinstance(e.get('ids'), list) and len(e['ids']) > 0
+        and all(isinstance(i, int) and not isinstance(i, bool) for i in e['ids']) for e in dd)
+
+
 def f8_rong(lan_lap, a6_sha256, co_ref_12b, truc_xe=None):
     """(True, []) when lan_lap (doc_lan_lap of THIS run, bound to the window file by c7_score.bind_lan_lap) is the
     F8 rong case of cach A, else (False, reasons). Same identity checks as the F5 gate HCC2-7 of CODE 23/11 (Chot F8
-    rong muc 1b): schema (doc_lan_lap), tam_id given, a6.sha256 = the A6 used (a6_sha256), the window file has a
-    ref_12b window of this place (co_ref_12b), and no run of the file has a lan_lap_id (doc_lan_lap
-    _moi_lan_lap_id_null). truc_xe_v1, when given, must not name a mounting either (its lan_lap_id null; its
-    lan_lap_v1_sha256, when written, this F8 file)."""
+    rong muc 1b): schema (doc_lan_lap), tam_id given, a6.sha256 = the A6 used (a6_sha256), a 12b reference of this
+    place (ref_12b_nguon: a ref_12b window in the window file, co_ref_12b, or, without one, a 'khoa' F7 with
+    dau_doan, Liam 24/11), and no run of the file has a lan_lap_id (doc_lan_lap _moi_lan_lap_id_null). truc_xe_v1,
+    when given, must not name a mounting either (its lan_lap_id null; its lan_lap_v1_sha256, when written, this F8
+    file)."""
     if lan_lap is None:
         return False, ['thieu_lan_lap_v1']
     why = []
@@ -596,14 +646,15 @@ def f8_rong(lan_lap, a6_sha256, co_ref_12b, truc_xe=None):
     a6 = lan_lap.get('a6') if isinstance(lan_lap.get('a6'), dict) else {}
     if not a6_sha256 or a6.get('sha256') != a6_sha256:
         why.append('F8 a6.sha256 khac A6 dang dung')
-    if co_ref_12b is not True:
+    if ref_12b_nguon(co_ref_12b, truc_xe, a6_sha256, lan_lap.get('cho')) is None:
         why.append('cua_so_v1 khong co cua so ref_12b cua cho nay')
     if truc_xe is not None:
         m = truc_xe.get('mien_hieu_luc') if isinstance(truc_xe.get('mien_hieu_luc'), dict) else {}
-        if m.get('lan_lap_id', truc_xe.get('lan_lap_id')) is not None:
+        # Codex F8R-3 (round 1 24/11): both levels read, a null in mien_hieu_luc does not hide the top level
+        if any(d.get('lan_lap_id') is not None for d in (m, truc_xe)):
             why.append('truc_xe_v1 co lan_lap_id ma F8 khong co')
-        t_sha = m.get('lan_lap_v1_sha256', truc_xe.get('lan_lap_v1_sha256'))
-        if t_sha is not None and t_sha != lan_lap.get('_sha256'):
+        if any(d.get('lan_lap_v1_sha256') is not None and d.get('lan_lap_v1_sha256') != lan_lap.get('_sha256')
+               for d in (m, truc_xe)):
             why.append('truc_xe_v1 lan_lap_v1_sha256 khac F8 dang dung')
     return not why, why
 

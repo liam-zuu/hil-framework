@@ -15,11 +15,48 @@ KHOA = dict(version='c8b_khoa_v5', trang_thai='khoa')
 def _rows(extra=()):
     r = []
     for ng in V.NGUON_CAN:
-        r.append(dict(nguon=ng, tap='khop', dai_luong='p', mien='goc', sai_m='0.001', chi_so_m='0.002',
-                      co_chuan_dong='1'))
-        r.append(dict(nguon=ng, tap='kiem', dai_luong='p', mien='goc', sai_m='-0.0015', chi_so_m='0.002',
-                      co_chuan_dong='1'))
+        for dl in V.NGUON_DL.get(ng, ('p',)):            # the two quantities of a source held out by session (D3-3)
+            r.append(dict(nguon=ng, tap='khop', dai_luong=dl, mien='goc', sai_m='0.001', chi_so_m='0.002',
+                          co_chuan_dong='1'))
+            r.append(dict(nguon=ng, tap='kiem', dai_luong=dl, mien='goc', sai_m='-0.0015', chi_so_m='0.002',
+                          co_chuan_dong='1'))
     return r + list(extra)
+
+
+def _nguon(p, k, **doi):
+    """The file c8b_d3_hang writes beside its rows: version, sha256 of the rows, the lock among nguon."""
+    import c8_u_imu as cu
+    d = dict(version='c8b_d3_hang_v1', sha256=cu.sha256(str(p)), nguon=[dict(vai='khoa', sha256=cu.sha256(str(k)))])
+    d.update(doi)
+    with open(str(p) + '.nguon.json', 'w', encoding='utf-8') as f:
+        json.dump(d, f)
+
+
+def test_one_quantity_alone_does_not_make_a_source_held_out_by_session(tmp_path):
+    rows, _ = _parse([r for r in _rows() if r['dai_luong'] != 'A3'], tmp_path)
+    o = V.build(rows, KHOA, 's' * 64)
+    assert o['trang_thai'] == 'thieu' and any('P1_A3_H32' in w and 'A3' in w for w in o['ly_do'])
+    rows, _ = _parse([r for r in _rows() if not (r['dai_luong'] == 'P_neo' and r['tap'] == 'kiem')], tmp_path)
+    assert V.build(rows, KHOA, 's' * 64)['trang_thai'] == 'thieu'
+
+
+def test_cli_takes_only_the_rows_of_c8b_d3_hang_for_this_lock(tmp_path):
+    """Codex D3-3: no .nguon.json, one of other rows, of another lock, or not of c8b_d3_hang -> refused."""
+    _, p = _parse(_rows(), tmp_path)
+    k = tmp_path / 'khoa.json'
+    k.write_text(json.dumps(KHOA), encoding='utf-8')
+    k2 = tmp_path / 'khoa2.json'
+    k2.write_text(json.dumps(dict(KHOA, x=1)), encoding='utf-8')
+    arg = ['--rows', str(p), '--khoa', str(k), '--out']
+    assert V.main(arg + [str(tmp_path / 'a.json')]) == 2                              # no .nguon.json
+    for doi in (dict(version='x'), dict(sha256='0' * 64), dict(nguon=[]),
+                dict(nguon=[dict(vai='a6', sha256='0' * 64)])):
+        _nguon(p, k, **doi)
+        assert V.main(arg + [str(tmp_path / 'b.json')]) == 2, doi
+    _nguon(p, k2)
+    assert V.main(arg + [str(tmp_path / 'c.json')]) == 2                              # rows made for another lock
+    _nguon(p, k)
+    assert V.main(arg + [str(tmp_path / 'd.json')]) == 0
 
 
 def _parse(rows, tmp_path):
@@ -52,7 +89,13 @@ def test_rule_test_set_excess_fit_raise_and_no_dynamic_reference(tmp_path):
     assert st[('12b', 'p', 'K1')]['trang_thai'] == 'dat' and st[('12b', 'p', 'K1')]['chi_so_dung_m'] == 0.0025
     assert o['chi_so_nang'][0]['chi_so_nang_m'] == 0.0025                 # before the lock: raised to the largest
     assert st[('do_nhay_cao', 'h', 'goc')]['trang_thai'] == 'gioi_han' and o['gioi_han']
-    assert o['trang_thai'] == 'dat'                                       # domains thieu go to the scoring
+    # Codex D3-2; Liam 25/11 (L157 question 3): a file that carries mien_thieu is thieu (nothing reads mien_thieu)
+    assert o['trang_thai'] == 'thieu' and len(o['ly_do']) == 1 and 'mien_thieu' in o['ly_do'][0]
+    assert 'E/p/K1' in o['ly_do'][0]
+    # the same rows without the excess of the test set: dat again (the fit-set raise and gioi_han do not make thieu)
+    rows2, _ = _parse(_rows(ex[1:]), tmp_path)
+    o2 = V.build(rows2, KHOA, 's' * 64)
+    assert o2['trang_thai'] == 'dat' and not o2['mien_thieu'] and o2['chi_so_nang'] and o2['gioi_han']
 
 
 def test_thieu_without_lock_or_source(tmp_path):
@@ -72,6 +115,7 @@ def test_cli(tmp_path):
     k = tmp_path / 'khoa.json'
     k.write_text(json.dumps(KHOA), encoding='utf-8')
     out = tmp_path / 'd3.json'
+    _nguon(p, k)
     assert V.main(['--rows', str(p), '--khoa', str(k), '--out', str(out)]) == 0
     d = json.loads(out.read_text(encoding='utf-8'))
     import c8_u_imu as cu

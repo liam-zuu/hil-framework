@@ -1259,3 +1259,95 @@ def test_gap_with_a_gyro_gap_still_breaks_without_usable_counts(tmp_path):
         S = U.rv_samples(U.load_log(p), period_s=T0)
         assert math.isfinite(S['t_break']) and S['nhanh_ho'][0]['gay'] and S['nhanh_ho'][0]['nguon'] == src, kw
         assert np.isnan(U.interp_yaw(S, np.array([13.5]))[0])
+
+
+# ── 24/11: a report whose rows all carry a negative age is left out, not refused (CODE order, CODE_C8B) ──
+
+def _neg_age(p, col_n, col_age, count, age='-0.1'):
+    """Rewrite every row of report `count` of col_n with a negative age (the case of run03 C8-P-F08-1_lai1)."""
+    with open(p, newline='', encoding='utf-8') as f:
+        rows = list(csv.DictReader(f))
+    hit = [r for r in rows if r[col_n] == str(count)]
+    assert hit
+    for r in hit:
+        r[col_age] = age
+    with open(p, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=COLS)
+        w.writeheader()
+        w.writerows(rows)
+    return float(hit[0]['timestamp_us']) * 1e-6
+
+
+@pytest.mark.parametrize('col_n,col_age,kind', [('gyro_n', 'age_g_ms', 'gyro'), ('rv_n', 'age_r_ms', 'rv')])
+def test_skip_report_with_only_negative_age(tmp_path, col_n, col_age, kind):
+    p, a, b = _c8_log(tmp_path)
+    L0 = U.load_log(p)
+    S0 = U.rv_samples(L0, period_s=T0)
+    assert S0['bo_report'] == dict(rv=[], gyro=[])                     # clean log: nothing left out
+    t_row = _neg_age(p, col_n, col_age, 200)
+    L = U.load_log(p)
+    with pytest.raises(U.InputError):                                   # the strict call still refuses
+        U.report_rows(L[col_n], L[col_age])
+    S = U.rv_samples(L, period_s=T0)                                    # was refused before 24/11
+    assert S['bo_report'][kind] == [dict(n=200, t_row_s=t_row)]
+    other = 'rv' if kind == 'gyro' else 'gyro'
+    assert S['bo_report'][other] == []
+    if kind == 'gyro':
+        assert len(S['tg']) == len(S0['tg']) - 1 and np.array_equal(S['t_recv'], S0['t_recv'])
+    else:
+        assert S['n_samples'] == S0['n_samples'] - 1 and np.array_equal(S['tg'], S0['tg'])
+        tt = np.linspace(a, b, 400)                                     # one lost report: still bridged within h_lim
+        assert np.all(np.isfinite(U.interp_yaw(S, tt)))
+    c = U.bo_report_trong(S, t_row - 0.01, t_row + 0.01)
+    assert c[kind]['tong'] == 1 and c[kind]['trong_cua_so'] == 1 and c[kind]['t_trong_cua_so_s'] == [t_row]
+    assert U.bo_report_trong(S, t_row + 1.0, t_row + 2.0)[kind]['trong_cua_so'] == 0
+
+
+def test_skip_report_tong_level_records_it(tmp_path):
+    """tong's per-log numbers carry the left-out report (in the window); without one the numbers are unchanged."""
+    g = _globals()
+    p, a, b = _c8_log(tmp_path)
+    x0 = U._level_numbers(p, 'O1-F08', g['tre'], g['thang'], T0, U.J_LIM_S, U.H_LIM_S, 2.0, 1.0)
+    assert x0['bo_report']['rv']['tong'] == 0 and x0['bo_report']['gyro']['tong'] == 0
+    q = str(tmp_path / 'c8b.csv')
+    with open(p, encoding='utf-8') as f, open(q, 'w', encoding='utf-8', newline='') as g2:
+        g2.write(f.read())
+    t_row = _neg_age(q, 'gyro_n', 'age_g_ms', 120)
+    x = U._level_numbers(q, 'O1-F08', g['tre'], g['thang'], T0, U.J_LIM_S, U.H_LIM_S, 2.0, 1.0)
+    assert x['bo_report']['gyro']['tong'] == 1
+    assert x['bo_report']['gyro']['trong_cua_so'] == (1 if a - 2.0 <= t_row <= b + 1.0 else 0)
+    assert x['P'] == pytest.approx(x0['P']) and x['N'] == pytest.approx(x0['N'])
+
+
+def test_sparse_turn_rate_floor_of_the_command_bound(tmp_path):
+    """L156 (Liam 25/11): the floor of the turn rate inside a gap is the bound of the body turn command, 6.98 rad/s
+    (W_MAX r / (lx + ly)), not 4.0: a 200 ms gap passes (1.40 rad), a 250 ms gap is refused (1.75 rad > pi / 2; it
+    passed with 4.0), also when the logged |gz| is small."""
+    assert U.THUA_W_PHYS == pytest.approx(34.56 * 0.0485 / 0.24, abs=0.01)
+    p = str(tmp_path / 'a.csv')
+    rate, t_end = turns(5, 0.5, 1)
+    make_log(p, rate, t_end)
+    q20, q25 = str(tmp_path / 'a20.csv'), str(tmp_path / 'a25.csv')
+    sparse_copy(p, q20, every=20)
+    sparse_copy(p, q25, every=25)
+    out = U._yaw_thua(U.load_log(q20))
+    assert 0.19 < out[5] < 0.225 and out[5] * U.THUA_W_PHYS < U.THUA_STEP_MAX
+    with pytest.raises(U.InputError, match='could hide'):
+        U._yaw_thua(U.load_log(q25))
+    assert 0.25 * 4.0 < U.THUA_STEP_MAX < 0.25 * U.THUA_W_PHYS             # the case the old floor let through
+
+
+def test_sparse_gap_check_refuses_a_gyro_report_that_is_not_a_number(tmp_path, monkeypatch):
+    """Codex D3-13: one NaN gyro report made the turn rate of the gap test NaN, and a 250 ms gap passed; now the log
+    is refused before the test."""
+    p, q25 = str(tmp_path / 'a.csv'), str(tmp_path / 'a25.csv')
+    rate, t_end = turns(5, 0.5, 1)
+    make_log(p, rate, t_end)
+    sparse_copy(p, q25, every=25)
+    L = U.load_log(q25)
+    tg, gz = U.gyro_samples(L, [])
+    gz = gz.copy()
+    gz[gz.size // 2] = math.nan
+    monkeypatch.setattr(U, 'gyro_samples', lambda L_, skip: (tg, gz))
+    with pytest.raises(U.InputError, match='not finite'):
+        U._yaw_thua(L)

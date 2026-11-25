@@ -29,7 +29,7 @@ def _rows(n=12, d=0.002, up=0.003, ui=0.002, tap='kiem', luot='c2', nodes=('0', 
 def _parse(rows, tmp_path, name='rows.csv'):
     p = tmp_path / name
     with open(p, 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['controller'])
+        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['controller', 'cham_id'], restval='')
         w.writeheader()
         w.writerows(rows)
     return O.read_rows(str(p))
@@ -102,7 +102,8 @@ def test_cells_sets_and_lock(tmp_path):
         O.build(_parse(_rows() + _rows(n=3, tap='khop', luot='c2', s0=500), tmp_path), 'giu_ngoai_a6', 'cho', KHOA, CHO)
     with pytest.raises(O.OError, match='khoa'):
         O.build(_all(tmp_path, _rows()), 'giu_ngoai_a6', 'cho', None, CHO)
-    o3 = O.build(_all(tmp_path, _rows()), 'd2', 'cho', KHOA, CHO)        # D2: the cells of the target runs
+    rows_d2 = [dict(r, cham_id='aa' * 8) if r['tap'] == 'dich' else r for r in _all(tmp_path, _rows())]
+    o3 = O.build([dict(r, cham=r.get('cham_id', '')) for r in rows_d2], 'd2', 'cho', KHOA, CHO)  # D2: target runs
     assert o3['o'][0]['tap'] == 'dich' and o3['o'][0]['n_id'] == 3
 
 
@@ -110,7 +111,7 @@ def test_cli(tmp_path):
     p = tmp_path / 'rows.csv'
     rows = _rows() + _rows(n=3, tap='khop', luot='c1') + _rows(n=3, tap='dich', luot='r1')
     with open(p, 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['controller'])
+        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['controller', 'cham_id'], restval='')
         w.writeheader()
         w.writerows(rows)
     k = tmp_path / 'khoa.json'
@@ -126,8 +127,157 @@ def test_cli(tmp_path):
     assert A.kiem_o(d, [cu.sha256(str(c))], cu.sha256(str(k)), O.read_rows(str(p)), LOCK)[0]
     rows[0]['U_psi_rad'] = -1
     with open(p, 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['controller'])
+        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['controller', 'cham_id'], restval='')
         w.writeheader()
         w.writerows(rows)
     assert O.main(['--rows', str(p), '--muc-dich', 'giu_ngoai_a6', '--giu-ngoai-theo', 'cho', '--khoa-truoc', str(k),
                    '--out', str(tmp_path / 'o2.json')]) == 2
+
+
+def test_d2_mask_cells_not_whole_file(tmp_path):
+    """D2 (design v7 7c line 166; CODE 24/11 khuya): a cell over the bound or short of samples masks its own frames
+    only; the file stays dat with the mask (o_dat, o_thieu, ngoai_dai_u). The A6 held-out branch keeps its strict rule."""
+    dich = (_rows(n=12, tap='dich', luot='r1')                                  # cell A: dat
+            + _rows(n=12, tap='dich', luot='r1', x=0.7, d=0.006, s0=200)        # cell B: over (0.006 > 0.005)
+            + _rows(n=4, tap='dich', luot='r1', x=1.3, s0=300)                  # cell C: 4 ids < N_ID_MIN
+            + _rows(n=12, tap='dich', luot='r1', x=1.9, s0=400, missing={(0, '1')})  # cell D: one id not compared
+            + [dict(r, u_mps=2.5) for r in _rows(n=2, tap='dich', luot='r1', s0=600)])  # outside the u bands
+    dich = [dict(r, cham_id='aa' * 8) for r in dich]
+    rows = _parse(dich + _rows(n=3, tap='khop', luot='c1') + _rows(n=3, tap='kiem', luot='c2'), tmp_path)
+    o = O.build(rows, 'd2', 'cho', KHOA, CHO)
+    assert o['trang_thai'] == 'dat'
+    m = o['mat_na']
+    ids = {c['o_id']: c for c in o['o']}
+    a = [k for k, c in ids.items() if c['vung'][0] == 0][0]
+    assert m['o_dat'] == [a]
+    why = {x['o_id']: x['ly_do'] for x in m['o_thieu']}
+    assert sorted(map(tuple, why.values())) == [('thieu_id',), ('thieu_mau',), ('vuot',)]
+    assert m['ngoai_dai_u'] == [['r1', 600], ['r1', 601]]
+    assert m['khung_mo'] == [['r1', 100 + i] for i in range(12)]              # the frames of cell A only
+    # the A6 held-out check on the same kind of cells is still strict
+    rk = _parse(_rows(n=3, tap='khop', luot='c1') + _rows(n=12, tap='kiem', luot='c2')
+                + _rows(n=12, tap='kiem', luot='c2', x=0.7, d=0.006, s0=200) + _rows(n=3, tap='dich', luot='r1'),
+                tmp_path, 'rk.csv')
+    ok = O.build(rk, 'giu_ngoai_a6', 'cho', KHOA, CHO)
+    assert ok['trang_thai'] == 'truot' and 'mat_na' not in ok
+    assert O.build(_parse(_rows(n=3, tap='khop', luot='c1') + _rows(n=3, tap='kiem', luot='c2'), tmp_path, 'e.csv'),
+                   'd2', 'cho', KHOA, CHO)['trang_thai'] == 'thieu'           # no target run, no cell
+
+
+# ── Codex D2 round 1 (24/11 khuya): the cells on the deciding frames, every deciding node compares (D2-8) ─────────
+
+def _parse_mh(rows, tmp_path, name='rows_mh.csv'):
+    p = tmp_path / name
+    with open(p, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['mien_hop', 'controller', 'cham_id'], restval='')
+        w.writeheader()
+        w.writerows(rows)
+    return O.read_rows(str(p))
+
+
+def _dich(mh=None, **kw):
+    """Target rows with mien_hop 1 everywhere; mh {(i, node): '0' | '1'} overrides."""
+    kw.setdefault('s0', 100)
+    rows = _rows(tap='dich', luot='r1', **kw)
+    for r in rows:
+        r['mien_hop'] = (mh or {}).get((int(r['id']) - kw['s0'], r['nut']), '1')
+        r['cham_id'] = 'aa' * 8                       # every target run of a d2 file has a scoring id (V3-6)
+    return rows
+
+
+def _d2(tmp_path, dich, name='rows_mh.csv'):
+    rows = _parse_mh(dich + _rows(n=3, tap='khop', luot='c1') + _rows(n=3, tap='kiem', luot='c2'), tmp_path, name)
+    return O.build(rows, 'd2', 'cho', KHOA, CHO)
+
+
+def test_d2_counts_only_frames_that_can_decide(tmp_path):
+    # ten ids, one of them in no deciding domain at any node: nine ids, the cell is short of samples
+    o = _d2(tmp_path, _dich(n=10, mh={(9, '0'): '0', (9, '1'): '0'}))
+    c = o['o'][0]
+    assert c['n_id'] == 9 and c['n_tho'] == 9 and not c['dat']
+    m = o['mat_na']
+    assert m['o_dat'] == [] and m['khung_mo'] == [] and m['n_ngoai_mien_quyet'] == 1 and m['ngoai_dai_u'] == []
+    assert m['o_thieu'][0]['ly_do'] == ['thieu_mau']
+    # ten deciding ids: dat; the id that decides nowhere is not in the mask either
+    o = _d2(tmp_path, _dich(n=11, mh={(10, '0'): '0', (10, '1'): '0'}), 'b.csv')
+    assert o['o'][0]['dat'] and o['o'][0]['n_id'] == 10
+    assert o['mat_na']['khung_mo'] == [['r1', 100 + i] for i in range(10)]
+
+
+def test_d2_every_deciding_node_must_compare(tmp_path):
+    # id 3 has no comparison at node 1: where it cannot decide there, it is still comparable; where it can, thieu
+    o = _d2(tmp_path, _dich(n=12, missing={(3, '1')}, mh={(3, '1'): '0'}))
+    assert o['o'][0]['dat'] and o['o'][0]['n_id'] == 12 and o['o'][0]['n_thieu'] == 0
+    o = _d2(tmp_path, _dich(n=12, missing={(3, '1')}), 'b.csv')
+    c = o['o'][0]
+    assert not c['dat'] and c['n_id'] == 11 and c['n_thieu'] == 1 and c['thieu_ids'] == [['r1', 103]]
+    assert o['mat_na']['o_thieu'][0]['ly_do'] == ['thieu_id'] and o['mat_na']['khung_mo'] == []
+    # the A6 held-out rows have no mien_hop column: every node counts, as before
+    r = _all(tmp_path, _rows(missing={(3, '1')}))
+    assert O.build(r, 'giu_ngoai_a6', 'cho', KHOA, CHO)['o'][0]['n_thieu'] == 1
+
+
+def test_d2_worst_node_over_every_comparison(tmp_path):
+    # id 5 is over the bound at node 1, where it cannot decide: the comparison still counts (the largest |d|)
+    rows = _dich(n=12, mh={(5, '1'): '0'})
+    for r in rows:
+        if r['id'] == '105' and r['nut'] == '1':
+            r['d_rad'] = 0.006
+    o = _d2(tmp_path, rows)
+    c = o['o'][0]
+    assert not c['dat'] and c['ty_le_max'] == pytest.approx(1.2) and c['id_xau'] == ['r1', 105, '1']
+    assert o['mat_na']['o_thieu'][0]['ly_do'] == ['vuot']
+
+
+def test_d2_scoring_id_of_each_target_run(tmp_path):
+    """Codex round 2 D2v2-4 (CODE 25/11): mat_na.lan_cham = the cham_id of the rows of each target run; a run with
+    rows of two scorings (or with some rows without the id) is refused; rows without the column give no id."""
+    def d2(dich, name):
+        p = tmp_path / name
+        with open(p, 'w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['mien_hop', 'controller', 'cham_id'], restval='')
+            w.writeheader()
+            w.writerows(dich + [dict(r, cham_id='dd' * 8) for r in _rows(n=3, tap='khop', luot='c1')]
+                        + _rows(n=3, tap='kiem', luot='c2'))             # an id on a run outside the target set
+        return O.build(O.read_rows(str(p)), 'd2', 'cho', KHOA, CHO)
+    r1 =[dict(r, cham_id='aa' * 8) for r in _dich(n=12)]
+    r2 = [dict(r, luot='r2', cham_id='bb' * 8) for r in _dich(n=12, x=0.7)]
+    o = d2(r1 + r2, 'a.csv')
+    assert o['mat_na']['lan_cham'] == {'r1': 'aa' * 8, 'r2': 'bb' * 8}
+    assert len(o['mat_na']['khung_mo']) == 24                           # the cells do not depend on the id
+    # Codex round 3 V3-6: a target run without an id is refused (its rows would fill cells shared with r1, r2):
+    # nine ids of r1 in a cell + one id of r3 without a scoring id would open the cell for r1
+    r3 = [dict(r, luot='r3', cham_id='') for r in _dich(n=1, s0=900)]
+    with pytest.raises(O.OError, match='without cham_id'):
+        d2(r1[:18] + r3, 'a3.csv')
+    assert d2(r1[:18], 'a9.csv')['mat_na']['khung_mo'] == []            # nine ids alone: the cell stays shut
+    A._check_sha(o, 'o')
+    r1[5]['cham_id'] = 'cc' * 8                                         # one row of another scoring
+    with pytest.raises(O.OError, match='more than one scoring'):
+        d2(r1, 'b.csv')
+    r1[5]['cham_id'] = ''                                               # one row without the id
+    with pytest.raises(O.OError, match='more than one scoring'):
+        d2(r1, 'c.csv')
+    with pytest.raises(O.OError, match='without cham_id'):              # a d2 file from rows without the column
+        _d2(tmp_path, [{k: v for k, v in r.items() if k != 'cham_id'} for r in _dich(n=12)], 'd.csv')
+
+
+def test_d2_mien_hop_values_and_bands_of_the_code(tmp_path):
+    rows = _dich(n=12)
+    rows[0]['mien_hop'] = 'x'
+    with pytest.raises(O.OError, match='mien_hop'):
+        _d2(tmp_path, rows)
+    # D2-15: the D2 bands are those of the code, not of the command line
+    p = tmp_path / 'r.csv'
+    with open(p, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['mien_hop', 'controller', 'cham_id'], restval='')
+        w.writeheader()
+        w.writerows(_dich(n=12) + _rows(n=3, tap='khop', luot='c1') + _rows(n=3, tap='kiem', luot='c2'))
+    k = tmp_path / 'khoa.json'
+    k.write_text(json.dumps(LOCK), encoding='utf-8')
+    base = ['--rows', str(p), '--muc-dich', 'd2', '--giu-ngoai-theo', 'cho', '--khoa-truoc', str(k)]
+    assert O.main(base + ['--dai-u', '0,0.4,1.5', '--out', str(tmp_path / 'o1.json')]) == 2
+    assert O.main(base + ['--dai-u', '0,0.3,0.6,1.0,1.5', '--out', str(tmp_path / 'o2.json')]) == 0
+    assert O.main(base + ['--out', str(tmp_path / 'o3.json')]) == 0
+    assert O.main(['--rows', str(p), '--muc-dich', 'giu_ngoai_a6', '--giu-ngoai-theo', 'cho', '--khoa-truoc', str(k),
+                   '--dai-u', '0,0.4,1.5', '--out', str(tmp_path / 'o4.json')]) == 0     # the A6 check may set them

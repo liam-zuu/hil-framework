@@ -376,7 +376,7 @@ def test_startup_intersection_counterexample(base_run, monkeypatch, lo, hi, want
     # C8BS-4, C8BS-17: L = 1.002, U~ = 1.018 -> scoring interval exactly [1.000, 1.020]; drift 0
     D = dict(speed_cnt=1.002, wz_cnt=1.002, gyro_rx=1.018, rv_rx=1.018)
 
-    def fake_match(t_cam, v_cam, valid, t_log, v_log, window_log, coarse):
+    def fake_match(t_cam, v_cam, valid, t_log, v_log, window_log, coarse, kiem=None):     # kiem: L157 (25/11)
         ch = fake_match.order.pop(0)
         return dict(D_s=D[ch], corr=0.99, window_cam_s=[3.0, 20.0], window_log_s=[4.0, 21.0], short=False,
                     D_start_s=D[ch], D_end_s=D[ch], corr_start=0.99, corr_end=0.99, rate=0.0, ok=True, why='')
@@ -545,9 +545,15 @@ def test_khong_dat_needs_same_frame_both_nodes():
     b['rows'][0.2] = dict(mien_chung=False, **{m: 0.05 for m in LU.MEASURED})
     res = LU.combine([a, b])
     assert res['states']['g3'] == 'chua_ket_luan'
-    # the same frames in the domain at both nodes: each one's bound (U_t with the whole step) holds over the cell
+    # the same frames in the domain at both nodes, each above the threshold at ONE node only: two different frames
+    # violating at the two nodes of a cell are not enough (J v6 line 112; L156, Liam 25/11 at CODE, box: "Sua code
+    # theo J (Recommended)"). Until 25/11 this was khong_dat (v4: the lo of either node counted).
     a['rows'][0.3]['mien_chung'] = True
     b['rows'][0.2]['mien_chung'] = True
+    res = LU.combine([a, b])
+    assert res['states']['g3'] == 'chua_ket_luan' and res['lo_cells']['g3'] == [pytest.approx(0.05)]
+    # frame 0.2 above at both nodes: the cell is violated
+    b['rows'][0.2]['g3'] = 0.11
     assert LU.combine([a, b])['states']['g3'] == 'khong_dat'
 
 
@@ -559,12 +565,27 @@ def test_khong_dat_frame_out_of_domain_at_one_node():
     assert res['states']['g3'] == 'chua_ket_luan'
 
 
-def test_khong_dat_lo_of_either_node_counts():
+def test_khong_dat_needs_the_frame_above_at_both_nodes():
+    """J v6 line 112 (Codex D2-16): the frame violates at BOTH nodes of the cell; lo 0.12 at one node and 0.09 at
+    the other is not a violation of the cell; a lo not finite at one node neither."""
     st = ['dat', 'dat', 'khong_dat', 'dat', 'dat']
     a = node(st, rows_with(0.2, lo=0.12))
     b = node(['dat', 'dat', 'chua_ket_luan', 'dat', 'dat'], rows_with(0.2, lo=0.09))
     res = LU.combine([a, b])
-    assert res['states']['g3'] == 'khong_dat'
+    assert res['states']['g3'] == 'chua_ket_luan' and res['lo_cells']['g3'] == [pytest.approx(0.09)]
+    assert res['bieu_dien']['g3']
+    b2 = node(st, rows_with(0.2, lo=0.11))
+    res = LU.combine([a, b2])
+    assert res['states']['g3'] == 'khong_dat' and res['nums']['g3']['chung']['lo'] == pytest.approx(0.11)
+    b3 = node(['dat', 'dat', 'chua_ket_luan', 'dat', 'dat'], rows_with(0.2, lo=-math.inf))
+    assert LU.combine([a, b3])['states']['g3'] == 'chua_ket_luan'
+    # three nodes: frame A above at nodes 0-1, frame B above at nodes 1-2 (J v6: the frame may differ between cells)
+    n0 = node(st, rows_with(0.2, lo=0.12, extra=(0.4,)))
+    n1 = node(st, rows_with(0.2, lo=0.12, extra=(0.4,)))
+    n1['rows'][0.4]['g3'] = 0.13
+    n2 = node(st, rows_with(0.4, lo=0.13))
+    n2['rows'][0.2]['g3'] = 0.05
+    assert LU.combine([n0, n1, n2])['states']['g3'] == 'khong_dat'
 
 
 def test_g1_rule():

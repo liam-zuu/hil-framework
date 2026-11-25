@@ -33,6 +33,17 @@ Per level (O1-F02, O1-F05, O1-F08; the K tasks take the F05 3b numbers only for 
                 the 3b covered: c8b_3b dung_duoc needs both ways up to v_max, wz_max), P4_m, A4_deg = can_quay after the
                 margin; trang_thai of can_quay (thieu: P4_m, A4_deg null). A frame with u outside every band has no
                 P4 / A4 (design v7 section 10). Without a (--canh-ma-m) the band is empty.
+                khong_khung (CODE 24/11 khuya, 2026-11-24_CODE_chot_khoa_gop_dai_khong_co_khung; a consequence of
+                Liam's A2 'one merged lock, each term the largest' for a session that redid some levels only): true
+                when the session has no frame at all in the band (p6_khong_khung: the P6 file counts n_khung = 0
+                there and every run it counted is of a level whose table does not hold the band). Such a band has no
+                number of this session (thieu, P4_m, A4_deg null), does not stop the session lock, and gives nothing
+                to the merged lock (c8b_khoa_gop takes the largest over the sessions WITH frames in the band). A band
+                with frames but no number (n_khung > 0, or a run of a level reaching the band) stops the lock as
+                before. Not one banding function on both sides: P6 counts the valid frames by their MEASURED u
+                (c8b_p6_ngang.in_band, lower edge open, upper closed), the gate applies the table of the level by the
+                COMMANDED u of its schedule (gate_c8._grid_bounds), to every run of the level whatever the session;
+                hence the level condition above, and muc_du_dai_theo_buoi of the merged lock for the gate.
   hang_dong     the constant closed terms the gate takes {a_m, hang_m, he_so_r, u_phi_rad, hang_rad} (names GATE
                 F19): a_m = the tag side; the others null until their sources come (hang_dong_ly_do says which).
   nhanh_tick    the U_t branch of the C8 plan (bo_tick / giu_tick), copied from it (GATE: = u_t_branch).
@@ -54,8 +65,9 @@ Per level (O1-F02, O1-F05, O1-F08; the K tasks take the F05 3b numbers only for 
                 mounting determined, CODE 23/11): no comparison, dat with nhan can_lech_tam_buoi1_chua_xac_minh_lan_lap
                 and gia_dinh (one mounting assumed). F8 of another
                 plate -> refused.
-  trang_thai    'khoa' only when every level of --muc has hang_dong all numbers, a band, the plan and its branch
-                named, eps_H, mien_car_pose and lan_lap_E dat there; else 'chua_khoa' with ly_do_chua_khoa.
+  trang_thai    'khoa' only when every level of --muc has hang_dong all numbers, a band (every band a number, or
+                khong_khung; not all of them khong_khung), the plan and its branch named, eps_H, mien_car_pose and
+                lan_lap_E dat there; else 'chua_khoa' with ly_do_chua_khoa.
 khoa_truoc: SHA-256 of every input and of this script (commit, dirty) and the time, written before any held-out part
 is looked at (design 0.3); the C8 plan with vai 'ke_hoach_c8' (GATE GC6-1).
 
@@ -71,6 +83,7 @@ import datetime
 import json
 import math
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -258,6 +271,20 @@ def hang_dong_tinh(src, side):
     if 'P6_rieng_ii_m' not in part and c6 is not None and d0 is not None:
         part['P6_rieng_ii_he_so'], part['P6_rieng_ii_B0_m'] = c6, d0
         part['P6_rieng_ii_m'] = c6 * d0
+    # Held out by session (L155, Liam 24/11 khuya at CODE, box: "So co le, vuot thi noi bat dinh (Recommended)"; the
+    # rule was changed after a trial on real data, LE is here since 8ff78a8; no file: nothing changes): a term whose
+    # largest leave-one-session-out ratio is above the margin LE is multiplied by ratio / LE (U grows, no threshold is
+    # loosened); the factors come from c8b_he_so_giu_ngoai.py (made from the neo / kiem_cheo files, before the lock)
+    hs = src.get('he_so_giu_ngoai')
+    if isinstance(hs, dict) and hs:
+        # Codex D3-5: also on a direct call (the CLI reads the file through doc_he_so): a factor only makes U larger
+        if set(hs) - set(HE_SO_HANG) or any(not _la_so(v) or v < 1.0 for v in hs.values()):
+            raise KhoaError(f'he_so_giu_ngoai {hs!r}: factors >= 1 of {HE_SO_HANG} only')
+        for name in sorted(hs):
+            if name in part:
+                part[f'{name}_truoc_he_so'] = part[name]
+                part[name] = part[name] * hs[name]
+        part['he_so_giu_ngoai'] = {k: hs[k] for k in sorted(hs)}
     have = dict(u_theta='u_theta_rad' in part, P6_rieng_i='P6_rieng_i_m' in part,
                 P6_rieng_ii='P6_rieng_ii_m' in part, neo='P_neo_m' in part, U_moc='U_moc_hieu_xy_m' in part,
                 W='W_psi_rad' in part)
@@ -324,26 +351,76 @@ def p6_delta(p6, band):
     return _num(d.get('delta_h_m')) if isinstance(d, dict) and d.get('trang_thai') == 'dat' else None
 
 
-def hang_theo_u(cq, level, a_m, p6=None, c6=None):
+# figure-8 run ids of the C8 session guide (the cells of rule 2b and their retakes); the level is the F0x part
+P6_LUOT_MUC = re.compile(r'^C8-[PL]-(F02|F05|F08)-[0-9]+(_lai[0-9]+)?' + chr(92) + 'Z')   # Z: no trailing newline (D3-1)
+
+
+def p6_muc_cua_luot(p6):
+    """The levels (sorted, of LEVELS) of the runs a c8b_P6_rieng_ii_v2 file counted its frames over (luot[].luot);
+    None when the list is absent or empty, an id is repeated or is not a figure-8 run id: the levels are not known."""
+    ls = p6.get('luot') if isinstance(p6, dict) and p6.get('schema') == P6_VERSION else None
+    if not isinstance(ls, list) or not ls:
+        return None
+    ids = [x.get('luot') if isinstance(x, dict) else None for x in ls]
+    ms = [P6_LUOT_MUC.match(i) if isinstance(i, str) else None for i in ids]
+    if any(m is None for m in ms) or len(set(ids)) != len(ids):
+        return None
+    return sorted({'O1-' + m.group(1) for m in ms})
+
+
+def p6_khong_khung(p6, band, luot_buoi=None):
+    """CODE 24/11 khuya (2026-11-24_CODE_chot_khoa_gop_dai_khong_co_khung, with its condition (a)): True when the
+    session of a c8b_P6_rieng_ii_v2 file has NO frame in a band B1 ..: the file says n_khung = 0, n_do = 0 there (no
+    number, thieu) AND every run it counted is of a level whose table does not hold the band (LEVELS[i] holds B1 ..
+    B(i+1)). The second part is the stop of (a): the gate applies a band by the commanded speed of the level, not by
+    the measured speed P6 counts with, so a session with a run of a level reaching the band needs the band even when
+    none of its valid frames was measured there; that case stays thieu and stops the lock. B0 (standing) never."""
+    if not isinstance(p6, dict) or p6.get('schema') != P6_VERSION or band not in P6_BANDS:
+        return False
+    d = (p6.get('dai') or {}).get(band)
+    if not isinstance(d, dict) or d.get('trang_thai') != 'thieu' or d.get('delta_h_m') is not None \
+            or any(type(d.get(k)) is not int or d[k] != 0 for k in ('n_khung', 'n_do')):
+        return False
+    lvs = p6_muc_cua_luot(p6)
+    # Codex D3-1 (25/11): the runs this lock knows of its session (the luot_id of its U_moc files) must all be among
+    # the runs the P6 file counted: a P6 made without one of them says nothing of that run's frames
+    # Codex round 2 D3v2-1: False = the lock does not know the runs of its session (no U_moc file, or one without a
+    # luot_id): the flag stays off
+    if luot_buoi is False:
+        return False
+    if luot_buoi and not set(luot_buoi) <= {x.get('luot') for x in p6.get('luot') or [] if isinstance(x, dict)}:
+        return False
+    return lvs is not None and all(LEVELS.index(lv) < P6_BANDS.index(band) for lv in lvs)
+
+
+def hang_theo_u(cq, level, a_m, p6=None, c6=None, luot_buoi=None):
     """The bands of u of a level. Without p6: one band [0, u_3b] with the turning bounds. With a c8b_P6_rieng_ii_v2
     file: the bands B1 .. of the level (edges u_3b of the levels up to its own), P4_m = can_quay + LE c6 delta_h_dong
-    (band), A4 the same; a band without its delta_h_dong (or without c6) -> thieu (P4_m, A4_deg null)."""
+    (band), A4 the same; a band without its delta_h_dong (or without c6) -> thieu (P4_m, A4_deg null). khong_khung:
+    the session has no frame in the band (p6_khong_khung; only with a turning bound, else the band is thieu as
+    before): thieu, null, but it does not stop the lock (trang_thai_khoa) and gives nothing to the merged lock."""
     if a_m is None:
         return [], 'thieu canh ma a (--canh-ma-m): dai u khong xac dinh'
     gone = cq['trang_thai'] == 'thieu'
     if p6 is None:
         return [dict(u_lo_m_s=0.0, u_hi_m_s=u_3b(level, a_m), P4_m=None if gone else cq['p_m'],
-                     A4_deg=None if gone else cq['psi_deg'], trang_thai=cq['trang_thai'])], None
+                     A4_deg=None if gone else cq['psi_deg'], trang_thai=cq['trang_thai'], khong_khung=False)], None
     edges = [0.0] + [u_3b(lv, a_m) for lv in LEVELS[:LEVELS.index(level) + 1]]
     out, why = [], []
     for j, nm in enumerate(P6_BANDS[:len(edges) - 1]):
         d = p6_delta(p6, nm)
         ok = not gone and d is not None and c6 is not None
-        if not gone and not ok:
+        kk = not gone and d is None and p6_khong_khung(p6, nm, luot_buoi)
+        if kk:
+            why.append(f'{nm}: buoi khong co khung nao o dai nay (P6 n_khung = 0; cac luot cua P6 o muc '
+                       f'{p6_muc_cua_luot(p6)}, khong muc nao toi dai): buoi khong dong gop cho dai, khoa buoi khong '
+                       'bi chan (CODE 24/11 khuya)')
+        elif not gone and not ok:
             why.append(f'{nm}: thieu delta_h_dong (c8b_p6_ngang) hay he so rho_max / (H - h_max) cua A6')
         out.append(dict(u_lo_m_s=edges[j], u_hi_m_s=edges[j + 1], dai=nm,
                         P4_m=(cq['p_m'] + LE * c6 * d) if ok else None, A4_deg=cq['psi_deg'] if ok else None,
-                        P6_rieng_ii_m=(c6 * d) if ok else None, trang_thai=cq['trang_thai'] if ok else 'thieu'))
+                        P6_rieng_ii_m=(c6 * d) if ok else None, trang_thai=cq['trang_thai'] if ok else 'thieu',
+                        khong_khung=kk))
     return out, ('; '.join(why) or None)
 
 
@@ -497,8 +574,15 @@ def trang_thai_khoa(out, muc_kha_thi):
         miss = [k for k in HANG_DONG if _num(m['hang_dong'].get(k)) is None]
         if miss:
             why.append(f'{lv}: hang_dong {miss} chua co')
-        if not m['hang_theo_u'] or any(b['trang_thai'] == 'thieu' for b in m['hang_theo_u']):
+        # a band the session has no frame in (khong_khung, CODE 24/11 khuya) does not stop the lock; a band with
+        # frames and no number does, and so does a level with no band of its own at all
+        bs = m['hang_theo_u']
+        if not bs or any(b['trang_thai'] == 'thieu' and b.get('khong_khung') is not True for b in bs) \
+                or all(b.get('khong_khung') is True for b in bs):
             why.append(f'{lv}: hang_theo_u thieu')
+        # Codex D3-11: a band whose state says it has a number must carry P4_m and A4_deg
+        elif any(b['trang_thai'] != 'thieu' and not (_la_so(b.get('P4_m')) and _la_so(b.get('A4_deg'))) for b in bs):
+            why.append(f'{lv}: hang_theo_u co dai trang thai khong thieu ma P4_m / A4_deg khong phai so')
     return ('khoa', None) if not why else ('chua_khoa', '; '.join(why))
 
 
@@ -512,6 +596,11 @@ def _num(x):
     except (TypeError, ValueError):
         return None
     return v if math.isfinite(v) else None
+
+
+def _la_so(x):
+    """A finite JSON number (not a string, not true / false): _num takes '1.2' and True as numbers."""
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
 def can_quay(tb, level):
@@ -621,9 +710,22 @@ def cua_so_khung(path, ids, sha, plumb):
     S = math.atan2(sum(math.sin(p) for _, _, p in v), sum(math.cos(p) for _, _, p in v))
     d = [math.atan2(math.sin(p - S), math.cos(p - S)) for _, _, p in v]
     m = re.search(r'[\\/](doan\d+)[\\/]', os.path.abspath(path))
+    b = re.search(BUOI_RE, os.path.abspath(path))
     return dict(rho_m=max(math.hypot(x - C[0], y - C[1]) for x, y, _ in v),
                 T_m=[sum(x for x, _, _ in v) / len(v), sum(y for _, y, _ in v) / len(v)], S_rad=S,
-                tan_rad=max(d) - min(d), doan=m.group(1) if m else None, n=len(v))
+                tan_rad=max(d) - min(d), doan=m.group(1) if m else None, buoi=b.group(1) if b else None, n=len(v))
+
+
+# A camera segment is a 'doanN' of ONE floor session: the same 'doanN' name in two session folders
+# (YYYY-MM-DD_runNN, e.g. 2026-11-20_run02/.../doan1 and 2026-11-23_run03/.../doan1) is two cameras (CODE 24/11 to
+# C8B: the run03 lock, plan (a) Liam 24/11 "Dung so buoi 2 (Recommended)", the leg starts of buoi 2 and the W of run03
+# must take the two-end bound, e580587). Key 'buoi/doanN'; a path without a session folder keeps 'doanN' (as before).
+BUOI_RE = r'[\\/](\d{4}-\d{2}-\d{2}_run\d+)[\\/]'
+
+
+def khoa_doan(buoi, doan):
+    """Segment key of a window or a kiem_cheo file: None without doanN, 'buoi/doanN' or 'doanN'."""
+    return None if not doan else (f'{buoi}/{doan}' if buoi else doan)
 
 
 def _a6_du_cua_so(a6, T, S, G, V, DH, cam):
@@ -719,7 +821,15 @@ def u_beta_cam_cho(a6, kcs, kc_doan, tam_id, dc, cho):
         p = dict(doan_ref=ref.get('doan'), doan_W=w.get('doan'), loai_ref=loai, ref=ref.get('luot_id'),
                  ref_i=ref.get('doan_i'), W=w.get('frames'))
         a3p, eps, cach = None, a6.get('eps_g'), 'bao_hai_dau'
-        kc = (kc_doan or {}).get(w.get('doan')) if ref.get('doan') and ref.get('doan') == w.get('doan') else None
+        # CODE 24/11 (run03 lock, plan (a)): both windows of the pair inside the A6 domain (c8b_a6._rho_ok: centre +
+        # side / sqrt 2 <= mien.rho_max_m), else this place has no u_beta_cam (the A6 replay is not claimed outside)
+        out_d = [f'{nm} rho {e.get("rho_m")!r} m' for nm, e in (('ref', ref), ('W', w))
+                 if _num(e.get('rho_m')) is None or not a6m._rho_ok(a6, float(e['rho_m']))]
+        if out_d:
+            why.append(f'ngoai mien A6 (rho_max_m {(a6.get("mien") or {}).get("rho_max_m")!r}): ' + '; '.join(out_d))
+            continue
+        kr, kw = khoa_doan(ref.get('buoi'), ref.get('doan')), khoa_doan(w.get('buoi'), w.get('doan'))
+        kc = (kc_doan or {}).get(kw) if kr and kr == kw else None
         if kc is not None:
             r = a6m.u_psi_hai_dau_rad(a6, kc, ref['T_m'], w['T_m'], tam_id)
             if r.get('trang_thai') == 'dat' and r.get('ghep') == 'replay_chung_theo_ca':
@@ -733,7 +843,7 @@ def u_beta_cam_cho(a6, kcs, kc_doan, tam_id, dc, cho):
             # segment (c8b_a6._a3_rad); an end in a segment without kiem_cheo takes the largest of the others (stand-in)
             ends = []
             for nm, e in (('ref', ref), ('W', w)):
-                own = kc_doan.get(e.get('doan'))
+                own = kc_doan.get(khoa_doan(e.get('buoi'), e.get('doan')))
                 tries = [(own, 'rieng')] if own is not None else [(x, 'thay_the') for x in kc_doan.values()]
                 got = [(a6m._a3_rad(x, e['T_m'], a6['plumb_xy_m']), how) for x, how in tries]
                 ok = [(r3[0], how) for r3, how in got if r3[0] is not None]
@@ -850,12 +960,14 @@ def u_beta_cam(lan_lap, kiem_cheo=None, a6=None, side=None, tham_chieu=None, dau
 
 def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None, muc_kha_thi=LEVELS, nguong=None,
           a6=None, ses=None, cam=None, commit_hil=None, kiem_cheo=None, xoay=None, u_h=None, truc_xe=None,
-          neo=None, u_moc=None, tham_chieu=None, dau_chan=None, kc_doan=None, p6_dong=None):
+          neo=None, u_moc=None, tham_chieu=None, dau_chan=None, kc_doan=None, p6_dong=None,
+          he_so_giu_ngoai=None):
     muc = {}
     side = a_m
     hd, hd_why, hd_part, lever = (hang_dong_tinh(dict(kiem_cheo=kiem_cheo, a6=a6, xoay=xoay, u_h=u_h,
                                                        lan_lap=lan_lap, truc_xe=truc_xe, neo=neo, u_moc=u_moc,
                                                        tham_chieu=tham_chieu, p6_dong=p6_dong,
+                                                       he_so_giu_ngoai=he_so_giu_ngoai,
                                                        cam=cam if isinstance(cam, list) else [cam] if cam else []),
                                                   side)
                                   if side is not None else (dict(hang_m=None, he_so_r=None, hang_rad=None,
@@ -888,7 +1000,9 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
     for lv in LEVELS:
         tb = tbs.get(lv)
         cq = can_quay(tb, lv)
-        bands, bwhy = hang_theo_u(cq, lv, a_m, p6_dong, p6_he_so(a6))
+        lb = [u.get('luot_id') if isinstance(u, dict) else None for u in (u_moc or [])]
+        bands, bwhy = hang_theo_u(cq, lv, a_m, p6_dong, p6_he_so(a6),
+                                  lb if lb and all(isinstance(x, str) and x for x in lb) else False)
         if lever is not None:                                 # (|q_hat| + dq) A4(u) into P4 (v7 10, GATE RT4-3)
             for b in bands:
                 if b.get('P4_m') is not None and b.get('A4_deg') is not None:
@@ -922,7 +1036,12 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
             bang[key]['nguon_3b'] = dict(duong_dan=n.get('duong_dan', n['file']), sha256=n['sha256'])
     eh, ehw = eps_h_of(nguong)
     lle, lle_st, lle_why = lan_lap_E(a6, lan_lap)
-    out = dict(lan_lap_E=lle, lan_lap_E_trang_thai=lle_st, lan_lap_E_ly_do=lle_why, version=VERSION, le=LE, muc=muc, bang_man_trap=bang, u_beta_cam_deg=ub, u_beta_cam_trang_thai=ust, u_beta_cam_trang_thai_cho=ust_cho, u_beta_cam_dau_chan=dau_chan or {}, u_beta_cam_gia_dinh=ugd,
+    out = dict(lan_lap_E=lle, lan_lap_E_trang_thai=lle_st, lan_lap_E_ly_do=lle_why, version=VERSION, le=LE, muc=muc, bang_man_trap=bang, u_beta_cam_deg=ub,
+               # N1 (FABLE_C8 24/11, CODE 24/11 local_42161302): the scorer (c7_score 2805) reads this field per place
+               # (dict -> st.get(cho)); a whole-lock 'thieu' (K1, K2 missing) left u_phi infinite at goc for every
+               # figure 8 run. Per place here; the whole-lock state kept as u_beta_cam_trang_thai_chung.
+               u_beta_cam_trang_thai=dict(ust_cho), u_beta_cam_trang_thai_chung=ust,
+               u_beta_cam_trang_thai_cho=ust_cho,u_beta_cam_dau_chan=dau_chan or {}, u_beta_cam_gia_dinh=ugd,
                u_beta_cam_ly_do=uwhy, nhanh_tick=nhanh_tick, commit_hil=commit_hil, muc_kha_thi=list(muc_kha_thi),
                eps_H=eh, eps_H_ly_do=ehw, mien_car_pose=mien_car_pose(a6, ses, cam),
                khoa_truoc=dict(nguon=nguon or [], script=script, commit_hil=commit_hil,
@@ -930,6 +1049,72 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
     st, why = trang_thai_khoa(out, muc_kha_thi)
     out.update(trang_thai=st, ly_do_chua_khoa=why)
     return out
+
+
+HE_SO_SCHEMA = 'c8b_he_so_giu_ngoai_v1'
+HE_SO_HANG = ('P1_m', 'P_neo_m', 'A_neo_rad')         # the terms a factor can scale (A3 also enters u_beta_cam: not here)
+
+
+def doc_he_so(d, nguon):
+    """The factors {term: k >= 1} of a c8b_he_so_giu_ngoai_v1 file for this lock: content sha, the same margin LE,
+    trang_thai dat, and every neo / kiem_cheo source of this lock among the files the factors were computed from.
+    The range [1, 10] of a factor is an input check only (a file outside it is refused), not a decision threshold."""
+    import c8b_a6 as a6m
+    if not isinstance(d, dict) or d.get('schema') != HE_SO_SCHEMA:
+        raise KhoaError(f'--he-so-giu-ngoai: not a {HE_SO_SCHEMA} file')
+    try:
+        a6m._check_sha(d, '--he-so-giu-ngoai')
+    except a6m.A6Error as exc:
+        raise KhoaError(str(exc))
+    if d.get('trang_thai') != 'dat' or d.get('le') != LE:
+        raise KhoaError(f'--he-so-giu-ngoai: trang_thai {d.get("trang_thai")!r}, le {d.get("le")!r} (dat, {LE})')
+    hang = d.get('hang')
+    if not isinstance(hang, dict) or set(hang) != set(HE_SO_HANG):
+        raise KhoaError(f'--he-so-giu-ngoai: hang must give exactly {HE_SO_HANG}')
+    for k, v in hang.items():
+        if _num(v) is None or not 1.0 <= float(v) <= 10.0:
+            raise KhoaError(f'--he-so-giu-ngoai: factor {k} {v!r} (a number in [1, 10])')
+    co = {n.get('sha256') for n in d.get('nguon') or [] if isinstance(n, dict)}
+    thieu = [n['file'] for n in nguon if n['vai'] in ('neo', 'kiem_cheo') and n['sha256'] not in co]
+    if thieu:
+        raise KhoaError(f'--he-so-giu-ngoai: not computed with the neo / kiem_cheo files of this lock: {thieu}')
+    return {k: float(hang[k]) for k in HE_SO_HANG}
+
+
+def nguon_cheo(nguon, extra):
+    """Codex KG2-1, KG3-1 (24/11 khuya): the per-session files name the common sources they were made from; each must
+    be the one this lock uses, else the lock (and the combined lock) would hold numbers made from another threshold,
+    A6, xoay or F7 than the ones it names: tham_chieu_v1 xoay_sha256 = --xoay, truc_xe_sha256 (when written) = the F7
+    of its place (--truc-xe goc, --truc-xe-cho K1/K2); u_moc a6_sha256 = --a6; p6_dong nguon 'nguong' = --nguong and
+    its 'session' one of --session."""
+    sha = {}
+    for n in nguon:
+        sha.setdefault(n['vai'], set()).add(n['sha256'])
+
+    def one(vai):
+        s = sha.get(vai) or set()
+        return next(iter(s)) if len(s) == 1 else None
+    for cho, ds in (extra.get('tham_chieu') or {}).items():
+        f7 = one('truc_xe' if cho == 'goc' else f'truc_xe {cho}')
+        for d in ds:
+            if 'xoay' in sha and d.get('xoay_sha256') != one('xoay'):
+                raise KhoaError(f'--tham-chieu {cho}: xoay_sha256 {d.get("xoay_sha256")!r} is not the --xoay file')
+            if d.get('truc_xe_sha256') is not None and d.get('truc_xe_sha256') != f7:
+                raise KhoaError(f'--tham-chieu {cho}: truc_xe_sha256 {d.get("truc_xe_sha256")!r} is not the F7 of '
+                                f'{cho} of this lock ({f7!r}): the scorer would use another u_phi_hat')
+    for d in extra.get('u_moc') or []:
+        if 'a6' in sha and isinstance(d, dict) and d.get('a6_sha256') != one('a6'):
+            raise KhoaError(f'--u-moc: a6_sha256 {d.get("a6_sha256")!r} is not the --a6 file')
+    p6 = extra.get('p6_dong')
+    if isinstance(p6, dict):
+        src = {}
+        for n in p6.get('nguon') or []:
+            if isinstance(n, dict):
+                src.setdefault(n.get('vai'), set()).add(n.get('sha256'))
+        if 'nguong' in sha and src.get('nguong') != sha['nguong']:
+            raise KhoaError(f'--p6-dong: made with nguong {sorted(src.get("nguong") or [])}, not the --nguong file')
+        if 'session' in sha and not (src.get('session') or set()) <= sha['session']:
+            raise KhoaError('--p6-dong: made with a camera session that is not a --session of this lock')
 
 
 def script_state():
@@ -1025,15 +1210,18 @@ def dau_chan_of(a, extra, nguon):
 
 
 def kc_doan_of(paths, kcs):
-    """{doanN: kiem_cheo dict} from the --kiem-cheo paths (segment = the 'doanN' directory of the path)."""
+    """{segment key: kiem_cheo dict} from the --kiem-cheo paths (segment = the 'doanN' directory of the path, of the
+    session folder YYYY-MM-DD_runNN when the path has one: khoa_doan, CODE 24/11)."""
     import re
     out = {}
     for p, k in zip(paths or [], kcs or []):
         m = re.search(r'[\\/](doan\d+)[\\/]', os.path.abspath(p))
         if m:
-            if m.group(1) in out:
-                raise KhoaError(f'--kiem-cheo: two files of {m.group(1)}')
-            out[m.group(1)] = k
+            b = re.search(BUOI_RE, os.path.abspath(p))
+            key = khoa_doan(b.group(1) if b else None, m.group(1))
+            if key in out:
+                raise KhoaError(f'--kiem-cheo: two files of {key}')
+            out[key] = k
     return out
 
 
@@ -1062,6 +1250,9 @@ def main(argv=None):
     ap.add_argument('--truc-xe-cho', action='append', default=None,
                     help='CHO=F7 truc_xe_v1 of K1 / K2 (dau_doan for u_beta_cam of that place); goc comes from --truc-xe')
     ap.add_argument('--neo', default=None, help='KIEMCHEO neo_luot.json (c7_neo_luot_v1, theo_cho.goc)')
+    ap.add_argument('--he-so-giu-ngoai', default=None,
+                    help='c8b_he_so_giu_ngoai_v1 (factors >= 1 of P1, P_neo, A_neo held out by session); without '
+                         'it nothing changes')
     ap.add_argument('--p6-dong', default=None,
                     help='c8b_p6_ngang tinh output (c8b_P6_rieng_ii_v2): B0 into hang_m, the bands of u into P4_m')
     ap.add_argument('--u-moc', action='append', default=None,
@@ -1165,6 +1356,12 @@ def main(argv=None):
             txc[cho] = d
             nguon.append(dict(vai=f'truc_xe {cho}', file=os.path.basename(pth), duong_dan=os.path.abspath(pth),
                               sha256=cu.sha256(pth)))
+        nguon_cheo(nguon, extra)
+        if a.he_so_giu_ngoai:
+            with open(a.he_so_giu_ngoai, encoding='utf-8') as f:
+                extra['he_so_giu_ngoai'] = doc_he_so(json.load(f), nguon)
+            nguon.append(dict(vai='he_so_giu_ngoai', file=os.path.basename(a.he_so_giu_ngoai),
+                              duong_dan=os.path.abspath(a.he_so_giu_ngoai), sha256=cu.sha256(a.he_so_giu_ngoai)))
         co_dd = any(isinstance(v.get('dau_doan'), list) and v['dau_doan'] for v in txc.values())
         if a.khung_12b or co_dd or any(v.get('trang_thai') != 'khoa' for v in txc.values()):
             extra['truc_xe_cho'] = txc
