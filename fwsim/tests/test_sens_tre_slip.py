@@ -10,6 +10,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 
 import numpy as np
 import pytest
@@ -150,13 +151,15 @@ def test_full_command(tmp_path, monkeypatch):
     args = sens.build_parser().parse_args(['--out', rel_out, '--dll', rel_dll, '--ctrl', 'ADRC'])
     argv = sens.full_command(args, ('ADRC',))
     assert argv[0] == sys.executable and argv[1] == os.path.abspath(sens.__file__)
-    for opt in ('--out', '--dll', '--workers', '--ctrl'):
+    for opt in ('--out', '--dll', '--fw', '--workers', '--ctrl'):
         assert opt in argv
     assert os.path.isabs(argv[argv.index('--out') + 1])
     assert argv[argv.index('--out') + 1] == os.path.abspath(rel_out)
     assert argv[argv.index('--dll') + 1] == os.path.abspath(rel_dll)
+    assert argv[argv.index('--fw') + 1] == os.path.abspath(sens.DEFAULT_FW)
     rt = sens.build_parser().parse_args(argv[2:])
     assert rt.out == os.path.abspath(rel_out) and rt.dll == os.path.abspath(rel_dll)
+    assert rt.fw == os.path.abspath(sens.DEFAULT_FW)
     assert rt.workers == args.workers and rt.ctrl == ['ADRC']
     argv_def = sens.full_command(sens.build_parser().parse_args([]), sens.CONTROLLERS)
     assert argv_def[-3:] == ['--ctrl', 'PID', 'ADRC']
@@ -250,8 +253,27 @@ def test_ctrl_filter():
         sens.build_parser().parse_args(['--ctrl', 'LADRC'])
 
 
+class _FakeIter:
+    """IMapIterator stand-in over a generator: next(timeout) as multiprocessing has it."""
+
+    def __init__(self, gen):
+        self.gen = gen
+        self.timeouts = []
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self.gen)
+
+    def next(self, timeout=None):
+        self.timeouts.append(timeout)
+        return next(self.gen)
+
+
 class _FakePool:
     """mp.Pool stand-in: imap_unordered runs each job in-process (no _init, no DLL)."""
+    terminated = 0
 
     def __init__(self, *a, **kw):
         pass
@@ -262,8 +284,11 @@ class _FakePool:
     def __exit__(self, *a):
         return False
 
+    def terminate(self):
+        type(self).terminated += 1
+
     def imap_unordered(self, func, jobs):
-        return (func(j) for j in jobs)
+        return _FakeIter(func(j) for j in jobs)
 
 
 def _fake_job(job):
@@ -362,14 +387,15 @@ def _drop_pool(drop):
     """_FakePool that never returns the jobs in drop (a missing key)."""
     class P(_FakePool):
         def imap_unordered(self, func, jobs):
-            return (func(j) for j in jobs if tuple(j) not in drop)
+            return _FakeIter(func(j) for j in jobs if tuple(j) not in drop)
     return P
 
 
-def _main_fakes(monkeypatch, tmp_path, job=_fake_job, pool=_FakePool, build='match'):
+def _main_fakes(monkeypatch, tmp_path, job=_fake_job, pool=_FakePool, build='match', fw=None):
     """main with fakes, --ctrl ADRC; build: 'match' (json with the DLL sha256 and the ESP32
     commit, dirty), 'nosha' ({"esp32": {"dirty": false}}), 'badsha', 'shaonly'
-    ({"dll_sha256": <right>}, C3-20 round 2) or a dict (written as is). Returns the out folder."""
+    ({"dll_sha256": <right>}, C3-20 round 2) or a dict (written as is). fw: --fw (default a
+    folder that does not exist: no git check, C3-20 round 3). Returns the out folder."""
     monkeypatch.setattr(sens.fwsim, 'FirmwareSim', _FakeFW)
     monkeypatch.setattr(sens.s03, 'defaults', lambda fw, c: {'g': c})
     monkeypatch.setattr(sens.mp, 'Pool', pool)
@@ -386,7 +412,8 @@ def _main_fakes(monkeypatch, tmp_path, job=_fake_job, pool=_FakePool, build='mat
         b['dll_sha256'] = '0' * 64
     dll, _ = _mk_dll(tmp_path, build=b)
     out = tmp_path / 'out'
-    sens.main(['--out', str(out), '--dll', dll, '--ctrl', 'ADRC', '--workers', '1'])
+    fw = str(tmp_path / 'khong_co_AGV') if fw is None else str(fw)
+    sens.main(['--out', str(out), '--dll', dll, '--fw', fw, '--ctrl', 'ADRC', '--workers', '1'])
     return out
 
 
@@ -696,6 +723,9 @@ class _RaisingIter:
             raise self.exc
         return self.func(j)
 
+    def next(self, timeout=None):
+        return self.__next__()
+
 
 def _raising_pool(bad, exc=ValueError('result not picklable')):
     class P(_FakePool):
@@ -704,30 +734,268 @@ def _raising_pool(bad, exc=ValueError('result not picklable')):
     return P
 
 
+def _counting(job):
+    """job wrapped to record every call (key) in .calls."""
+    calls = []
+
+    def f(j):
+        calls.append(tuple(j))
+        return job(j)
+    f.calls = calls
+    return f
+
+
 def test_c3_19_worker_exception_recorded(tmp_path, monkeypatch, capsys):
-    """C3-19 (Codex): _job raises in the worker for one key. Old code: the exception left
-    main through the pool iterator, no meta.json. Now every file is written, meta.json
-    loi_worker holds the key and the error, 'chưa kết luận', not a confirmation run."""
-    out = _main_fakes(monkeypatch, tmp_path, job=_raise_on(X_SO))
+    """C3-19 round 3 (b): _job raises in the worker for one key at both attempts. Round 2 code:
+    no rerun (81 calls), loi_worker lan 1 only, chay_lai.csv empty. Now the key is run once
+    more in a new pool (82 calls), both attempts in chay_lai.csv (status loi_worker), the key
+    is missing, 'chưa kết luận', not a confirmation run; every file written."""
+    job = _counting(_raise_on(X_SO))
+    out = _main_fakes(monkeypatch, tmp_path, job=job)
+    assert len(job.calls) == 82 and job.calls.count(X_SO) == 2
     meta = _meta(out)
-    assert meta['loi_worker'] == [dict(khoa=sens._ks(X_SO), lan=1, error='RuntimeError: boom')]
+    assert meta['loi_worker'] == [dict(khoa=sens._ks(X_SO), lan=1, error='RuntimeError: boom'),
+                                  dict(khoa=sens._ks(X_SO), lan=2, error='RuntimeError: boom')]
     kc = meta['kiem_cap']
     assert kc['ket_luan'] == 'chưa kết luận'
-    assert kc['n_loi_worker'] == 1 and kc['khoa_loi_worker'] == [sens._ks(X_SO)]
+    assert kc['n_loi_worker'] == 2 and kc['khoa_loi_worker'] == [sens._ks(X_SO)] * 2
     assert kc['khoa_thieu'] == [sens._ks(X_SO)] and kc['cap_thieu'] == [sens._ks(X_SO)]
+    assert kc['khoa_run_error'] == []
     assert meta['dung_lam_luot_xac_nhan'] is False and meta['ly_do_khong_dung'] == [Y3_DONG]
-    assert meta['n_run_error_lan_1'] == 0                 # a worker exception is not rerun
+    assert meta['n_run_error_lan_1'] == 0 and meta['loi_chua_ro_nguyen_nhan'] == []
     assert len(_read_csv(out / 'bang.csv')) == 80
     for f in ('tom_tat.csv', 'tom_tat_theo_dieu_kien.csv', 'chay_lai.csv'):
         assert (out / f).exists()
+    cl = _read_csv(out / 'chay_lai.csv')
+    assert [(r['attempt'], r['status'], r['error']) for r in cl] == [
+        ('1', 'loi_worker', 'RuntimeError: boom'), ('2', 'loi_worker', 'RuntimeError: boom')]
+    assert all((r['controller'], r['io_delay_ms'], r['slip_omega_s'], r['mu'], r['v'])
+               == ('ADRC', '1', '0.05', '0.413', '0.2') for r in cl)
+    assert set(cl[0]) == set(sens.BANG_COLS + ['attempt'])         # no private field written
     assert 'worker exceptions' in capsys.readouterr().out
 
 
 def test_c3_19_worker_exception_reference(tmp_path, monkeypatch):
-    """A reference run raising: its 8 pairs are missing, recorded, no crash."""
+    """A reference run raising at both attempts: its 8 pairs are missing, recorded, no crash."""
     kc = _meta(_main_fakes(monkeypatch, tmp_path, job=_raise_on(X_MOC)))['kiem_cap']
     assert kc['ket_luan'] == 'chưa kết luận' and kc['moc_thieu'] == [sens._ks(X_MOC)]
-    assert kc['n_cap_thieu'] == 8 and kc['khoa_loi_worker'] == [sens._ks(X_MOC)]
+    assert kc['n_cap_thieu'] == 8 and kc['khoa_loi_worker'] == [sens._ks(X_MOC)] * 2
+
+
+def _raise_first(keys, exc=RuntimeError('boom')):
+    """_fake_job that raises at the first call of each key in keys, then returns its row."""
+    seen = set()
+
+    def job(j):
+        k = tuple(j)
+        if k in keys and k not in seen:
+            seen.add(k)
+            raise exc
+        return _fake_job(j)
+    return job
+
+
+@pytest.mark.parametrize('key', (X_SO, X_MOC))
+def test_c3_19_r3_exception_then_ok(key, tmp_path, monkeypatch):
+    """C3-19 round 3 (a) (Codex: 'the exception test expects a missing run and no attempt 2'):
+    _job raises at attempt 1, succeeds at attempt 2. Round 2 code: 81 calls, the key missing,
+    'chưa kết luận'. Now as a run_error: rerun once in a new pool, the key present in
+    bang.csv, both attempts in chay_lai.csv, 'lỗi chưa rõ nguyên nhân', grid complete."""
+    job = _counting(_raise_first({key}))
+    out = _main_fakes(monkeypatch, tmp_path, job=job)
+    assert len(job.calls) == 82 and job.calls.count(key) == 2
+    meta = _meta(out)
+    kc = meta['kiem_cap']
+    assert kc['ket_luan'] == 'đủ cặp' and kc['n_khoa_co'] == 81 and kc['khoa_thieu'] == []
+    assert kc['n_loi_worker'] == 0 and kc['n_cap_du'] == 72
+    assert meta['loi_worker'] == [dict(khoa=sens._ks(key), lan=1, error='RuntimeError: boom')]
+    assert meta['loi_chua_ro_nguyen_nhan'] == [dict(
+        khoa=sens._ks(key), error_lan_1='RuntimeError: boom', status_lan_2='ok',
+        ghi_chu='lỗi chưa rõ nguyên nhân')]
+    assert meta['dung_lam_luot_xac_nhan'] is True and meta['ly_do_khong_dung'] == []
+    bang = _read_csv(out / 'bang.csv')
+    assert len(bang) == 81 and all(r['status'] == 'ok' for r in bang)
+    assert sum(sens._ks((r['controller'], int(r['io_delay_ms']), float(r['slip_omega_s']),
+                         float(r['mu']), float(r['v']))) == sens._ks(key) for r in bang) == 1
+    cl = _read_csv(out / 'chay_lai.csv')
+    assert [(r['attempt'], r['status']) for r in cl] == [('1', 'loi_worker'), ('2', 'ok')]
+
+
+def test_c3_19_r3_exception_then_run_error(tmp_path, monkeypatch):
+    """Attempt 1 raises, attempt 2 returns a run_error row: the run_error row stays (key
+    present with run_error), 'chưa kết luận'."""
+    seen = []
+
+    def job(j):
+        if tuple(j) == X_SO:
+            seen.append(1)
+            if len(seen) == 1:
+                raise RuntimeError('boom')
+            return _err_row(j)
+        return _fake_job(j)
+
+    meta = _meta(_main_fakes(monkeypatch, tmp_path, job=job))
+    kc = meta['kiem_cap']
+    assert kc['ket_luan'] == 'chưa kết luận' and kc['khoa_run_error'] == [sens._ks(X_SO)]
+    assert kc['khoa_thieu'] == [] and kc['n_loi_worker'] == 1
+    cl = _read_csv(tmp_path / 'out' / 'chay_lai.csv')
+    assert [(r['attempt'], r['status']) for r in cl] == [('1', 'loi_worker'), ('2', 'run_error')]
+
+
+class _TimeoutIter(_FakeIter):
+    """IMapIterator stand-in: after the results of the jobs not in lost, next() raises
+    multiprocessing.TimeoutError (a worker died holding a lost job: its result never comes)."""
+
+    def __init__(self, func, jobs, lost):
+        super().__init__(func(j) for j in jobs if tuple(j) not in lost)
+
+    def next(self, timeout=None):
+        self.timeouts.append(timeout)
+        try:
+            return next(self.gen)
+        except StopIteration:
+            raise sens.mp.TimeoutError from None
+
+
+def _timeout_pool(lost, lan=(1, 2)):
+    """_FakePool whose iterator times out on the jobs in lost, at the attempts in lan."""
+    class P(_FakePool):
+        n = 0
+        iters = []
+
+        def imap_unordered(self, func, jobs):
+            type(self).n += 1
+            it = (_TimeoutIter(func, jobs, lost) if type(self).n in lan
+                  else _FakeIter(func(j) for j in jobs))
+            type(self).iters.append(it)
+            return it
+    P.terminated = 0
+    return P
+
+
+def test_c3_19_r3_timeout_in_process(tmp_path, monkeypatch, capsys):
+    """C3-19 round 3: no result for a key within HAN_CHO_WORKER_S (the wait passed to next()):
+    the key goes to loi_worker with ly_do het_han_cho_worker, the pool is terminated, the key
+    is not rerun, 'chưa kết luận', every file written."""
+    pool = _timeout_pool({X_SO})
+    out = _main_fakes(monkeypatch, tmp_path, pool=pool)
+    assert pool.n == 1 and pool.terminated == 1                      # no rerun pool
+    assert set(pool.iters[0].timeouts) == {sens.HAN_CHO_WORKER_S}
+    meta = _meta(out)
+    err = f'het_han_cho_worker: no worker result within {sens.HAN_CHO_WORKER_S} s'
+    assert meta['loi_worker'] == [dict(khoa=sens._ks(X_SO), lan=1, error=err,
+                                       ly_do='het_han_cho_worker')]
+    kc = meta['kiem_cap']
+    assert kc['ket_luan'] == 'chưa kết luận' and kc['khoa_thieu'] == [sens._ks(X_SO)]
+    assert kc['n_loi_worker'] == 1 and meta['dung_lam_luot_xac_nhan'] is False
+    assert len(_read_csv(out / 'bang.csv')) == 80 and _read_csv(out / 'chay_lai.csv') == []
+    assert 'pool terminated' in capsys.readouterr().out
+
+
+def test_c3_19_r3_timeout_in_rerun(tmp_path, monkeypatch):
+    """Attempt 1 raises, the rerun pool times out on that key: both attempts in chay_lai.csv
+    (attempt 2 het_han_cho_worker), the key missing, 'chưa kết luận'."""
+    pool = _timeout_pool({X_SO}, lan=(2,))
+    out = _main_fakes(monkeypatch, tmp_path, pool=pool, job=_raise_first({X_SO}))
+    assert pool.n == 2 and pool.terminated == 1
+    meta = _meta(out)
+    assert [(e['lan'], e.get('ly_do')) for e in meta['loi_worker']] == [
+        (1, None), (2, 'het_han_cho_worker')]
+    kc = meta['kiem_cap']
+    assert kc['ket_luan'] == 'chưa kết luận' and kc['khoa_thieu'] == [sens._ks(X_SO)]
+    cl = _read_csv(out / 'chay_lai.csv')
+    assert [(r['attempt'], r['status']) for r in cl] == [('1', 'loi_worker'), ('2', 'loi_worker')]
+    assert cl[1]['error'].startswith('het_han_cho_worker')
+
+
+def test_c3_19_r3_wait_constant():
+    """HAN_CHO_WORKER_S: a named constant, 600 s, >= 20 x the longest run of run01 (27.25 s,
+    05_DATA/results/SENS_TRE_SLIP/2026-11-22_run01/bang.csv t_chay_s)."""
+    assert sens.HAN_CHO_WORKER_S == 600.0 and sens.HAN_CHO_WORKER_S >= 20 * 27.25
+
+
+_WORKER_GIA = '''
+import os
+X = {x!r}
+REF = {ref!r}
+
+
+def _init(dll):
+    pass
+
+
+def _job_safe(job):
+    ctrl, delay, omega_s, mu, v = job
+    if tuple(job) == X:
+        os._exit(3)                       # the worker process is lost, as a native crash
+    return dict(controller=ctrl, io_delay_ms=delay, slip_omega_s=omega_s,
+                la_moc=(delay == REF[0] and omega_s == REF[1]), mu=mu, v=v, seed_plant=1,
+                seed_imu_noise=1, n_seed=1, slip_nsub=1, status='ok', completed='true',
+                e_perp_max=0.01 + 0.001 * delay, e_perp_max_cens=0.02, tv_duty=1.0 + v,
+                sat_frac=0.0, sat_any_frac=0.0, e_perp_global_max=0.03, e_perp_rms=0.005,
+                pos_reset_mid=0, gate_outcome='dat', error='', t_chay_s=0.0)
+'''
+
+_CHAY = '''
+import sys
+sys.path.insert(0, {fwsim!r})
+sys.path.insert(0, {tmp!r})
+import e5_worker_gia as g
+
+
+class FW:
+    def __init__(self, dll):
+        self.pos_cols = True
+        self.build_info = {{}}
+
+
+if __name__ == '__main__':
+    import sens_tre_slip as sens
+    sens.fwsim.FirmwareSim = FW
+    sens.s03.defaults = lambda fw, c: {{'g': c}}
+    sens.s03.THRESH['tv_duty'] = 0.4
+    sens._init = g._init
+    sens._job_safe = g._job_safe
+    sens.HAN_CHO_WORKER_S = float(sys.argv[1])
+    sens.main(sys.argv[2:])
+'''
+
+
+def test_c3_19_r3_worker_os_exit(tmp_path):
+    """C3-19 round 3 (c) (Codex: 'a worker dying in native code after taking a job: next(it)
+    can wait for a result that never comes'): a real mp.Pool whose worker calls os._exit on one
+    key, main run as a script. Round 2 code: next(it) waits forever (the script is killed at the
+    subprocess timeout, no meta.json). Now the script ends within the bound, writes every file,
+    the key in loi_worker (het_han_cho_worker), 'chưa kết luận'."""
+    (tmp_path / 'e5_worker_gia.py').write_text(
+        _WORKER_GIA.format(x=X_SO, ref=sens.REF), encoding='utf-8')
+    chay = tmp_path / 'chay.py'
+    chay.write_text(_CHAY.format(fwsim=os.path.dirname(os.path.abspath(sens.__file__)),
+                                 tmp=str(tmp_path)), encoding='utf-8')
+    dll, _ = _mk_dll(tmp_path, build=dict(esp32=dict(commit='5bde4c5', dirty=False),
+                                          dll_sha256=_SHA))
+    out = tmp_path / 'out'
+    han = 5.0
+    t0 = time.monotonic()
+    r = subprocess.run([sys.executable, str(chay), str(han), '--out', str(out), '--dll', dll,
+                        '--fw', str(tmp_path / 'khong_co_AGV'), '--ctrl', 'ADRC',
+                        '--workers', '2'],
+                       capture_output=True, text=True, timeout=90,
+                       env=dict(os.environ, PYTHONIOENCODING='utf-8'))
+    dt = time.monotonic() - t0
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert han <= dt < 90
+    meta = _meta(out)
+    assert meta['loi_worker'] == [dict(
+        khoa=sens._ks(X_SO), lan=1, ly_do='het_han_cho_worker',
+        error=f'het_han_cho_worker: no worker result within {han} s')]
+    kc = meta['kiem_cap']
+    assert kc['ket_luan'] == 'chưa kết luận' and kc['khoa_thieu'] == [sens._ks(X_SO)]
+    assert kc['n_khoa_co'] == 80 and meta['dung_lam_luot_xac_nhan'] is False
+    assert len(_read_csv(out / 'bang.csv')) == 80
+    for f in ('tom_tat.csv', 'tom_tat_theo_dieu_kien.csv', 'chay_lai.csv'):
+        assert (out / f).exists()
+    assert 'pool terminated' in r.stdout
 
 
 def test_c3_19_iterator_exception_recorded(tmp_path, monkeypatch):
@@ -842,3 +1110,114 @@ def test_c3_20_main_both_reasons(tmp_path, monkeypatch):
                              build='shaonly'))
     assert meta['dung_lam_luot_xac_nhan'] is False
     assert meta['ly_do_khong_dung'] == [ESP_DONG, Y3_DONG]
+
+
+# ── review round 3 (C3-20) ──────────────────────────────────────────────────────────
+
+_HEX40 = '5bde4c5' + '0123456789abcdef0123456789abcdef0'
+
+
+def _no_git(monkeypatch):
+    """commit_in_repo must not be called (no readable --fw folder or no valid commit)."""
+    def boom(fw, commit):
+        raise AssertionError('commit_in_repo called')
+    monkeypatch.setattr(sens, 'commit_in_repo', boom)
+
+
+def test_c3_20_r3_garbage_commit_main(tmp_path, monkeypatch):
+    """C3-20 round 3 (Codex: esp32.commit="garbage" with a boolean dirty still passed).
+    Round 2 code: nguon_build 'đã xác minh', dung_lam_luot_xac_nhan true. Now through main:
+    'khớp SHA, thiếu nguồn ESP32', not a confirmation run, esp32_commit None."""
+    _no_git(monkeypatch)
+    meta = _meta(_main_fakes(monkeypatch, tmp_path, build=dict(
+        esp32=dict(commit='garbage', dirty=False), dll_sha256=_SHA)))
+    assert meta['nguon_build'] == 'khớp SHA, thiếu nguồn ESP32'
+    assert meta['dll']['nguon_esp32_du'] is False and meta['dll']['esp32_commit'] is None
+    assert meta['dll']['build_verified'] is True and meta['dll']['esp32_commit_trong_repo'] is None
+    assert meta['kiem_cap']['ket_luan'] == 'đủ cặp'
+    assert meta['dung_lam_luot_xac_nhan'] is False and meta['ly_do_khong_dung'] == [ESP_DONG]
+
+
+@pytest.mark.parametrize('commit, ok', [
+    ('garbage', False),
+    ('5bde4c', False),                    # 6 hex: below the 7 character floor
+    ('5bde4c5', True),                    # 7: at the floor
+    (_HEX40, True),                       # 40: a full SHA-1
+    (_HEX40 + 'a', False),                # 41
+    ('5BDE4C5', True),                    # upper case hex
+    ('5bde4cg', False),                   # one non-hex character
+    (' 5bde4c5', False), ('5bde4c5\n', False),
+    ('UNKNOWN', False), ('', False),
+    (1234567, False),                     # not a string
+])
+def test_c3_20_r3_commit_format(commit, ok, tmp_path, monkeypatch):
+    """esp32.commit counts only as a 7-40 character hex string (COMMIT_RE.fullmatch)."""
+    _no_git(monkeypatch)
+    dll, _ = _mk_dll(tmp_path, build=dict(esp32=dict(commit=commit, dirty=False),
+                                          dll_sha256=_SHA))
+    info = sens.dll_info(dll)
+    assert info['nguon_esp32_du'] is ok
+    assert info['esp32_commit'] == (commit if ok else None)
+    assert info['nguon_build'] == ('đã xác minh' if ok else 'khớp SHA, thiếu nguồn ESP32')
+
+
+@pytest.mark.parametrize('in_repo', (True, False))
+def test_c3_20_r3_commit_in_fw_repo(in_repo, tmp_path, monkeypatch):
+    """A readable --fw folder: the commit must be a commit of that repo (commit_in_repo stub;
+    no real git). Not found: 'khớp SHA, thiếu nguồn ESP32' and a warning, through main."""
+    seen = []
+
+    def stub(fw, commit):
+        seen.append((fw, commit))
+        return in_repo
+    monkeypatch.setattr(sens, 'commit_in_repo', stub)
+    agv = tmp_path / 'AGV_FIRMWARE'
+    agv.mkdir()
+    meta = _meta(_main_fakes(monkeypatch, tmp_path, fw=agv))
+    assert seen == [(os.path.abspath(str(agv)), '5bde4c5')]
+    d = meta['dll']
+    assert d['fw_dir'] == os.path.abspath(str(agv)) and d['esp32_commit_trong_repo'] is in_repo
+    assert d['nguon_esp32_du'] is in_repo
+    assert meta['nguon_build'] == ('đã xác minh' if in_repo else 'khớp SHA, thiếu nguồn ESP32')
+    assert meta['dung_lam_luot_xac_nhan'] is in_repo
+    assert meta['ly_do_khong_dung'] == ([] if in_repo else [ESP_DONG])
+    assert any('not a commit of the AGV repo' in w for w in meta['warnings']) is (not in_repo)
+
+
+def test_c3_20_r3_fw_not_readable(tmp_path, monkeypatch):
+    """--fw missing (or fw None in dll_info): no git check, esp32_commit_trong_repo None; the
+    format rule alone decides."""
+    _no_git(monkeypatch)
+    dll, _ = _mk_dll(tmp_path, build=dict(esp32=dict(commit='5bde4c5', dirty=False),
+                                          dll_sha256=_SHA))
+    for fw in (None, str(tmp_path / 'khong_co'), dll):          # a file is not a folder
+        info = sens.dll_info(dll, fw)
+        assert info['esp32_commit_trong_repo'] is None and info['nguon_build'] == 'đã xác minh'
+
+
+def test_c3_20_r3_commit_in_repo_git_call(monkeypatch):
+    """commit_in_repo runs 'git -C <fw> cat-file -e <commit>^{commit}' (subprocess stub):
+    exit 0 = True; other exit code, OSError (no git), timeout = False."""
+    calls = []
+
+    def run(argv, **kw):
+        calls.append((argv, kw))
+        return subprocess.CompletedProcess(argv, rc[0], '', '')
+    monkeypatch.setattr(sens.subprocess, 'run', run)
+    rc = [0]
+    assert sens.commit_in_repo('D:/x/AGV', '5bde4c5') is True
+    assert calls[0][0] == ['git', '-C', 'D:/x/AGV', 'cat-file', '-e', '5bde4c5^{commit}']
+    assert calls[0][1]['timeout'] == sens.GIT_TIMEOUT_S
+    rc[0] = 128
+    assert sens.commit_in_repo('D:/x/AGV', '5bde4c5') is False
+    for exc in (OSError('no git'), subprocess.TimeoutExpired('git', 1)):
+        def run_exc(argv, exc=exc, **kw):
+            raise exc
+        monkeypatch.setattr(sens.subprocess, 'run', run_exc)
+        assert sens.commit_in_repo('D:/x/AGV', '5bde4c5') is False
+
+
+def test_c3_20_r3_build_verified_doc():
+    """The dll_info docstring says build_verified confirms only the DLL SHA."""
+    doc = ' '.join(sens.dll_info.__doc__.split())
+    assert 'build_verified (= sidecar_khop_sha) confirms only the DLL SHA-256' in doc

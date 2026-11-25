@@ -57,9 +57,15 @@ checked (completeness(), meta.json kiem_cap): still failing, missing or duplicat
 ket_luan 'chưa kết luận' (report to Liam). A pair counts only when both runs hold Y1
 (completed), the gate outcome and finite Y2 (e_perp_max), Y3 (tv_duty) (C3-29; meta.json
 kiem_cap cap_khong_so_duoc, khoa_thieu_dai_luong). An exception raised by a worker or the
-pool iterator does not stop the script: its key goes to meta.json loi_worker, ket_luan
-'chưa kết luận' (C3-19). The build origin is verified only when fwsim_build.json dll_sha256
-equals the DLL sha256 and the json holds the ESP32 source (esp32.commit, esp32.dirty) (C3-20,
+pool iterator does not stop the script: its key goes to meta.json loi_worker. A worker
+exception keeps its key and is run once more in a new pool like a run_error (C3-19 round 3:
+both attempts in chay_lai.csv, status 'loi_worker' for an attempt that raised); still failing =
+the key is missing, 'chưa kết luận'. The wait for each worker result is bounded
+(HAN_CHO_WORKER_S): a worker dying in native code cannot hang the script; past the bound the
+keys not returned go to loi_worker (ly_do 'het_han_cho_worker'), the pool is terminated,
+'chưa kết luận'. The build origin is verified only when fwsim_build.json dll_sha256
+equals the DLL sha256 and the json holds the ESP32 source (esp32.commit a 7-40 character hex
+commit, of the --fw AGV repo when that folder is readable, and esp32.dirty) (C3-20,
 meta.json dll.sidecar_khop_sha, dll.nguon_esp32_du, nguon_build); an unverified build or an
 inconclusive grid is not a confirmation run before S03 main (meta.json
 dung_lam_luot_xac_nhan). This script does not compare with run01.
@@ -76,6 +82,7 @@ import json
 import math
 import multiprocessing as mp
 import os
+import re
 import subprocess
 import sys
 import time
@@ -100,6 +107,17 @@ MU_SOURCE = ('05_DATA/results/S03/2026-11-10_run02/meta.yaml line 18 mu_levels '
 SEED = s03.SEED                                         # plant seed and IMU noise seed (s03.IMU)
 RESPONSES = s03.RESPONSES                               # e_perp_max, e_perp_max_cens, tv_duty, sat_frac
 DEFAULT_DLL = os.path.join(HERE, 'build', 'fwsim.dll')  # output of fwsim/build_fwsim.py
+DEFAULT_FW = os.path.join(HERE, '..', '..', 'AGV_FIRMWARE')  # the build_fwsim.py --fw default
+# C3-19 round 3: longest wait [s] for the next worker result. Basis: the longest run of
+# 05_DATA/results/SENS_TRE_SLIP/2026-11-22_run01/bang.csv is t_chay_s 27.25 s (PID,
+# io_delay_ms 0, slip_omega_s 0.05, mu 0.473, v 0.2; 162 runs, 8 workers); 600 s is about
+# 22 x that run (convention: a 20x margin, rounded up). imap_unordered returns results as they
+# finish, so with every worker alive the gap between two results is at most about one run.
+HAN_CHO_WORKER_S = 600.0
+HET_HAN = 'het_han_cho_worker'
+LOI_STATUS = ('run_error', 'loi_worker')               # attempts that are rerun once (C3-19)
+COMMIT_RE = re.compile(r'[0-9a-fA-F]{7,40}')            # esp32.commit: short or full git SHA-1
+GIT_TIMEOUT_S = 60                                      # git cat-file bound (convention)
 THRESH_SOURCE = 'fwsim/s03_doe.py THRESH (S03 section 5.2, read at run time)'
 TEN_C2 = {'e_perp_max': 'Y1', 'e_perp_max_cens': 'Y1 (cens)', 'sat_frac': 'Y2', 'tv_duty': 'Y3'}
 TEN_S03 = {'e_perp_max': 'Y2', 'e_perp_max_cens': 'Y2 (cens)', 'tv_duty': 'Y3', 'sat_frac': 'Y4'}
@@ -193,6 +211,17 @@ def _job_safe(job):
         return dict(_loi_worker=f'{type(exc).__name__}: {exc}', _khoa=tuple(job))
 
 
+def _loi_row(k, error, het_han=False):
+    """Stand-in row of a key whose attempt gave no row (worker exception or no result within
+    HAN_CHO_WORKER_S): status 'loi_worker', so it is rerun (exception) and written as an
+    attempt of chay_lai.csv; main drops it from the final rows (the key is then missing)."""
+    ctrl, delay, omega_s, mu, v = k
+    return dict(controller=ctrl, io_delay_ms=delay, slip_omega_s=omega_s,
+                la_moc=(delay == REF[0] and omega_s == REF[1]), mu=mu, v=v,
+                status='loi_worker', completed='', error=error, slip_nsub='', t_chay_s='',
+                _khong_ket_qua=True, _het_han=het_han)
+
+
 # ── summaries ───────────────────────────────────────────────────────────────────────
 
 def _hieu(g, gm):
@@ -264,7 +293,9 @@ def completeness(rows, ctrls, loi_worker=()):
     (comparison run + reference run of the same controller, mu, v) present without run_error.
     C3-29: a present pair counts only when both runs hold Y1, the gate outcome and finite Y2, Y3
     (missing_quantities; else cap_khong_so_duoc, the runs in khoa_thieu_dai_luong). loi_worker:
-    exceptions of the pool (main run_pool). Any failure: ket_luan 'chưa kết luận'."""
+    the pool errors left unresolved (main: iterator errors, het_han_cho_worker, exceptions whose
+    key has no successful row; an exception rerun with success is not passed). Any failure:
+    ket_luan 'chưa kết luận'."""
     want = [tuple(j) for j in make_jobs(ctrls)]
     wset = set(want)
     cnt = Counter(key_of(r) for r in rows)
@@ -303,21 +334,22 @@ def completeness(rows, ctrls, loi_worker=()):
 
 
 def merge_retries(rows, retry_rows):
-    """Rows of the first pass with each run_error row replaced by its rerun (same key) when the
-    rerun returned. Returns (rows, attempts, loi_chua_ro): attempts = both attempts of every
-    rerun key (attempt 1, 2; S03 section 8 condition 12 'báo cả hai lần'), loi_chua_ro = keys
-    whose rerun succeeded after a run_error ('lỗi chưa rõ nguyên nhân')."""
+    """Rows of the first pass with each run_error or loi_worker row (LOI_STATUS) replaced by its
+    rerun (same key) when the rerun returned; a run_error row is kept when its rerun gave only a
+    loi_worker stand-in (C3-19 round 3). Returns (rows, attempts, loi_chua_ro): attempts = both
+    attempts of every rerun key (attempt 1, 2; S03 section 8 condition 12 'báo cả hai lần'),
+    loi_chua_ro = keys whose rerun succeeded after an error ('lỗi chưa rõ nguyên nhân')."""
     retry = {key_of(r): r for r in retry_rows}
     out, attempts, loi_chua_ro = [], [], []
     for r in rows:
         k = key_of(r)
-        if r.get('status') != 'run_error' or k not in retry:
+        if r.get('status') not in LOI_STATUS or k not in retry:
             out.append(r)
             continue
         r2 = retry[k]
-        out.append(r2)
+        out.append(r if r2.get('_khong_ket_qua') and not r.get('_khong_ket_qua') else r2)
         attempts += [dict(r, attempt=1), dict(r2, attempt=2)]
-        if r2.get('status') != 'run_error':
+        if r2.get('status') not in LOI_STATUS:
             loi_chua_ro.append(dict(khoa=_ks(k), error_lan_1=r.get('error', ''),
                                     status_lan_2=r2.get('status', ''),
                                     ghi_chu='lỗi chưa rõ nguyên nhân'))
@@ -398,6 +430,9 @@ def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--out', default='ket_qua_c2')
     ap.add_argument('--dll', default=DEFAULT_DLL)
+    ap.add_argument('--fw', default=DEFAULT_FW,
+                    help='AGV_FIRMWARE git tree; when this folder is readable, esp32.commit of '
+                         'fwsim_build.json must be a commit of it (C3-20)')
     ap.add_argument('--workers', type=int, default=8)
     ap.add_argument('--ctrl', nargs='+', choices=CONTROLLERS, default=list(CONTROLLERS),
                     help='controllers to run (default both); --ctrl ADRC = LADRC only, 81 runs')
@@ -420,18 +455,40 @@ def full_command(args, ctrls):
     command_full_argv): a rerun needs only to copy it."""
     return [sys.executable, os.path.abspath(__file__),
             '--out', os.path.abspath(args.out), '--dll', os.path.abspath(args.dll),
+            '--fw', os.path.abspath(args.fw),
             '--workers', str(args.workers), '--ctrl', *ctrls]
 
 
-def dll_info(dll):
+def fw_readable(fw):
+    """True when fw names a readable folder (the AGV tree to resolve esp32.commit in)."""
+    return fw is not None and os.path.isdir(fw) and os.access(fw, os.R_OK)
+
+
+def commit_in_repo(fw, commit):
+    """True when commit names a commit object of the git repo fw (C3-20):
+    'git -C <fw> cat-file -e <commit>^{commit}' exits 0. False on any other exit code, when
+    git cannot be run or does not end within GIT_TIMEOUT_S."""
+    try:
+        r = subprocess.run(['git', '-C', fw, 'cat-file', '-e', f'{commit}^{{commit}}'],
+                           capture_output=True, text=True, timeout=GIT_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+def dll_info(dll, fw=None):
     """Provenance of --dll: absolute path, sha256, the fwsim_build.json next to it and
     warnings; never exits (a sensitivity trial continues on an unknown or dirty build).
-    The build origin is verified (build_verified, nguon_build 'đã xác minh') only when the
-    json's dll_sha256 equals the sha256 of this DLL (C3-20); otherwise 'chưa xác minh' and
-    esp32_dirty is None (the json's fields stay in fwsim_build, as read, not as a result).
-    Two states (C3-20, round 2): sidecar_khop_sha (= build_verified, the json is tied to this
-    DLL) and nguon_esp32_du (that json also holds esp32.commit and a boolean esp32.dirty);
-    nguon_build 'đã xác minh' needs both, 'khớp SHA, thiếu nguồn ESP32' when only the first."""
+    build_verified (= sidecar_khop_sha) confirms only the DLL SHA-256: the json's dll_sha256
+    equals the sha256 of this DLL (C3-20). It says nothing of the ESP32 source; a reader must
+    also require nguon_esp32_du (nguon_build 'đã xác minh') before using the results. Without
+    the SHA match: 'chưa xác minh' and esp32_dirty None (the json's fields stay in fwsim_build,
+    as read, not as a result).
+    nguon_esp32_du (C3-20 rounds 2, 3): the SHA matches and the json holds esp32.commit as a
+    7-40 character hex string (COMMIT_RE; not 'UNKNOWN', empty or other text) and a boolean
+    esp32.dirty; when fw (--fw) is a readable folder the commit must also be a commit of that
+    repo (commit_in_repo; esp32_commit_trong_repo True / False, None = not checked).
+    nguon_build 'đã xác minh' needs both, 'khớp SHA, thiếu nguồn ESP32' when only the SHA."""
     path = os.path.abspath(dll)
     sha = s03.sha256_file(dll)
     build_json = os.path.join(os.path.dirname(path), 'fwsim_build.json')
@@ -473,18 +530,26 @@ def dll_info(dll):
         esp32_dirty = None
     esp32 = (build or {}).get('esp32') or {}
     commit = esp32.get('commit')
-    esp32_commit = commit if verified and isinstance(commit, str) and commit.strip() \
-        and commit != 'UNKNOWN' else None
+    esp32_commit = commit if verified and isinstance(commit, str) \
+        and COMMIT_RE.fullmatch(commit) else None
+    fw_dir = os.path.abspath(fw) if fw is not None else None
+    trong_repo = commit_in_repo(fw_dir, esp32_commit) \
+        if esp32_commit is not None and fw_readable(fw_dir) else None
     # C3-20: the ESP32 source of a sidecar tied to this DLL is complete with a commit and a
     # boolean dirty state (dirty true still counts: no "clean build" rule is decided)
-    esp32_ok = esp32_commit is not None and isinstance(esp32_dirty, bool)
+    esp32_ok = esp32_commit is not None and isinstance(esp32_dirty, bool) and trong_repo is not False
+    if trong_repo is False:
+        warnings.append(f'esp32.commit {esp32_commit} of fwsim_build.json is not a commit of the '
+                        f'AGV repo {fw_dir} (git cat-file -e)')
     if verified and not esp32_ok:
         warnings.append('fwsim_build.json matches the DLL sha256 but lacks the ESP32 source '
-                        '(esp32.commit, esp32.dirty): the firmware the DLL was built from is '
+                        '(esp32.commit as a 7-40 character hex commit, of the --fw repo when '
+                        'readable, esp32.dirty): the firmware the DLL was built from is '
                         'unknown; sensitivity trial, run continues')
     return dict(path=path, sha256=sha, fwsim_build_json=build_json, fwsim_build=build,
                 esp32_dirty=esp32_dirty, build_verified=verified,
-                sidecar_khop_sha=verified, esp32_commit=esp32_commit, nguon_esp32_du=esp32_ok,
+                sidecar_khop_sha=verified, esp32_commit=esp32_commit, fw_dir=fw_dir,
+                esp32_commit_trong_repo=trong_repo, nguon_esp32_du=esp32_ok,
                 nguon_build=('đã xác minh' if verified and esp32_ok else
                              'khớp SHA, thiếu nguồn ESP32' if verified else 'chưa xác minh'),
                 warnings=warnings)
@@ -503,7 +568,7 @@ def main(argv=None):
     fw0 = fwsim.FirmwareSim(args.dll)
     if not fw0.pos_cols:
         sys.exit('fwsim.dll has no pos_ctrl.c: C2 needs the campaign firmware')
-    info = dll_info(args.dll)
+    info = dll_info(args.dll, args.fw)
     for w in info['warnings']:
         print(f'WARNING: {w}', flush=True)
     gains = {c: s03.defaults(fw0, c) for c in ctrls}
@@ -514,14 +579,26 @@ def main(argv=None):
     loi_worker = []          # C3-19: exceptions out of the pool, recorded instead of exiting
 
     def run_pool(js, tag='', lan=1):
-        out, n_exc = [], 0
+        """Rows of js; a worker exception or a key without result within HAN_CHO_WORKER_S
+        gives a _loi_row stand-in (C3-19 round 3) and a loi_worker entry."""
+        out, n_exc, ve = [], 0, set()
         with mp.Pool(processes=n_workers, initializer=_init, initargs=(args.dll,)) as pool:
             it = pool.imap_unordered(_job_safe, js)
             i = 0
             while True:
                 try:
-                    row = next(it)
+                    row = it.next(timeout=HAN_CHO_WORKER_S)
                 except StopIteration:
+                    break
+                except mp.TimeoutError:
+                    cho = [tuple(j) for j in js if tuple(j) not in ve]
+                    err = f'{HET_HAN}: no worker result within {HAN_CHO_WORKER_S} s'
+                    for k in cho:
+                        loi_worker.append(dict(khoa=_ks(k), lan=lan, error=err, ly_do=HET_HAN))
+                        out.append(_loi_row(k, err, het_han=True))
+                    print(f'{tag}WARNING: no worker result within {HAN_CHO_WORKER_S} s, '
+                          f'{len(cho)} keys not returned, pool terminated', flush=True)
+                    pool.terminate()
                     break
                 except Exception as exc:     # noqa: BLE001 (raised by the iterator itself)
                     n_exc += 1
@@ -533,9 +610,13 @@ def main(argv=None):
                     continue
                 i += 1
                 if '_loi_worker' in row:
-                    loi_worker.append(dict(khoa=_ks(row['_khoa']), lan=lan, error=row['_loi_worker']))
-                    print(f'{tag}[{i}/{len(js)}] {_ks(row["_khoa"])} worker exception', flush=True)
+                    k = tuple(row['_khoa'])
+                    ve.add(k)
+                    loi_worker.append(dict(khoa=_ks(k), lan=lan, error=row['_loi_worker']))
+                    out.append(_loi_row(k, row['_loi_worker']))
+                    print(f'{tag}[{i}/{len(js)}] {_ks(k)} worker exception', flush=True)
                     continue
+                ve.add(key_of(row))
                 out.append(row)
                 print(f"{tag}[{i}/{len(js)}] {row['controller']} delay={row['io_delay_ms']} "
                       f"omega_s={row['slip_omega_s']} mu={row['mu']} v={row['v']} "
@@ -543,14 +624,21 @@ def main(argv=None):
         return out
 
     rows = run_pool(jobs)
-    # S03 section 8 condition 12: a run_error is run once more, in a new pool (new processes)
-    retry_jobs = [key_of(r) for r in rows if r.get('status') == 'run_error']
+    # S03 section 8 condition 12: a run_error is run once more, in a new pool (new processes);
+    # C3-19 round 3: so is a worker exception (not a key past HAN_CHO_WORKER_S)
+    retry_jobs = [key_of(r) for r in rows
+                  if r.get('status') in LOI_STATUS and not r.get('_het_han')]
+    n_run_error_1 = sum(r.get('status') == 'run_error' for r in rows)
     retry_rows = run_pool(retry_jobs, 'rerun ', 2) if retry_jobs else []
     rows, attempts, loi_chua_ro = merge_retries(rows, retry_rows)
+    rows = [r for r in rows if not r.get('_khong_ket_qua')]     # still no row: key missing
     rows.sort(key=lambda r: (CONTROLLERS.index(r['controller']), r['io_delay_ms'],
                              r['slip_omega_s'], r['mu'], r['v']))
     refs = {(r['controller'], r['mu'], r['v']): r for r in rows if r['la_moc']}
-    kiem_cap = completeness(rows, ctrls, loi_worker)
+    ok_keys = {_ks(key_of(r)) for r in rows if r.get('status') != 'run_error'}
+    loi_con = [e for e in loi_worker
+               if not e['khoa'] or e.get('ly_do') == HET_HAN or e['khoa'] not in ok_keys]
+    kiem_cap = completeness(rows, ctrls, loi_con)
 
     s03.write_csv(bang, rows, BANG_COLS)
     s03.write_csv(os.path.join(args.out, 'tom_tat_theo_dieu_kien.csv'),
@@ -575,7 +663,7 @@ def main(argv=None):
         fwsim_build_json=info['fwsim_build_json'], fwsim_build=info['fwsim_build'],
         esp32_dirty=info['esp32_dirty'], warnings=info['warnings'],
         nguon_build=info['nguon_build'],
-        kiem_cap=kiem_cap, n_run_error_lan_1=len(retry_jobs),
+        kiem_cap=kiem_cap, n_run_error_lan_1=n_run_error_1,
         loi_chua_ro_nguyen_nhan=loi_chua_ro, chay_lai_csv='chay_lai.csv', loi_worker=loi_worker,
         dung_lam_luot_xac_nhan=not ly_do, ly_do_khong_dung=ly_do,
         gains=gains,
