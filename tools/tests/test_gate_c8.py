@@ -3743,6 +3743,29 @@ def test_d2_ghep_takes_the_masked_grid_beside_luoi_json(tmp_path):
         _ghep(goc, ho_so='chuan_u/ho_so_ghep2.json')
 
 
+def test_d2_1a_so_do_and_ghep_under_the_mask(tmp_path):
+    """D2-1a: a so_do condition (G5 at F08) of a masked grid is decided on the q of the frames the mask leaves defined
+    at the middle node (not the q_so_do of the node file); ghep takes the outcome of the masked grid."""
+    d, goc = build_c8(tmp_path)
+    c = d['o_c8'][4]
+    x = c['chuoi'][0]
+    assert c['muc'] == 'O1-F08'
+    _cham_lai(goc, d, x, c, {2: {'g5': 6.0}}, che={x['run_id']: {2}})   # the largest heading error on a masked frame
+    lu, fd = _doc(goc, x['file_cham']), _doc(goc, x['file_cham_d2'])
+    assert lu['q_so_do']['g5']['q'] == 6.0 and lu['states']['g5'] == 'dat' and lu['outcome'] == 'dat'
+    assert fd['q_so_do']['g5'] == dict(nut=0, q=5.0, q_chung=5.0) and fd['nums']['g5']['n_undef'] == 1
+    assert fd['states']['g5'] == 'chua_ket_luan' and fd['outcome'] == 'chua_ket_luan'
+    with pytest.raises(GC.GateFileError, match="outcome is 'chua_ket_luan'"):    # past the checks of the masked grid
+        GC.check_nguon(d, goc)
+    for cc in d['o_c8']:
+        for j, y in enumerate(cc['chuoi']):
+            y['run_id'] = cc['o'] + (f'_lai{j}' if j else '')
+    _d2_all(goc, d, che={x['run_id']: {2}})
+    g = _ghep(goc)
+    assert g['o_c8'][4]['chuoi'][0]['ket_qua'] == 'chua_ket_luan'       # luoi.json says dat
+    assert g['o_c8'][4]['chuoi'][0]['file_cham_d2'] == x['file_cham_d2']
+
+
 # ── D3-8: the later HC_goc ends of D3 ────────────────────────────────────────────────────────────────────────
 
 def _hc_goc(goc, d, k, clip):
