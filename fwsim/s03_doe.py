@@ -1450,6 +1450,7 @@ def main():
     stop_case = None                                  # S03 v8.4: '(i)' / '(ii)' when the sweep stopped there
     kiem_rows, kiem_sum = [], {}
     stop_before, stop_public, stop_sealed = None, None, None   # before the sweep / sweep / sealed window
+    worker_tree_stopped = True
     stop_test, test_rows, test_notes, test_s = None, [], [], None
     t_sweep_end = None
     t_sl0 = t_sl1 = t_md0 = t_md1 = None        # _mono() bounds of the screening step and main design
@@ -1489,6 +1490,13 @@ def main():
         raise S03Stop(f'run_error at {ctrl} {g} v={v} mu={mu}: {note["first"]}; rerun in a new process: '
                       f'{note["second"]} (B8b-20: S03 stops, CODE finds the cause)')
 
+    def final_status():
+        return ('stopped before the sweep: ' + stop_before if stop_before else
+                'stopped in the sweep: ' + stop_public if stop_public else
+                'stopped after the sweep (the reason is in sealed/stop.json)' if stop_sealed else
+                'stopped in the test set (the reason is in sealed_test/stop.json)'
+                if stop_test else 'ran to the end')
+
     def write_meta(final, running=None):
         """meta.yaml (S03 section 7, 8.9, 8.10): written three times — at the start, before the
         first run (final=False, running 'started': the SHA-256 of the numbers file is public from
@@ -1515,11 +1523,7 @@ def main():
             tset = ('not run (S03 stopped before it)' if (stop_before or stop_public or stop_sealed)
                     else 'sealed in sealed_test/ (not looked at before the RSM coefficients are '
                     'saved, S03 v8 section 7)')
-            stat = ('stopped before the sweep: ' + stop_before if stop_before else
-                    'stopped in the sweep: ' + stop_public if stop_public else
-                    'stopped after the sweep (the reason is in sealed/stop.json)' if stop_sealed
-                    else 'stopped in the test set (the reason is in sealed_test/stop.json)'
-                    if stop_test else 'ran to the end')
+            stat = final_status()
             if changed:
                 stat += '; the script or evaluator sources changed during the run (S3G-1); ' \
                         'see meta.yaml source_check'
@@ -1553,8 +1557,7 @@ def main():
                          kiem_cong_cu=(dict(n0=a.sangloc_thu_n0, n=a.sangloc_thu_n)
                                        if screening == 'thu' else None))
         kep_channel = bool(getattr(fw, 'kep_cols', 0))
-        with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
-            f.write(f"""spec: S03 v8.6 (06_SPECS/2026-11-05_Spec_S03_DOE_chon_gain.md)
+        text = f"""spec: S03 v8.6 (06_SPECS/2026-11-05_Spec_S03_DOE_chon_gain.md)
 date: {time.strftime('%Y-%m-%d')}
 setup: sim                     # fwsim: ESP32 firmware C code (DLL) + rpi5/plant_step.py, NOT hardware
 operator: Claude (phiên CODE)
@@ -1634,10 +1637,10 @@ interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THES
   - "sealed/notes.json pha: no entry with the label 'bo' (this script cannot resume a run; a new run needs a new folder)"
   - "the --sangloc-thu numbers file must be committed and is checked bit for bit against the seeds 2026112105..09; every numbers file is regenerated in memory by (mode, r, t) and compared bit for bit and as the canonical text before the sweep (S03 3.1b item 3, 8.11; Codex C3-36)"
   - "a run with the screening step needs both controllers PID and ADRC, each once, and three finite, distinct mu levels (exact binary64 comparison); --trial keeps its own rule (S03 2.2, 3.1b items 1, 5, 10; Codex C3-37)"
-  - "the closing of sealed/ is guarded (Codex C3-38): stop.json is written first when a stop is pending; a failure while writing the sealed outputs becomes a 'dong_niem_phong' stop and stop.json / diag.txt / manifest.json are rewritten best effort — meta.yaml never stays at 'running'"
+  - "when a stop is pending, stop.json is written first. A failure while closing sealed/ becomes a 'dong_niem_phong' stop. An atomic update of meta.yaml keeps the previous copy if the update fails (Codex C3-38)"
   - "sealed/notes.json: every phase entry exists from the phase start with trang_thai, moc_bat_dau, moc_ket_thuc and n_luot_tong (Codex C3-39, D2A-2); t_S0 of sangloc_thu/so_dem.json is the monotonic time of the whole S0 phase; elapsed_s_main_design is the main design only and elapsed_s_sang_loc the screening step (the field rsm_compare.shared_cost_rows reads keeps its name)"
-  - "a worker of the screening pool that dies while running a gain set makes that set a run_error of the gain set (one diagnosis rerun in a new process at the middle mu, never replacing it), the rest of the job runs in a new worker and S03 goes on; a worker dead before or between gain sets is a tool error; wait limits 7200 s per job, 600 s per diagnosis rerun, 30 s to end a killed worker (S03 3.1b item 5; Codex C3-40)"
-  - "sealed/sangloc_thu/loi_S0.json holds only the number of unclassifiable S0 gain sets per controller and mode and the error text of the S0 error runs (first attempt and diagnosis), and is the one sealed file the CODE session may read before campaign A ends (S03 3.1b items 5, 13; D2A-3)"
+  - "screening workers checkpoint each evaluation attempt. A crash preserves completed evaluations, triggers a fresh-process diagnosis for an interrupted first attempt and marks skipped evaluations not_run. The wait limits are 7200 s per job, 600 s per crash diagnosis and 30 s to end a worker tree. sealed/ closes after the trees have stopped (S03 3.1b item 5, Codex C3-50 and C3-51)"
+  - "CODE may read sealed/sangloc_thu/loi_S0.json before campaign A ends. It holds unclassifiable S0 gain-set counts per controller and mode and fixed error codes (S03 3.1b items 5 and 13, Codex C3-52)"
   - "v8.2: the public sweep carries the G columns too (Liam 14/11 CODE_FEAS 'Co, mot cach cham'); G3-G5 are not responses of section 5"
 elapsed_s: {sweep_s}
 file_sha256: {json.dumps(files)}
@@ -1649,7 +1652,17 @@ files:
   - logs_sweep/: "npz of the sweep runs not completed"
   - sealed/: "SEALED (L56): levels_sangloc.csv (the screening or fallback levels, section 3.2 'Nguồn mức'), design.csv (371 rows per controller: centre, outer box, inner box, axial points, test points; v8.6: ngoai_tam_giac), sangloc/, sangloc_thu/ (the screening step of section 3.1b), runs.csv (section 4 responses; centre, outer, inner, axial; kep_frac_vx/vy/wz columns at the end), effects.csv (every term, per box, response, speed, mu / worst / range; outer and inner only), curvature.csv (5.4), y2_versions.csv (5.1), fail_counts.csv (5.3), determinism_check.csv (3.4), notes.json (v8.6: ngoai_tam_giac_points per controller, pha), stop.json, diag.txt (prints, warnings, tracebacks of the sealed phases), manifest.json, logs/"
   - sealed_test/: "SEALED separately (S03 v8 section 7): runs_test.csv, logs/, notes.json (v8.6: ngoai_tam_giac_points per controller, test points), stop.json, diag.txt (warnings, prints, traceback of the test phase), manifest.json; opened only after the RSM coefficients at the middle mu are saved and committed"
-""")
+"""
+        tmp = os.path.join(a.out, '.meta.yaml.tmp')
+        f = open(tmp, 'x', encoding='utf-8')
+        try:
+            with f:
+                f.write(text)
+            os.replace(tmp, os.path.join(a.out, 'meta.yaml'))
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
 
     # ── step 1 (S03 v8.5 section 7 'Thứ tự chạy khóa', 3.1b item 13): the committed input files
     # are read ONCE, before any run; a failed check is a public stop BEFORE the sweep (no result
@@ -1672,7 +1685,13 @@ files:
     if stop_before is None:
         # S03 section 8 condition 9: the SHA-256 of the numbers file is in the public meta.yaml
         # from the start of the run, before the first firmware run
-        write_meta(final=False, running='running: started; the sweep is not finished')
+        try:
+            write_meta(final=False, running='running: started; the sweep is not finished')
+        except OSError:
+            stop_before = 'writing meta.yaml failed'
+            print(f'S03 finished -> {a.out}; status: {final_status()}')
+            return 2
+    if stop_before is None:
         try:
             # 3.1 (i) first, for every controller, so S03 stops before any sweep (S3C-9)
             for ctrl in a.controllers:
@@ -1981,6 +2000,7 @@ files:
             except S03Stop as exc:
                 pha_notes += getattr(exc, 'pha_notes', [])        # run_step's phase notes (C3-39)
                 stop_sealed = dict(pha=pha_name, ly_do=str(exc))
+                worker_tree_stopped = not isinstance(exc, sl.WorkerTreeStop)
             except Exception as exc:            # noqa: BLE001 (item 13: any failure stays sealed)
                 pha_notes += getattr(exc, 'pha_notes', [])
                 stop_sealed = dict(pha=pha_name, ly_do=f'{type(exc).__name__}: {exc}')
@@ -2002,6 +2022,8 @@ files:
             """sealed/manifest.json from the files ON DISK: the six CSVs, levels_sangloc.csv,
             design.csv, notes.json, diag.txt, stop.json (each when it exists) and every file
             under sangloc/ and sangloc_thu/ (relative name with '/')."""
+            if not worker_tree_stopped:
+                return
             sfiles = {}
             for name in ('runs.csv', 'effects.csv', 'curvature.csv', 'y2_versions.csv',
                          'fail_counts.csv', 'determinism_check.csv', 'levels_sangloc.csv',
@@ -2032,8 +2054,10 @@ files:
             # S3V8-1: the empty work folders of the sweep, of the main design and of the screening
             # worker pools are removed BEFORE sealed/ is written and closed; after the manifest
             # only sealed_test/ changes
-            for d in (work_pub, work_sealed, os.path.join(sealed, 'sangloc', '_work'),
-                      os.path.join(sealed, 'sangloc_thu', '_work')):
+            work_dirs = [work_pub, work_sealed]
+            if worker_tree_stopped:
+                work_dirs += [os.path.join(sealed, sub, '_work') for sub in ('sangloc', 'sangloc_thu')]
+            for d in work_dirs:
                 if os.path.isdir(d) and not os.listdir(d):
                     os.rmdir(d)
             # sealed outputs, with their own manifest (no hash of a sealed file outside sealed/, S3C-1)
@@ -2098,7 +2122,7 @@ files:
                 _manifest()
             except Exception:           # noqa: BLE001,S110
                 pass
-    # sealed/ is closed here: nothing below writes in it (S03 v8 section 7)
+    # The parent has finished writing sealed/ (S03 v8 section 7).
 
     # v8 (L67, S38-8): the test set of both controllers runs only now, after sealed/ is written,
     # so sealed/ does not depend on it; everything about it stays in sealed_test/
@@ -2149,6 +2173,10 @@ files:
                     write(f_)
                 test_files[name] = sha256_file(p_)
 
+            def write_test_manifest():
+                with open(os.path.join(sealed_test, 'manifest.json'), 'w', encoding='utf-8') as f_:
+                    json.dump(dict(files=test_files), f_, indent=1)
+
             test_files = {}
             try:
                 if os.path.isdir(work_test) and not os.listdir(work_test):    # before the manifest
@@ -2166,8 +2194,7 @@ files:
                                                                 for c in a.controllers}),
                                                        f_, indent=1, default=str))
                 put('diag.txt', lambda f_: f_.write(diag_text()))
-                with open(os.path.join(sealed_test, 'manifest.json'), 'w', encoding='utf-8') as f_:
-                    json.dump(dict(files=test_files), f_, indent=1)
+                write_test_manifest()
             except Exception as exc:          # noqa: BLE001 (R2-1: an output error is a stop, kept sealed)
                 out_error = f'{type(exc).__name__}: {exc}'
                 traceback.print_exc(file=diag)
@@ -2182,7 +2209,17 @@ files:
                         pass
         # the test-set stop is not printed: after the sweep the console prints one line when
         # S03 ends (v8.5 3.1b item 13); the status string carries the phase
-    write_meta(final=True)                       # the real status, source check, counts
+    try:
+        write_meta(final=True)
+    except Exception as exc:                    # keep the last complete meta and the fixed end line
+        if not (stop_before or stop_public or stop_sealed or stop_test):
+            stop_test = f'writing final meta.yaml failed: {type(exc).__name__}: {exc}'
+            traceback.print_exc(file=diag)
+            with contextlib.suppress(Exception):
+                put('stop.json', lambda f_: json.dump(dict(stop=stop_test), f_, indent=1))
+                put('diag.txt', lambda f_: f_.write(diag_text()))
+                write_test_manifest()
+        meta_state['status'] = final_status()
     print(f'S03 finished -> {a.out}; status: {meta_state["status"]}')
     return 0 if not (stop_before or stop_public or stop_sealed or stop_test
                      or meta_state['src_changed']) else 2

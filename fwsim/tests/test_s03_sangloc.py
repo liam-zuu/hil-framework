@@ -1358,7 +1358,7 @@ def test_c3_40_n_luot_not_double_counted(tmp_path, monkeypatch):
     """C3-40: the 'xong' sets of a worker that died while running a set are merged into the
     result AND are not counted again in exc.n_luot when a later stop goes up: the first
     worker finishes row 1 and dies in row 2, the continuation finishes row 3 and reports
-    the tool stop in row 4 -> n_luot == (6, 0) (with the double count it is 9)."""
+    the tool stop in row 4 -> n_luot == (7, 0), including the attempt killed in row 2."""
     script = _fake_worker(tmp_path)
     work = str(tmp_path / 'wk')
     log_path = str(tmp_path / 'tien_trinh.log')
@@ -1369,30 +1369,26 @@ def test_c3_40_n_luot_not_double_counted(tmp_path, monkeypatch):
     jobs = [_job_pid('J', work, _five_rows())]
     with pytest.raises(s3.S03Stop, match='fake tool stop') as ei:
         sl.run_jobs(jobs, work, 2, log_path)
-    assert ei.value.n_luot == (6, 0)
+    assert ei.value.n_luot == (7, 0)
     assert not os.path.exists(work) or not os.listdir(work)
 
 
 def test_c3_40_read_part_cut_record(tmp_path):
-    """C3-40: _read_part keeps the good records and stops at a record cut by the death of the
-    worker: a truncated pickle, a garbage tail and a complete pickle that is not a 3-tuple
-    each leave (done, started) = ([(1, rows)], 2); a missing file gives ([], None)."""
+    """A cut checkpoint leaves the last completed attempt and the in-flight key intact."""
     import pickle as _pkl
-    rows = [dict(attempt=1, status='ok')]
+    row = dict(attempt=1, status='ok')
     p = str(tmp_path / 'job_X')
 
     def build(tail):
         with open(p + '.part', 'wb') as f:
-            _pkl.dump(('bat_dau', 1, None), f)
-            _pkl.dump(('xong', 1, rows), f)
-            _pkl.dump(('bat_dau', 2, None), f)
+            _pkl.dump(('ket_qua', 1, row), f)
+            _pkl.dump(('xong', 1, None), f)
+            _pkl.dump(('ket_qua', 2, row), f)
+            _pkl.dump(('bat_dau', 2, (0.8, MU_MID, 1)), f)
             f.write(tail)
 
-    rec = _pkl.dumps(('xong', 2, rows))
-    build(rec[:len(rec) // 2])                                     # a truncated pickle
-    assert sl._read_part(p) == ([(1, rows)], 2)
-    build(b'\x80\x05garbage')                                      # a garbage tail
-    assert sl._read_part(p) == ([(1, rows)], 2)
-    build(_pkl.dumps('x'))                                         # not a 3-tuple
-    assert sl._read_part(p) == ([(1, rows)], 2)
-    assert sl._read_part(str(tmp_path / 'none')) == ([], None)
+    rec = _pkl.dumps(('ket_qua', 2, row))
+    for tail in (rec[:len(rec) // 2], b'\x80\x05garbage', _pkl.dumps('x')):
+        build(tail)
+        assert sl._read_part(p) == ([(1, [row])], [row], (2, 0.8, MU_MID, 1))
+    assert sl._read_part(str(tmp_path / 'none')) == ([], [], None)

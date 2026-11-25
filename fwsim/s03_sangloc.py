@@ -1,8 +1,8 @@
 """
 s03_sangloc.py: spec S03 v8.6 section 3.1b (06_SPECS/2026-11-05_Spec_S03_DOE_chon_gain.md),
 the screening step that sets the domain [L, H] of the DOE/GA on the reference box W: many gain
-sets drawn log-uniformly on W are run on fwsim and scored with the S04 evaluator (s04_ga.py
-safe_run_gate, Evaluator, score); a threshold per mode locks a competing set C_j, boxes on the
+sets drawn log-uniformly on W are run on fwsim and scored with the S04 evaluation functions.
+A threshold per mode locks a competing set C_j, boxes on the
 nodes of W hold it, and two independent checks (S2, S2b) accept a mode when every competing set
 stays inside. Nothing of this module prints to the console in the parent process and every file
 it writes is under the sealed folder it is given (section 3.1b item 13).
@@ -43,18 +43,16 @@ it writes is under the sealed folder it is given (section 3.1b item 13).
       again in new processes through the same scoring path; log SHA-256 and every field from
       'status' on must be equal bit for bit.
 
-  Codex round 3: the numbers file is regenerated in memory from (mode, r, t) and checked bit
-  for bit and as text at every load (C3-36); a worker that dies while running a gain set makes
-  that set a run_error (one diagnosis rerun in a new process, never replacing it), the rest of
-  its job runs in a new worker and the step goes on; wait limits JOB_WAIT_MAX_S per job and
-  DIAG_WAIT_MAX_S per diagnosis (C3-40); the phases run with live notes entries (trang_thai,
-  moc_bat_dau/moc_ket_thuc, n_luot_tong) that also survive a stop (C3-39, D2A-2);
-  sealed/sangloc_thu/loi_S0.json holds the S0 error runs' text only (D2A-3); a PID run without
-  the clamp indicator stops S03 (C3-48).
+  The numbers file is regenerated from (mode, r, t) and checked at load (C3-36).
+  Workers checkpoint each attempt so the scheduler can recover from a crash during an
+  evaluation after stopping the worker tree (C3-50, C3-51). Phase notes retain counts on a stop
+  (C3-39). sealed/sangloc_thu/loi_S0.json gives CODE the unclassifiable counts and fixed error
+  codes (C3-52). A PID run without the clamp indicator stops S03 (C3-48).
 """
 from __future__ import annotations
 
 import bisect
+import contextlib
 import csv
 import hashlib
 import io
@@ -62,6 +60,7 @@ import json
 import math
 import os
 import pickle
+import signal
 import struct
 import subprocess
 import sys
@@ -320,10 +319,13 @@ def feasible(s):
 
 
 def mid_feasible(rows, mu_mid):
-    """feasible() of the score over the first-attempt rows at mu_mid (Evaluator records; the
-    diagnosis rows with attempt 2 never enter the score, item 5)."""
+    """Feasibility of the first-attempt rows at mu_mid."""
     first = [(r['mu'], r['v'], r) for r in rows if r.get('attempt') == 1 and r['mu'] == mu_mid]
     return bool(first) and feasible(s4.score(first, False))
+
+
+def _ran(e):
+    return e['status'] != 'not_run'
 
 
 def score_modes(rows, flag, speeds, mu_levels):
@@ -331,8 +333,8 @@ def score_modes(rows, flag, speeds, mu_levels):
     ba_mu = all 3g runs (only when the set is feasible at the middle mu; else it is not feasible
     at three mu and step b was not run). rows = the eval rows of the set (empty for flag
     'ngoai_bang'); record keys phan_loai_duoc, kha_thi, buoc_b, ngoai_bang and the keys of
-    s4.score (None when not computed). An eval row with status run_error makes the set
-    unclassifiable in the mode. Anything but exactly the planned runs is a tool error (S03Stop)."""
+    s4.score (None when not computed). A run_error makes the set unclassifiable in the mode.
+    Check the planned keys, then score the attempted rows and omit not_run placeholders."""
     g = len(speeds)
     mu_mid = mu_levels[len(mu_levels) // 2]
     if flag == 'ngoai_bang':
@@ -347,7 +349,7 @@ def score_modes(rows, flag, speeds, mu_levels):
     if len(mid) != g or {(r['v'], r['mu']) for r in mid} != {(v, mu_mid) for v in speeds}:
         raise s3.S03Stop(f'the middle-mu runs of a gain set are {len(mid)}, not {g} '
                          '(S03 3.1b item 5: tool error)')
-    s_mid = s4.score([(r['mu'], r['v'], r) for r in mid], False)
+    s_mid = s4.score([(r['mu'], r['v'], r) for r in mid if _ran(r)], False)
     ok_mid = not any(r['status'] == 'run_error' for r in mid)
     feas_mid = feasible(s_mid)
     rec = {'giua': dict(s_mid, phan_loai_duoc=ok_mid, kha_thi=feas_mid, buoc_b=feas_mid,
@@ -357,7 +359,7 @@ def score_modes(rows, flag, speeds, mu_levels):
                 {(v, m) for m in mu_levels if m != mu_mid for v in speeds}:
             raise s3.S03Stop('a gain set feasible at the middle mu lacks its 2g step-b runs '
                              '(S03 3.1b item 5: tool error)')
-        s_all = s4.score([(r['mu'], r['v'], r) for r in first], False)
+        s_all = s4.score([(r['mu'], r['v'], r) for r in first if _ran(r)], False)
         rec['ba_mu'] = dict(s_all, phan_loai_duoc=not any(r['status'] == 'run_error' for r in first),
                             kha_thi=feasible(s_all), buoc_b=True, ngoai_bang=False)
     else:
@@ -527,13 +529,12 @@ def _firmware(dll):
 
 def check_kep_rows(ctrl, rows):
     """C3-48 (S03 v8.6 2.1, 11 item 6 (c)): a PID run without the clamp indicator stops S03 —
-    for every first-attempt row that is not a run_error, kep_note must be empty and every
-    kep_frac_* column a value (NaN is a value). ADRC rows, attempt-2 (diagnosis) rows and
-    run_error rows are exempt."""
+    a completed first-attempt PID evaluation needs an empty kep_note and a value in every
+    kep_frac_* column. NaN is accepted."""
     if ctrl != 'PID':
         return
     for r in rows:
-        if r.get('attempt') != 1 or r.get('status') == 'run_error':
+        if r.get('attempt') != 1 or r.get('status') in ('run_error', 'not_run'):
             continue
         if r.get('kep_note', '') not in ('', None) or \
                 any(r.get(k, '') in ('', None) for k in s3.KEP_FRAC_COLS):
@@ -543,70 +544,86 @@ def check_kep_rows(ctrl, rows):
                 'a failed kep_indicator self-check stops S03)')
 
 
+def _diagnose(job, g, v, mu, row_no, timeout=None):
+    ctrl = job['controller']
+    try:
+        again = s3.run_in_new_process(job['dll'], [(ctrl, g, v, mu)], job['work'],
+                                      timeout=timeout)[0]
+        digest = s4.digest_sha(again['digest']) if again.get('digest') else ''
+        return _eval_rec(ctrl, row_no, v, mu, 2, again['row'], digest)
+    except Exception as exc:                     # a failed diagnosis is recorded
+        return _eval_rec(ctrl, row_no, v, mu, 2, dict(status='diagnosis_failed',
+                                                    error=f'{type(exc).__name__}: {exc}'))
+
+
 def do_job(job, bao=None):
-    """One worker job (dict(name, dll, controller, speeds, mu_levels, rows=[(row_no, g)], work)):
-    for every (row_no, gain set) the set runs at the middle mu (g runs, Evaluator ev_mid), and
-    only when feasible there at the two other mu levels (2g runs, Evaluator ev_rest) — the
-    scoring path of item 5 (safe_run_gate + the tv_duty conversion inside Evaluator.candidate).
-    Returns [(row_no, [eval rows appended])]. A set the evaluator marks ngoai_bang, or that
-    appends no row, is a tool error (the parent filters those sets): S03Stop. bao (optional
-    callable, worker processes only) is called bao('bat_dau', row_no) before the work of a gain
-    set and bao('xong', row_no, rows) after its rows are complete and checked."""
+    """Run middle mu first, then low/high mu when feasible, using the S04 scoring path.
+    Record the start and result of each attempt before moving to the next one."""
     dll, ctrl, speeds, mu_levels = job['dll'], job['controller'], job['speeds'], job['mu_levels']
     mu_mid = mu_levels[len(mu_levels) // 2]
-    fw = _firmware(dll)
-    ev_mid = s4.Evaluator(fw, dll, ctrl, speeds, [mu_mid], job['work'])
-    ev_rest = s4.Evaluator(fw, dll, ctrl, speeds, [m for m in mu_levels if m != mu_mid], job['work'])
+    fw, path = _firmware(dll), s3.o1.Path8()
+
+    def run_levels(g, row_no, levels, rows):
+        for mu in levels:
+            for v in speeds:
+                if bao is not None:
+                    bao('bat_dau', row_no, (v, mu, 1))
+                row, log = s4.safe_run_gate(fw, path, ctrl, g, v, mu)
+                row = s4.tv_duty_run_error(row)
+                first = _eval_rec(ctrl, row_no, v, mu, 1, row, s4.log_sha(log))
+                if bao is not None:
+                    bao('ket_qua', row_no, first)
+                rows.append(first)
+                if first['status'] == 'run_error':
+                    if bao is not None:
+                        bao('bat_dau', row_no, (v, mu, 2))
+                    second = _diagnose(job, g, v, mu, row_no)
+                    if bao is not None:
+                        bao('ket_qua', row_no, second)
+                    rows.append(second)
+
     out = []
     for row_no, g in job['rows']:
-        if bao is not None:
-            bao('bat_dau', row_no)
-        n0_ = len(ev_mid.evals)
-        s = ev_mid.candidate(g, '', '', row_no)
-        if s.get('status') == 'ngoai_bang':
+        table, tri = s4.gain_check(ctrl, g)
+        if table:
+            raise s3.S03Stop(f'{ctrl} row {row_no}: gain outside the range table of the '
+                             f'campaign binary ({"; ".join(table)})')
+        if tri:
             raise s3.S03Stop(f'{ctrl} row {row_no}: a ngoai_bang set reached a worker '
                              '(S03 3.1b item 5: tool error — the parent filters those sets)')
-        rows = list(ev_mid.evals[n0_:])
+        rows = []
+        run_levels(g, row_no, [mu_mid], rows)
         if not rows:
             raise s3.S03Stop(f'{ctrl} row {row_no}: the evaluator appended no run '
                              '(S03 3.1b item 5: tool error)')
         if mid_feasible(rows, mu_mid):
-            n0_ = len(ev_rest.evals)
-            s = ev_rest.candidate(g, '', '', row_no)
-            if s.get('status') == 'ngoai_bang':
-                raise s3.S03Stop(f'{ctrl} row {row_no}: a ngoai_bang set reached a worker '
-                                 '(S03 3.1b item 5: tool error)')
-            rows += list(ev_rest.evals[n0_:])
+            run_levels(g, row_no, [m for m in mu_levels if m != mu_mid], rows)
         check_kep_rows(ctrl, rows)
         out.append((row_no, rows))
         if bao is not None:
-            bao('xong', row_no, rows)
+            bao('xong', row_no, None)
     return out
 
 
 def job_main(path):
-    """--job <pickle> of a worker process: open path + '.part' first and report every gain set
-    over it ('bat_dau', row_no before the work, 'xong', row_no, rows after it — the parent keeps
-    the finished sets when the worker dies, C3-40); run the job, write path + '.out' (pickle
-    dict(ok=True, rows) or dict(ok=False, stop)); a S03Stop is reported with exit code 0, any
-    other exception goes to stderr and a non-zero exit."""
-    part = open(path + '.part', 'wb')
+    """Run one job and flush each checkpoint to its sealed .part file."""
+    if '--wait-for-job' in sys.argv and sys.stdin.buffer.read(1) != b'1':
+        return
 
-    def bao(kind, row_no, rows=None):
-        pickle.dump((kind, row_no, rows), part)
-        part.flush()
+    with open(path + '.part', 'wb') as part:
+        def bao(kind, row_no, payload):
+            pickle.dump((kind, row_no, payload), part)
+            part.flush()
 
-    try:
-        with open(path, 'rb') as f:
-            job = pickle.load(f)
-        res = dict(ok=True, rows=do_job(job, bao))
-    except s3.S03Stop as exc:
-        res = dict(ok=False, stop=str(exc))
-    finally:
-        part.close()
+        try:
+            with open(path, 'rb') as f:
+                job = pickle.load(f)
+            res = dict(ok=True, rows=do_job(job, bao))
+        except s3.S03Stop as exc:
+            bao('bo', None, None)                # orderly tool stop, with no result for the current attempt
+            res = dict(ok=False, stop=str(exc))
     with open(path + '.out', 'wb') as f:
         pickle.dump(res, f)
-
 
 def _worker_cmd(path):
     """The argv of a worker process ('--job' and the job path at index 2 and 3: the tests
@@ -615,32 +632,35 @@ def _worker_cmd(path):
 
 
 def _read_part(path):
-    """(done, started) of the .part records of a dead worker: 'xong' appends (row_no, rows) to
-    done and clears started, 'bat_dau' sets started = row_no. The read ends at any error of a
-    record cut by the death of the worker (a truncated pickle, a garbage tail, a value that is
-    not a 3-tuple); a missing file -> ([], None)."""
-    done, started = [], None
+    """Return finished gain sets, the partial set's rows and its in-flight attempt key."""
+    done, partial, active = [], [], None
     try:
-        with open(path + '.part', 'rb') as f:
-            while True:
-                try:
-                    kind, row_no, rows = pickle.load(f)
-                except Exception:                           # noqa: BLE001
-                    break
-                if kind == 'xong':
-                    done.append((row_no, rows))
-                    started = None
-                else:
-                    started = row_no
-    except OSError:
-        return [], None
-    return done, started
+        f = open(path + '.part', 'rb')
+    except FileNotFoundError:
+        return done, partial, active
+    with f:
+        while True:
+            try:
+                kind, row_no, payload = pickle.load(f)
+            except (EOFError, pickle.UnpicklingError, TypeError, ValueError):
+                break                           # a dead worker can leave a cut record at EOF
+            if kind == 'bat_dau':
+                active = (row_no, *payload)
+            elif kind == 'ket_qua':
+                partial.append(payload)
+                active = None
+            elif kind == 'xong':
+                done.append((row_no, partial))
+                partial = []
+            elif kind == 'bo':
+                active = None
+            else:
+                break
+    return done, partial, active
 
 
 def _eval_rec(ctrl, row_no, v, mu, attempt, row, log_sha256=''):
-    """One eval record shaped as s04_ga.Evaluator._rec makes it (the eval rows of a gain set
-    whose worker died, C3-40): the EVAL_COLS fields of row, the S03 identifiers and the
-    pen_ flags of s4.run_values."""
+    """Build an S04-shaped eval record with the shared penalty flags."""
     r = {k: row.get(k, '') for k in s4.EVAL_COLS if k in row}
     r.update(controller=ctrl, ga_seed='', gen='', cand_id=row_no, v=v, mu=mu, attempt=attempt,
              log_sha256=log_sha256, cause='')
@@ -648,30 +668,24 @@ def _eval_rec(ctrl, row_no, v, mu, attempt, row, log_sha256=''):
     return r
 
 
-def _crashed_rows(job, row_no, why):
-    """The eval rows of a gain set whose worker died (C3-40): one attempt-1 'run_error' row per
-    speed at the middle mu (the death reason in 'error'), then one attempt-2 diagnosis row per
-    speed of ONE rerun in ONE new process (s3.run_in_new_process, timeout DIAG_WAIT_MAX_S); when
-    the diagnosis itself fails (child failed, timeout), every attempt-2 row is
-    'diagnosis_failed'. The diagnosis never replaces the attempt-1 rows."""
-    ctrl, speeds = job['controller'], job['speeds']
-    mu_mid = job['mu_levels'][len(job['mu_levels']) // 2]
-    g = dict(job['rows'])[row_no]
-    try:
-        again = s3.run_in_new_process(job['dll'], [(ctrl, g, v, mu_mid) for v in speeds],
-                                      job['work'], timeout=DIAG_WAIT_MAX_S)
-        second = {v: a for v, a in zip(speeds, again)}
-    except Exception as exc:                        # noqa: BLE001 (a failed diagnosis is recorded)
-        second = {v: dict(row=dict(status='diagnosis_failed',
-                                   error=f'{type(exc).__name__}: {exc}'), digest=None)
-                  for v in speeds}
-    out = []
-    for v in speeds:
-        out.append(_eval_rec(ctrl, row_no, v, mu_mid, 1,
+def _crashed_rows(job, rows, active, why, diagnose):
+    """Keep committed results and recover only the interrupted evaluation."""
+    ctrl = job['controller']
+    row_no, v, mu, attempt = active
+    out = list(rows)
+    if attempt == 1:
+        out.append(_eval_rec(ctrl, row_no, v, mu, 1,
                              dict(status='run_error', completed='', error=why)))
-        a = second[v]
-        out.append(_eval_rec(ctrl, row_no, v, mu_mid, 2, a['row'],
-                             s4.digest_sha(a['digest']) if a.get('digest') else ''))
+        out.append(diagnose(job, dict(job['rows'])[row_no], v, mu, row_no))
+    else:
+        # The first result already recorded the error, and its fresh-process rerun was interrupted.
+        out.append(_eval_rec(ctrl, row_no, v, mu, 2, dict(status='diagnosis_failed', error=why)))
+    mu_mid = job['mu_levels'][len(job['mu_levels']) // 2]
+    levels = [mu_mid] if mu == mu_mid else [m for m in job['mu_levels'] if m != mu_mid]
+    planned = [(speed, level) for level in levels for speed in job['speeds']]
+    for vr, mur in planned[planned.index((v, mu)) + 1:]:
+        out.append(_eval_rec(ctrl, row_no, vr, mur, 1, dict(status='not_run')))
+    check_kep_rows(ctrl, out)
     return out
 
 
@@ -708,117 +722,232 @@ def _collect_logs(jobs, paths, work, log_path):
             os.rmdir(work)
 
 
+class WorkerTreeStop(s3.S03Stop):
+    """The scheduler could not confirm that a worker tree stopped."""
+
+
+if os.name == 'nt':
+    import ctypes
+    from ctypes import wintypes
+
+    class _JobAccounting(ctypes.Structure):
+        _fields_ = [('total_user_time', ctypes.c_longlong),
+                    ('total_kernel_time', ctypes.c_longlong),
+                    ('period_user_time', ctypes.c_longlong),
+                    ('period_kernel_time', ctypes.c_longlong),
+                    ('page_faults', wintypes.DWORD),
+                    ('total_processes', wintypes.DWORD),
+                    ('active_processes', wintypes.DWORD),
+                    ('terminated_processes', wintypes.DWORD)]
+
+    _kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    _kernel.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+    _kernel.CreateJobObjectW.restype = wintypes.HANDLE
+    _kernel.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    _kernel.QueryInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                  wintypes.DWORD, ctypes.c_void_p)
+    _kernel.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    _kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+    class _WindowsJob:
+        def __init__(self):
+            self.handle = _kernel.CreateJobObjectW(None, None)
+            if not self.handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+
+        def attach(self, proc):
+            if not _kernel.AssignProcessToJobObject(self.handle, int(proc._handle)):
+                raise ctypes.WinError(ctypes.get_last_error())
+
+        def active(self):
+            info = _JobAccounting()
+            if not _kernel.QueryInformationJobObject(self.handle, 1, ctypes.byref(info),
+                                                      ctypes.sizeof(info), None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return bool(info.active_processes)
+
+        def terminate(self):
+            if not _kernel.TerminateJobObject(self.handle, 1):
+                raise ctypes.WinError(ctypes.get_last_error())
+
+        def close(self):
+            _kernel.CloseHandle(self.handle)
+
+
+def _group_active(pgid):
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    if sys.platform != 'linux':
+        return True
+    # Linux can retain orphan zombies until init reaps them. They cannot change files.
+    for pid in os.listdir('/proc'):
+        if pid.isdecimal():
+            try:
+                with open(f'/proc/{pid}/stat', 'rb') as f:
+                    state, _, group, *_ = f.read().rsplit(b')', 1)[1].split()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if int(group) == pgid and state not in (b'Z', b'X'):
+                return True
+    return False
+
+
+def _reap_worker(worker):
+    proc, job_object = worker['proc'], worker['job_object']
+    deadline = time.monotonic() + KILL_WAIT_S
+    try:
+        if job_object is not None:
+            if worker['attached']:
+                if job_object.active():
+                    job_object.terminate()
+                active = job_object.active
+            else:                     # the Windows startup pipe still blocks the job
+                if proc.poll() is None:
+                    proc.kill()
+                active = lambda: False
+        else:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            active = lambda: _group_active(proc.pid)
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        while active():
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(proc.args, KILL_WAIT_S)
+            time.sleep(POLL_S)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WorkerTreeStop(f'a screening worker tree could not be confirmed stopped within '
+                             f'{KILL_WAIT_S:g} s: {type(exc).__name__}: {exc}') from exc
+    finally:
+        if job_object is not None:
+            job_object.close()
+
+
 def run_jobs(jobs, work, n_parallel, log_path):
-    """Run job dicts as child processes `python s03_sangloc.py --job <pickle>` (at most
-    n_parallel at once): each job's pickle and .log are made when it is started and the child
-    reports every gain set over .part ('bat_dau' / 'xong'). Returns the do_job results in job
-    order, rows in the job's row order. A result ok=False: the S03Stop carries its text.
-    A child dead (non-zero exit) or late (over JOB_WAIT_MAX_S, killed) while running a gain
-    set: the sets it reported 'xong' are kept, the set it was running counts as a run_error of
-    the gain set with ONE diagnosis rerun in a new process (_crashed_rows; S03 goes on, C3-40),
-    and the rest of the job runs in a new worker ('<name>_tiep<k>'). A child dead before or
-    between gain sets is a tool error (S03Stop naming log_path). A raised exception carries
-    .n_luot = (n attempt-1, n attempt-2 rows of the sets finished). When run_jobs returns or
-    raises, no worker is alive and no job file is left."""
+    """Run the screening pool and return each job's rows in input order.
+
+    Recover a crashed in-flight evaluation from its checkpoints and dispatch the later gain sets
+    in a new worker. A death between evaluations is a tool error. Attach attempt counts to errors
+    before removing the journals. Collect logs only after every worker tree has stopped.
+    """
     os.makedirs(work, exist_ok=True)
-    all_jobs, orig = list(jobs), list(range(len(jobs)))   # continuations appended, orig -> job index
+    all_jobs, orig = list(jobs), list(range(len(jobs)))
     pending = list(range(len(all_jobs)))
-    running, zombies = {}, []             # i -> dict(proc, logf, path, t_start); killed, still alive
-    started_jobs, started_paths = [], []  # every started job (continuations too) for _collect_logs
-    merged_paths = set()                  # .part files already merged into results
-    results = {}                          # original job index -> {row_no: rows}
-    crashed = []                          # (original index, job, row_no, why) for _crashed_rows
+    running = {}
+    started_jobs, started_paths = [], []
+    results = {}
+    crashed = []
     n_tiep = {}
+    n_recovery_diag = 0
     going_up = None
 
     def start_job(i):
         p = os.path.join(work, f"job_{all_jobs[i]['name']}.pkl")
+        started_jobs.append(all_jobs[i])
+        started_paths.append(p)
         with open(p, 'wb') as f:
             pickle.dump(all_jobs[i], f)
         logf = open(p + '.log', 'w')
-        started_jobs.append(all_jobs[i])
-        started_paths.append(p)             # recorded even when Popen fails: no job file left
+        job_object = None
+        cmd = _worker_cmd(p)
         try:
-            proc = subprocess.Popen(_worker_cmd(p), stdout=logf, stderr=subprocess.STDOUT)
-        except Exception:
+            if os.name == 'nt':
+                job_object = _WindowsJob()
+                proc = subprocess.Popen(cmd + ['--wait-for-job'], stdout=logf,
+                                        stderr=subprocess.STDOUT, stdin=subprocess.PIPE)
+            else:
+                proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
+                                        start_new_session=True)
+        except BaseException:
+            if job_object is not None:
+                job_object.close()
             logf.close()
             raise
-        running[i] = dict(proc=proc, logf=logf, path=p, t_start=time.monotonic())
+        worker = running[i] = dict(proc=proc, logf=logf, path=p, t_start=time.monotonic(),
+                                   job_object=job_object, attached=False)
+        if job_object is not None:
+            # The child cannot launch a diagnosis until it belongs to the Job Object.
+            with contextlib.suppress(BrokenPipeError), proc.stdin:
+                try:
+                    job_object.attach(proc)
+                except OSError as exc:
+                    if proc.poll() is not None:
+                        raise worker_failed() from exc
+                    raise
+                worker['attached'] = True
+                proc.stdin.write(b'1')
+                proc.stdin.flush()
+
+    def finish_job(i):
+        worker = running.pop(i)
+        try:
+            _reap_worker(worker)
+        finally:
+            with contextlib.suppress(OSError):
+                worker['logf'].close()
+
+    def diagnose(job, g, v, mu, row_no):
+        nonlocal n_recovery_diag
+        n_recovery_diag += 1
+        return _diagnose(job, g, v, mu, row_no, timeout=DIAG_WAIT_MAX_S)
 
     def n_luot():
-        """(attempt-1, attempt-2 rows) of the finished sets: merged results plus the 'xong'
-        records of the .part files of the jobs not merged (best effort at stop time)."""
-        n1 = n2 = 0
-        for per in results.values():
-            for rows in per.values():
-                n1 += sum(1 for e in rows if e.get('attempt') == 1)
-                n2 += sum(1 for e in rows if e.get('attempt') == 2)
+        counts = Counter({2: n_recovery_diag})
         for p in started_paths:
-            if p in merged_paths:
-                continue
-            for _rn, rows in _read_part(p)[0]:
-                n1 += sum(1 for e in rows if e.get('attempt') == 1)
-                n2 += sum(1 for e in rows if e.get('attempt') == 2)
-        return n1, n2
+            done, partial, active = _read_part(p)
+            counts.update(e['attempt'] for _, rows in done for e in rows)
+            counts.update(e['attempt'] for e in partial)
+            if active is not None:
+                counts[active[-1]] += 1
+        return counts[1], counts[2]
+
+    def worker_failed():
+        return s3.S03Stop('a worker of the screening step failed; its output is '
+                          f'in {log_path} (S03 3.1b item 5: tool error)')
 
     try:
         while pending or running:
             while pending and len(running) < max(1, n_parallel):
                 start_job(pending.pop(0))
             time.sleep(POLL_S)
-            for i in list(running):
-                r = running[i]
+            for i, r in list(running.items()):
                 rc = r['proc'].poll()
                 late = rc is None and time.monotonic() - r['t_start'] > JOB_WAIT_MAX_S
-                if late:
-                    try:
-                        r['proc'].kill()
-                        r['proc'].wait(timeout=KILL_WAIT_S)
-                    except Exception:                       # noqa: BLE001
-                        zombies.append(r)
-                    rc = r['proc'].returncode
                 if rc is None and not late:
                     continue
-                r['logf'].close()
-                del running[i]
-                oi = orig[i]
+                finish_job(i)
+                have = results.setdefault(orig[i], {})
                 if rc == 0 and not late:
-                    res = None
                     try:
                         with open(r['path'] + '.out', 'rb') as f:
                             res = pickle.load(f)
-                    except Exception:                       # noqa: BLE001
-                        res = None
-                    if res is None:
-                        raise s3.S03Stop('a worker of the screening step failed; its output is '
-                                         f'in {log_path} (S03 3.1b item 5: tool error)')
+                    except (OSError, EOFError, pickle.UnpicklingError) as exc:
+                        raise worker_failed() from exc
                     if not res.get('ok'):
                         raise s3.S03Stop(res.get('stop', 'a worker stopped without a reason'))
-                    merged_paths.add(r['path'])
-                    results.setdefault(oi, {}).update(res['rows'])
+                    have.update(res['rows'])
                     continue
-                done, started = _read_part(r['path'])
-                if started is None:
-                    raise s3.S03Stop('a worker of the screening step failed; its output is '
-                                     f'in {log_path} (S03 3.1b item 5: tool error)')
-                merged_paths.add(r['path'])
-                results.setdefault(oi, {}).update(done)
-                why = (f'worker process exceeded the wait limit of {JOB_WAIT_MAX_S:g} s and was '
-                       'killed while running this gain set' if late
-                       else f'worker process died (exit code {rc}) while running this gain set')
-                why += ': counted as a run_error of the gain set (S03 3.1b item 5; Codex C3-40)'
-                crashed.append((oi, all_jobs[i], started, why))
+                done, partial, active = _read_part(r['path'])
+                if active is None:
+                    raise worker_failed()
+                have.update(done)
+                why = (f'worker process exceeded the wait limit of {JOB_WAIT_MAX_S:g} s and was killed'
+                       if late else f'worker process died (exit code {rc})')
+                why += ' during this attempt (S03 3.1b item 5)'
+                crashed.append((have, all_jobs[i], partial, active, why))
                 rows = all_jobs[i]['rows']
-                k = [rn for rn, _g in rows].index(started)
+                k = [rn for rn, _g in rows].index(active[0])
                 rest = rows[k + 1:]
                 if rest:
+                    oi = orig[i]
                     n_tiep[oi] = n_tiep.get(oi, 0) + 1
                     all_jobs.append(dict(all_jobs[i], rows=rest,
                                          name=f"{all_jobs[oi]['name']}_tiep{n_tiep[oi]}"))
                     orig.append(oi)
                     pending.insert(0, len(all_jobs) - 1)
-        for oi, job, row_no, why in crashed:
-            results[oi][row_no] = _crashed_rows(job, row_no, why)
+        for have, job, partial, active, why in crashed:
+            have[active[0]] = _crashed_rows(job, partial, active, why, diagnose)
         out = []
         for i, job in enumerate(jobs):
             have = results.get(i, {})
@@ -831,34 +960,28 @@ def run_jobs(jobs, work, n_parallel, log_path):
         going_up = exc
         raise
     finally:
-        for i, r in list(running.items()) + [(None, z) for z in zombies]:
+        tree_error = going_up if isinstance(going_up, WorkerTreeStop) else None
+        for i in list(running):
             try:
-                if r['proc'].poll() is None:
-                    r['proc'].kill()
-                r['proc'].wait(timeout=KILL_WAIT_S)
-            except Exception:                               # noqa: BLE001
-                zombies.append(r)
+                finish_job(i)
+            except WorkerTreeStop as exc:
+                tree_error = tree_error or exc
+        counts = (0, 0)
+        with contextlib.suppress(OSError):
+            counts = n_luot()
+        if tree_error is not None:
+            tree_error.n_luot = counts
+            if tree_error is not going_up:
+                raise tree_error from going_up
+        else:
+            if going_up is not None:
+                going_up.n_luot = counts
             try:
-                r['logf'].close()
-            except Exception:                               # noqa: BLE001
-                pass
-        running.clear()
-        stuck = [z for z in zombies if z['proc'].poll() is None]
-        if going_up is not None and not hasattr(going_up, 'n_luot'):
-            try:
-                going_up.n_luot = n_luot()
-            except Exception:                               # noqa: BLE001
-                pass
-        try:
-            _collect_logs(started_jobs, started_paths, work, log_path)
-        except Exception:                                   # noqa: BLE001
-            if going_up is None:
-                raise
-        if stuck:
-            raise s3.S03Stop('a worker of the screening step could not be ended within '
-                             f'{KILL_WAIT_S:g} s (S03 3.1b item 5: tool error; Codex C3-40)') \
-                from going_up
-
+                _collect_logs(started_jobs, started_paths, work, log_path)
+            except Exception as exc:
+                if going_up is None:
+                    exc.n_luot = counts
+                    raise
 
 def run_set(set_name, rows_by_ctrl, dll, speeds, mu_levels, work, n_proc, log_path):
     """Run the runnable gain sets (flag 'ok'; a ngoai_bang row is never dispatched and maps to
@@ -945,7 +1068,10 @@ def determinism_check(set_name, rows_by_ctrl, evals_by_ctrl, dll, speeds, mu_lev
                              and all(s3._bits(e2.get(k)) == s3._bits(e1.get(k)) for k in DET_FIELDS))
                 rows.append(dict(controller=ctrl, set=set_name, row=row_no, v=e1['v'], mu=e1['mu'],
                                  log_arrays_equal=eq_log, fields_equal=eq_fields))
-    stats = dict(seconds=_clock() - t0, n_luot_thuc=sum(1 for r in rows), n_chay_lai=n_rerun)
+    stats = dict(seconds=_clock() - t0,
+                 n_luot_thuc=sum(e['attempt'] == 1 and _ran(e) for per_ctrl in again.values()
+                                 for evals in per_ctrl.values() for e in evals),
+                 n_chay_lai=n_rerun)
     return rows, chosen, stats
 
 
@@ -1006,6 +1132,13 @@ def _set_phase(set_name, n_use, out_dir, work_dir, log_path, controllers, gate, 
         if entry is not None:
             entry['n_luot_thuc'], entry['n_chay_lai_chan_doan'] = getattr(exc, 'n_luot', (0, 0))
         raise
+    n_by_ctrl = {c: sum(e.get('attempt') == 1 and _ran(e) for rows in evals[c].values() for e in rows)
+                 for c in controllers}
+    n_runs = sum(n_by_ctrl.values())
+    n_rerun = sum(e.get('attempt') == 2 for c in controllers for rows in evals[c].values() for e in rows)
+    if entry is not None:
+        entry['n_luot_thuc'], entry['n_chay_lai_chan_doan'] = n_runs, n_rerun
+        entry['n_luot_thuc_theo_controller'] = n_by_ctrl
     eval_rows = [e for ctrl in controllers for e in eval_csv_rows(set_name, records[ctrl], evals[ctrl])]
     s3.write_csv(os.path.join(out_dir, f'evals_{set_name}.csv'), eval_rows, EVAL_SL_COLS)
     scores = {ctrl: {r['row']: score_modes(evals[ctrl].get(r['row'], []), r['flag'], gate, mu_levels)
@@ -1016,13 +1149,6 @@ def _set_phase(set_name, n_use, out_dir, work_dir, log_path, controllers, gate, 
                        **{k: scores[ctrl][r['row']][mode][k]
                           for k in ('phan_loai_duoc', 'kha_thi', 'buoc_b')})
                   for ctrl in controllers for r in records[ctrl] for mode in MODES]
-    n_runs = sum(e.get('attempt') == 1 for e in eval_rows)
-    n_rerun = sum(e.get('attempt') == 2 for e in eval_rows)
-    if entry is not None:
-        entry['n_luot_thuc'], entry['n_chay_lai_chan_doan'] = n_runs, n_rerun
-        entry['n_luot_thuc_theo_controller'] = \
-            {c: sum(e.get('attempt') == 1 for rows in evals[c].values() for e in rows)
-             for c in controllers}
     return records, evals, score_rows, scores, seconds, n_runs, n_rerun
 
 
@@ -1038,17 +1164,11 @@ def _mode_stats(records, scores):
 
 
 LOI_S0_KEYS = ('n_bo_khong_phan_loai', 'luot_loi')
-LOI_LUOT_KEYS = ('controller', 'pha', 'thong_bao')
+LOI_LUOT_KEYS = ('controller', 'pha', 'ma_loi')
 
 
 def loi_s0_doc(controllers, records, evals, dem):
-    """sealed/sangloc_thu/loi_S0.json (D2A-3), written always when S0 ended:
-    n_bo_khong_phan_loai = {ctrl: {mode: the n_khong_phan_loai of so_dem.json}}, luot_loi = the
-    error text of the S0 error runs in record order — attempt 1 with status run_error ->
-    pha 'lan_1', the error text; an attempt-2 row -> pha 'chan_doan' with 'status: error' for
-    run_error / diagnosis_failed, else 'ran in the new process without a run_error'. Nothing
-    else: no row number, gain, v, mu, score, f1, q or the status of a run that is not an
-    error."""
+    """Allow CODE to read the S0 unclassifiable counts and fixed error codes early."""
     doc = dict(n_bo_khong_phan_loai={ctrl: {mode: dem[ctrl]['che_do'][mode]['n_khong_phan_loai']
                                             for mode in MODES} for ctrl in controllers},
                luot_loi=[])
@@ -1056,15 +1176,11 @@ def loi_s0_doc(controllers, records, evals, dem):
         for r in records[ctrl]:
             for e in evals[ctrl].get(r['row'], []):
                 if e.get('attempt') == 1 and e.get('status') == 'run_error':
-                    doc['luot_loi'].append(dict(controller=ctrl, pha='lan_1',
-                                                thong_bao=str(e.get('error', ''))))
+                    doc['luot_loi'].append(dict(controller=ctrl, pha='lan_1', ma_loi='run_error'))
                 elif e.get('attempt') == 2:
-                    st = e.get('status')
-                    tb = (f"{st}: {e.get('error', '')}"
-                          if st in ('run_error', 'diagnosis_failed')
-                          else 'ran in the new process without a run_error')
-                    doc['luot_loi'].append(dict(controller=ctrl, pha='chan_doan',
-                                                thong_bao=tb))
+                    code = {'run_error': 'run_error', 'diagnosis_failed': 'diagnosis_failed'}.get(
+                        e.get('status'), 'diagnosis_completed')
+                    doc['luot_loi'].append(dict(controller=ctrl, pha='chan_doan', ma_loi=code))
     return doc
 
 
@@ -1316,9 +1432,13 @@ def run_step(sealed, dll, controllers, gate, mu_levels, W, quet, screen, n_proc,
         scs = {'S1': sc1, 'S2': sc2, 'S2b': sc3}
         rec_sets = {'S1': (rec1, ev1), 'S2': (rec2, ev2), 'S2b': (rec3, ev3)}
         e_det = pha_start('kiem_tat_dinh_sang_loc')
-        det_rows, det_chosen, det_st = determinism_check(
-            'S1', rec1, ev1, dll, gate, mu_levels, work_sl, n_proc,
-            os.path.join(sl_dir, 'tien_trinh_kiem_tat_dinh.log'))
+        try:
+            det_rows, det_chosen, det_st = determinism_check(
+                'S1', rec1, ev1, dll, gate, mu_levels, work_sl, n_proc,
+                os.path.join(sl_dir, 'tien_trinh_kiem_tat_dinh.log'))
+        except Exception as exc:
+            e_det['n_luot_thuc'], e_det['n_chay_lai_chan_doan'] = getattr(exc, 'n_luot', (0, 0))
+            raise
         e_det['n_luot_thuc'], e_det['n_chay_lai_chan_doan'] = \
             det_st['n_luot_thuc'], det_st['n_chay_lai']
         e_det['n_bo_gain'] = {c: len(det_chosen.get(c, [])) for c in controllers}
