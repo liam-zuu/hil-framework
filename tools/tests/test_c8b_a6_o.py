@@ -29,7 +29,7 @@ def _rows(n=12, d=0.002, up=0.003, ui=0.002, tap='kiem', luot='c2', nodes=('0', 
 def _parse(rows, tmp_path, name='rows.csv'):
     p = tmp_path / name
     with open(p, 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['controller'])
+        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['controller', 'cham_id'], restval='')
         w.writeheader()
         w.writerows(rows)
     return O.read_rows(str(p))
@@ -102,7 +102,8 @@ def test_cells_sets_and_lock(tmp_path):
         O.build(_parse(_rows() + _rows(n=3, tap='khop', luot='c2', s0=500), tmp_path), 'giu_ngoai_a6', 'cho', KHOA, CHO)
     with pytest.raises(O.OError, match='khoa'):
         O.build(_all(tmp_path, _rows()), 'giu_ngoai_a6', 'cho', None, CHO)
-    o3 = O.build(_all(tmp_path, _rows()), 'd2', 'cho', KHOA, CHO)        # D2: the cells of the target runs
+    rows_d2 = [dict(r, cham_id='aa' * 8) if r['tap'] == 'dich' else r for r in _all(tmp_path, _rows())]
+    o3 = O.build([dict(r, cham=r.get('cham_id', '')) for r in rows_d2], 'd2', 'cho', KHOA, CHO)  # D2: target runs
     assert o3['o'][0]['tap'] == 'dich' and o3['o'][0]['n_id'] == 3
 
 
@@ -110,7 +111,7 @@ def test_cli(tmp_path):
     p = tmp_path / 'rows.csv'
     rows = _rows() + _rows(n=3, tap='khop', luot='c1') + _rows(n=3, tap='dich', luot='r1')
     with open(p, 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['controller'])
+        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['controller', 'cham_id'], restval='')
         w.writeheader()
         w.writerows(rows)
     k = tmp_path / 'khoa.json'
@@ -126,7 +127,7 @@ def test_cli(tmp_path):
     assert A.kiem_o(d, [cu.sha256(str(c))], cu.sha256(str(k)), O.read_rows(str(p)), LOCK)[0]
     rows[0]['U_psi_rad'] = -1
     with open(p, 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['controller'])
+        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['controller', 'cham_id'], restval='')
         w.writeheader()
         w.writerows(rows)
     assert O.main(['--rows', str(p), '--muc-dich', 'giu_ngoai_a6', '--giu-ngoai-theo', 'cho', '--khoa-truoc', str(k),
@@ -141,6 +142,7 @@ def test_d2_mask_cells_not_whole_file(tmp_path):
             + _rows(n=4, tap='dich', luot='r1', x=1.3, s0=300)                  # cell C: 4 ids < N_ID_MIN
             + _rows(n=12, tap='dich', luot='r1', x=1.9, s0=400, missing={(0, '1')})  # cell D: one id not compared
             + [dict(r, u_mps=2.5) for r in _rows(n=2, tap='dich', luot='r1', s0=600)])  # outside the u bands
+    dich = [dict(r, cham_id='aa' * 8) for r in dich]
     rows = _parse(dich + _rows(n=3, tap='khop', luot='c1') + _rows(n=3, tap='kiem', luot='c2'), tmp_path)
     o = O.build(rows, 'd2', 'cho', KHOA, CHO)
     assert o['trang_thai'] == 'dat'
@@ -167,7 +169,7 @@ def test_d2_mask_cells_not_whole_file(tmp_path):
 def _parse_mh(rows, tmp_path, name='rows_mh.csv'):
     p = tmp_path / name
     with open(p, 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['mien_hop', 'controller'])
+        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['mien_hop', 'controller', 'cham_id'], restval='')
         w.writeheader()
         w.writerows(rows)
     return O.read_rows(str(p))
@@ -179,6 +181,7 @@ def _dich(mh=None, **kw):
     rows = _rows(tap='dich', luot='r1', **kw)
     for r in rows:
         r['mien_hop'] = (mh or {}).get((int(r['id']) - kw['s0'], r['nut']), '1')
+        r['cham_id'] = 'aa' * 8                       # every target run of a d2 file has a scoring id (V3-6)
     return rows
 
 
@@ -239,10 +242,15 @@ def test_d2_scoring_id_of_each_target_run(tmp_path):
         return O.build(O.read_rows(str(p)), 'd2', 'cho', KHOA, CHO)
     r1 =[dict(r, cham_id='aa' * 8) for r in _dich(n=12)]
     r2 = [dict(r, luot='r2', cham_id='bb' * 8) for r in _dich(n=12, x=0.7)]
-    r3 = [dict(r, luot='r3') for r in _dich(n=12, x=1.3)]                # rows without the id: no entry
-    o = d2(r1 + r2 + r3, 'a.csv')
+    o = d2(r1 + r2, 'a.csv')
     assert o['mat_na']['lan_cham'] == {'r1': 'aa' * 8, 'r2': 'bb' * 8}
-    assert len(o['mat_na']['khung_mo']) == 36                           # the cells do not depend on the id
+    assert len(o['mat_na']['khung_mo']) == 24                           # the cells do not depend on the id
+    # Codex round 3 V3-6: a target run without an id is refused (its rows would fill cells shared with r1, r2):
+    # nine ids of r1 in a cell + one id of r3 without a scoring id would open the cell for r1
+    r3 = [dict(r, luot='r3', cham_id='') for r in _dich(n=1, s0=900)]
+    with pytest.raises(O.OError, match='without cham_id'):
+        d2(r1[:18] + r3, 'a3.csv')
+    assert d2(r1[:18], 'a9.csv')['mat_na']['khung_mo'] == []            # nine ids alone: the cell stays shut
     A._check_sha(o, 'o')
     r1[5]['cham_id'] = 'cc' * 8                                         # one row of another scoring
     with pytest.raises(O.OError, match='more than one scoring'):
@@ -250,7 +258,8 @@ def test_d2_scoring_id_of_each_target_run(tmp_path):
     r1[5]['cham_id'] = ''                                               # one row without the id
     with pytest.raises(O.OError, match='more than one scoring'):
         d2(r1, 'c.csv')
-    assert _d2(tmp_path, _dich(n=12), 'd.csv')['mat_na']['lan_cham'] == {}
+    with pytest.raises(O.OError, match='without cham_id'):              # a d2 file from rows without the column
+        _d2(tmp_path, [{k: v for k, v in r.items() if k != 'cham_id'} for r in _dich(n=12)], 'd.csv')
 
 
 def test_d2_mien_hop_values_and_bands_of_the_code(tmp_path):
@@ -261,7 +270,7 @@ def test_d2_mien_hop_values_and_bands_of_the_code(tmp_path):
     # D2-15: the D2 bands are those of the code, not of the command line
     p = tmp_path / 'r.csv'
     with open(p, 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['mien_hop', 'controller'])
+        w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['mien_hop', 'controller', 'cham_id'], restval='')
         w.writeheader()
         w.writerows(_dich(n=12) + _rows(n=3, tap='khop', luot='c1') + _rows(n=3, tap='kiem', luot='c2'))
     k = tmp_path / 'khoa.json'

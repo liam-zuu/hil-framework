@@ -22,7 +22,8 @@ the checked set dat) | truot (a cell with ty_le_max > 1) | thieu (otherwise). Fi
 is in o_dat), lan_cham {run: cham_id}}: c8b_luoi --mat-na-d2 makes every other frame of a target run n_undef for
 G2-G5 (G1 per its rule). lan_cham (optional column cham_id of the rows, c8b_d2_hang; Codex round 2 D2v2-4, CODE
 25/11): the id of the scoring the rows of a target run come from; a run with rows of two scorings is refused; the mask
-is applied only on the node files of that id (a run without the column gets no id: its mask is refused there).
+is applied only on the node files of that id; a d2 file is refused when a target run has rows without the id (Codex
+round 3 V3-6: the cells are shared by the runs).
 The three sets (khop, kiem, dich) must be disjoint by run.
 
   python tools/c8b_a6_o.py --rows d2_rows.csv --muc-dich giu_ngoai_a6 --giu-ngoai-theo cho --khoa-truoc khoa.json \
@@ -226,7 +227,13 @@ def build(rows, muc_dich, giu_ngoai_theo, khoa_sha, cho_sha, dai_u=DAI_U):
         hai = sorted(k for k, v in cham.items() if len(v) > 1)
         if hai:
             raise OError(f'runs {hai[:5]}: rows of more than one scoring (cham_id), or some rows without it')
-        lan_cham = {k: next(iter(v)) for k, v in sorted(cham.items()) if v != {''}}
+        # Codex round 3 V3-6: the cells are shared by the target runs, so the rows of a run without an id (its mask
+        # would be refused) must not fill a cell that opens the frames of another run: every target run has an id
+        khong = sorted(k for k, v in cham.items() if v == {''})
+        if khong:
+            raise OError(f'runs {khong[:5]}: D2 rows without cham_id (c8b_d2_hang before the scoring id): every '
+                         'target run of a d2 cell file carries the id of its scoring')
+        lan_cham = {k: next(iter(v)) for k, v in sorted(cham.items())}
         mat_na = dict(o_dat=[c['o_id'] for c in o if c['dat']], khung_mo=mo, lan_cham=lan_cham,
                       o_thieu=[dict(o_id=c['o_id'], ly_do=ly_do(c)) for c in o if not c['dat']],
                       ngoai_dai_u=ngoai, n_ngoai_mien_quyet=ngoai_mien,

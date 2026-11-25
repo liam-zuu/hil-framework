@@ -368,6 +368,11 @@ def hang(a):
             nodes.append(dict(nut=k, dung=False, cham=False, ly_do=f'node not scored ({sc.get("outcome")})'))
             continue
         if not ln[k].get('ok') and os.path.isfile(rp):
+            if ln[k].get('kind') == 'loi':
+                # Codex round 3 V3-7: a node the loader refuses for an ERROR (its rows or its gate block cannot be
+                # read as the scorer wrote them) is not a node "not scored": leaving it out would build the cells
+                # without its comparisons
+                raise D2Error(f'node {k}: the grid loader refuses the node ({ln[k].get("why")}): score it again')
             nodes.append(dict(nut=k, dung=False, cham=False,
                               ly_do=f'node not scored by the grid loader ({ln[k].get("kind")}: {ln[k].get("why")})'))
             continue
