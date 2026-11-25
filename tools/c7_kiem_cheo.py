@@ -3367,6 +3367,8 @@ def neo_luot(a):
     kh_csv = getattr(a, 'khung_csv', None)
     if kh_csv and os.path.exists(kh_csv):
         raise KCError(f'{kh_csv} exists: not replaced')
+    if kh_csv and not os.path.isdir(os.path.dirname(os.path.abspath(kh_csv))):   # D3-12: both outputs or neither
+        raise KCError(f'{kh_csv}: directory does not exist')
     kh_rows = []
     with open(a.cua_so, 'rb') as f:
         cb = f.read()
@@ -3532,7 +3534,11 @@ def neo_luot(a):
             w.writeheader()
             for r in kh_rows:
                 w.writerow({k: r.get(k, '') for k in KHUNG_CSV_COLS})
-        publish_new(kh_csv, _w)
+        try:
+            publish_new(kh_csv, _w)
+        except BaseException:                       # D3-12 (Codex C8B D3 v1): the JSON this call just published is
+            os.unlink(a.out)                        # taken back, so a failed export leaves neither file and the
+            raise                                   # same command can be run again
     _say(f"neo_luot: {len(out_l)} luot, {sum(v['trang_thai'] == 'dat' for v in out_l.values())} dat; theo_cho "
          + ', '.join(f"{c} {v['trang_thai']}: P "
                      f"{'-' if v['P_neo_m'] is None else round(v['P_neo_m'] * 1000, 3)} mm, A "

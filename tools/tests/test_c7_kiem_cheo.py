@@ -2813,6 +2813,27 @@ def test_neo_luot_khung_csv_same_json_and_signed_rows(tmp_path, scene, kind):
     assert rc2 != 0 and not (tmp_path / 'neo2.json').exists()
 
 
+def test_neo_luot_khung_csv_failure_leaves_neither_file(tmp_path, scene, monkeypatch):
+    """D3-12 (Codex C8B D3 v1, P3): --khung-csv into a missing directory is refused before anything is written; a CSV
+    export failing after the JSON is published takes the JSON back, so the same command can be run again."""
+    csp, sp, *_ = _neo_files(tmp_path, scene, drop_b=(25,), tape_off=(25, 0.003))
+    rc, b = _neo_run_bytes(tmp_path, csp, sp, 'neo.json', tmp_path / 'khong_co' / 'k.csv')
+    assert rc != 0 and b is None
+    real = kc.publish_new
+
+    def boom(path, write):
+        if str(path).endswith('.csv'):
+            raise OSError('disk full')
+        return real(path, write)
+    monkeypatch.setattr(kc, 'publish_new', boom)
+    rc, b = _neo_run_bytes(tmp_path, csp, sp, 'neo.json', tmp_path / 'k.csv')
+    assert rc != 0 and b is None and not (tmp_path / 'k.csv').exists()
+    monkeypatch.setattr(kc, 'publish_new', real)
+    rc, b = _neo_run_bytes(tmp_path, csp, sp, 'neo.json', tmp_path / 'k.csv')   # the same command, now fine
+    rc0, b0 = _neo_run_bytes(tmp_path, csp, sp, 'neo0.json')
+    assert rc == 0 and rc0 == 0 and b == b0 and (tmp_path / 'k.csv').exists()
+
+
 def test_neo_luot_sees_an_isolated_peak_between_the_windows(tmp_path, scene):
     """KCP4 test (Codex): a frame in the MIDDLE of the run (5, tag seen) loses the taped-off mark 25, the windows do
     not: the two-end number is 0 but P_neo, A_neo are the replay at frame 5 (independent oracle), so an implementation
