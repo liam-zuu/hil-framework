@@ -2701,6 +2701,8 @@ def main_rel(argv):
         ap.add_argument('--offset-anchor-s', default=None)
         for k in ('--luot-id', '--clip', '--session', '--dets'):
             ap.add_argument(k, default=None)
+        ap.add_argument('--l174', action='store_true', help='run07 only (Liam L174): pre window from the first clip '
+                        'frame, heading smoothed 0.25 s in the stillness gates')
     else:
         ap.add_argument('--cua-so', required=True)
         ap.add_argument('--luot-id', default=None, help='run id (a cua_so_v1 / lan_lap_v1 file of several runs)')
@@ -2748,7 +2750,8 @@ def main_rel(argv):
                          hang_so_sha256=cm.sha256(a.hang_so),
                          hang_so_dung={k: hs[k] for k in HANG_SO_F2})
             out = ctd.cua_so(frames, chain, rows, t0_us, nodes, u, kt, hs['t_trong_s'], lane_T, a.task, extra,
-                             gates=gates, extra_why=cwhy)
+                             gates=gates, extra_why=cwhy,
+                             l174=dict(pre_tu_dau_clip=True, psi_muot_s=0.25) if a.l174 else None)
             ctd.write_jsonl(a.out, out)
             pre = out[0]['ket_luan']
             print(f'pre: {"dat" if pre["dat"] else "khong dat: " + "; ".join(pre["ly_do"])}')

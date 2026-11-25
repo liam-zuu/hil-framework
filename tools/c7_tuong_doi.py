@@ -198,6 +198,13 @@ def _stillness(t, x, y, psi, kt):
     return bool(ok), dict(n=int(len(t)), dich_dau_cuoi_m=shift, lech_tb_max_m=dev, tan_huong_deg=math.degrees(spread))
 
 
+def _psi_muot(t, psi, s):
+    """L174 (Liam 26/11 ~02:5x at CODE, run07 only, history_CODE.md L174): heading smoothed by a centred moving mean over
+    s seconds of frame time (unwrapped), used by the stillness and heading-spread gates instead of the raw heading."""
+    t, u = np.asarray(t, float), np.unwrap(np.asarray(psi, float))
+    return np.array([u[np.abs(t - x) <= s / 2.0].mean() for x in t]) if len(t) else u
+
+
 def _samples(t_ok, a, b, dt, kt, t_trong):
     """Sample gate on [a, b) of the tag-gate frame times t_ok (J 2): count, share of the nominal frames, no hole above
     t_trong (from a, between frames, to the capture end of the last), a frame in the first and the last bien_s."""
@@ -299,7 +306,7 @@ def _log_cover(log_rows, left_s, right_s, gap_s):
 
 
 def cua_so(frames, chain, log_rows, t0_us, nodes, u_nodes, kt, t_trong, t_cmd_end, task, extra=None, gates=None,
-           extra_why=()):
+           extra_why=(), l174=None):
     """F2 rows (pre, post) of one run. frames: rows of c7_measure.read_frames; chain: rows of c7_chuoi_khung (same
     order, same idx); nodes: D_i (t_log = t_cam + D_i); u_nodes: u_ref,i [s] (the time part: grid or match error,
     drift, one frame, tick), symmetric. t_cmd_end: T_cmd (command time). extra: identity keys (luot_id, clip...).
@@ -328,6 +335,12 @@ def cua_so(frames, chain, log_rows, t0_us, nodes, u_nodes, kt, t_trong, t_cmd_en
     # pre: every decoded PTS in [t_ref - w_s, t_ref) (khung); a tag frame is used when it passes the one-sided gate and
     # its latest capture time (PTS + one frame) is before t_ref (khung_ma_hop_le; Codex CT1-14)
     a = t_ref - kt['w_s']
+    if l174:   # L174 (run07 only): the pre window and the 6 s stillness start no earlier than the first frame of the clip;
+        # the heading of the stillness gates is the smoothed one (_psi_muot); thresholds unchanged
+        a = max(a, float(t[0])) if l174.get('pre_tu_dau_clip') else a
+        if l174.get('psi_muot_s'):
+            tp = tp.copy()
+            tp[ok1] = _psi_muot(t[ok1], tp[ok1], float(l174['psi_muot_s']))
     m = (t >= a) & (t < t_ref)
     mo = m & ok1 & (t + dt < t_ref)
     s_ok, s_why = _samples(t[mo], a, t_ref, dt, kt, t_trong)
@@ -345,6 +358,8 @@ def cua_so(frames, chain, log_rows, t0_us, nodes, u_nodes, kt, t_trong, t_cmd_en
     # Codex CT1-12 (round 2): the car STILL for 6 s before the edge, not only 6 s of log: the still gate (tag frames
     # of the window gate) over [t_ref - 6 s, t_max] (6 s before the earliest edge to the latest), no hole above t_trong
     a6 = t_ref - CHO_LOG_S
+    if l174 and l174.get('pre_tu_dau_clip'):
+        a6 = max(a6, float(t[0]))
     m6 = (t >= a6) & (t <= t_max) & ok1
     d6_ok, d6_num = _stillness(t[m6], tx[m6], ty[m6], tp[m6], kt)
     ho6 = _max_hole(t[ok1], dt, a6, t_max)
@@ -362,7 +377,8 @@ def cua_so(frames, chain, log_rows, t0_us, nodes, u_nodes, kt, t_trong, t_cmd_en
                     ket_luan=dict(du_mau=s_ok, dung_yen=d_ok, log_phu=l_ok, ho_noi_s=ho, ho_noi_max_s=ho_max,
                                   noi_phu=noi_ok, cho_log_s=cho, cho_du=cho_ok, dung_yen_6s=d6_ok,
                                   so_dung_yen_6s=d6_num, dat=not why, ly_do=why,
-                                  so_dung_yen=d_num, encoder_doi=enc)))
+                                  so_dung_yen=d_num, encoder_doi=enc),
+                    **({'l174': dict(l174, a_pre=a, a6=a6)} if l174 else {})))
     # post: the last w_s of tag-gate frames, all after the latest possible end of the command
     t_end = max(t0 - D + u for D, u in zip(nodes, u_nodes)) + t_cmd_end
     tl = t[ok]
@@ -481,7 +497,9 @@ def tham_chieu(pre, chain, lan_lap, kt, t_trong, dt, extra=None, f8_rong_ok=Fals
         trang = 'hong_cua_so_tc'
         why += ['pre: ' + w for w in pre['ket_luan']['ly_do']]
     tt = np.array([by[i]['t_cam'] for i in ids], float)
-    s_ok, s_why = _samples(tt, pre['t_ref'] - kt['w_s'], pre['t_ref'], dt, kt, t_trong) if len(ids) else (False, ['rong'])
+    l174 = pre.get('l174')
+    a_tc = l174['a_pre'] if l174 else pre['t_ref'] - kt['w_s']
+    s_ok, s_why = _samples(tt, a_tc, pre['t_ref'], dt, kt, t_trong) if len(ids) else (False, ['rong'])
     if not s_ok and trang == 'dat':
         trang = 'hong_cua_so_tc'                       # J 2 (J5-1): an intersection with samples, not enough
         why += ['tap tham chieu: ' + w for w in s_why]
@@ -498,6 +516,8 @@ def tham_chieu(pre, chain, lan_lap, kt, t_trong, dt, extra=None, f8_rong_ok=Fals
         why.append('vi_tri_qua_q_khong_xac_dinh: ' + (next((r['ly_do'] for r in rows if not r['q_ok']), '')))
     if y_ok:
         ps = np.array([r['psi_ma_p'] for r in rows])
+        if l174 and l174.get('psi_muot_s'):
+            ps = ck.wrap(_psi_muot(tt, ps, float(l174['psi_muot_s'])))
         psi_tc = ck.trung_binh_go_vong(ps)
         dv = ck.wrap(ps - psi_tc)
         lpsi, tan = float(np.max(np.abs(dv))), float(np.max(dv) - np.min(dv))
