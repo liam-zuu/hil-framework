@@ -516,10 +516,10 @@ def tham_chieu(pre, chain, lan_lap, kt, t_trong, dt, extra=None, f8_rong_ok=Fals
         why.append('vi_tri_qua_q_khong_xac_dinh: ' + (next((r['ly_do'] for r in rows if not r['q_ok']), '')))
     if y_ok:
         ps = np.array([r['psi_ma_p'] for r in rows])
-        if l174 and l174.get('psi_muot_s'):
-            ps = ck.wrap(_psi_muot(tt, ps, float(l174['psi_muot_s'])))
-        psi_tc = ck.trung_binh_go_vong(ps)
-        dv = ck.wrap(ps - psi_tc)
+        psi_tc = ck.trung_binh_go_vong(ps)        # the raw heading: the scorer aligns with it (CODE 26/11, L174)
+        # L174 (run07 only): the smoothed heading enters the heading spread gate only (dv, tan), not psi_tc
+        pg = ck.wrap(_psi_muot(tt, ps, float(l174['psi_muot_s']))) if l174 and l174.get('psi_muot_s') else ps
+        dv = ck.wrap(pg - psi_tc)
         lpsi, tan = float(np.max(np.abs(dv))), float(np.max(dv) - np.min(dv))
     elif rows:
         why.append('huong_sau_A6_khong_xac_dinh')
