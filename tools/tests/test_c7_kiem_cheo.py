@@ -2998,6 +2998,34 @@ def test_neo_luot_w_not_still_on_r_t_is_not_usable(tmp_path, scene, monkeypatch)
     assert all('khong dung yen' in x['ly_do'] for x in r['info']['khong_hop_le'])
 
 
+@pytest.mark.parametrize('l174, ket', [(dict(pre_tu_dau_clip=True, psi_muot_s=0.25, a_pre=0.0, a6=0.0), 'dat'),
+                                        (None, 'chua_ket_luan'), (dict(pre_tu_dau_clip=True, a_pre=0.0), 'chua_ket_luan')])
+def test_neo_luot_w_stillness_uses_the_l174_heading_smoothing(tmp_path, scene, monkeypatch, l174, ket):
+    """L174 (Liam 26/11, run07 only; CODE 26/11): when the F2 pre row carries l174.psi_muot_s, the W stillness on R_t
+    takes the heading through c7_tuong_doi._psi_muot with that span (as F2 did), thresholds unchanged; without the
+    key (or without psi_muot_s) the raw heading, as before."""
+    import c7_tuong_doi as td
+    csp, sp, *_ = _neo_files(tmp_path, scene)
+    if l174 is not None:
+        _neo_rewrite(csp, lambda r: dict(r, l174=l174) if r.get('loai') == 'pre' else r)
+    seen = []
+
+    def muot(t, psi, s_):
+        seen.append(s_)
+        return np.zeros(len(psi))                    # the smoothed heading: perfectly still
+
+    monkeypatch.setattr(td, '_psi_muot', muot)
+    monkeypatch.setattr(td, '_stillness', lambda t, x, y, psi, kt: (bool(np.all(np.asarray(psi) == 0.0)),
+                                                                     dict(n=len(t))))
+    rc, o = _neo_run(tmp_path, csp, sp)
+    r = o['luot']['C8-P-F02-1']
+    assert rc == 0 and r['trang_thai'] == ket
+    if ket == 'dat':                                 # smoothed with the F2 span, every R_t W check
+        assert seen and set(seen) == {0.25}
+    else:                                            # no l174.psi_muot_s: the raw heading, never smoothed
+        assert seen == []
+
+
 def test_neo_luot_refuses_bad_f2_thresholds(tmp_path, scene):
     """KCP4V3-5: t_canh_s not a finite number, or w_s outside the CAM ranges: code 2."""
     for key, val in (('t_canh_s', '26'), ('nguong', dict(NEO_KT, w_s=0.1)), ('nguong', dict(NEO_KT, w_s=2.0)),

@@ -3165,7 +3165,8 @@ def _gate12(r, gates, rms_h):
     return why
 
 
-def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms_h, t_ref=None, kt=None, khung=None):
+def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms_h, t_ref=None, kt=None, khung=None,
+            l174=None):
     """P_neo / A_neo of one C8 run (S7-14.5; CODE 23/11: the bound of hang_m covers EVERY frame t of the run). W = pre.
     For every valid frame t of the run (frames.csv valid with a tag pose, from the first W frame to the last post
     frame), R_t = (anchors common to every W frame) & S_t; the replay deviation of a frame f on R_t is e_f = TAG pose
@@ -3316,10 +3317,12 @@ def neo_run(fp_, rows, dets, ids_w, ids_post, side, kappa, plumb, to, gates, rms
                               f'cong mot phia (dau {miss[:5]})', rec_w)
             else:
                 ok = sorted(W_ids)
-                still, num = td._stillness(np.array([t_csv[f] for f in ok]),
-                                           np.array([ch_[w_ctx.index(f)]['tag_x'] for f in ok]),
-                                           np.array([ch_[w_ctx.index(f)]['tag_y'] for f in ok]),
-                                           np.array([ch_[w_ctx.index(f)]['tag_psi'] for f in ok]), kt)
+                tw = np.array([t_csv[f] for f in ok])
+                pw = np.array([ch_[w_ctx.index(f)]['tag_psi'] for f in ok])
+                if l174 and l174.get('psi_muot_s'):  # L174 (Liam 26/11, run07 only): the heading smoothing F2 used
+                    pw = td._psi_muot(tw, pw, float(l174['psi_muot_s']))    # for this W (CAM's function, as td)
+                still, num = td._stillness(tw, np.array([ch_[w_ctx.index(f)]['tag_x'] for f in ok]),
+                                           np.array([ch_[w_ctx.index(f)]['tag_y'] for f in ok]), pw, kt)
                 rec_w['dung_yen'] = num
                 m = np.array([np.mean([wd[f][0] for f in ok]), np.mean([wd[f][1] for f in ok]),
                               circ_mean([wd[f][2] for f in ok])])
@@ -3509,7 +3512,7 @@ def neo_luot(a):
                     fp_ = FramePoses(s, pc)
                     kh = {} if kh_csv else None
                     res, w3 = neo_run(fp_, rows, dets, ids['pre'], ids['post'], *cfg, gates, float(s['rms_px_H']),
-                                      t_ref=pre.get('t_canh_s'), kt=pre.get('nguong'), khung=kh)
+                                      t_ref=pre.get('t_canh_s'), kt=pre.get('nguong'), khung=kh, l174=pre.get('l174'))
                     for t_, v_ in sorted((kh or {}).items()):
                         kh_rows.append(dict(v_, luot_id=lid, khung=t_))
                     if w3:
