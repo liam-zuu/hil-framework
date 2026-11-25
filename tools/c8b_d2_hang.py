@@ -22,8 +22,10 @@ hang (one target run, every scored node of its grid folder):
                     frame (u < v_d, the band B0 of the P6 rule; design 0.7) has A4 = 0; a frame beyond the bands
                     or in a band without a number has no bound (empty: not comparable). Empty where the heading
                     is not defined (huong_xac_dinh 0). Not U_psi_k_deg of the rows, which a suspect frame widens to
-                    |d| + U_IMU: comparing d with it would pass by construction. A K run takes the F05 block (the
-                    lock's bang_man_trap: K by F05, J v6 J4-7) [CACH HIEU C8B].
+                    |d| + U_IMU: comparing d with it would pass by construction. A K run is in the target set of D2 and
+                    takes the F05 block (same 0.5 m/s; the lock's bang_man_trap: K by F05, J v6 J4-7): a reading,
+                    J v6 does not say it (lines 40, 163), decided by Liam 25/11/2026 at CODE local_c65e48c9, L157
+                    question 4, box choice "Co, dung can F05 (Recommended)".
   U_imu_rad       U_IMU,D(k) of u_imu_dong_v3 (c8b_u_imu_v3 formula, the turn totals by prefix sums, checked
                     equal to c8b_u_imu_v3.u_imu_delta in the tests), omega / alpha from the camera yaw (frames.csv,
                     as the E_noi table), clock pairing u- = u+ = U_t_s of the node (CODE 25/11 02:54, question 5 of
@@ -492,7 +494,9 @@ def hang(a):
                      u_lag_s=P3['u_lag_s'], lan_lap_id=a.lan_lap, cham_id=cham_id,
                      u_psi='can truoc le theo khung tu khoa (L156, Liam 25/11): hang_dong_truoc_le.hang_rad + '
                            'A4_deg cua dai toc do / le; khung dung yen (u < v_d) A4 = 0',
-                     cach_hieu=['luot K lay khoi muc O1-F05 cua khoa (bang_man_trap: K theo F05)',
+                     cach_hieu=['luot K thuoc tap dich D2 va lay khoi muc O1-F05 cua khoa (bang_man_trap: K theo F05): '
+                                'cach hieu, J v6 chua noi ro (dong 40, 163); Liam 25/11/2026 phien CODE '
+                                'local_c65e48c9, L157 cau 4, "Co, dung can F05 (Recommended)"',
                                 'u-/u+ = U_t_s cua nut (gio.json khong co u_cham-/+)'])
 
 

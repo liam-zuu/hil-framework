@@ -18,9 +18,11 @@ State rule (design 8): per (dai_luong, mien): every |sai| of the test set (kiem,
 one above -> that quantity thieu in that domain (listed in mien_thieu; the index is NOT raised after the lock); on the
 fit set (khop, before the lock) an excess raises the index to the largest |sai| seen (listed in chi_so_nang); a source
 without an independent dynamic reference -> gioi_han (usable, the assumption written). File trang_thai: dat when the
-lock is a c8b_khoa_v5 file with trang_thai khoa, every required source of design 8 (NGUON_CAN) has test rows, and every
-value is finite; else thieu with the reasons. A dat file may still carry mien_thieu. LIMIT (found 24/11, L155): no
-tool reads mien_thieu yet (lock, scorer and gate do not): a domain listed there is NOT made n_undef in the scoring.
+lock is a c8b_khoa_v5 file with trang_thai khoa, every required source of design 8 (NGUON_CAN) has test rows, every
+value is finite, and mien_thieu is empty; else thieu with the reasons. mien_thieu not empty -> thieu (Codex D3-2; Liam
+25/11/2026 at CODE local_c65e48c9, L157 question 3, "Doi thanh thieu (Recommended)"): no tool reads mien_thieu (lock,
+scorer and gate do not; a domain listed there is NOT made n_undef in the scoring), so the gate must not lock C8 on a
+file that carries one until someone has decided on those domains.
 
   python tools/c8b_kiem_vi_tri.py --rows d3_rows.csv --khoa c8b_khoa_v5.json --out c8b_kiem_vi_tri.json
 Last line: #ket_qua,ma=0 written / 2 refused or error.
@@ -124,11 +126,18 @@ def build(rows, khoa, khoa_sha):
         bang.append(dict(nguon=ng, dai_luong=dl, mien=mien, n_khop=len(kh), n_kiem=len(ki),
                          sai_kiem_min_m=min(ki) if ki else None, sai_kiem_max_m=max(ki) if ki else None,
                          chi_so_m=c, chi_so_dung_m=c_moi, trang_thai=st))
+    if mien_thieu:
+        # Codex D3-2; Liam 25/11/2026 at CODE local_c65e48c9, L157 question 3, box choice "Doi thanh thieu
+        # (Recommended)": no tool reads mien_thieu (lock, scorer, gate), so a file that carries one is not dat: the
+        # gate does not lock C8 until someone has looked at the domains listed
+        why.append(f'mien_thieu: {len(mien_thieu)} quantity / domain of the test set above its index '
+                   f'({", ".join(sorted({m["nguon"] + "/" + m["dai_luong"] + "/" + m["mien"] for m in mien_thieu})[:6])})')
     return dict(version=VERSION, trang_thai='dat' if not why else 'thieu', ly_do=why, khoa_truoc_sha256=khoa_sha,
                 bang=bang, mien_thieu=mien_thieu, chi_so_nang=nang, gioi_han=gh, nguon_can=list(NGUON_CAN),
                 truoc_le=True,
                 quy_tac='kiem sau khoa: |sai| <= chi so -> dat, vuot -> dai luong thieu o mien do (khong nang); khop '
-                        'truoc khoa: vuot -> nang chi so toi cuc dai; khong chuan dong doc lap -> gioi_han')
+                        'truoc khoa: vuot -> nang chi so toi cuc dai; khong chuan dong doc lap -> gioi_han; file thieu '
+                        'khi mien_thieu khac rong (L157, Liam 25/11)')
 
 
 def main(argv=None):
