@@ -146,7 +146,7 @@ def make_s03(tmp_path, q1=q1_convex, q2=q2_convex, mods=None, fake=True, dll=Non
     (d / 'sealed_test').mkdir()
     lv = levels or LEVELS
     for name, extra in (('levels.csv', []), (os.path.join('sealed', 'levels_sangloc.csv'),
-                                             ['L_nguon', 'H_nguon', 'b', 'b_n', 'nguon_mien', 'ly_do'])):
+                                             ['a', 'b', 'b_n', 'L_nguon', 'H_nguon', 'nguon_mien', 'ly_do'])):
         with open(d / name, 'w', newline='') as f:
             w = csv.writer(f)
             w.writerow(['controller', 'factor', 'L', 'H', 'centre', 'scale', 'default', 'rule_note'] + extra)
@@ -154,7 +154,7 @@ def make_s03(tmp_path, q1=q1_convex, q2=q2_convex, mods=None, fake=True, dll=Non
                 for n in s3.FACTORS[c]:
                     L, H = lv[c][n]
                     w.writerow([c, n, repr(L), repr(H), '', 'log' if L > 0 and H / L >= 4 else 'lin', '', '']
-                               + (['', '', '', '', 'sang_loc', ''] if extra else []))
+                               + ([L if L > 0 else '', H, H, '', '', 'sang_loc', ''] if extra else []))
     pts = ([(0, 'centre', (0.0,) * 7)] + [(p, 'outer', c) for p, c in s3.design_points(1.0, 1)] +
            [(p, 'inner', c) for p, c in s3.design_points(0.5, 129)] + [(p, 'axial', c) for p, c in s3.axial_points()] +
            [(p, 'test', c) for p, c in _test_points()])
@@ -182,9 +182,21 @@ def make_s03(tmp_path, q1=q1_convex, q2=q2_convex, mods=None, fake=True, dll=Non
     s3.write_csv(str(d / 'sealed' / 'runs.csv'), runs)
     s3.write_csv(str(d / 'sealed_test' / 'runs_test.csv'), trows)
     (d / 'sealed' / 'notes.json').write_text(json.dumps(dict(elapsed_s_main_design=123, run_error_reruns=[])))
-    (d / 'sealed' / 'sangloc' / 'ket_qua.json').write_text('{}')
+    (d / 'sealed' / 'sangloc' / 'ket_qua.json').write_text(json.dumps(
+        {'N': None, 'N_da_dung': 0, 'm_min': 86,
+         **{c: dict(nhanh='nhan', trang_thai='hoan_tat', ly_do=[], nguon_mien='sang_loc')
+            for c in s3.CONTROLLERS}}))                     # C3-41: a finished screening for both
     (d / 'sealed' / 'sangloc_thu' / 'so_dem.json').write_text('{}')
     (d / 'sealed_test' / 'notes.json').write_text(json.dumps(dict(elapsed_s_test=45, run_error_reruns=[])))
+    import hashlib
+    files = {}                                          # C3-41: sealed/manifest.json as S03 writes it
+    for root, _, names in os.walk(d / 'sealed'):
+        for n in names:
+            p = os.path.join(root, n)
+            rel = os.path.relpath(p, d / 'sealed').replace(os.sep, '/')
+            if rel != 'manifest.json':
+                files[rel] = hashlib.sha256(open(p, 'rb').read()).hexdigest()
+    (d / 'sealed' / 'manifest.json').write_text(json.dumps(dict(files=files)))
     dll_sha = s3.sha256_file(dll) if dll and os.path.isfile(dll) else 'no dll'
     y3 = {f'{c} v={v:g}': 5.0 for c in s3.CONTROLLERS for v in SPEEDS}
     (d / 'meta.yaml').write_text(
@@ -1863,3 +1875,101 @@ def test_end_to_end_with_a_real_s04_tool_check(tmp_path, monkeypatch, capsys):
     cost = list(csv.DictReader(open(out / 'rsm' / 'check' / 'cost.csv')))
     main = next(r for r in cost if r['item'] == 'S04 main')
     assert main['n_runs_planned'] == main['n_runs_actual']          # the seeds run (1), not the locked ones (5)
+
+
+# ── C3-44: every guarded S03 input is refused from its directory entry before it is opened ──
+
+def _c3_spy(monkeypatch):
+    """builtins.open + os.open spy: records the real path of every opened name and the (dev, ino) of
+    every opened descriptor, so a hard-link alias is caught by the opened target, not by its name."""
+    rec = []
+    real_open, real_os_open = builtins.open, os.open
+
+    def note(name, f):
+        try:
+            st = os.fstat(f.fileno() if hasattr(f, 'fileno') else f)
+        except (AttributeError, OSError, TypeError):
+            st = None
+        try:
+            real = os.path.normcase(os.path.realpath(name))
+        except (TypeError, ValueError):
+            real = None
+        rec.append((real, (st.st_dev, st.st_ino) if st else None))
+
+    def spy_open(name, *a, **kw):
+        f = real_open(name, *a, **kw)
+        note(name, f)
+        return f
+
+    def spy_os_open(name, *a, **kw):
+        fd = real_os_open(name, *a, **kw)
+        note(name, fd)
+        return fd
+
+    monkeypatch.setattr(builtins, 'open', spy_open)
+    monkeypatch.setattr(os, 'open', spy_os_open)
+
+    class Spy:
+        def opened(self, path):
+            try:
+                st = os.stat(path)
+                ident = (st.st_dev, st.st_ino)
+            except OSError:
+                ident = None
+            real = os.path.normcase(os.path.realpath(path))
+            return any(r == real or (i is not None and i == ident) for r, i in rec)
+
+        def under(self, dirpath):
+            base = os.path.normcase(os.path.realpath(dirpath)) + os.sep
+            return any(r is not None and r.startswith(base) for r, _ in rec)
+
+    return Spy()
+
+
+@pytest.mark.parametrize('rel', ['sealed/sangloc/ket_qua.json', 'sealed/sangloc_thu/so_dem.json'])
+def test_c3_44_rsm_refuses_a_hard_link_before_the_start_row(tmp_path, dummy_dll, monkeypatch, rel):
+    """C3-44 (L56): every S03 file check_inputs fingerprints is checked from its path entry before the
+    start row; a hard-link alias of a sealed input to sealed_test/runs_test.csv is refused and the
+    target bytes are never opened."""
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    target = s03 / 'sealed_test' / 'runs_test.csv'
+    victim = s03.joinpath(*rel.split('/'))
+    os.remove(victim)
+    os.link(target, victim)
+    spy = _c3_spy(monkeypatch)
+    with pytest.raises(rc.Stop, match='hard link'):
+        rc.run_phase('fit', str(s04), dummy_dll)
+    assert not spy.opened(target)                                    # the aliased bytes were never read
+    p = s04 / 'rsm' / 'attempts.csv'
+    assert not p.exists() or all(r['kind'] != 'start' for r in att(s04))   # refused before the start row
+
+
+def test_c3_44_rsm_refuses_a_junction_directory(tmp_path, dummy_dll, monkeypatch):
+    """C3-44: a junction where sealed/sangloc_thu/ should be is refused from the path entry; the file
+    behind it is never opened."""
+    if sys.platform != 'win32':
+        pytest.skip('junction needs Windows')
+    import _winapi
+    import shutil
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    other = s03 / 'elsewhere_thu'
+    other.mkdir()
+    (other / 'so_dem.json').write_text('{}', encoding='utf-8')
+    shutil.rmtree(s03 / 'sealed' / 'sangloc_thu')
+    _winapi.CreateJunction(str(other), str(s03 / 'sealed' / 'sangloc_thu'))
+    spy = _c3_spy(monkeypatch)
+    with pytest.raises(rc.Stop, match='link'):
+        rc.run_phase('fit', str(s04), dummy_dll)
+    assert not spy.opened(other / 'so_dem.json')
+
+
+def test_c3_44_rsm_main_mode_refuses_a_non_bool_trial(tmp_path, dummy_dll, monkeypatch, fake_eval):
+    """C3-44: check_mode reads only the public meta.yaml; trial: \"yes\" is not the bool -> refused,
+    no start row."""
+    repo, s03, s04 = _main_mode(tmp_path, dummy_dll, monkeypatch)
+    (s03 / 'meta.yaml').write_text(
+        'trial: "yes"     # x\nstatus: "ran to the end"\nmu_levels: [0.4, 0.5, 0.6]\n', encoding='utf-8')
+    with pytest.raises(rc.Stop, match='bool'):
+        rc.run_phase('fit', str(s04), dummy_dll)
+    p = s04 / 'rsm' / 'attempts.csv'
+    assert not p.exists() or all(r['kind'] != 'start' for r in att(s04))

@@ -9,8 +9,11 @@ on, or for a packet it received before it saw the motors off, it answers err=mot
 nothing.
 
   python tools/gain_send.py --ip 192.168.1.50 --ctrl PID --id 12 \
-      --gains kp_xy=1.2,ki_xy=0.4,kp_wz=1.0,ki_wz=0.05,pos_kp=6,pos_ki=3,k_psi=1
-  python tools/gain_send.py --ip 192.168.1.50 --file 05_DATA/.../gain_A-PID_03.json --id 3
+      --gains kp_xy=1.2,ki_xy=0.4,kp_wz=1.0,ki_wz=0.05,pos_kp=6,pos_ki=3,k_psi=1 \
+      --nguon-gain-tay "manual tuning on the bench"
+  python tools/gain_send.py --ip 192.168.1.50 --file 05_DATA/.../gain_A-PID_03.json --id 3 \
+      --nguon-gain-tay "frozen gain file of <campaign>"
+  python tools/gain_send.py --ip 192.168.1.50 --ctrl PID --id 3 --gains <7 gains> --s04-run <S04 run>
   python tools/gain_send.py --ip 192.168.1.50 --query        (read the running set, change nothing)
   add --mac aa:bb:cc:dd:ee:ff to refuse an answer from any other board (the MAC is in every answer)
 
@@ -25,11 +28,21 @@ Every value is rounded to float32 and sent as %.9g, so the ESP32 gets exactly th
 Before sending, the set is checked against the PC gain table tools/gain_table.py (range; ADRC
 omega_c + 2*omega_o < 200 on each axis, xy and wz); a violation sends nothing (exit 1, like bad
 arguments); warnings (the pos_kp / pos_ki wedge) are printed and the set is still sent.
+Every send declares where its gains come from (C3-8): a campaign gain set with
+--s04-run <S04 run folder>, any other send with --nguon-gain-tay "<where the gains come from>"
+(logged on the '#nguon_gain,loai=tay' line); both flags or a blank description: usage error
+(exit 1); no source at all: refused, nothing sent (exit 5). --query needs no source.
 --s04-run <S04 run folder>: before the send, the S04 section 6 hand-over check runs
-(s04_hand_over): post_checks/notes.json cho_liam must be a list and selected.csv must hold exactly
-one send_to_HIL row of this controller with feasible 'true' whose 7 gains are the sent ones bit for
+(s04_hand_over): post_checks/notes.json cho_liam must be a list of objects with str 'controller',
+str 'check' and list 'reasons' (a broken record refuses, never overridable), tool_check must be
+exactly false (a tool-check run is never handed over), post_trang_thai must be 'hoan_tat' (the post
+checks ran to their end; notes.json carries selected_sha256 / selected_sha256_lf of the selected.csv
+bytes the post hashed — the file read for this send must hash to one of them, else it changed after
+post and the send is refused), and selected.csv must hold exactly one send_to_HIL row of this
+controller with feasible 'true' whose 7 gains are the sent ones bit for
 bit as float32; a non-empty cho_liam refuses the send (exit 5) unless --liam-da-quyet "<reason>"
-overrides it (every item is listed, the reason is logged on the '#ban_giao_s04' line).
+overrides it (every item is listed, the reason is logged on the '#ban_giao_s04' line, which also
+carries selected_sha256 of the sent file).
 --liam-da-quyet without --s04-run, a blank reason, or a reason while cho_liam is empty: usage error
 (exit 1). Right before the '# send' line the spectral radius of the one-axis sub-model
 (tools/mo_hinh_con.ban_kinh_pho_va_trang_thai) is printed as an indicator: report only, it NEVER
@@ -50,14 +63,17 @@ The running set is not kept over a reset: after a reboot the ESP32 runs the buil
 
 Exit code / last line '#ket_qua,ma=N': 0 applied and verified (or --query read a complete set);
 2 rejected by the ESP32 (err=..); 3 no answer; 4 answer does not match what was sent (or another
-board's MAC); 5 refused by the S04 hand-over check (--s04-run, nothing sent); 1 bad arguments or
-refused by the PC gain table.
+board's MAC); 5 refused by the S04 hand-over check (--s04-run) or no gain source declared (nothing
+sent); 1 bad arguments or refused by the PC gain table.
 """
 import argparse
 import csv
+import hashlib
+import io
 import json
 import math
 import os
+import re
 import secrets
 import socket
 import struct
@@ -75,6 +91,8 @@ NAMES = {'PID': ['kp_xy', 'ki_xy', 'kp_wz', 'ki_wz', 'pos_kp', 'pos_ki', 'k_psi'
 ALIASES = {'wc_xy': 'omega_c_xy', 'wo_xy': 'omega_o_xy', 'wc_wz': 'omega_c_wz', 'wo_wz': 'omega_o_wz'}
 ID_MAX = 2147483647
 RETRY_ERRS = ('busy', 'timeout')
+SHA_RE = re.compile(r'[0-9a-f]{64}')
+POST_DONE = 'hoan_tat'                    # post_trang_thai of a notes.json whose post checks ran to the end
 
 
 class UsageError(Exception):
@@ -291,15 +309,22 @@ def board_mismatch(ack: dict, want_mac):
 
 def s04_hand_over(run_dir, ctrl, gains, reason):
     """S04 section 6 hand-over check before one gain set goes to the board. Reads
-    <run_dir>/post_checks/notes.json and <run_dir>/selected.csv. Returns (code, out_lines, err_lines):
+    <run_dir>/post_checks/notes.json and <run_dir>/selected.csv (the latter ONCE, as bytes: hashed
+    and parsed from the same bytes, C3-8). Returns (code, out_lines, err_lines):
       5  refused, nothing may be sent: notes.json missing / not JSON / not an object / 'cho_liam'
-         missing or not a list; selected.csv missing or without exactly one row kind=send_to_HIL of
-         controller ctrl with feasible 'true'; the 7 sent gains differ bit for bit as float32 from
-         that row; or cho_liam is non-empty and reason is None (ANY item blocks, whatever its
-         controller; each item is listed: controller, check, number of reasons)
+         missing or not a list; a cho_liam item not an object with str 'controller', str 'check',
+         list 'reasons' (a broken hand-over record, C3-47 — never overridable); tool_check not
+         exactly false (a tool-check run is never handed over); post_trang_thai not 'hoan_tat' (the
+         post checks did not run to their end); selected_sha256 / selected_sha256_lf missing, not a
+         SHA-256, or not matching the selected.csv bytes (C3-8: changed after post); selected.csv
+         missing, not UTF-8 or without exactly one row kind=send_to_HIL of controller ctrl with
+         feasible 'true'; the 7 sent gains differ bit for bit as float32 from that row; or cho_liam
+         is non-empty and reason is None (ANY item blocks, whatever its controller; each item is
+         listed: controller, check, number of reasons)
       1  usage error: a reason is given but cho_liam is empty (nothing to override)
       0  send; out_lines: '#ban_giao_s04,run=<json abs path>,tool_check=<json>,cho_liam=<n>,
-         liam_da_quyet=<json reason or "">' plus one '# cho_liam: ...' line per item overridden.
+         liam_da_quyet=<json reason or "">,selected_sha256=<hex of the raw bytes>' plus one
+         '# cho_liam: ...' line per item overridden.
     All text is ASCII (free text through json.dumps ensure_ascii=True)."""
     p = os.path.join(run_dir, 'post_checks', 'notes.json')
     try:
@@ -314,11 +339,36 @@ def s04_hand_over(run_dir, ctrl, gains, reason):
         return 5, [], [f"# error: {p}: 'cho_liam' missing or not a list: not the notes.json of an S04 "
                        f'post check (S04 section 6)']
     cho = notes['cho_liam']
+    for i, it in enumerate(cho):                # C3-47: a broken hand-over record can never be overridden
+        if not isinstance(it, dict) or not isinstance(it.get('controller'), str) \
+                or not isinstance(it.get('check'), str) or not isinstance(it.get('reasons'), list):
+            return 5, [], [f'# error: {p}: cho_liam item {i} is not an object with str "controller", str '
+                           f'"check" and list "reasons": a broken hand-over record (C3-47)']
+    if notes.get('tool_check') is not False:    # C3-8: a tool-check S04 run (or no tool_check: false) is never
+        return 5, [], [f'# error: {p}: tool_check is {notes.get("tool_check")!r}, not false: a tool-check S04 '
+                       f'run is never handed over to the board (S04 section 6; C3-8)']
+    if notes.get('post_trang_thai') != POST_DONE:   # C3-8: the post phase did not run to its end
+        return 5, [], [f'# error: {p}: post_trang_thai is {notes.get("post_trang_thai")!r}, not '
+                       f'{POST_DONE!r}: the post checks did not run to their end, no hand-over (C3-8)']
     sp = os.path.join(run_dir, 'selected.csv')
     try:
-        with open(sp, newline='', encoding='utf-8') as f:
-            rows = list(csv.DictReader(f))
+        with open(sp, 'rb') as f:
+            raw = f.read()                      # C3-8: read ONCE; hashed and parsed from the same bytes
     except OSError as e:
+        return 5, [], [f'# error: {sp}: {e}']
+    want, want_lf = notes.get('selected_sha256'), notes.get('selected_sha256_lf')
+    if not (isinstance(want, str) and SHA_RE.fullmatch(want)) \
+            or not (isinstance(want_lf, str) and SHA_RE.fullmatch(want_lf)):
+        return 5, [], [f'# error: {p}: selected_sha256 / selected_sha256_lf missing or not a SHA-256: not the '
+                       f'notes.json of an S04 post check that ran to the end (C3-8)']
+    if hashlib.sha256(raw).hexdigest() != want \
+            and hashlib.sha256(raw.replace(b'\r\n', b'\n')).hexdigest() != want_lf:
+        return 5, [], [f'# error: {sp} is not the file the post checks hashed (changed after post): '
+                       f'selected_sha256 {want[:12]}... of {p}, file {hashlib.sha256(raw).hexdigest()[:12]}... '
+                       f'(C3-8); run the post checks again, nothing sent']
+    try:
+        rows = list(csv.DictReader(io.StringIO(raw.decode('utf-8'), newline='')))
+    except (OSError, UnicodeDecodeError) as e:
         return 5, [], [f'# error: {sp}: {e}']
     sel = [r for r in rows if r.get('kind') == 'send_to_HIL' and r.get('controller') == ctrl
            and r.get('feasible') == 'true']
@@ -349,7 +399,8 @@ def s04_hand_over(run_dir, ctrl, gains, reason):
     out = ['#ban_giao_s04,run=' + json.dumps(os.path.abspath(run_dir), ensure_ascii=True)
            + ',tool_check=' + json.dumps(notes.get('tool_check'))
            + f',cho_liam={len(cho)}'
-           + ',liam_da_quyet=' + json.dumps(reason or '', ensure_ascii=True)]
+           + ',liam_da_quyet=' + json.dumps(reason or '', ensure_ascii=True)
+           + f',selected_sha256={hashlib.sha256(raw).hexdigest()}']
     for it in cho:
         out.append('# cho_liam: ' + json.dumps(it.get('controller'), ensure_ascii=True)
                    + ' ' + json.dumps(it.get('check'), ensure_ascii=True)
@@ -394,6 +445,9 @@ def main(argv=None):
                     help='S04 run folder: the section 6 hand-over check (post_checks/notes.json cho_liam, '
                          'selected.csv send_to_HIL row) runs before the send; a non-empty cho_liam refuses '
                          '(exit 5) unless --liam-da-quyet overrides it')
+    ap.add_argument('--nguon-gain-tay', metavar='MO_TA',
+                    help='a MANUAL gain set: where these gains come from (logged on the #nguon_gain line); '
+                         'needed for every send that is not a campaign S04 hand-over')
     ap.add_argument('--liam-da-quyet', metavar='LY_DO',
                     help='the reason Liam gave for sending although the S04 post checks list cho_liam items '
                          '(logged on the #ban_giao_s04 line)')
@@ -424,6 +478,23 @@ def main(argv=None):
         print('#gain_running,' + ','.join(f'{k}={v}' for k, v in ack.items() if k not in ('tx', 'req_id', 'ok', 'err')))
         print('#ket_qua,ma=0')
         return 0
+
+    # C3-8: every send declares where its gains come from (a query needs none)
+    if a.s04_run is not None and a.nguon_gain_tay is not None:
+        print('error: give --s04-run or --nguon-gain-tay, not both', file=sys.stderr)
+        print('#ket_qua,ma=1')
+        return 1
+    if a.nguon_gain_tay is not None and not a.nguon_gain_tay.strip():
+        print('error: --nguon-gain-tay needs a non-empty description of where the gains come from',
+              file=sys.stderr)
+        print('#ket_qua,ma=1')
+        return 1
+    if a.s04_run is None and a.nguon_gain_tay is None:
+        print('error: no gain source declared: a campaign gain set needs --s04-run <S04 run folder> (S04 '
+              'hand-over check); any other send needs --nguon-gain-tay "<where the gains come from>"; '
+              'nothing sent', file=sys.stderr)
+        print('#ket_qua,ma=5')
+        return 5
 
     try:
         ctrl, set_id, raw = a.ctrl, a.id, {}
@@ -462,7 +533,11 @@ def main(argv=None):
         print(f'# warning: {w}')
 
     if a.s04_run is not None:                    # S04 section 6: the hand-over check before anything is sent
-        code, out_lines, err_lines = s04_hand_over(a.s04_run, ctrl, gains, a.liam_da_quyet)
+        try:
+            code, out_lines, err_lines = s04_hand_over(a.s04_run, ctrl, gains, a.liam_da_quyet)
+        except Exception as e:                   # noqa: BLE001  C3-8: a broken record never sends and never
+            code, out_lines, err_lines = 5, [], ['# error: the S04 hand-over check failed: ' +  # ends without #ket_qua
+                                                 json.dumps(f'{type(e).__name__}: {e}', ensure_ascii=True)]
         for t in out_lines:
             print(t)
         for t in err_lines:
@@ -470,6 +545,8 @@ def main(argv=None):
         if code:
             print(f'#ket_qua,ma={code}')
             return code
+    else:                                        # C3-8: a manual send logs its declared source
+        print('#nguon_gain,loai=tay,mo_ta=' + json.dumps(a.nguon_gain_tay.strip(), ensure_ascii=True))
     for t in spectral_lines(ctrl, gains):        # S04 v6.8 section 6: report only, never blocks
         print(t)
 
