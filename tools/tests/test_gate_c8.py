@@ -3895,3 +3895,222 @@ def test_d3_8_every_later_hc_goc_end_is_in_d3(tmp_path):
         f.write(b'x\n')
     with pytest.raises(GC.GateFileError, match='nguon rows.*sha256 differs'):
         GC.check_nguon(d, goc)
+
+
+# ── L170 (Liam 25/11 ~21:45 at CODE local_4932073c; run07): the declared substitute of a clip H at the end ──────────────
+LIAM_L170 = dict(ngay='2026-11-25', phien='local_4932073c',
+                 nguyen_van='lay clip H giua, duplicate len lam 2 cai H cuoi di')
+
+
+def _l170(goc, d, decl=None, block=True):
+    """_hai_doan, then run07 as Liam decided it (L170): the clips H at the end of both segments (IMG_9002, IMG_9006)
+    are not used; one clip H filmed after the first LADRC run (H_n, IMG_9007) is the clip H at the end of both, by the
+    declaration thay_the_L170.json of the session. Premise files, clip H comparisons and scorings follow. decl: an
+    edit of the declaration content; block False: the gate without its thay_the_h_cuoi block. Returns the expected
+    block (written by hand, not by the gate code)."""
+    _hai_doan(goc, d)
+    t = d['tien_de_c8'][0]
+    hn = _jw(goc, 'clip_h/H_n.json', dict(kind=GC.SESSION_KIND, ten='H_n', video='H_n_07_IMG_9007.MOV',
+                                          video_sha256=_h('video H_n'), **SESSION))
+    runs = {'PID': [], 'LADRC': []}
+    for c in d['o_c8']:
+        for j, x in enumerate(c['chuoi']):
+            runs[c['controller']].append(c['o'] + (f'_lai{j}' if j else ''))
+    first = runs['LADRC'][0]
+    _csv_edit(goc, d, lambda ls: sum(([l, 'IMG_9007,H_n,,,,,'] if l.split(',')[1] == first else [l] for l in ls), []))
+    for s, ctrl in zip(t['doan'], ('PID', 'LADRC')):
+        s['cuoi'] = dict(hn)
+        td = json.load(open(os.path.join(goc, s['file']['duong_dan']), encoding='utf-8'))
+        end = next(n for n, r in td['vai_tro_clip_h'].items() if r == 'cuoi')
+        _rewrite(goc, s['file'], lambda y: y['sha256']['sessions'].update({end: hn['sha256']}))
+        dr = None
+        for c in d['o_c8']:
+            if c['controller'] != ctrl:
+                continue
+            for x in c['chuoi']:
+                if dr is None:
+                    dr = dict(x['file_so_h'])
+                    _rewrite(goc, dr, lambda y: y.update(s1_session_sha256=hn['sha256']))
+                x['file_so_h'] = dict(dr)
+                lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
+                _relink_nodes(goc, d, x, lu, file_so_h=dict(dr))
+    f = dict(format=GC.THAY_THE_FORMAT, buoi=t['buoi'], quyet_dinh=dict(LIAM_L170), clip_thay='IMG_9007',
+             doan=[dict(ten='doan2', cuoi_goc='IMG_9002', luot=list(runs['PID'])),
+                   dict(ten='doan3', cuoi_goc='IMG_9006', luot=list(runs['LADRC']))])
+    if decl:
+        decl(f)
+    ref = _jw(goc, 'thay_the_L170.json', f)
+    want = dict(file=ref, clip_thay='IMG_9007',
+                doan=[dict(ten='doan2', cuoi_goc='IMG_9002', clip_thay_trong_doan=False, luot=list(runs['PID']),
+                           luot_sau_clip_thay=[]),
+                      dict(ten='doan3', cuoi_goc='IMG_9006', clip_thay_trong_doan=True, luot=list(runs['LADRC']),
+                           luot_sau_clip_thay=runs['LADRC'][1:])])
+    if block:
+        t[GC.THAY_THE_KEY] = json.loads(json.dumps(want))
+    return want
+
+
+def test_l170_the_declared_clip_h_at_the_end_of_two_segments(tmp_path):
+    """L170: with the declaration the gate takes one clip H as the clip H at the end of both segments; each segment
+    still ends at its own (failed) clip H at the end; the runs covered and the runs filmed after the declared clip are
+    in the gate; ghep rebuilds the same block; without the declaration every rule is as before."""
+    d, goc = build_c8(tmp_path / 'a')
+    want = _l170(goc, d)
+    assert len(want['doan'][1]['luot']) == 3 and len(want['doan'][1]['luot_sau_clip_thay']) == 2
+    GC.check(d)
+    GC.check_nguon(d, goc)
+    g = GC.ghep(goc, 'ke_hoach_c8.json', 'thu_tu_clip.csv', 'c8b_khoa_v5.json',
+                ['tien_de_c8_doan3.json', 'tien_de_c8.json'], 'kiem_cheo.json', dict(BANG_CHUNG),
+                'chuan_u/ho_so_ghep.json', thay_the_h_cuoi='thay_the_L170.json')
+    assert g['tien_de_c8'] == d['tien_de_c8'] and g['tien_de_c8'][0][GC.THAY_THE_KEY] == want
+    assert [s['ten'] for s in g['tien_de_c8'][0]['doan']] == ['doan2', 'doan3']
+    GC.write_gate(str(tmp_path / 'g.json'), g, goc)
+    # the runs a segment holds: the rows strictly between, of the plan cells (with _lai<n>) and the K runs
+    rr = [dict(buoc=b) for b in ('C8-P-K1-1', 'H_a', 'C8-P-K1-2', 'O1-F02_PID_lai1', 'ngoai_y', 'O1-F02_PID', 'H_z',
+                                 'C8-L-K2-1')]
+    assert GC._run_rows(rr, 1, 6, {'O1-F02_PID'}) == [(2, 'C8-P-K1-2'), (3, 'O1-F02_PID_lai1'), (5, 'O1-F02_PID')]
+    assert GC._run_rows(rr, 0, 7, {'O1-F05_PID'}) == [(2, 'C8-P-K1-2')]
+    with pytest.raises(GC.GateFileError, match='one session, one declaration'):
+        GC.ghep(goc, 'ke_hoach_c8.json', 'thu_tu_clip.csv', 'c8b_khoa_v5.json',
+                ['tien_de_c8_doan3.json', 'tien_de_c8.json'], 'kiem_cheo.json', dict(BANG_CHUNG),
+                'chuan_u/ho_so_ghep2.json', thay_the_h_cuoi=['thay_the_L170.json', 'thay_the_L170.json'])
+    # the same sources without the declaration: refused as before (a clip H used twice), by check and by ghep
+    d, goc = build_c8(tmp_path / 'b')
+    _l170(goc, d, block=False)
+    with pytest.raises(GC.GateFileError, match='a clip H used twice'):
+        GC.check_nguon(d, goc)
+    g = GC.ghep(goc, 'ke_hoach_c8.json', 'thu_tu_clip.csv', 'c8b_khoa_v5.json',
+                ['tien_de_c8_doan3.json', 'tien_de_c8.json'], 'kiem_cheo.json', dict(BANG_CHUNG),
+                'chuan_u/ho_so_ghep.json')
+    assert GC.THAY_THE_KEY not in g['tien_de_c8'][0]
+    with pytest.raises(GC.GateFileError, match='a clip H used twice'):
+        GC.write_gate(str(tmp_path / 'g2.json'), g, goc)
+
+
+def test_l170_cli_says_the_flag(tmp_path, capsys):
+    d, goc = build_c8(tmp_path)
+    want = _l170(goc, d)
+    out = str(tmp_path / 'gate.json')
+    args = ['ghep', '--goc', goc, '--ke-hoach', 'ke_hoach_c8.json', '--thu-tu-clip', 'thu_tu_clip.csv',
+            '--khoa-c8b', 'c8b_khoa_v5.json', '--tien-de', 'tien_de_c8.json', '--tien-de', 'tien_de_c8_doan3.json',
+            '--kiem-cheo', 'kiem_cheo.json', '--ho-so', 'chuan_u/ho_so_cli.json', '--out', out,
+            '--thay-the-h-cuoi', 'thay_the_L170.json'] + \
+        sum((['--bang-chung', f'{k}={p}'] for k, p in BANG_CHUNG.items()), [])
+    assert GC.main(args) == 0
+    assert 'CO KHAI BAO thay_the_h_cuoi (L170)' in capsys.readouterr().out
+    assert json.load(open(out, encoding='utf-8'))['tien_de_c8'][0][GC.THAY_THE_KEY] == want
+    args[args.index('--out') + 1] = str(tmp_path / 'gate2.json')        # without the declaration: no gate file
+    args[args.index('--ho-so') + 1] = 'chuan_u/ho_so_cli2.json'
+    del args[args.index('--thay-the-h-cuoi'):args.index('--thay-the-h-cuoi') + 2]
+    assert GC.main(args) == 1 and not os.path.exists(str(tmp_path / 'gate2.json'))
+
+
+def _l170_block(d):
+    return d['tien_de_c8'][0][GC.THAY_THE_KEY]
+
+
+def _l170_decl(goc, d, edit):
+    """The declaration file rewritten, the gate naming the new bytes."""
+    _rewrite(goc, _l170_block(d)['file'], edit)
+
+
+@pytest.mark.parametrize('name, edit, match', [
+    # the gate block is not what the declaration file and thu_tu_clip.csv give
+    ('sau', lambda goc, d: _l170_block(d)['doan'][1].update(luot_sau_clip_thay=[]), 'not what its declaration file'),
+    ('trong', lambda goc, d: _l170_block(d)['doan'][0].update(clip_thay_trong_doan=True),
+     'not what its declaration file'),
+    ('luot_cong', lambda goc, d: _l170_block(d)['doan'][0].update(luot=_l170_block(d)['doan'][0]['luot'][:-1]),
+     'not what its declaration file'),
+    ('sha', lambda goc, d: _l170_block(d)['file'].update(sha256='a' * 64), 'sha256|changed|not the file'),
+    # the runs covered are named one by one in the declaration
+    ('luot_file', lambda goc, d: _l170_decl(goc, d, lambda y: y['doan'][1].update(luot=y['doan'][1]['luot'][:-1])),
+     'named one by one'),
+    ('luot_thu_tu', lambda goc, d: _l170_decl(goc, d, lambda y: y['doan'][1]['luot'].reverse()), 'named one by one'),
+    # the declaration itself
+    ('buoi', lambda goc, d: _l170_decl(goc, d, lambda y: y.update(buoi='buoi khac')), 'file of session'),
+    ('format', lambda goc, d: _l170_decl(goc, d, lambda y: y.update(format='x')), 'file of session'),
+    ('liam', lambda goc, d: _l170_decl(goc, d, lambda y: y['quyet_dinh'].pop('nguyen_van')), 'quyet_dinh'),
+    ('trung', lambda goc, d: _l170_decl(goc, d, lambda y: y['doan'].append(dict(y['doan'][0]))), 'each segment once'),
+    ('doan_la', lambda goc, d: _l170_decl(goc, d, lambda y: y['doan'][0].update(ten='doan9')),
+     'no segment of session'),
+    ('thieu_doan', lambda goc, d: _l170_decl(goc, d, lambda y: y['doan'].pop(0)), 'not what its declaration file'),
+    # the gate names another clip, or another own clip H at the end, than the session files and rows give
+    ('clip', lambda goc, d: _l170_block(d).update(clip_thay='IMG_9004'), 'declares clip'),
+    ('goc_xa', lambda goc, d: _l170_block(d)['doan'][0].update(cuoi_goc='IMG_9006'), 'session order'),
+    ('goc_la', lambda goc, d: _l170_block(d)['doan'][0].update(cuoi_goc='IMG_0000'), 'on 0 rows'),
+    ('goc_file', lambda goc, d: _l170_decl(goc, d, lambda y: y['doan'][0].update(cuoi_goc='IMG_9001')),
+     'not what its declaration file'),
+    # shape (check)
+    ('ten_la', lambda goc, d: _l170_block(d)['doan'].append(dict(_l170_block(d)['doan'][0], ten='doan9')),
+     'no segments of the session'),
+    ('ten_trung', lambda goc, d: _l170_block(d)['doan'].append(dict(_l170_block(d)['doan'][0])), 'each segment once'),
+    ('goc_la_clip', lambda goc, d: _l170_block(d)['doan'][0].update(cuoi_goc='IMG_9007'), 'each segment once'),
+    ('sau_ngoai', lambda goc, d: _l170_block(d)['doan'][0].update(luot_sau_clip_thay=['X']), 'runs of luot'),
+    ('rong', lambda goc, d: _l170_block(d).update(doan=[]), 'at least one'),
+    ('khoa_thua', lambda goc, d: _l170_block(d).update(ghi_chu='x'), 'an object with keys'),
+])
+def test_l170_refusals(tmp_path, name, edit, match):
+    d, goc = build_c8(tmp_path / name)
+    _l170(goc, d)
+    edit(goc, d)
+    with pytest.raises(GC.GateFileError, match=match):
+        GC.check(d)
+        GC.check_nguon(d, goc)
+
+
+def test_l170_the_declared_clip_only_where_declared(tmp_path):
+    """L170 is no general rule: the declared clip is the clip H at the end of the declared segments only; the other
+    rules on the clips H and on the clip H comparison of a segment stand."""
+    d, goc = build_c8(tmp_path / 'a')                                   # declared for one segment, used at two
+    _l170(goc, d)
+    _l170_decl(goc, d, lambda y: y['doan'].pop(0))
+    _l170_block(d)['doan'].pop(0)
+    with pytest.raises(GC.GateFileError, match='a clip H used twice'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'a2')                                  # the same, the undeclared segment the later one
+    _l170(goc, d)
+    _l170_decl(goc, d, lambda y: y['doan'].pop(1))
+    _l170_block(d)['doan'].pop(1)
+    with pytest.raises(GC.GateFileError, match='a clip H used twice'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'b')                                   # the declared clip also at the start of a segment
+    _l170(goc, d)
+    d['tien_de_c8'][0]['doan'][1]['dau'][0] = dict(d['tien_de_c8'][0]['doan'][1]['cuoi'])
+    with pytest.raises(GC.GateFileError, match='a clip H used twice'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'c')                                   # two declared segments, two different clips
+    _l170(goc, d)
+    old = _jw(goc, 'clip_h/H_z2.json', dict(kind=GC.SESSION_KIND, ten='H_z2', video='H_z2_08_IMG_9008.MOV',
+                                            video_sha256=_h('video H_z2'), **SESSION))
+    d['tien_de_c8'][0]['doan'][1]['cuoi'] = old
+    with pytest.raises(GC.GateFileError, match='share ONE clip H'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'e')                                   # the comparison of a declared segment: against
+    _l170(goc, d)                                                       # the declared clip, not its failed clip H
+    x = next(c for c in d['o_c8'] if c['controller'] == 'LADRC')['chuoi'][0]
+    dr = dict(x['file_so_h'])
+    _rewrite(goc, dr, lambda y: y.update(s1_session_sha256=_h('session H_z')))
+    for c in d['o_c8']:
+        if c['controller'] == 'LADRC':
+            for x in c['chuoi']:
+                x['file_so_h'] = dict(dr)
+                lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
+                _relink_nodes(goc, d, x, lu, file_so_h=dict(dr))
+    with pytest.raises(GC.GateFileError, match='camera segment'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'f')                                   # a run after the own clip H at the end of its
+    _l170(goc, d)                                                       # segment is still in no segment
+    last = _l170_block(d)['doan'][1]['luot'][-1]
+    _csv_edit(goc, d, lambda ls: [l for l in ls if not l.startswith('IMG_9006,')][:-1] + ['IMG_9006,H_z,,,,,']
+              + [l for l in ls if l.split(',')[1] == last])
+    with pytest.raises(GC.GateFileError, match='named one by one'):
+        GC.check_nguon(d, goc)
+    _l170_decl(goc, d, lambda y: y['doan'][1].update(luot=y['doan'][1]['luot'][:-1]))
+    b = _l170_block(d)['doan'][1]
+    b.update(luot=b['luot'][:-1], luot_sau_clip_thay=b['luot_sau_clip_thay'][:-1])
+    with pytest.raises(GC.GateFileError, match='lies in no camera segment'):
+        GC.check_nguon(d, goc)
+    with pytest.raises(GC.GateFileError, match='file of the folder'):  # the declaration outside the session folder
+        GC._thay_the_shape(dict(file=dict(duong_dan='b3/thay_the.json', sha256='a' * 64), clip_thay='IMG_1',
+                                doan=[dict(ten='d', cuoi_goc='IMG_2', clip_thay_trong_doan=False, luot=[],
+                                           luot_sau_clip_thay=[])]), 'w', 'b2')

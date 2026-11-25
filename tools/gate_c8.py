@@ -133,6 +133,19 @@ SESSION_KIND = 'c7_session'                              # a camera session file
 # F18 (3): tien_de_buoi_v1 vai_tro_clip_h of ONE camera segment (CODE 20/11 after C8 session 2, three segments: the
 # iPhone was taken off twice; one premise file per segment, roles dau1, dau2, cuoi; J3-5 per segment that holds runs)
 TD_ROLES = ('dau1', 'dau2', 'cuoi')
+# L170 (Liam 25/11/2026 ~21:45 at CODE local_4932073c; docs/archive/history_CODE.md line "L170"; run07: the clips H at
+# the end of both camera segments could not be calibrated, the frame was not touched by Liam's word, no session again):
+# a C8 session may DECLARE, in a file of its folder (THAY_THE_FORMAT: {format, buoi, quyet_dinh {ngay, phien,
+# nguyen_van}, clip_thay, doan [{ten, cuoi_goc, luot}]}), one clip H of the session that stands for the clip H at the
+# end of the segments it names. No general rule changes: a segment still ends at the row of its own clip H at the end
+# (cuoi_goc, the one that failed) and its runs are the rows between; only the calibration session of role cuoi is the
+# declared clip, which no other segment may use. The gate carries the declaration in tien_de_c8[k].thay_the_h_cuoi
+# {file, clip_thay, doan [{ten, cuoi_goc, clip_thay_trong_doan, luot, luot_sau_clip_thay}]}: the runs covered, named
+# one by one, and those filmed after the declared clip (no camera drift check covers them): the flag the thesis states
+# as a limit. A session without a declaration: every rule as before.
+THAY_THE_KEY = 'thay_the_h_cuoi'
+THAY_THE_FORMAT = 'c8_h_cuoi_thay_the_v1'
+THAY_THE_DOAN = ('ten', 'cuoi_goc', 'clip_thay_trong_doan', 'luot', 'luot_sau_clip_thay')
 BAND_KEYS_C8B = ('u_lo_m_s', 'u_hi_m_s', 'P4_m', 'A4_deg', 'trang_thai')   # c8b_khoa_v5 M5b (CODE 19/11)
 BAND_STATES_C8B = ('dat', 'gioi_han', 'thieu')           # C8B term states (data contract 2.G (3))
 DRIFT_KIND = 'c7_calib_drift'                            # F18 (2): drift.json of c7_calib_drift so (CODE 19/11)
@@ -1167,6 +1180,36 @@ def _check_luot_k(d: dict) -> list:
     return lk
 
 
+def _thay_the_shape(x, w: str, folder: str) -> Dict[str, dict]:
+    """L170: tien_de_c8[k].thay_the_h_cuoi {file {duong_dan, sha256} (a file of the folder of the session), clip_thay,
+    doan [{ten, cuoi_goc, clip_thay_trong_doan, luot, luot_sau_clip_thay}]}, each segment once. Returns {segment name:
+    its entry with clip_thay}. The content is recomputed from the declaration file by check_nguon (_thay_the_block)."""
+    _obj(x, ('file', 'clip_thay', 'doan'), w)
+    if not _under(_ref(x['file'], f'{w}.file')['duong_dan'], folder):
+        raise GateFileError(f'{w}.file {x["file"]["duong_dan"]!r}: the declaration is a file of the folder {folder!r} of '
+                            'its session (L170)')
+    ct = _text(x['clip_thay'], f'{w}.clip_thay')
+    if not isinstance(x['doan'], list) or not x['doan']:
+        raise GateFileError(f'{w}.doan: the segments whose clip H at the end is the declared clip, at least one (L170)')
+    out = {}
+    for i, e in enumerate(x['doan']):
+        we = f'{w}.doan[{i}]'
+        _obj(e, THAY_THE_DOAN, we)
+        ten = _text(e['ten'], f'{we}.ten')
+        if ten in out or _text(e['cuoi_goc'], f'{we}.cuoi_goc') == ct:
+            raise GateFileError(f'{we}: each segment once, and its own clip H at the end (cuoi_goc) is another clip than '
+                                'the declared one (L170)')
+        _bool(e['clip_thay_trong_doan'], f'{we}.clip_thay_trong_doan')
+        for q in ('luot', 'luot_sau_clip_thay'):
+            if not isinstance(e[q], list) or any(not isinstance(v, str) or not v for v in e[q]) \
+                    or len(set(e[q])) != len(e[q]):
+                raise GateFileError(f'{we}.{q}: a list of run codes, each once (L170)')
+        if not set(e['luot_sau_clip_thay']) <= set(e['luot']):
+            raise GateFileError(f'{we}.luot_sau_clip_thay: runs of luot (L170)')
+        out[ten] = dict(e, clip_thay=ct)
+    return out
+
+
 def _check_tien_de(d: dict) -> List[dict]:
     """The C8 sessions (CODE 22/11, C8 contract section 3: a lost run rerun in a later floor session; one folder per
     session): thu_tu_clip [one reference per session, in session order; the folder of the session is the folder of its
@@ -1175,8 +1218,10 @@ def _check_tien_de(d: dict) -> List[dict]:
     segment that holds C8 runs, in session order (CODE 20/11 after C8 session 2: three camera segments, each mounting
     with its own sessions; J v6 section 5 J3-5 read per segment: two clips H at its start, one at its end; a segment
     without C8 runs is not listed; KIEMCHEO fix/c8-kiemcheo-doan: one kiem_cheo.json and one premise per segment, its
-    name doan.ten, once in its session). Returns [{ten, clips [dau1, dau2, cuoi], file, kiem_cheo, buoi, k}] of every
-    session in order (k the session index)."""
+    name doan.ten, once in its session). Returns [{ten, clips [dau1, dau2, cuoi], file, kiem_cheo, buoi, k, thay}] of
+    every session in order (k the session index; thay: the entry of the segment in the declaration thay_the_h_cuoi of
+    its session with clip_thay, else None. L170: a session may carry that key; the one declared clip is then the clip H
+    at the end of each segment the declaration names, and of no other)."""
     tts, tds = d['thu_tu_clip'], d['tien_de_c8']
     if not isinstance(tts, list) or not tts or not isinstance(tds, list) or len(tds) != len(tts):
         raise GateFileError('thu_tu_clip, tien_de_c8: one entry for each C8 session, in session order, as many of one '
@@ -1189,7 +1234,10 @@ def _check_tien_de(d: dict) -> List[dict]:
                                 'another (CODE 22/11)')
         folders.append(f)
         w0 = f'tien_de_c8[{k}]'
-        _obj(t, ('buoi', 'doan'), w0)
+        co = isinstance(t, dict) and THAY_THE_KEY in t   # L170: the declared substitute of the clip H at the end
+        _obj(t, ('buoi', 'doan') + ((THAY_THE_KEY,) if co else ()), w0)
+        thay = _thay_the_shape(t[THAY_THE_KEY], f'{w0}.{THAY_THE_KEY}', f) if co else {}
+        sub = None                                       # the session file of the declared clip
         b = _text(t['buoi'], f'{w0}.buoi')               # GC6-4: the C8 session the premise belongs to
         if b in ids:
             raise GateFileError(f'{w0}.buoi {b!r}: each C8 session once')
@@ -1209,17 +1257,30 @@ def _check_tien_de(d: dict) -> List[dict]:
                 raise GateFileError(f'{w}: two clips H at the start of the segment (dau), one at its end (cuoi); missing '
                                     'one, C8 is not locked: CAN LIAM QUYET (J v6 section 5 J3-5, section 0b)')
             clips = [_ref(x, f'{w}.dau[{j}]') for j, x in enumerate(s['dau'])] + [_ref(s['cuoi'], f'{w}.cuoi')]
-            for x in clips:
+            for j, x in enumerate(clips):
+                if j == 2 and ten in thay and x['sha256'] == sub:
+                    continue                             # L170: the one declared clip, at the end of a declared segment
                 if x['sha256'] in shas:
-                    raise GateFileError(f'{w}: a clip H used twice (every clip H of C8 is a different clip)')
+                    raise GateFileError(f'{w}: a clip H used twice (every clip H of C8 is a different clip; L170: but '
+                                        f'the one clip a session declares in {THAY_THE_KEY}, at the end of the segments '
+                                        'named there)')
                 shas.add(x['sha256'])
+                if j == 2 and ten in thay:
+                    if sub is not None:
+                        raise GateFileError(f'{w}: the segments named in {THAY_THE_KEY} of a session share ONE clip H at '
+                                            'the end, the declared clip (L170)')
+                    sub = x['sha256']
             _ref(s['file'], f'{w}.file')
             _ref(s['kiem_cheo'], f'{w}.kiem_cheo')
             for x in clips + [s['file'], s['kiem_cheo']]:
                 if not _under(x['duong_dan'], f):
                     raise GateFileError(f'{w}: {x["duong_dan"]!r} is not in the folder {f!r} of its session (a session '
                                         'computes its own premise, sessions and checks; CODE 22/11)')
-            out.append(dict(ten=ten, clips=clips, file=s['file'], kiem_cheo=s['kiem_cheo'], buoi=b, k=k))
+            out.append(dict(ten=ten, clips=clips, file=s['file'], kiem_cheo=s['kiem_cheo'], buoi=b, k=k,
+                            thay=thay.get(ten)))
+        if set(thay) - names:
+            raise GateFileError(f'{w0}.{THAY_THE_KEY}.doan: {sorted(set(thay) - names)} are no segments of the session '
+                                '(L170)')
     return out
 
 
@@ -1852,10 +1913,85 @@ def _clip_row(goc: str, ref: dict, w: str, rows: List[dict]) -> int:
     return hit[0]
 
 
-def _doan_spans(goc: str, segs: List[dict], rows: List[dict], slices: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+def _row_of(rows: List[dict], clip: str, w: str) -> int:
+    """The one row of the thu_tu_clip.csv of a session whose clip is `clip` (L170: a clip a declaration names)."""
+    hit = [i for i, r in enumerate(rows) if (r.get('clip') or '').strip() == clip]
+    if len(hit) != 1:
+        raise GateFileError(f'thu_tu_clip: {w} {clip!r} is on {len(hit)} rows of the session, one needed (L170)')
+    return hit[0]
+
+
+def _run_rows(rows: List[dict], lo: int, hi: int, plan_cells) -> List[Tuple[int, str]]:
+    """[(row index, buoc)] of the run rows strictly between rows lo and hi: the runs of the plan cells (with their
+    _lai<n>) and the K runs (L170: the runs a camera segment holds)."""
+    out = []
+    for i in range(lo + 1, hi):
+        full = (rows[i].get('buoc') or '').strip()
+        if re.sub(r'_lai\d+$', '', full) in plan_cells or RUN_CODE_K.match(full):
+            out.append((i, full))
+    return out
+
+
+def _thay_the_file(goc: str, ref: dict, buoi: str, w: str) -> dict:
+    """L170: the declaration file of a session (THAY_THE_FORMAT): {format, buoi, quyet_dinh {ngay, phien, nguyen_van}
+    (Liam's words, A1), clip_thay, doan [{ten, cuoi_goc, luot [run codes]}]}, each segment once."""
+    f = _open_ref(goc, ref, w)
+    _obj(f, ('format', 'buoi', 'quyet_dinh', 'clip_thay', 'doan'), w, extra_ok=True)
+    if f['format'] != THAY_THE_FORMAT or f['buoi'] != buoi:
+        raise GateFileError(f'{w}: a {THAY_THE_FORMAT} file of session {buoi!r}, got format {f["format"]!r}, buoi '
+                            f'{f["buoi"]!r} (L170)')
+    _liam(f['quyet_dinh'], f'{w}.quyet_dinh')
+    _text(f['clip_thay'], f'{w}.clip_thay')
+    if not isinstance(f['doan'], list) or not f['doan']:
+        raise GateFileError(f'{w}.doan: the segments the declared clip stands for, at least one (L170)')
+    names = []
+    for i, e in enumerate(f['doan']):
+        we = f'{w}.doan[{i}]'
+        _obj(e, ('ten', 'cuoi_goc', 'luot'), we, extra_ok=True)
+        names.append(_text(e['ten'], f'{we}.ten'))
+        _text(e['cuoi_goc'], f'{we}.cuoi_goc')
+        if not isinstance(e['luot'], list) or any(not isinstance(v, str) or not v for v in e['luot']):
+            raise GateFileError(f'{we}.luot: the run codes the declared clip covers in this segment (L170)')
+    if len(set(names)) != len(names):
+        raise GateFileError(f'{w}.doan: each segment once (L170)')
+    return f
+
+
+def _thay_the_block(goc: str, ref: dict, buoi: str, segs_n: List[Tuple[int, dict]], spans: List[Tuple[int, int]],
+                    cts: Dict[int, int], rows: List[dict], plan_cells, w: str) -> dict:
+    """L170: tien_de_c8[k].thay_the_h_cuoi recomputed from the declaration file ref of session buoi and the
+    thu_tu_clip.csv rows. segs_n [(index in spans, segment)] of that session; cts {index: row of the declared clip}
+    of its declared segments (_doan_spans). Per segment of the declaration: the runs between its clips H at the start
+    and its own clip H at the end (cuoi_goc) are exactly the runs the declaration names, in order (the cover is
+    explicit); clip_thay_trong_doan: the declared clip was filmed inside the segment; luot_sau_clip_thay: its runs
+    filmed after the declared clip (no camera drift check covers them: the limit to state)."""
+    f = _thay_the_file(goc, ref, buoi, w)
+    by = {s['ten']: n for n, s in segs_n}
+    doan = []
+    for e in f['doan']:
+        n = by.get(e['ten'])
+        if n is None or n not in cts:
+            raise GateFileError(f'{w}: segment {e["ten"]!r} of the declaration is no segment of session {buoi!r} whose '
+                                f'clip H at the end is declared in the gate ({THAY_THE_KEY}; L170)')
+        lo, hi = spans[n]
+        runs = _run_rows(rows, lo, hi, plan_cells)
+        if [b for _, b in runs] != e['luot']:
+            raise GateFileError(f'{w}: segment {e["ten"]!r}: the declaration covers the runs {e["luot"]}; thu_tu_clip.csv '
+                                f'has {[b for _, b in runs]} between its clips H at the start and its own clip H at the '
+                                f'end {e["cuoi_goc"]!r}: the runs covered are named one by one, in order (L170)')
+        doan.append(dict(ten=e['ten'], cuoi_goc=e['cuoi_goc'], clip_thay_trong_doan=lo < cts[n] < hi,
+                         luot=list(e['luot']), luot_sau_clip_thay=[b for i, b in runs if i > cts[n]]))
+    return dict(file=dict(duong_dan=ref['duong_dan'], sha256=ref['sha256']), clip_thay=f['clip_thay'], doan=doan)
+
+
+def _doan_spans(goc: str, segs: List[dict], rows: List[dict], slices: List[Tuple[int, int]],
+                cts: Optional[Dict[int, int]] = None) -> List[Tuple[int, int]]:
     """[(row of its last clip H at the start, row of its clip H at the end)] of each camera segment (CODE 20/11 after
     C8 session 2), row indices of rows (_buoi_rows): its runs are the rows strictly between; the clips H of a segment
-    are rows of its own session (CODE 22/11); the segments of a session in session order, never overlapping."""
+    are rows of its own session (CODE 22/11); the segments of a session in session order, never overlapping.
+    L170: a segment named in the declaration of its session (seg thay) ends at the row of its OWN clip H at the end
+    (cuoi_goc, the clip that failed), as it would without the declaration; the session file of role cuoi is that of
+    the declared clip (clip_thay), a row of the same session, put in cts {segment index: its row}."""
     spans = []
     for n, s in enumerate(segs):
         w = f'tien_de_c8[{s["k"]}] segment {s["ten"]!r}'
@@ -1863,6 +1999,15 @@ def _doan_spans(goc: str, segs: List[dict], rows: List[dict], slices: List[Tuple
         sub = rows[b0:b1]
         at = [b0 + _clip_row(goc, x, f'{w} clip {r}', sub) for x, r in zip(s['clips'], TD_ROLES)]
         lo, hi = max(at[:2]), at[2]
+        th = s.get('thay')
+        if th:                                           # L170
+            got = (rows[at[2]].get('clip') or '').strip()
+            if got != th['clip_thay']:
+                raise GateFileError(f'{w}: {THAY_THE_KEY} declares clip {th["clip_thay"]!r} as its clip H at the end; '
+                                    f'the session file of role cuoi is of clip {got!r} (L170)')
+            hi = b0 + _row_of(sub, th['cuoi_goc'], f'{w}: its own clip H at the end (cuoi_goc)')
+            if cts is not None:
+                cts[n] = at[2]
         if not lo < hi or (n and segs[n - 1]['k'] == s['k'] and not spans[-1][1] < min(at[:2])):
             raise GateFileError(f'{w}: its clips H at the start come before its clip H at the end, after the end of the '
                                 'segment before it in the thu_tu_clip.csv of its session (segments in session order, '
@@ -2138,7 +2283,17 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
     d2_ref, luots = d['chuan_u']['dieu_kien'][DK_D2]['bang_chung'], []       # D2-1a: the D2 mask, the runs it masks
     h1_cham = []                                         # rule 2 of CODE 24/11: scored runs with a second scoring
     _ref_bytes(goc, d2_ref, f'chuan_u.dieu_kien.{DK_D2}.bang_chung')     # the mask every scored run is rebuilt with
-    spans = _doan_spans(goc, segs, rows, slices)
+    cts = {}
+    spans = _doan_spans(goc, segs, rows, slices, cts)
+    for k, t in enumerate(d['tien_de_c8']):              # L170: the declared substitute of a clip H at the end
+        if THAY_THE_KEY in t:
+            w = f'tien_de_c8[{k}].{THAY_THE_KEY}'
+            want = _thay_the_block(goc, t[THAY_THE_KEY]['file'], t['buoi'],
+                                   [(n, s) for n, s in enumerate(segs) if s['k'] == k], spans, cts, rows, plan_cells, w)
+            if not _json_same(t[THAY_THE_KEY], want):
+                raise GateFileError(f'{w}: not what its declaration file and thu_tu_clip.csv give: {want!r} (the '
+                                    'segments, their own clips H at the end, the runs covered and those filmed after the '
+                                    'declared clip; L170)')
     part_drift = {}                                      # GC6-3 (round 3): one comparison per camera segment
     for c in d['o_c8']:
         got = [x['clip'] for x in c['chuoi']]
@@ -3594,7 +3749,7 @@ def ghep_va_ghi(out: str, goc: str, *args, **kw) -> str:
 def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem_cheo,
          bang_chung: Dict[str, str], ho_so: str, muc_bo_theo_liam: Optional[dict] = None,
          quyet_liam: Optional[dict] = None, o_hong_theo_liam: Optional[dict] = None,
-         bo_cham_cu: Optional[dict] = None) -> dict:
+         bo_cham_cu: Optional[dict] = None, thay_the_h_cuoi=None) -> dict:
     """The gate content of C8 assembled from its sources under the C8 folder goc (paths relative to it; F10-F19, the
     contract of 19/11 with C8B: the gate reads the C8B files, C8B does not call the gate):
       sessions     thu_tu_clip: the thu_tu_clip.csv of one C8 session (a path) or of each, in session order (a list;
@@ -3619,6 +3774,10 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
       premise      one tien_de_buoi_v1 file per camera segment that holds C8 runs (tien_de: a path or a list) and
                    the three session files each names by sha256, by role (dau1, dau2, cuoi; CODE 20/11); each with the
                    session whose folder holds it, its files and the logs of its rows found in that folder (CODE 22/11)
+                   thay_the_h_cuoi (L170; a path or a list, at most one per session, in the folder of its session):
+                   the declaration c8_h_cuoi_thay_the_v1 of a session whose clip H at the end of the segments it names
+                   is one declared clip; written to tien_de_c8[k].thay_the_h_cuoi with the runs covered and the runs
+                   filmed after the declared clip (_thay_the_block)
       camera       khoa_sha256, mien_car_pose, eps_H of the C8b lock; the U manifests of the eligible scorings, the
                    largest of each of their four numbers and their common nguon
     The content is checked by write_gate (check and check_nguon) before anything is written; ho_so is written first
@@ -3836,6 +3995,14 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
         kcr = kho.by((td.get('sha256') or {}).get('kiem_cheo'), f'kiem_cheo.json of {td_ref["duong_dan"]}', under=bf)
         per_buoi[ks[0]].append((td.get('session_id'), dict(ten=(td.get('doan') or {}).get('ten'), dau=cr[:2],
                                                             cuoi=cr[2], file=td_ref, kiem_cheo=kcr)))
+    tt_decl = {}                                         # L170: {session index: its declaration file}
+    for p in ([thay_the_h_cuoi] if isinstance(thay_the_h_cuoi, str) else list(thay_the_h_cuoi or [])):
+        r_ = kho.ref(p)
+        ks = [k for k, t in enumerate(tt_refs) if _under(r_['duong_dan'], _folder_of(t))]
+        if len(ks) != 1 or ks[0] in tt_decl:
+            raise GateFileError(f'ghep: thay_the_h_cuoi {r_["duong_dan"]!r} is in the folder of {len(ks)} C8 sessions, or '
+                                'its session has two declarations; one session, one declaration (L170)')
+        tt_decl[ks[0]] = r_
     tien_de_c8 = []
     for k, segs in enumerate(per_buoi):
         ids = {b for b, _ in segs}
@@ -3843,9 +4010,22 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
             raise GateFileError(f'ghep: the premise files of the session of {tt_refs[k]["duong_dan"]!r} are of the '
                                 f'sessions {sorted(map(str, ids))}; one C8 session (one premise per camera segment)')
         b0, b1 = slices[k]
-        doan = sorted((s_ for _, s_ in segs), key=lambda s_: _clip_row(
-            kho.goc, s_['cuoi'], f'ghep: clip H at the end of {s_["ten"]!r}', rows[b0:b1]))
-        tien_de_c8.append(dict(buoi=next(iter(ids)), doan=doan))
+        buoi, thay = next(iter(ids)), {}
+        if k in tt_decl:                                 # L170: a declared segment ends at its own clip H at the end
+            wt = f'ghep: thay_the_h_cuoi {tt_decl[k]["duong_dan"]}'
+            tf = _thay_the_file(kho.goc, tt_decl[k], buoi, wt)
+            thay = {e['ten']: dict(cuoi_goc=e['cuoi_goc'], clip_thay=tf['clip_thay']) for e in tf['doan']}
+        doan = sorted((s_ for _, s_ in segs), key=lambda s_: (
+            _row_of(rows[b0:b1], thay[s_['ten']]['cuoi_goc'], f'ghep: clip H at the end of {s_["ten"]!r} (cuoi_goc)')
+            if s_['ten'] in thay else
+            _clip_row(kho.goc, s_['cuoi'], f'ghep: clip H at the end of {s_["ten"]!r}', rows[b0:b1])))
+        tien_de_c8.append(dict(buoi=buoi, doan=doan))
+        if k in tt_decl:
+            sg = [dict(ten=s_['ten'], clips=s_['dau'] + [s_['cuoi']], k=k, thay=thay.get(s_['ten'])) for s_ in doan]
+            cts = {}
+            sp = _doan_spans(kho.goc, sg, rows, slices, cts)
+            tien_de_c8[-1][THAY_THE_KEY] = _thay_the_block(kho.goc, tt_decl[k], buoi, list(enumerate(sg)), sp, cts,
+                                                           rows, set(plan), wt)
     # the U standard and its dossier (after the premise: khoa_kiem_luc names each session)
     bc_refs = {k: kho.ref(p) for k, p in bang_chung.items()}
     kkl, s7_same = [], None
@@ -3955,6 +4135,9 @@ def main(argv=None) -> int:
     g.add_argument('--ho-so', required=True, help='the dossier ho_so_c8_v1 to write (new, or the same bytes)')
     g.add_argument('--liam', default=None, help='JSON {muc_bo_theo_liam, quyet_liam, o_hong_theo_liam, bo_cham_cu} of Liam\'s '
                    'recorded choices')
+    g.add_argument('--thay-the-h-cuoi', action='append', default=None,
+                   help='L170: the declaration c8_h_cuoi_thay_the_v1 of a C8 session (in its folder) whose clip H at '
+                        'the end of the segments it names is one declared clip; at most once per session')
     g.add_argument('--out', required=True, help='the gate file (new, never replaced; not under the C8 folder)')
     a = ap.parse_args(argv)
     try:
@@ -3979,7 +4162,8 @@ def main(argv=None) -> int:
         try:
             sha = ghep_va_ghi(a.out, a.goc, a.ke_hoach, a.thu_tu_clip, a.khoa_c8b, a.tien_de, a.kiem_cheo, bc,
                               a.ho_so, liam.get('muc_bo_theo_liam'), liam.get('quyet_liam'),
-                              liam.get('o_hong_theo_liam'), liam.get('bo_cham_cu'))
+                              liam.get('o_hong_theo_liam'), liam.get('bo_cham_cu'),
+                              thay_the_h_cuoi=a.thay_the_h_cuoi)
         except CanLiamChon as exc:
             # CODE 24/11: the decision sheet beside --out (never replaced), no gate file; exit 3
             sp = os.path.splitext(a.out)[0] + '_phieu_chon.json'
@@ -3989,6 +4173,9 @@ def main(argv=None) -> int:
             print('phieu_chon', sp, sha256_file(sp))
             return 3
         print('gate_c8_v2', a.out, sha)
+        if a.thay_the_h_cuoi:                            # L170: the flag, said aloud
+            print(f'gate_c8: CO KHAI BAO thay_the_h_cuoi (L170) cho {len(a.thay_the_h_cuoi)} buoi: clip H cuoi doan thay '
+                  'bang clip khai bao; gioi han o tien_de_c8[].thay_the_h_cuoi (clip_thay_trong_doan, luot_sau_clip_thay)')
     except (OSError, ValueError, GateFileError) as exc:
         print(f'gate_c8: {exc}', file=sys.stderr)
         return 1
