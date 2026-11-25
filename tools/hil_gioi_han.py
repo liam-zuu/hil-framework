@@ -30,13 +30,15 @@ ESP32 (pwm -> duty MISO) khi có log phía Pi.
     rỗng; số 1 s cuối là số mô tả riêng ở cột *_last1s.
     C3-28 (khoá kết quả chấm): JSON chấm phải có khối 'e2_khoa_cham' (LOCK_KEY) do --cham ghi:
     frame_log_sha256 = SHA-256 của chính file --frame-log, task = --task (và trường 'task' của
-    bộ chấm = --task), cờ allow_final_set / allow_pre_b81_15 (bool), scorer = blob git (nội dung
-    CRLF -> LF) của tools/hil_o1_score.py và các module chấm SCORER_MODULES; cùng esp_log,
-    esp_log_sha256 của log ESP32 đưa cho bộ chấm (chỉ ghi, không đối chiếu). JSON thô của
-    hil_o1_score.py --out không có khối này -> mã 2. Thêm: frame_log bắt buộc; t0_step, T_cmd,
-    t_deadline phải hữu hạn; completed 'true' cần t_end hữu hạn; t_end có mặt mà không hữu hạn
-    -> mã 2. win_ht_src = 'hil_o1_score:<t0_src>:completed=<..>:allow_final_set=<0|1>:
-    allow_pre_b81_15=<0|1>:scorer_blob=<blob hil_o1_score>'.
+    bộ chấm = --task); khi đọc khoá còn đối chiếu: mỗi cờ CHAM_FLAGS (allow_final_set,
+    allow_pre_b81_15) là bool bằng đúng giá trị --cham dùng; esp_log_sha256 = SHA-256 của file
+    --esp-log của lần chạy này (không có log -> cả hai phía None); blob git (CRLF -> LF) của
+    mọi module SCORER_MODULES (kể cả rpi5/protocol.py và tools/gate_c8.py mà hil_o1_score
+    import) = blob tính lại trên bản đang chạy; k0 là chỉ số frame nguyên trong [0, n); t_end
+    (khi có) nằm trong [T_cmd; t_deadline] ±1e-9. JSON thô của hil_o1_score.py --out không có
+    khối này -> mã 2. Thêm: frame_log bắt buộc; t0_step, T_cmd, t_deadline phải hữu hạn;
+    completed 'true' cần t_end hữu hạn. win_ht_src = 'hil_o1_score:<t0_src>:completed=<..>:
+    allow_final_set=<0|1>:allow_pre_b81_15=<0|1>:scorer_blob=<blob hil_o1_score>'.
 
 (b) Băng mù theo bánh (đề xuất v6 C3(b)): blind_band(omega32) -> (n,4) bool, a = |omega32|
     float32, (a > 0) & (a <= float32(0.3)): H7 không phát xung encoder khi
@@ -226,7 +228,7 @@ LECH_UDP = 'chua_do'                # C3-31 cột lech_udp: lệch một phía d
 LOCK_KEY = 'e2_khoa_cham'
 CHAM_FLAGS = dict(allow_final_set=True, allow_pre_b81_15=True)   # cờ chấm của lô --cham
 SCORER_MODULES = ('hil_o1_score', 'o1_gate_eval', 'o1_gate', 'o1_feasibility', 'o1_lanes',
-                  'o1_tasks', 'hil_edge_map')                    # nguồn của bộ chấm (blob git)
+                  'o1_tasks', 'hil_edge_map', 'protocol', 'gate_c8')   # nguồn của bộ chấm (blob git)
 
 
 def a11_cols(sfx):
@@ -387,6 +389,11 @@ def git_blob(path):
     return hashlib.sha1(b'blob %d\0' % len(data) + data).hexdigest()
 
 
+def scorer_blobs():
+    """C3-28: blob git (CRLF -> LF) của mọi module SCORER_MODULES trên bản đang chạy."""
+    return {m: git_blob(sys.modules[m].__file__) for m in SCORER_MODULES}
+
+
 def score_lock(npz_path, task, esp_path):
     """C3-28: khối LOCK_KEY ghi vào JSON chấm của --cham: SHA-256 NPZ, task, bộ cờ chấm
     CHAM_FLAGS, log ESP32 đưa cho bộ chấm (tên, SHA-256) và blob git các nguồn SCORER_MODULES."""
@@ -394,12 +401,15 @@ def score_lock(npz_path, task, esp_path):
                 task=task, **CHAM_FLAGS,
                 esp_log=os.path.basename(esp_path) if esp_path else None,
                 esp_log_sha256=sha256_file(esp_path) if esp_path else None,
-                scorer={m: git_blob(sys.modules[m].__file__) for m in SCORER_MODULES})
+                scorer=scorer_blobs())
 
 
-def check_score_lock(score, npz_path, task):
-    """C3-28: kết quả chấm phải mang khối LOCK_KEY của đúng NPZ (SHA-256) và đúng task, đủ bộ
-    cờ và blob bộ chấm; trường 'task' của bộ chấm cũng phải là task. Sai -> ValueError."""
+def check_score_lock(score, npz_path, task, esp_path=None):
+    """C3-28: kết quả chấm phải mang khối LOCK_KEY của đúng NPZ (SHA-256) và đúng task (trường
+    'task' của khoá và của bộ chấm), mỗi cờ CHAM_FLAGS là bool bằng đúng giá trị --cham dùng,
+    esp_log_sha256 bằng SHA-256 của file --esp-log của lần chạy này (không có log -> cả hai
+    phía None) và blob git của mọi module SCORER_MODULES bằng blob tính lại trên bản đang
+    chạy. Sai -> ValueError."""
     lock = score.get(LOCK_KEY)
     if not isinstance(lock, dict):
         raise ValueError(f'ket qua cham khong co khoa {LOCK_KEY} (SHA-256 NPZ + task)')
@@ -410,22 +420,30 @@ def check_score_lock(score, npz_path, task):
     if lock.get('task') != task or score.get('task') != task:
         raise ValueError(f"ket qua cham cua task {lock.get('task')!r}/{score.get('task')!r}, "
                          f'khong phai {task!r}')
-    for c in CHAM_FLAGS:
-        if not isinstance(lock.get(c), bool):
-            raise ValueError(f'khoa cham thieu co {c}')
+    for c, v in CHAM_FLAGS.items():
+        x = lock.get(c)
+        if not (isinstance(x, bool) and x == v):
+            raise ValueError(f'khoa cham co {c}={x!r}, lo --cham dung {v!r}')
+    want = sha256_file(esp_path) if esp_path else None
+    if 'esp_log_sha256' not in lock or lock['esp_log_sha256'] != want:
+        raise ValueError(f"khoa cham esp_log_sha256={lock.get('esp_log_sha256')!r}, "
+                         f'--esp-log cua lan nay co sha256={want!r}')
     sc = lock.get('scorer')
-    blob = sc.get('hil_o1_score') if isinstance(sc, dict) else None
-    if not (isinstance(blob, str) and re.fullmatch(r'[0-9a-f]{40}', blob)):
-        raise ValueError('khoa cham thieu blob git cua hil_o1_score')
+    if not isinstance(sc, dict):
+        raise ValueError('khoa cham thieu blob bo cham')
+    now = scorer_blobs()
+    bad = [m for m in SCORER_MODULES if sc.get(m) != now[m]]
+    if bad:
+        raise ValueError(f'khoa cham: blob bo cham khac ban dang chay: {bad}')
     return lock
 
 
 def score_window(score, npz_name, n, period, lock=None):
     """C3-17: mặt nạ cửa sổ hoàn thành (n,) bool từ kết quả hil_o1_score.score (docstring mục
     a) -> (mask, t_ht0, t_ht1, src). JSON không khớp log -> ValueError. C3-28: frame_log bắt
-    buộc; k0, t0_step, T_cmd, t_deadline phải hữu hạn; completed 'true' cần t_end hữu hạn;
-    t_end có mặt mà không hữu hạn -> ValueError. lock (check_score_lock): bộ cờ và blob bộ
-    chấm ghi vào src."""
+    buộc; k0 phải là chỉ số frame nguyên trong [0, n); t0_step, T_cmd, t_deadline phải hữu
+    hạn; completed 'true' cần t_end hữu hạn; t_end khi có phải nằm trong
+    [T_cmd; t_deadline] +-1e-9. lock (check_score_lock): bộ cờ và blob bộ chấm ghi vào src."""
     try:
         k0s, a = int(score['k0']), float(score['t0_step'])
         t_cmd, t_dl = float(score['T_cmd']), float(score['t_deadline'])
@@ -435,6 +453,9 @@ def score_window(score, npz_name, n, period, lock=None):
     if not all(math.isfinite(v) for v in (a, t_cmd, t_dl)):
         raise ValueError(f'ket qua cham co moc khong huu han: t0_step={a}, T_cmd={t_cmd}, '
                          f't_deadline={t_dl}')
+    k = score['k0']
+    if not (isinstance(k, int) and not isinstance(k, bool) and 0 <= k < n):
+        raise ValueError(f'ket qua cham k0={k!r} khong phai chi so frame trong [0, {n})')
     fl = score.get('frame_log')
     if fl != npz_name:
         raise ValueError(f'ket qua cham cua {fl!r}, khong phai {npz_name!r}')
@@ -448,6 +469,9 @@ def score_window(score, npz_name, n, period, lock=None):
             raise ValueError(f'ket qua cham t_end={t_end!r} khong phai so') from None
         if not math.isfinite(t_end):
             raise ValueError(f'ket qua cham t_end={t_end} khong huu han')
+        if not (t_cmd - 1e-9 <= t_end <= t_dl + 1e-9):
+            raise ValueError(f'ket qua cham t_end={t_end} ngoai cua so [T_cmd={t_cmd}; '
+                             f't_deadline={t_dl}]')
     if score.get('completed') == 'true' and t_end is None:
         raise ValueError("ket qua cham completed='true' ma khong co t_end huu han")
     t = (np.arange(n) - a) * period
@@ -584,7 +608,7 @@ def clock_pairs(raw_path):
     return np.asarray(rx, dtype=float), np.asarray(te, dtype=float)
 
 
-def count_run(npz_path, task, score=None):
+def count_run(npz_path, task, score=None, esp_path=None):
     """Phần MOSI/MISO của một frame log (docstring mục a-c) -> (row, aux, segs).
     score: kết quả hil_o1_score.score (dict) cho cửa sổ hoàn thành, hay None.
     aux: duty (n,4) float64, t_f (n,) µs từ t_send_ns hoặc None, miso_empty, valid, cut, k0."""
@@ -669,7 +693,7 @@ def count_run(npz_path, task, score=None):
     )
     # C3-17: cửa sổ hoàn thành của bộ chấm (mặt nạ trên mọi frame của log)
     if score is not None:
-        lock = check_score_lock(score, npz_path, task)                   # C3-28
+        lock = check_score_lock(score, npz_path, task, esp_path)         # C3-28
         ht, t_ht0, t_ht1, src = score_window(score, os.path.basename(npz_path), n, period, lock)
         row.update(win_ht_src=src, t_ht0_s=round(t_ht0, 6), t_ht1_s=round(t_ht1, 6),
                    win_ht_n=int(ht.sum()),
@@ -871,7 +895,7 @@ def a11_stats(ev, sfx):
 def process_one(npz_path, esp_path, task, score=None):
     """Một npz (+ log ESP32 nếu có, + kết quả chấm nếu có) -> (row, segs, events).
     ValueError/OSError -> caller."""
-    row, aux, segs = count_run(npz_path, task, score)
+    row, aux, segs = count_run(npz_path, task, score, esp_path=esp_path)
     if esp_path is None:
         row['esp_part'] = 'khong_co_log_ESP32'
         return row, segs, []
