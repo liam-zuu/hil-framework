@@ -329,7 +329,8 @@ def test_cli_luot_reads_the_mask_through_the_masked_grid(tmp_path, capsys):
     assert rc == 0 and r['trang_thai'] == 'dat' and not r['vuot_moi_nut'] and not r['can_xac_dinh_moi_nut']
     assert [(x['n_khung'], x['n_che'], x['n_undef'], x['khung_vuot']) for x in r['theo_nut']] == [(6, 1, 1, [])] * 2
     assert r['mat_na_d2'] == dict(sha256=c8_u_imu.sha256(mp), sha_noi_dung=g['mat_na_d2']['sha_noi_dung'], luot='r1',
-                                  lan_cham=g['mat_na_d2']['lan_cham'], n_khung_mo=5, nut_khong_cham=[])
+                                  lan_cham=g['mat_na_d2']['lan_cham'], n_khung_mo=5, nut_khong_cham=[],
+                                  ca_luot_chua_ket_luan=False)
     assert r['luoi_d2_sha256'] == c8_u_imu.sha256(os.path.join(d, 'luoi_d2.json'))
     assert r['gio_sha256'] == r0['gio_sha256'] and r['esp32_sha256'] == r0['esp32_sha256']
     # --mat-na-d2 without --luot, and a run that is not in the target set of the mask
@@ -456,3 +457,24 @@ def test_chung_cu_mask_pairs():
         E.chung_cu([l0], [em], True, luoi_sha256=['e' * 64])
     # two scorings: the first with the mask, the second (H1, no mask of its own) without
     assert len(E.chung_cu([lm, _luoi()], [em, e1], True)['bo_so']) == 2
+
+
+def test_cli_luot_whole_run_not_concluded_in_the_masked_grid(tmp_path):
+    # L166 (Liam 25/11): a t_som node with a masked frame -> the masked grid has the whole run not concluded; so has
+    # e_do, though frame 104 (open) is over D and the run is over D at every node without the mask
+    d, gp, lp = _luoi_that(tmp_path, over=(104,), g1=dict(ca_t_som=True, t_som_s=1.0))
+    assert TM.run(d, gp)[0] == 0
+    assert _edo(tmp_path, d, gp, lp, name='e0.json')[1]['vuot_moi_nut']
+    mp = TM.mask_file(tmp_path, [100, 101, 103, 104, 105])
+    rc, g = TM.run(d, gp, mp)
+    assert rc == 0 and g['mat_na_d2']['ca_luot_chua_ket_luan'] and g['outcome'] == 'chua_ket_luan'
+    rc, r = _edo(tmp_path, d, gp, lp, mp)
+    assert rc == 0 and r['trang_thai'] == 'chua_ket_luan' and not r['vuot_moi_nut'] and not r['can_xac_dinh_moi_nut']
+    assert any('L166' in w for w in r['ly_do']) and r['mat_na_d2']['ca_luot_chua_ket_luan'] is True
+    assert [x['n_che'] for x in r['theo_nut']] == [1, 1]                # the frames outside khung_mo, as the grid says
+    out = str(tmp_path / 'cc.json')
+    assert E.main(['chung-cu', '--luoi', os.path.join(d, 'luoi_d2.json'), '--edo', str(tmp_path / 'edo.json'),
+                   '--ban-cham-cuoi', 'true', '--out', out]) == 0
+    c = json.load(open(out, encoding='utf-8'))['chung_cu_c8']
+    assert c['phan_loai_du'] is True and c['bo_so'] == [dict(e_do_lo_vuot_D_moi_nut=False, e_do_xac_dinh_moi_nut=False,
+                                                             g4_can_huu_han_mien_hop_moi_nut=False)]

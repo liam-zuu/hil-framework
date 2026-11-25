@@ -16,9 +16,12 @@ values e_perp, e_trk, e_bao, e_theta_cmd_deg):
      c7_score.evaluate: G2 e_perp, G3 e_trk, G4 e_bao, G5 |e_theta_cmd_deg|. The rows file must be the one the
      scorer wrote for this node (khung_tuong_doi_v1.rows_sha256 of the node score; D2-6).
      Refused, because the rows do not carry what the scorer decided with (the scorer would have to run again):
-     a node of the plate-changed case (tam_doi 'doi': G5 q from the IMU heading, not in the rows; D2-7); a node of
-     the t_som case (g1.ca_t_som: the end of its common domain comes from the frame speeds) with a masked frame in
-     its union domain (D2-5).
+     a node of the plate-changed case (tam_doi 'doi': G5 q from the IMU heading, not in the rows; D2-7).
+     A node of the t_som case (g1.ca_t_som: the end of its common domain comes from the frame speeds) with a
+     masked frame (D2-5, D2v2-3) cannot be masked without the scorer either: the WHOLE run is then not concluded
+     (L166, Liam 25/11 at CODE, box: "Chua ket luan (Recommended)"; before: refused): every frame of every
+     scored node undefined for G2-G5, G1 chua_ket_luan at every node, no cat_t1 branch kept; the masked grid is
+     written with ca_luot_chua_ket_luan in its mat_na_d2 block (real data: every node of a K run is t_som).
   2. A frame of the run whose (run, frame_id) is not in the mask's khung_mo (cell not in o_dat, outside the u bands,
      not in the D2 rows at all) is masked (rows with an empty or repeated frame_id are refused): lo = -inf, hi = +inf for G2-G5 (q kept, as the scorer keeps
      the q of an undefined frame as a diagnostic). A finite violation of another frame stays (design 7c).
@@ -239,10 +242,10 @@ def ap_dung(nodes, out_dir, mn, state_fn, key_dec=6):
         raise MatNaError(f'the mask is not of this scoring of run {mn.get("luot")!r}: mat_na.lan_cham '
                          f'{mn.get("lan_cham")!r}, the node files here give {ma!r} (D2 rows of another scoring, e.g. '
                          'H0 / H1, or written before cham_id): build the D2 rows and the cell file from these nodes')
-    tom = []
+    # pass 1: every scored node is checked and its masked frames found BEFORE any node is changed
+    pre = {}
     for k, x in enumerate(nodes):
         if not x.get('ok'):
-            tom.append(dict(nut=k, cham=False))
             continue
         rp = os.path.join(out_dir, f'nut_{k:03d}_rows.csv')
         ktd = _diem_nut(os.path.join(out_dir, f'nut_{k:03d}.json'), rp, k)
@@ -263,23 +266,35 @@ def ap_dung(nodes, out_dir, mn, state_fn, key_dec=6):
         dinh = np.zeros(len(che), bool)
         for c in MEASURED:
             dinh |= np.isfinite(H['lo'][c]) & np.isfinite(H['hi'][c])
-        moi = che & dinh                                 # frames newly undefined by the mask (reported)
-        # D2-5; Codex round 2 D2v2-3: ANY masked frame of the node, not only one in its union domain (a frame outside
-        # the domain the scorer cut can still be a sample of the turn rate that places t_som)
-        if (x['gate'].get('g1') or {}).get('ca_t_som') and np.any(che):
-            raise MatNaError(f'node {k}: t_som case with a masked frame: the end of the common domain comes from the '
-                             'frame speeds; the mask cannot be applied without the scorer')
+        pre[k] = dict(rp=rp, H=H, che=che, moi=che & dinh)   # moi: frames newly undefined by the mask (reported)
+    # D2-5; Codex round 2 D2v2-3: a t_som node with ANY masked frame (not only one in its union domain: a frame
+    # outside the domain the scorer cut can still be a sample of the turn rate that places t_som) cannot be masked
+    # without the scorer. L166 (Liam 25/11 ~14:20 at CODE local_4932073c, box, verbatim: "Chua ket luan
+    # (Recommended)"; before: refused): the WHOLE run is then not concluded: every frame of every scored node is
+    # undefined for G2-G5 (as a mask with no open frame), G1 chua_ket_luan at every node, no node keeps the cat_t1
+    # branch (its violation would stand on frames that are all masked); the masked grid is still written
+    vuong = [k for k, d in pre.items() if (nodes[k]['gate'].get('g1') or {}).get('ca_t_som') and d['che'].any()]
+    tom = []
+    for k, x in enumerate(nodes):
+        if not x.get('ok'):
+            tom.append(dict(nut=k, cham=False))
+            continue
+        rp, H, che, moi = pre[k]['rp'], pre[k]['H'], pre[k]['che'], pre[k]['moi']
+        ap = np.ones(len(che), bool) if vuong else che   # the frames made undefined at this node
         for c in MEASURED:
-            H['lo'][c] = np.where(che, -math.inf, H['lo'][c])
-            H['hi'][c] = np.where(che, math.inf, H['hi'][c])
+            H['lo'][c] = np.where(ap, -math.inf, H['lo'][c])
+            H['hi'][c] = np.where(ap, math.inf, H['hi'][c])
         truoc = dict(x['states'])
         # rows: the frame file the mask was applied on (GATE 24/11: the mask goes by frame_id, the node score names
-        # only its own sha)
+        # only its own sha); n_che ...: the frames outside khung_mo (also when the whole run is not concluded)
         e = dict(nut=k, cham=True, rows=dict(duong_dan=os.path.abspath(rp), sha256=cu.sha256(rp)),
                  n_khung=len(che), n_che=int(che.sum()), n_che_moi=int(moi.sum()),
                  n_che_mien_hop=int((che & H['mu']).sum()),
                  n_che_moi_mien_hop=int((moi & H['mu']).sum()), trang_thai_truoc=truoc)
-        if x.get('cat') and np.any(che & H['mc']) and not _certain_before(H, set(x.get('so_do') or [])):
+        if vuong:
+            e['che_ca_luot'] = True
+            x['cat'] = False
+        elif x.get('cat') and np.any(che & H['mc']) and not _certain_before(H, set(x.get('so_do') or [])):
             why = 'mat_na_d2: the violation before t1 (cat_t1) stands only on masked frames: score the node again'
             nodes[k] = dict(x, ok=False, kind='loi', why=why)
             tom.append(dict(e, trang_thai_sau=None, ly_do=why))
@@ -291,8 +306,10 @@ def ap_dung(nodes, out_dir, mn, state_fn, key_dec=6):
             nm.update({kk: v for kk, v in nums[c].items()
                        if kk not in ('q_sd', 'q_sd_chung') or (kk in nm and _co_q_so_do(x, c))})
             st[c] = state_fn(nm['lo_chung'], nm['lo'], nm['hi'], nm['n_undef'], o1_gate.THRESHOLDS[c])
-        if np.any(che & H['mu']):
-            st['g1'] = 'chua_ket_luan'                   # step 4 (L156); any masked frame (D2-4)
+        if vuong or np.any(che & H['mu']):
+            st['g1'] = 'chua_ket_luan'                   # step 4 (L156); any masked frame (D2-4); L166
+        if vuong and any(v != 'chua_ket_luan' for v in st.values()):
+            raise MatNaError(f'node {k}: every frame masked (L166) but the states are {st} (a bug)')
         x['states'] = st
         for i, t in enumerate(H['t_cam']):
             r = x['rows'].get(round(float(t), key_dec))
@@ -300,14 +317,20 @@ def ap_dung(nodes, out_dir, mn, state_fn, key_dec=6):
                 raise MatNaError(f'node {k}: rows frame t_cam_s {t!r} not in the node rows (a bug)')
             for c in MEASURED:
                 r[c] = float(H['lo'][c][i])
-        tom.append(dict(e, trang_thai_sau=st, g1_che=bool(np.any(che & H['mu']))))
+        tom.append(dict(e, trang_thai_sau=st, g1_che=bool(vuong or np.any(che & H['mu']))))
     return nodes, dict(version=VERSION, file=mn['file'], sha256=mn['sha256'], sha_noi_dung=mn['sha_noi_dung'],
                        luot=mn['luot'], lan_cham=ma, n_khung_mo=len(mn['mo']), n_o_dat=mn['n_o_dat'],
                        n_o_thieu=mn['n_o_thieu'], nut=tom,
+                       ca_luot_chua_ket_luan=(dict(nut_t_som_co_khung_che=vuong, luat=LIAM_T_SOM) if vuong else None),
                        quy_tac='khung (luot, frame_id) khong trong khung_mo -> lo -inf, hi +inf G2-G5 (q giu); so lieu '
                                'nut va trang thai ba nhanh tinh lai; G1 chua_ket_luan khi nut co khung bi che trong '
-                               'mien hop (L156, Liam 25/11); cat_t1 mat vi pham chac chan -> nut khong cham; nut tam_doi doi, '
-                               'nut t_som co khung bi che trong mien hop -> tu choi')
+                               'mien hop (L156, Liam 25/11); cat_t1 mat vi pham chac chan -> nut khong cham; nut tam_doi '
+                               'doi -> tu choi; co nut t_som co khung bi che -> CA LUOT chua ket luan: moi khung cua moi '
+                               'nut khong xac dinh, G1-G5 chua_ket_luan (L166, Liam 25/11)')
+
+
+LIAM_T_SOM = ('L166, Liam 25/11 ~14:20 o CODE local_4932073c, hop chon, nguyen van: "Chua ket luan (Recommended)": '
+              'luot co nut t_som co khung bi che thi ca luot chua ket luan, van ghi luoi_d2.json')
 
 
 LUOI_GOC = ('task', 'gio_sha256', 'gate_file_sha256', 'clip', 'file_so_h', 'file_cham_h1', 'file_gio_h1')

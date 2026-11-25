@@ -165,6 +165,15 @@ def main(argv=None):
             raise ViTriError(f'{a.rows}: not the rows c8b_d3_hang wrote for the lock {a.khoa} (its .nguon.json: '
                              'version, sha256 of the rows, sha256 of the lock)')
         out = build(read_rows(a.rows), khoa, cu.sha256(a.khoa))
+        # L165 (Liam 25/11 at CODE, "Bo kiem, ghi gioi han (Recommended)"): the places of one session only, which
+        # c8b_d3_hang left out of the replay_neo rows (no other session to be held out against), are written here
+        # as limits; the file state does not change (they are not rows, not mien_thieu)
+        mb = ((ng.get('thong_tin') or {}).get('replay_neo_cho_mot_buoi') or {}).get('mien') or []
+        if not isinstance(mb, list) or any(not isinstance(m, str) or not m for m in mb):
+            raise ViTriError(f'{a.rows}.nguon.json: thong_tin.replay_neo_cho_mot_buoi.mien is not a list of domains')
+        out['gioi_han'] += [dict(nguon='replay_neo', dai_luong=dl, mien=m,
+                                 ly_do='cho chi do o mot buoi: khong so giu ngoai theo buoi (L165)')
+                            for m in sorted(mb) for dl in NGUON_DL['replay_neo']]
         c = subprocess.run(['git', '-C', HERE, 'rev-parse', 'HEAD'], capture_output=True, text=True)
         s = subprocess.run(['git', '-C', HERE, 'status', '--porcelain', '--', 'c8b_kiem_vi_tri.py'],
                            capture_output=True, text=True)

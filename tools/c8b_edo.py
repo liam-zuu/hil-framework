@@ -37,8 +37,10 @@ there (n_khung, n_che per node), else refused. A frame whose frame_id is not in 
 (counted in n_undef and n_che of its node): it is never in khung_vuot, never in the cell rule, and its node is not
 bounded, so a masked frame makes no conclusion; a finite lower bound of another frame stays. A node the mask turned
 into "not scored" (cat_t1 whose certain violation stood only on masked frames) is not scored here either. A masked
-grid without a node used (clock file not bounded): chua_ket_luan. The file written carries mat_na_d2 {sha256,
-sha_noi_dung, luot, lan_cham, n_khung_mo, nut_khong_cham} and luoi_d2_sha256 (both null without the mask).
+grid without a node used (clock file not bounded): chua_ket_luan. A masked grid whose whole run is not concluded
+(L166, Liam 25/11: a t_som node with a masked frame, every node of a K run on real data): chua_ket_luan too. The file
+written carries mat_na_d2 {sha256, sha_noi_dung, luot, lan_cham, n_khung_mo, nut_khong_cham,
+ca_luot_chua_ket_luan} and luoi_d2_sha256 (both null without the mask).
 `chung-cu`: a masked grid (a file with the key mat_na_d2) goes with an e_do file made with that grid's mask, and a
 grid without the mask with an e_do file without it; mixed pairs are refused.
 
@@ -443,7 +445,7 @@ def doc_mat_na_luoi(gio, gio_path, luoi_dir, mat_na_path, luot, nodes):
     blk = g['mat_na_d2']
     n = len(gio['nodes_s'])
     tin = dict(sha256=mn['sha256'], sha_noi_dung=mn['sha_noi_dung'], luot=luot, lan_cham=mn['lan_cham'],
-               n_khung_mo=len(mn['mo']), nut_khong_cham=[])
+               n_khung_mo=len(mn['mo']), nut_khong_cham=[], ca_luot_chua_ket_luan=False)
     if blk is None:                                          # clock file not bounded: no node used by the grid
         return (dict(mo=mn['mo'], nut_khong_cham={},
                      ly_do_luot=['mat_na_d2: the masked grid has no node used (clock file not bounded)']), tin, lsha)
@@ -480,7 +482,13 @@ def doc_mat_na_luoi(gio, gio_path, luoi_dir, mat_na_path, luot, nodes):
         if e.get('trang_thai_sau') is None:
             bo[k] = str(e.get('ly_do') or 'node not scored in the masked grid')
     tin['nut_khong_cham'] = sorted(bo)
-    return dict(mo=mn['mo'], nut_khong_cham=bo, ly_do_luot=[]), tin, lsha
+    # L166 (Liam 25/11 at CODE, "Chua ket luan (Recommended)"): a run with a t_som node that has a masked frame is
+    # not concluded as a whole in the masked grid (c8b_mat_na_d2: ca_luot_chua_ket_luan); so is its e_do
+    ca = blk.get('ca_luot_chua_ket_luan')
+    tin['ca_luot_chua_ket_luan'] = bool(ca)
+    why = [] if not ca else ['mat_na_d2: the whole run is not concluded in the masked grid (L166: t_som node with a '
+                             f'masked frame, nodes {(ca or {}).get("nut_t_som_co_khung_che")})']
+    return dict(mo=mn['mo'], nut_khong_cham=bo, ly_do_luot=why), tin, lsha
 
 
 def _clean(o):
