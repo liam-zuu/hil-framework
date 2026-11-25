@@ -1561,7 +1561,7 @@ def levels_rows(ctrl, mien, W, grid_info, defaults, public_rows, nhanh, ly_do, g
     levels.csv unchanged plus nguon_mien 'du_phong' and the reasons. Else per factor: L, H from
     the box; scale/centre = s3.scale_of; a, b, b_n from grid_info[(ctrl, factor)] (the info dict
     of s3.sweep_grid_cut); L_nguon 'biên W' at the first node else 'sàng lọc'; H_nguon at the
-    last node: 'trần bảng chặn' over 'biên W' when H = b_n = T (the cut), 'trần ω_o' for omega_o*
+    last node: 'trần bảng chặn' over 'biên W' when H = b_n = T, 'trần ω_o' for omega_o*
     at 48, else 'biên W'; below the last node 'sàng lọc'."""
     if mien is None:
         return [dict(r, nguon_mien='du_phong', ly_do='; '.join(ly_do)) for r in public_rows]
@@ -1573,7 +1573,7 @@ def levels_rows(ctrl, mien, W, grid_info, defaults, public_rows, nhanh, ly_do, g
         nodes = W[ctrl][name]
         l_src = 'biên W' if L == nodes[0] else 'sàng lọc'
         if H == nodes[-1]:
-            if info.get('n_bo') and H == info.get('T'):
+            if H == info['b_n'] == info.get('T'):
                 h_src = 'trần bảng chặn'
             elif name.startswith('omega_o') and H == s3.OMEGA_O_MAX:
                 h_src = 'trần ω_o'

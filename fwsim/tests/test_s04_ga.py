@@ -1858,7 +1858,8 @@ def _fake_post(tmp_path, monkeypatch, gains=G_PID, ctrl='PID', eval_mu=(0.5,), l
     out.mkdir(parents=True)
     dll = tmp_path / 'fake.dll'
     dll.write_bytes(b'fake dll')
-    s03 = _s03_dir(tmp_path, trial=tool_check, mu=levels, dll=str(dll))
+    runs = None if tool_check else [dict(controller=ctrl, v=0.2, mu=0.5)]
+    s03 = _s03_dir(tmp_path, runs=runs, trial=tool_check, mu=levels, dll=str(dll))
     speeds = [0.2, 0.5]
     lock = dict(common=dict(tool_check=tool_check, s03_run=str(s03),
                             fingerprint=s4.fingerprint(str(dll), str(s03), unsealed=not tool_check),
@@ -1896,11 +1897,11 @@ def _fake_post(tmp_path, monkeypatch, gains=G_PID, ctrl='PID', eval_mu=(0.5,), l
         return r, None, {}, dict(motor_R=1.0), dict(motor_R=1.0)
 
     def fake_new(dll_, jobs, work):
-        res = [dict(row=row(), digest=dict(_DIG)) for _ in jobs]
+        res = [dict(key=(c, v, mu), digest=dict(_DIG)) for c, _, v, mu in jobs]
         return det_mod(jobs, res) if det_mod else res
 
     monkeypatch.setattr(fwsim, 'FirmwareSim', lambda dll_: None)
-    monkeypatch.setattr(s3, 'run_in_new_process', fake_new)
+    monkeypatch.setattr(s4, 'run_determinism', fake_new)
     monkeypatch.setattr(s4, 'run_custom', fake_custom)
     monkeypatch.setattr(s3, 'safe_run', fake_safe)
     sel = (out / 'selected.csv').read_bytes()
@@ -2428,11 +2429,11 @@ def test_kep_fields_report_only(monkeypatch):
                                                     kep_note='')
     monkeypatch.setattr(fwsim, 'kep_indicator',
                         lambda log, t: dict(kep_frac_vx=0.1, kep_frac_vy=0.2, kep_frac_wz=0.3))
-    assert s4.kep_fields('PID', 'log', 1.0) == dict(kep_frac_vx=0.1, kep_frac_vy=0.2, kep_frac_wz=0.3,
-                                                   kep_note='')
+    log = {'kep': object()}
+    assert s4.kep_fields('PID', log, 1.0) == dict(kep_frac_vx=0.1, kep_frac_vy=0.2, kep_frac_wz=0.3, kep_note='')
     monkeypatch.setattr(fwsim, 'kep_indicator',
                         lambda log, t: (_ for _ in ()).throw(ValueError('no kep channel in log')))
-    k = s4.kep_fields('PID', 'log', 1.0)
+    k = s4.kep_fields('PID', log, 1.0)
     assert k['kep_frac_vx'] == '' and 'no kep channel' in k['kep_note']
 
 
@@ -2629,8 +2630,9 @@ def test_main_refuses_a_dll_without_the_kep_channel(tmp_path, monkeypatch):
     monkeypatch.setattr(s4, 'fingerprint', lambda *a, **k: sys.exit('past the kep check'))
     monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'trial', '--tool-check', '--controller',
                                     'PID', '--s03', str(d), '--out', str(tmp_path / 'o'), '--dll', 'x.dll'])
-    with pytest.raises(SystemExit, match='no kep channel'):
-        s4.main()
+    assert s4.main() == 2
+    stop = tmp_path / 'o' / 'sealed' / 'trial' / 'PID' / 'stop.json'
+    assert 'no kep channel' in json.loads(stop.read_text(encoding='utf-8'))['stop']
     monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'trial', '--tool-check', '--controller',
                                     'ADRC', '--s03', str(d), '--out', str(tmp_path / 'o2'), '--dll', 'x.dll'])
     with pytest.raises(SystemExit, match='past the kep check'):       # stopped later, not by kep_cols
@@ -2770,6 +2772,55 @@ def test_c3_41_manifest_catches_a_tampered_runs_csv(tmp_path, monkeypatch, mode)
     p.write_bytes(p.read_bytes() + b'\n')
     with pytest.raises(SystemExit, match='manifest'):
         _go(monkeypatch, tmp_path, d, mode)
+
+
+def test_c3_41_main_requires_runs_missing_from_disk_and_manifest(tmp_path, monkeypatch):
+    d, _ = _s03_for_mode(tmp_path, 'mm_main')
+    (d / 'sealed' / 'runs.csv').unlink()
+    _reseal(d)
+    with pytest.raises(SystemExit, match=r'missing S03 sealed inputs .*sealed/runs\.csv'):
+        _go(monkeypatch, tmp_path, d, 'mm_main')
+    common = json.loads((tmp_path / 'out' / 'lock.yaml').read_text(encoding='utf-8'))['common']
+    with pytest.raises(SystemExit, match=r'post: missing S03 sealed input sealed/runs\.csv'):
+        s4.check_fingerprint(common, common['fingerprint'], 'post')
+
+
+@pytest.mark.parametrize('closed, mode', (('sealed_test', 'mm_trial'), ('sealed', 'tc_trial')))
+def test_c3_53_main_does_not_open_a_closed_phase_as_the_root_number(tmp_path, monkeypatch, closed, mode):
+    d, _ = _s03_for_mode(tmp_path, mode)
+    phase_dir = d / closed
+    phase_dir.mkdir(exist_ok=True)
+    target = phase_dir / 'runs_test.csv'
+    raw = b'private runs\n'
+    target.write_bytes(raw)
+    meta = d / 'meta.yaml'
+    lines = [line for line in meta.read_text(encoding='utf-8').splitlines() if not line.startswith('sang_loc:')]
+    lines.append('sang_loc: ' + json.dumps(dict(file_so=dict(file=str(target),
+                                                            sha256=hashlib.sha256(raw).hexdigest()))))
+    meta.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    spy = _OpenSpy(monkeypatch)
+    with pytest.raises(SystemExit, match='sealed phase that is still closed'):
+        _go(monkeypatch, tmp_path, d, mode)
+    assert not spy.opened(target)
+
+
+def test_c3_53_root_number_rechecks_opened_descriptor(tmp_path, monkeypatch):
+    import builtins
+
+    d = _s03_dir(tmp_path)
+    number = tmp_path / 'so_goc.txt'
+    substitute = tmp_path / 'substitute.txt'
+    substitute.write_bytes(number.read_bytes())
+    real_open = builtins.open
+
+    def swap(path, *args, **kwargs):
+        return real_open(substitute if path == str(number) else path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, 'open', swap)
+    spy = _OpenSpy(monkeypatch)
+    with pytest.raises(SystemExit, match='the file opened is not the plain single-name file'):
+        s4.so_goc(str(d))
+    assert spy.opened(substitute)
 
 
 @pytest.mark.parametrize('mode', _C3_MODES)
@@ -3181,6 +3232,7 @@ def test_c3_46_determinism_all_equal(tmp_path, monkeypatch):
     """C3-46: identical digests in the GA evals rows and the new-process runs -> rc 0, no cho_liam."""
     rc, notes, out, sel = _fake_post(tmp_path, monkeypatch)
     assert rc == 0 and notes['cho_liam'] == []
+    assert notes['determinism_all_equal'] is True
     assert notes['notes']['PID determinism']['all_equal'] is True
     assert notes['notes']['PID determinism']['n_runs'] == 2
     det = list(csv.DictReader(open(out / 'post_checks' / 'determinism.csv', encoding='utf-8')))
@@ -3192,7 +3244,9 @@ def _c3_det_case(case):
     if case == 'drop_last':
         return dict(det_mod=lambda j, r: r[:-1])
     if case == 'extra':
-        return dict(det_mod=lambda j, r: r + [r[-1]])
+        return dict(det_mod=lambda j, r: r + [dict(r[-1], key=('ADRC', j[-1][2], j[-1][3]))])
+    if case == 'duplicate_first':
+        return dict(det_mod=lambda j, r: [r[0], r[0]])
     if case == 'digest_none':
         return dict(det_mod=lambda j, r: [dict(rr, digest=None) if i == 1 else rr
                                           for i, rr in enumerate(r)])
@@ -3212,13 +3266,14 @@ def _c3_det_case(case):
     raise AssertionError(case)
 
 
-@pytest.mark.parametrize('case', ('drop_last', 'extra', 'digest_none', 'digest_diff', 'ga_missing',
+@pytest.mark.parametrize('case', ('drop_last', 'extra', 'duplicate_first', 'digest_none', 'digest_diff', 'ga_missing',
                                   'ga_hash_empty', 'ga_hash_bad', 'ga_extra_key'))
 def test_c3_46_determinism_mismatch_waits_for_liam(tmp_path, monkeypatch, case):
     """C3-46: every mismatch between the GA attempt-1 rows and the new-process runs gives rc 2 with a
     cho_liam determinism item; determinism.csv keeps one row per expected key, equal false for it."""
     rc, notes, out, sel = _fake_post(tmp_path, monkeypatch, **_c3_det_case(case))
     assert rc == 2 and notes['cho_liam'] and notes['cho_liam'][0]['check'] == 'determinism'
+    assert notes['determinism_all_equal'] is False
     assert notes['notes']['PID determinism']['all_equal'] is False
     assert notes['notes']['PID determinism']['reasons']
     det = list(csv.DictReader(open(out / 'post_checks' / 'determinism.csv', encoding='utf-8')))
@@ -3227,8 +3282,30 @@ def test_c3_46_determinism_mismatch_waits_for_liam(tmp_path, monkeypatch, case):
         assert det[1]['equal'] == 'false' and det[0]['equal'] == 'true'
     elif case in ('extra', 'ga_extra_key'):
         assert all(r['equal'] == 'true' for r in det)         # an extra row: the keys still match
+    elif case == 'duplicate_first':
+        assert all(r['equal'] == 'false' for r in det)
+        reasons = notes['notes']['PID determinism']['reasons']
+        assert any('2 new-process results' in reason for reason in reasons)
+        assert any('missing row' in reason for reason in reasons)
     else:
         assert det[0]['equal'] == 'false'
+
+
+def test_c3_46_determinism_matches_reordered_child_results(tmp_path, monkeypatch):
+    other = {'t': ['float64', [3], 'cd' * 32]}
+    rc, notes, _, _ = _fake_post(tmp_path, monkeypatch,
+                                det_mod=lambda jobs, res: [dict(res[1], digest=other), res[0]],
+                                evals_mod=lambda rows: [rows[0], dict(rows[1], log_sha256=s4.digest_sha(other))])
+    assert rc == 0 and notes['determinism_all_equal'] is True and notes['cho_liam'] == []
+
+
+@needs_dll
+def test_c3_46_real_child_returns_run_key_and_digest(tmp_path):
+    fw = fwsim.FirmwareSim(_DLL)
+    _, log = s4.run_gate(fw, s4.o1.Path8(), 'PID', G_PID, 0.2, 0.5)
+    [child] = s4.run_determinism(_DLL, [('PID', G_PID, 0.2, 0.5)], str(tmp_path))
+    assert child['key'] == ('PID', 0.2, 0.5)
+    assert s4.digest_sha(child['digest']) == s4.log_sha(log)
 
 
 def test_c3_46_determinism_rows_unit(tmp_path):
@@ -3238,13 +3315,14 @@ def test_c3_46_determinism_rows_unit(tmp_path):
     jobs = [('PID', {}, 0.2, 0.5)]
     ga = [dict(controller='PID', v='0.2', mu='0.5', attempt='1', log_sha256=dig),
           dict(controller='PID', v='0.2', mu='0.5', attempt='1', log_sha256=dig)]
-    rows, why = s4.determinism_rows('PID', False, jobs, [dict(digest=dict(_DIG))], ga)
+    child = [dict(key=('PID', 0.2, 0.5), digest=dict(_DIG))]
+    rows, why = s4.determinism_rows('PID', False, jobs, child, ga)
     assert len(rows) == 1 and rows[0]['equal'] is False and why and '2 GA evals rows' in why[0]
-    rows, why = s4.determinism_rows('PID', False, jobs, [dict(digest=dict(_DIG))],
+    rows, why = s4.determinism_rows('PID', False, jobs, child,
                                     [dict(controller='PID', v='9.9', mu='9.9', attempt='1',
                                           log_sha256=dig)])
     assert why and 'extra row' in why[0]
-    rows, why = s4.determinism_rows('PID', True, [], [dict(digest=dict(_DIG))],
+    rows, why = s4.determinism_rows('PID', True, [], child,
                                     [dict(controller='PID', v='1', mu='2', attempt='1',
                                           log_sha256=dig)])
     assert len(rows) == 0 and len(why) == 3           # count, extra GA row, extra result
@@ -3406,6 +3484,47 @@ def test_c3_48_kep_values_in_the_ga_evals(tmp_path):
 
 
 @needs_dll
+@needs_dll
+@pytest.mark.parametrize('phase', ('trial', 'main'))
+def test_c3_48_kep_lech_stops_ga_and_seals_reason(tmp_path, monkeypatch, capsys, phase):
+    d = _s03_dir(tmp_path, runs=_runs())
+    out = tmp_path / 'out'
+    lock = None
+    if phase == 'main':
+        _c3_lock(out, d, False)
+        lock = (out / 'lock.yaml').read_bytes()
+    pre = tmp_path / 'pre.json'
+    pre.write_text(json.dumps({k: 'checked' for k in s4.PRECONDITIONS}), encoding='utf-8')
+    simulate = fwsim.simulate
+
+    def simulate_with_kep_lech(*args, **kwargs):
+        log = simulate(*args, **kwargs)
+        log['kep'][0, fwsim.KEP_COLS.index('kep_lech')] = 1
+        return log
+
+    def run_one_candidate(ev, *args, **kwargs):
+        ev.candidate(G_PID, 1, 1, 0)
+        pytest.fail('GA continued after kep_lech')
+
+    monkeypatch.setattr(fwsim, 'simulate', simulate_with_kep_lech)
+    monkeypatch.setattr(s4, 'run_seed', run_one_candidate)
+    monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', phase, '--controller', 'PID', '--s03', str(d),
+                                    '--dll', _DLL, '--s03-unsealed', '--preconditions', str(pre), '--out', str(out)])
+    assert s4.main() == 2
+    phases = json.loads((out / 'phases.json').read_text(encoding='utf-8'))
+    assert phases[-1]['status'] == 'stopped'
+    assert s4.meta_value((out / 'meta.yaml').read_text(encoding='utf-8'), 'running') is None
+    stop = json.loads((out / phases[-1]['stop_file']).read_text(encoding='utf-8'))
+    assert stop['phase'] == phase and 'kep_lech set' in stop['stop']
+    assert 'kep_lech' not in capsys.readouterr().out
+    assert 'kep_lech' not in (out / 'phases.json').read_text(encoding='utf-8')
+    assert not (out / 'selected.csv').exists()
+    if lock is None:
+        assert not (out / 'lock.yaml').exists()
+    else:
+        assert (out / 'lock.yaml').read_bytes() == lock
+
+
 def test_c3_48_hash_compat_with_and_without_kep(tmp_path):
     """C3-48: log_sha is on fwsim.BIT_EXACT_KEYS only, so a log with the kep channel and the same log
     without it hash identically (old-DLL comparisons still work)."""

@@ -883,6 +883,22 @@ def test_levels_rows_labels_and_scale():
     assert rows_a['omega_o_xy']['H_nguon'] == 'trần ω_o'          # H = 48, T = 100: no bang cut
 
 
+def test_levels_rows_labels_ceiling_with_no_grid_points_removed(monkeypatch):
+    ctrl, name = 'PID', 'kp_xy'
+    default = FAKE_DEFAULTS[ctrl][name]
+    grid, _ = s3.sweep_grid_n(name, default, 0.5, 50.0)
+    ceiling = s3.ceiling
+    monkeypatch.setattr(s3, 'ceiling', lambda c, n: grid[-1] if (c, n) == (ctrl, name) else ceiling(c, n))
+    gi, W, defaults = _grid_and_W(ctrl)
+    info = gi[(ctrl, name)]
+    assert info['n_bo'] == 0 and info['b_n'] == info['T'] == W[name][-1]
+    mien = {n: (nodes[0], nodes[-1]) for n, nodes in W.items()}
+    rows = sl.levels_rows(ctrl, mien, {ctrl: W}, gi, defaults, [], 'nhan', [], [0.5])
+    row = next(r for r in rows if r['factor'] == name)
+    assert row['H'] == row['b_n'] == info['T']
+    assert row['H_nguon'] == 'trần bảng chặn'
+
+
 def test_levels_rows_fallback_and_readback(tmp_path):
     """section 7, item 9: fallback copies the public levels.csv rows (L = 0 kept) with
     nguon_mien 'du_phong' and the reasons; read_levels gives the floats back bit-exact."""

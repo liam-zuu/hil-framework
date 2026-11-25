@@ -604,28 +604,30 @@ def test_inbox_missing_sealed_levels(fake, tmp_path):
     assert not (tmp_path / 'ib' / 'meta.yaml').exists()
 
 
-def _c3_open_spy(monkeypatch):
-    """Wrap builtins.open AND os.open; record the real path of every opened target (C3-43/C3-44)."""
+def _c3_open_spy(monkeypatch, inodes=None):
+    """Record the resolved path and optionally the descriptor identity of each opened target."""
     import builtins
     seen = []
     real_open, real_osopen = builtins.open, os.open
 
-    def spy(f, *a, **kw):
-        fh = real_open(f, *a, **kw)
+    def record(f, fd):
         try:
             if isinstance(f, (str, bytes, os.PathLike)):
                 seen.append(os.path.normcase(os.path.realpath(f)))
+            if inodes is not None:
+                st = os.fstat(fd)
+                inodes.add((st.st_dev, st.st_ino))
         except (OSError, TypeError, ValueError):
             pass
+
+    def spy(f, *a, **kw):
+        fh = real_open(f, *a, **kw)
+        record(f, fh.fileno())
         return fh
 
     def ospy(f, *a, **kw):
         fd = real_osopen(f, *a, **kw)
-        try:
-            if isinstance(f, (str, bytes, os.PathLike)):
-                seen.append(os.path.normcase(os.path.realpath(f)))
-        except (OSError, TypeError, ValueError):
-            pass
+        record(f, fd)
         return fd
 
     monkeypatch.setattr(builtins, 'open', spy)
@@ -674,6 +676,80 @@ def test_c3_43_inbox_needs_the_public_meta(fake, tmp_path):
     code, text = _main(['inbox', '--from', str(out), '--out', str(tmp_path / 'ib'), '--s03', str(s03),
                         '--s03-unsealed'])
     assert code == 2 and 'meta.yaml' in text and not (tmp_path / 'ib').exists()
+
+
+def test_c3_43_inbox_refuses_meta_without_trial(fake, tmp_path, monkeypatch):
+    out = tmp_path / 'run'
+    _search(fake, out)
+    s03 = tmp_path / 'S03'
+    s03.mkdir()
+    (s03 / 'meta.yaml').write_text('status: "ran to the end"\n', encoding='utf-8')
+    _s03_levels(s03)
+    seen = _c3_open_spy(monkeypatch)
+    code, text = _main(['inbox', '--from', str(out), '--out', str(tmp_path / 'ib'), '--s03', str(s03),
+                        '--s03-unsealed'])
+    assert code == 2 and 'missing trial' in text and not (tmp_path / 'ib').exists()
+    levels = s03 / 'sealed' / 'levels_sangloc.csv'
+    assert os.path.normcase(os.path.realpath(levels)) not in seen
+
+
+@pytest.mark.parametrize('rel', ('meta.yaml', 'sealed/levels_sangloc.csv'))
+def test_c3_53_inbox_refuses_multi_name_files_before_opening(fake, tmp_path, monkeypatch, rel):
+    out = tmp_path / 'run'
+    _search(fake, out)
+    s03 = tmp_path / 'S03'
+    s03.mkdir()
+    _s03_meta(s03)
+    _s03_levels(s03)
+    target = s03 / rel
+    st = target.stat()
+    target_name = os.path.normcase(str(target))
+    lstat = os.lstat
+
+    def lstat_with_second_link(path, *args, **kwargs):
+        current = lstat(path, *args, **kwargs)
+        if not isinstance(path, int) and os.path.normcase(os.fsdecode(path)) == target_name:
+            fields = list(current)
+            fields[3] = 2  # st_nlink of a hardlink
+            return os.stat_result(fields)
+        return current
+
+    monkeypatch.setattr(os, 'lstat', lstat_with_second_link)
+    inodes = set()
+    seen = _c3_open_spy(monkeypatch, inodes)
+    code, text = _main(['inbox', '--from', str(out), '--out', str(tmp_path / 'ib'), '--s03', str(s03),
+                        '--s03-unsealed'])
+    assert code == 2 and 'one name' in text and not (tmp_path / 'ib').exists()
+    assert (st.st_dev, st.st_ino) not in inodes
+    assert os.path.normcase(os.path.realpath(target)) not in seen
+
+
+def test_c3_53_inbox_rechecks_opened_levels_descriptor(fake, tmp_path, monkeypatch):
+    import builtins
+
+    out = tmp_path / 'run'
+    _search(fake, out)
+    s03 = tmp_path / 'S03'
+    s03.mkdir()
+    _s03_meta(s03)
+    _s03_levels(s03)
+    levels = s03 / 'sealed' / 'levels_sangloc.csv'
+    substitute = tmp_path / 'substitute.csv'
+    substitute.write_bytes(levels.read_bytes())
+    st = substitute.stat()
+    real_open = builtins.open
+
+    def swap(path, *args, **kwargs):
+        return real_open(substitute if path == str(levels) else path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, 'open', swap)
+    inodes = set()
+    _c3_open_spy(monkeypatch, inodes)
+    code, text = _main(['inbox', '--from', str(out), '--out', str(tmp_path / 'ib'), '--s03', str(s03),
+                        '--s03-unsealed'])
+    assert code == 2 and 'the file opened is not the plain single-name file' in text
+    assert (st.st_dev, st.st_ino) in inodes
+    assert not (tmp_path / 'ib').exists()
 
 
 def test_child_failure_prints_one_fixed_sentence(tmp_path):

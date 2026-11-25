@@ -89,6 +89,7 @@ import o1_feasibility as o1                             # noqa: E402
 import o1_gate as G                                     # noqa: E402
 import o1_gate_eval as E                                # noqa: E402
 import s03_doe as s3                                    # noqa: E402
+import s04_ga as s4                                     # noqa: E402
 import tune_ga                                          # noqa: E402
 
 SCRIPT_VERSION = 'o1_feas_search_v2'
@@ -853,20 +854,7 @@ def inside(g, L, H):
     return bool(math.isfinite(g) and L - tol <= g <= H + tol)
 
 
-S03_INBOX_LEVELS = os.path.join('sealed', 'levels_sangloc.csv')   # S04 v6.7 9.6: B's domain is the sealed file
-
-
-def _s03_meta_line(text, key):
-    """Value of a 'key: <json>' line of an S03 meta.yaml (text after '  #' dropped; json.loads, else the
-    text without quotes). KeyError when the line is absent."""
-    for line in text.splitlines():
-        if line.startswith(key + ':'):
-            v = line[len(key) + 1:].split('  #')[0].strip()
-            try:
-                return json.loads(v)
-            except ValueError:
-                return v.strip('"')
-    raise KeyError(key)
+S03_INBOX_LEVELS = 'sealed/levels_sangloc.csv'   # S04 v6.7 9.6: B's domain is the sealed file
 
 
 def s03_unsealed_gate(a):
@@ -878,20 +866,24 @@ def s03_unsealed_gate(a):
         raise FeasStop('L56: inbox reads sealed/levels_sangloc.csv of the S03 run; give --s03-unsealed only '
                        'after campaign A ended (nothing under sealed/ was opened)')
     mp = os.path.join(a.s03, 'meta.yaml')
-    if not os.path.isfile(mp):
-        raise FeasStop(f'{mp} missing: inbox needs the public meta.yaml of the S03 run (C3-43)')
-    meta = open(mp, encoding='utf-8').read()
     try:
-        status = _s03_meta_line(meta, 'status')
+        meta = s4.s03_text(a.s03, 'meta.yaml', closed_dirs=('sealed', 'sealed_test'))
+    except SystemExit as e:
+        raise FeasStop(str(e)) from None
+    if meta is None:
+        raise FeasStop(f'{mp} missing: inbox needs the public meta.yaml of the S03 run (C3-43)')
+    try:
+        status = s4.meta_value(meta, 'status')
     except KeyError:
         status = None
     if status != 'ran to the end':
         raise FeasStop(f'{mp}: status {status!r} is not "ran to the end": inbox needs the finished main '
                        f'S03 run (C3-43)')
     try:
-        trial = _s03_meta_line(meta, 'trial')
+        trial = s4.meta_value(meta, 'trial')
     except KeyError:
-        trial = False
+        raise FeasStop(f'{mp}: missing trial: inbox needs the main S03 run with trial set to the bool false '
+                       f'(C3-43)') from None
     if trial is not False:
         raise FeasStop(f'{mp}: trial is {trial!r}, not the bool false: inbox needs the main S03 run '
                        f'(C3-43)')
@@ -903,14 +895,18 @@ def cmd_inbox(a):
     never the public levels.csv)? sealed only; a missing sealed levels file stops (FeasStop)."""
     s03_unsealed_gate(a)                          # C3-43: BEFORE read_source / new_out: a refused call writes nothing
     wit, _ = read_source(getattr(a, 'from'))
+    try:
+        raw = s4.s03_read(a.s03, S03_INBOX_LEVELS, closed_dirs=('sealed_test',))
+    except SystemExit as e:
+        raise FeasStop(str(e)) from None
+    if raw is None:
+        lp = os.path.join(a.s03, *S03_INBOX_LEVELS.split('/'))
+        raise FeasStop(f'{lp} missing: the sealed levels of the S03 v8.5 screening (S04 v6.7 section 9 item 6)')
     new_out(a.out)
     say = Console(a.out)
     sealed = os.path.join(a.out, 'sealed')
-    lp = os.path.join(a.s03, S03_INBOX_LEVELS)
-    if not os.path.isfile(lp):
-        raise FeasStop(f'{lp} missing: the sealed levels of the S03 v8.5 screening (S04 v6.7 section 9 item 6)')
-    raw = open(lp, 'rb').read()                   # read ONCE: the CSV is parsed from these bytes and their
-    lv = {(r['controller'], r['factor']): (float(r['L']), float(r['H']))   # sha256 goes into the manifest
+    # Parse the same bytes whose sha256 goes into the manifest.
+    lv = {(r['controller'], r['factor']): (float(r['L']), float(r['H']))
           for r in csv.DictReader(io.StringIO(raw.decode('utf-8'), newline=''))}
     rows = []
     for (c, sn), w in sorted(wit.items()):
