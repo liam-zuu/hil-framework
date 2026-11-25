@@ -2516,3 +2516,277 @@ def test_dau_doan_every_attempt_or_issued_only(tmp_path):
     assert allr[1]['session_sha256'] == 's2' and allr[0]['psi_deg'] == pytest.approx(math.degrees(0.5))
     one = ca.dau_doan(att, src, {}, 'cap', every=False)
     assert [x['thu_id'] for x in one] == ['cap']
+
+
+# ------------------------------------------------------------------ repeated UDP datagram (CAM, CODE 24/11; L92)
+def write_segments(d, status=None):
+    """<log>.segments.csv as agv_logger writes it: one row per data line; status[i] (1-based) overrides 'ok'."""
+    import csv
+    p = os.path.join(d, 'log.csv')
+    with open(p, newline='', encoding='utf-8') as f:
+        rows = list(csv.reader(f))
+    hdr, body = rows[0], rows[1:]
+    with open(p + '.segments.csv', 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['row', 'log_seq', 'timestamp_us', 'segment', 'status'])
+        for i, r in enumerate(body, start=1):
+            w.writerow([i, r[col(hdr, 'log_seq')], r[col(hdr, 'timestamp_us')], 0, (status or {}).get(i, 'ok')])
+    name_segments(d)
+
+
+def name_segments(d, sha=None, n_dup=None):
+    """The logger summary names the segments file and its sha256 (agv_logger writes files.segments) and counts
+    the lines it marked 'duplicate' (segments[].duplicates; n_dup overrides)."""
+    p = os.path.join(d, 'log.csv')
+    s = json.load(open(p + '.summary.json', encoding='utf-8'))
+    s.setdefault('files', {})['segments'] = dict(file='log.csv.segments.csv',
+                                                 sha256=sha or ca.sha256(p + '.segments.csv'))
+    marks = open(p + '.segments.csv', encoding='utf-8').read().splitlines()[1:]
+    s['segments'] = [dict(segment=0, duplicates=sum(1 for m in marks if m.endswith(',duplicate'))
+                          if n_dup is None else n_dup)]
+    write_json(p + '.summary.json', s)
+
+
+def test_drop_count_must_be_the_logger_summary_duplicates(tmp_path):
+    """Codex vong 2: the summary counts one 'duplicates' per marked line; another count (or no counter) -> AError."""
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+    line = insert_after(d, 400)
+    write_segments(d, {line: 'duplicate'})
+    assert ca.load_log(os.path.join(d, 'log.csv'))['n_dong_trung_bo'] == 1
+    name_segments(d, n_dup=0)
+    with pytest.raises(ca.AError, match='dem duplicates 0'):
+        ca.load_log(os.path.join(d, 'log.csv'))
+    d2, _ = make(tmp_path, 'HC_goc_2', cho='goc')
+    write_segments(d2)
+    name_segments(d2, n_dup=2)                                               # counter says 2, nothing marked
+    with pytest.raises(ca.AError, match='dem duplicates 2'):
+        ca.load_log(os.path.join(d2, 'log.csv'))
+
+
+def test_duplicate_with_unreadable_log_seq_is_code_2(tmp_path):
+    """Codex vong 2: a marked duplicate whose log_seq is 'inf' gave OverflowError (traceback); now AError."""
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+
+    def fn(hdr, body):
+        i0, _ = run_rows(hdr, body)
+        body[i0 + 400][col(hdr, 'log_seq')] = 'inf'
+        body.insert(i0 + 401, list(body[i0 + 400]))
+    edit_log(d, fn)
+    body = open(os.path.join(d, 'log.csv'), encoding='utf-8').read().splitlines()
+    line = next(i for i in range(2, len(body)) if body[i] == body[i - 1])     # 1-based data line of the copy
+    write_segments(d, {line: 'duplicate'})
+    with pytest.raises(ca.AError, match='OverflowError'):
+        ca.load_log(os.path.join(d, 'log.csv'))
+
+
+def insert_after(d, k_from_run0, copy_of=None, change=None):
+    """Insert a copy of data row (run start + k_from_run0) [or of row copy_of] right after that row; change(hdr, row)
+    may edit the copy. Returns the 1-based data line number of the inserted line."""
+    pos = {}
+
+    def fn(hdr, body):
+        i0, _ = run_rows(hdr, body)
+        k = i0 + k_from_run0
+        src = list(body[k if copy_of is None else i0 + copy_of])
+        if change:
+            change(hdr, src)
+        body.insert(k + 1, src)
+        pos['line'] = k + 2
+    edit_log(d, fn)
+    return pos['line']
+
+
+def test_dup_line_marked_and_byte_equal_is_dropped(tmp_path):
+    """run06 (Pi on LAN + WiFi): the logger receives a datagram twice and marks the copy 'duplicate'; the reader drops
+    it and counts it, and every check and the F5 equal those of the log without the copy."""
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+    write_segments(d)
+    L0 = ca.load_log(os.path.join(d, 'log.csv'))
+    line = insert_after(d, 400)
+    write_segments(d, {line: 'duplicate'})
+    L = ca.load_log(os.path.join(d, 'log.csv'))
+    assert L0['n_dong_trung_bo'] == 0 and L['n_dong_trung_bo'] == 1 and L['n'] == L0['n']
+    assert L['seq_trung_bo'] == [int(L0['log_seq'][list(L0['run_active']).index(1.0) + 400])]
+    assert all(np.array_equal(L[c], L0[c]) for c in ca.LOG_COLS)
+    ok, ck, _ = checks(d)
+    assert all(ok.values()), [c for c in ck if not c[1]]
+    assert 'bo 1 dong trung byte' in dict((n, x) for n, _, x in ck)['log_seq_lien']
+    _, doan = run_cua_so(d)
+    assert doan['n_dong_trung_bo'] == 1 and doan['seq_trung_bo'] == L['seq_trung_bo']
+    out = str(tmp_path / 'f7.json')
+    ca.main(tinh_args(d, 'goc', '--out', out))
+    r = json.load(open(out, encoding='utf-8'))
+    assert [(x['n_dong_trung_bo'], x['seq_trung_bo']) for x in r['luot_thu']] == [(1, L['seq_trung_bo'])]   # HCD1-4
+    assert doan['segments_sha256'] == ca.sha256(os.path.join(d, 'log.csv.segments.csv'))
+
+
+def test_dup_line_without_segments_file_is_kept_and_fails(tmp_path):
+    """No logger segments file: nothing is dropped (L92: only a line the logger marked); log_seq_lien fails as before."""
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+    insert_after(d, 400)
+    L = ca.load_log(os.path.join(d, 'log.csv'))
+    assert L['n_dong_trung_bo'] == 0
+    ok, _, _ = checks(d)
+    assert ok['log_seq_lien'] is False
+
+
+@pytest.mark.parametrize('status', ['ok', 'conflict'])
+def test_same_seq_other_content_is_kept_and_fails(tmp_path, status):
+    """A repeated log_seq whose content differs (logger 'conflict', or not marked) is kept: log_seq_lien fails."""
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+
+    def change(hdr, row):
+        row[col(hdr, 'yaw_rad')] = str(float(row[col(hdr, 'yaw_rad')]) + 0.01)
+    line = insert_after(d, 400, change=change)
+    write_segments(d, {line: status})
+    L = ca.load_log(os.path.join(d, 'log.csv'))
+    assert L['n_dong_trung_bo'] == 0
+    ok, _, _ = checks(d)
+    assert ok['log_seq_lien'] is False
+
+
+def test_marked_duplicate_not_equal_to_line_before_is_refused(tmp_path):
+    """Marked 'duplicate' but its bytes differ from the line kept just before (other content, or a copy of an older
+    line): AError (code 2), nothing dropped silently."""
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+
+    def change(hdr, row):
+        row[col(hdr, 'yaw_rad')] = str(float(row[col(hdr, 'yaw_rad')]) + 0.01)
+    line = insert_after(d, 400, change=change)
+    write_segments(d, {line: 'duplicate'})
+    with pytest.raises(ca.AError, match='not byte-equal'):
+        ca.load_log(os.path.join(d, 'log.csv'))
+    d2, _ = make(tmp_path, 'HC_goc_2', cho='goc')
+    line = insert_after(d2, 400, copy_of=398)                                # an older line, not the one before
+    write_segments(d2, {line: 'duplicate'})
+    with pytest.raises(ca.AError, match='not byte-equal'):
+        ca.load_log(os.path.join(d2, 'log.csv'))
+
+
+def test_segments_file_not_matching_the_log_is_refused(tmp_path):
+    """A segments file with another row count, or a row whose log_seq is not the CSV line's: AError."""
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+    write_segments(d)
+    insert_after(d, 400)                                                     # log grew, segments did not
+    with pytest.raises(ca.AError, match='rows for'):
+        ca.load_log(os.path.join(d, 'log.csv'))
+    d2, _ = make(tmp_path, 'HC_goc_2', cho='goc')
+    write_segments(d2)
+    p = os.path.join(d2, 'log.csv.segments.csv')
+    lines = open(p, encoding='utf-8').read().splitlines()
+    f = lines[5].split(',')
+    f[1] = str(int(f[1]) + 1)
+    lines[5] = ','.join(f)
+    open(p, 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
+    name_segments(d2)
+    with pytest.raises(ca.AError, match='does not match'):
+        ca.load_log(os.path.join(d2, 'log.csv'))
+
+
+@pytest.mark.parametrize('col_i', [0, 2])                                   # row alone, timestamp_us alone (HCD1-1)
+def test_segments_row_or_time_alone_wrong_is_refused(tmp_path, col_i):
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+    line = insert_after(d, 400)
+    write_segments(d, {line: 'duplicate'})
+    p = os.path.join(d, 'log.csv.segments.csv')
+    lines = open(p, encoding='utf-8').read().splitlines()
+    f = lines[line].split(',')
+    f[col_i] = str(int(f[col_i]) + 1)
+    lines[line] = ','.join(f)
+    open(p, 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
+    name_segments(d)
+    with pytest.raises(ca.AError, match='does not match'):
+        ca.load_log(os.path.join(d, 'log.csv'))
+
+
+def test_segments_sha_must_be_the_one_the_logger_summary_names(tmp_path):
+    """HCD1-1: a segments file edited after the run (an 'ambiguous' relabelled 'duplicate'): its sha256 is not the
+    one of the logger summary -> AError; a drop with a summary that names no segments file -> AError."""
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+    line = insert_after(d, 400)
+    write_segments(d, {line: 'ambiguous'})
+    p = os.path.join(d, 'log.csv.segments.csv')
+    txt = open(p, encoding='utf-8', newline='').read()
+    assert txt.count(',ambiguous') == 1
+    open(p, 'w', encoding='utf-8', newline='').write(txt.replace(',ambiguous', ',duplicate'))
+    with pytest.raises(ca.AError, match='sha256 khac'):
+        ca.load_log(os.path.join(d, 'log.csv'))
+    sy.write_summary(os.path.join(d, 'log.csv'))                             # summary without files.segments
+    with pytest.raises(ca.AError, match='khong ghi sha256'):
+        ca.load_log(os.path.join(d, 'log.csv'))
+
+
+@pytest.mark.parametrize('status', ['ok', 'ambiguous'])
+def test_byte_equal_copy_not_marked_duplicate_is_kept(tmp_path, status):
+    """HCD1-9: a byte-equal copy the logger did not mark 'duplicate' stays: log_seq_lien fails."""
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+    line = insert_after(d, 400)
+    write_segments(d, {line: status})
+    assert ca.load_log(os.path.join(d, 'log.csv'))['n_dong_trung_bo'] == 0
+    ok, _, _ = checks(d)
+    assert ok['log_seq_lien'] is False
+
+
+@pytest.mark.parametrize('k', [-1, 0])                                        # copy of the line before / at the edge
+def test_dup_at_run_active_edge_keeps_every_check_and_f5(tmp_path, k):
+    """HCD1-9: a copy at the run_active rising edge is dropped; kiem and the F5 legs equal those of the clean log."""
+    d0, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+    d, _ = make(tmp_path, 'HC_goc_2', cho='goc')
+    write_segments(d0)
+    line = insert_after(d, k)
+    write_segments(d, {line: 'duplicate'})
+    ok, ck, _ = checks(d)
+    assert all(ok.values()), [c for c in ck if not c[1]]
+    _, f0 = run_cua_so(d0)
+    _, f1 = run_cua_so(d)
+    assert f1['n_dong_trung_bo'] == 1 and f0['n_dong_trung_bo'] == 0
+    strip = lambda f: [{k2: v for k2, v in x.items()} for x in f['doan']]   # noqa: E731
+    assert strip(f1) == strip(f0) and f1['chuoi'] == f0['chuoi'] and f1['can_gio'] == f0['can_gio']
+
+
+def test_f5_and_tinh_must_drop_the_same_rows(tmp_path):
+    """HCD1-2: the F5 was made with the segments file (one line dropped); tinh then reads the log without it (or
+    with another segments file): the F5 of --doan / F9 is refused, not issued on another set of rows."""
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+    line = insert_after(d, 400)
+    write_segments(d, {line: 'duplicate'})
+    run_cua_so(d)
+    fr, tr = os.path.join(d, 'frames.csv'), os.path.join(d, 'track.json')
+    L = ca.load_log(os.path.join(d, 'log.csv'))
+    ca.check_cap_sources(d, fr, tr, os.path.join(d, 'log.csv'), None, None, need=True, L=L)   # same rows: ok
+    os.remove(os.path.join(d, 'log.csv.segments.csv'))
+    L2 = ca.load_log(os.path.join(d, 'log.csv'))
+    assert L2['n_dong_trung_bo'] == 0
+    with pytest.raises(ca.AError, match='seq_trung_bo'):
+        ca.check_cap_sources(d, fr, tr, os.path.join(d, 'log.csv'), None, None, need=True, L=L2)
+
+
+def test_log_lines_blank_or_not_csv(tmp_path):
+    """HCD1-3, HCD1-8: an empty line is skipped (as csv.DictReader did); a line of blanks, a field over the CSV limit
+    in the log or in the segments file: AError (code 2), no traceback."""
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+    p = os.path.join(d, 'log.csv')
+    n = ca.load_log(p)['n']
+    body = open(p, 'rb').read().split(b'\n')
+    open(p, 'wb').write(b'\n'.join(body[:5] + [b''] + body[5:]))
+    assert ca.load_log(p)['n'] == n
+    open(p, 'wb').write(b'\n'.join(body[:5] + [b' \t'] + body[5:]))
+    with pytest.raises(ca.AError):
+        ca.load_log(p)
+    open(p, 'wb').write(b'\n'.join(body))
+    write_segments(d)
+    seg = p + '.segments.csv'
+    lines = open(seg, encoding='utf-8').read().splitlines()
+    lines[3] = lines[3].rsplit(',', 1)[0] + ',"' + 'x' * 140000 + '"'
+    open(seg, 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
+    name_segments(d)
+    with pytest.raises(ca.AError, match='Error'):
+        ca.load_log(p)
+
+
+def test_clean_log_kiem_detail_unchanged(tmp_path):
+    """HCD1-6: nothing dropped -> log_seq_lien prints no detail (stdout of clean runs as before)."""
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc')
+    write_segments(d)
+    _, ck, _ = checks(d)
+    assert dict((n, x) for n, _, x in ck)['log_seq_lien'] == ''
