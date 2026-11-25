@@ -2270,6 +2270,35 @@ def _check_mien_theo_buoi(d: dict, khoa: dict, elig_seg: dict) -> None:
                                 '(inside the hull of the merged lock only; KG-5)')
 
 
+def _check_muc_du_dai(d: dict, khoa: dict, elig_seg: dict) -> None:
+    """D3-1 (Codex D3 round 1; CODE 24/11 khuya, 2026-11-24_CODE_chot_khoa_gop_dai_khong_co_khung.md, condition (a);
+    C8B c8b_khoa_gop e7e00e6): the merged lock writes muc_du_dai_theo_buoi {session id: [levels at which that session
+    has frames of its own in every band of hang_theo_u]}; a band a session has no frame in takes its bound from the
+    other sessions, and a run of that session must not use it silently. Keyed as mien_car_pose_theo_buoi (KG-5): the
+    sessions of the gate; the lock of one session without the field is left alone. Every eligible scoring (the run a
+    cell rests on) of session b at level lv needs lv in the list of b. Limit: the K runs are no eligible scoring of
+    the gate (only their scoring time is taken) and are not asked here."""
+    mdb = khoa.get('muc_du_dai_theo_buoi')
+    buois = [t['buoi'] for t in d['tien_de_c8']]
+    if mdb is None and len(buois) == 1:
+        return
+    if not isinstance(mdb, dict) or set(mdb) != set(buois) or any(
+            not isinstance(v, list) or any(not isinstance(lv, str) for lv in v) for v in mdb.values()):
+        raise GateFileError(f'khoa_c8b.muc_du_dai_theo_buoi: the levels each C8 session of the gate {buois} has every '
+                            'band of, keyed by session id, each a list of levels (D3-1)')
+    for c in d['o_c8']:
+        if c['trang_thai'] != 'co_luot':
+            continue
+        seg = elig_seg.get(c['chuoi'][-1]['file_cham']['sha256'])
+        if seg is None:
+            continue
+        if c['muc'] not in mdb[seg['buoi']]:
+            raise GateFileError(f'cell {c["o"]}: its eligible run was made in session {seg["buoi"]}, which has no frame '
+                                f'of its own in some band of level {c["muc"]} (khoa_c8b.muc_du_dai_theo_buoi '
+                                f'{mdb[seg["buoi"]]}): the band bound of that level comes from other sessions only '
+                                '(D3-1)')
+
+
 def scorings_dropped(goc: str, commit: Optional[str]) -> List[dict]:
     """KG-6 (Codex 24/11; CODE 24/11, Liam A2 "Một khóa, lấy lớn nhất"): with a bo_tick lock (commit = its
     commit_hil), the c8b_luoi luoi.json files under the C8 folder (also in folders _...) made at another commit: the
@@ -2608,6 +2637,12 @@ def _check_bang_chung(d: dict, goc: str, scorers: set) -> None:
         if b.get('version') != ver or b.get('trang_thai') != 'dat':
             raise GateFileError(f'chuan_u.dieu_kien.{k}.bang_chung: a {ver} file with trang_thai dat, got '
                                 f'{b.get("version")!r} / {b.get("trang_thai")!r} (C8B 19/11)')
+        if k == 'kiem_vi_tri_rieng' and b.get('mien_thieu') not in (None, []):
+            # D3-2 (Codex D3 round 1; Liam 25/11 at CODE, L157 "Doi thanh thieu (Recommended)"): c8b_kiem_vi_tri writes
+            # thieu when mien_thieu is not empty (refused above); a file saying dat with one is not its output
+            raise GateFileError('chuan_u.dieu_kien.kiem_vi_tri_rieng.bang_chung: trang_thai dat with mien_thieu not '
+                                'empty (a quantity above its index in a domain: no tool reads it, C8 is not locked; '
+                                'D3-2)')
         if k == 'kiem_vi_tri_rieng' and b.get('khoa_truoc_sha256') != d['khoa_c8b']['sha256']:
             raise GateFileError('chuan_u.dieu_kien.kiem_vi_tri_rieng: khoa_truoc_sha256 is not the C8b lock of the gate')
 
@@ -2729,6 +2764,7 @@ def check_nguon(d: dict, goc: str) -> dict:
     # dossier lists them, with Liam's record when there is one
     kl = _open_ref(goc, d['khoa_c8b'], 'khoa_c8b')
     _check_mien_theo_buoi(d, kl, elig_seg)              # KG-5
+    _check_muc_du_dai(d, kl, elig_seg)                  # D3-1
     bo_want = scorings_dropped(goc, commit_bo_of(kl))
     cb = _obj(hs.get('cham_cu_bo'), ('luoi', 'liam'), 'chuan_u.ho_so_c8.cham_cu_bo')
     if cb['luoi'] != bo_want:

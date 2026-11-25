@@ -2671,7 +2671,8 @@ def _buoi3(goc, d, o):
     k0 = hs0['khoa_kiem_luc'][0]                     # CODE 24/11: the S7 lock of session b3 (the same manifest)
     _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: y['khoa_kiem_luc'].append(dict(k0, buoi='C8_buoi3', kiem_cheo=kc)))
     _rewrite_khoa(goc, d, lambda k: k.update(mien_car_pose_theo_buoi={   # KG-5: the merged lock's domain per session
-        b: {q: k['mien_car_pose'][q] for q in ('side_m', 'phien_ban', 'h_m', 'kappa')} for b in ('C8_buoi2', 'C8_buoi3')}))
+        b: {q: k['mien_car_pose'][q] for q in ('side_m', 'phien_ban', 'h_m', 'kappa')} for b in ('C8_buoi2', 'C8_buoi3')},
+        muc_du_dai_theo_buoi={b: ['O1-F02', 'O1-F05', 'O1-F08'] for b in ('C8_buoi2', 'C8_buoi3')}))   # D3-1
     return x
 
 
@@ -3308,6 +3309,50 @@ def test_kg_6_scorings_before_the_merged_lock_are_dropped(tmp_path):
     hs = json.load(open(os.path.join(goc, 'chuan_u/ho_so_kg6b.json'), encoding='utf-8'))
     assert hs['cham_cu_bo'] == dict(luoi=GC.scorings_dropped(goc, '5' * 40), liam=rec)
     assert g['o_c8'][0]['chuoi'][0]['file_cham']['sha256'] == x['file_cham']['sha256']
+
+
+def test_d3_1_levels_with_every_band_per_session(tmp_path):
+    """D3-1: with two sessions the lock lists, per session, the levels it has every band of; the eligible run of a
+    cell made in a session at a level outside its list is refused (here the F08 PID cell, rerun in session b3)."""
+    d, goc = build_c8(tmp_path / 'a', sub='b2')
+    _buoi3(goc, d, 'O1-F08_PID')
+    GC.check_nguon(d, goc)
+    for name, edit, msg in [
+            ('b', lambda k: k.pop('muc_du_dai_theo_buoi'), 'D3-1'),
+            ('c', lambda k: k['muc_du_dai_theo_buoi'].pop('C8_buoi3'), 'D3-1'),
+            ('d', lambda k: k['muc_du_dai_theo_buoi'].update(C8_buoi3='O1-F08'), 'D3-1'),
+            ('e', lambda k: k['muc_du_dai_theo_buoi'].update(C8_buoi3=['O1-F02', 'O1-F05']),
+             'session C8_buoi3, which has no frame of its own in some band of level O1-F08')]:
+        d, goc = build_c8(tmp_path / name, sub='b2')
+        _buoi3(goc, d, 'O1-F08_PID')
+        _rewrite_khoa(goc, d, edit)
+        with pytest.raises(GC.GateFileError, match=msg):
+            GC.check_nguon(d, goc)
+    # the level missing in the list of the OTHER session does not touch this cell
+    d, goc = build_c8(tmp_path / 'f', sub='b2')
+    _buoi3(goc, d, 'O1-F08_PID')
+    cells2 = {c['muc'] for c in d['o_c8'] if c['trang_thai'] == 'co_luot' and c['o'] != 'O1-F08_PID'}
+    _rewrite_khoa(goc, d, lambda k: k['muc_du_dai_theo_buoi'].update(C8_buoi3=['O1-F08']))
+    GC.check_nguon(d, goc)
+    assert cells2                                                    # the other cells rest on session b2
+    # one session, a lock without the field: left alone (as KG-5)
+    d, goc = build_c8(tmp_path / 'g')
+    GC.check_nguon(d, goc)
+
+
+def test_d3_2_position_check_file_thieu_or_with_mien_thieu(tmp_path):
+    """D3-2 (Liam 25/11, L157): a D3 file that says thieu does not lock C8; one saying dat with mien_thieu neither."""
+    for name, edit, msg in [
+            ('a', lambda y: y.update(trang_thai='thieu', ly_do=['mien_thieu: 1 quantity'],
+                                     mien_thieu=[dict(nguon='P1_A3_H32', dai_luong='P1', mien='A')]),
+             'trang_thai dat, got'),
+            ('b', lambda y: y.update(mien_thieu=[dict(nguon='P1_A3_H32', dai_luong='P1', mien='A')]), 'D3-2')]:
+        d, goc = build_c8(tmp_path / name)
+        ref = d['chuan_u']['dieu_kien']['kiem_vi_tri_rieng']['bang_chung']
+        _rewrite(goc, ref, edit)
+        _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: y['bang_chung'].update(kiem_vi_tri_rieng=ref['sha256']))
+        with pytest.raises(GC.GateFileError, match=msg):
+            GC.check_nguon(d, goc)
 
 
 def test_kg_5_camera_domain_per_session(tmp_path):
