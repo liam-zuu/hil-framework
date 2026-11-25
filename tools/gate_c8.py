@@ -183,7 +183,7 @@ def _same(a, b) -> bool:
     SD3-1, Codex round 3: a number copied from another file is that number)."""
     if a is None or b is None:
         return a is None and b is None
-    return _isnum(a) and _isnum(b) and float(a) == float(b)
+    return _fin(a) and _fin(b) and a == b              # Python compares an int and a float exactly (round 4)
 
 
 def _close(a, b) -> bool:
@@ -607,7 +607,18 @@ def so_do_of(level: str, uh: Dict[str, dict], quyet: Optional[dict] = None) -> T
 # ── the branch so_do on a run gate (CODE 23/11, Liam "duyệt bảng luật mới") ──────────────────────────────────────
 
 def _fin(x) -> bool:
-    return not isinstance(x, bool) and isinstance(x, (int, float)) and math.isfinite(x)
+    """A finite JSON number (not bool). A whole number too large for a float is not one (SD4-2: no OverflowError)."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return False
+    try:
+        return math.isfinite(x)
+    except OverflowError:
+        return False
+
+
+def _count(x) -> bool:
+    """A count as the tools write it: a whole number >= 0, not bool (0.0 is taken as 0; SD1-3, SD2-1 round 4)."""
+    return _fin(x) and x >= 0 and x == int(x)
 
 
 def so_do_state(q_common, q_union, n_undef_union, threshold: float) -> str:
@@ -686,13 +697,18 @@ def check_q_so_do(x, b: dict, w: str, grid: bool) -> dict:
     ch = b.get('chung') if isinstance(b.get('chung'), dict) else b
     for lo_k, hi_v, what in (('q_chung', x['q'], 'q'), ('q', b.get('q'), 'q of the block'),
                              ('q_chung', ch.get('q'), 'q of the common domain')):
-        if _fin(x[lo_k]) and _fin(hi_v) and float(x[lo_k]) > float(hi_v):
+        if _fin(x[lo_k]) and not _fin(hi_v):             # round 4: a defined frame has a q, so the larger set has one
+            raise GateFileError(f'{w}.q_so_do.{lo_k} {x[lo_k]!r} with {what} {hi_v!r}: a number of the defined frames '
+                                'needs that number (SD1-3)')
+        if _fin(x[lo_k]) and _fin(hi_v) and x[lo_k] > hi_v:
             raise GateFileError(f'{w}.q_so_do.{lo_k} {x[lo_k]!r} above {what} {hi_v!r} (SD1-3)')
     if not grid:
         for k, dom, what in (('q', b, 'the block'), ('q_chung', ch, 'the common domain')):
             nu = dom.get('n_undef')
-            all_defined = _isnum(nu) and float(nu) == 0 and _fin(dom.get('q'))    # 0 or 0.0 (SD1-3, round 3)
-            if all_defined and not (_fin(x[k]) and float(x[k]) == float(dom['q'])):
+            if not _count(nu):                           # round 4: false, null, text are no count
+                raise GateFileError(f'{w}: n_undef {nu!r} of {what}: a whole number >= 0 (SD2-1)')
+            all_defined = nu == 0 and _fin(dom.get('q'))     # 0 or 0.0 (SD1-3, round 3)
+            if all_defined and not (_fin(x[k]) and x[k] == dom['q']):
                 raise GateFileError(f'{w}.q_so_do.{k} {x[k]!r}: no frame of {what} is undefined, so it is its q '
                                     f'{dom["q"]!r} (SD1-3, SD2-1)')
     return x
@@ -1360,13 +1376,26 @@ def _ref_bytes(goc: str, ref: dict, what: str) -> bytes:
     return raw
 
 
+def _finite_float(s: str) -> float:
+    """SD4-1 (Codex round 4): a JSON number that does not fit a float (1e400 reads as inf) is refused."""
+    v = float(s)
+    if not math.isfinite(v):
+        raise GateFileError(f'the number {s[:40]} is not finite as a float')
+    return v
+
+
+def _no_constant(s: str):
+    raise GateFileError(f'{s}: not a JSON number (the tools write null)')
+
+
 def _open_ref(goc: str, ref: dict, what: str, as_json: bool = True):
     """The file of a reference under goc, hashed again (realpath inside goc). Its JSON when as_json."""
     raw = _ref_bytes(goc, ref, what)
     if not as_json:
         return None
     try:
-        x = json.loads(raw.decode('utf-8'), object_pairs_hook=_no_duplicate_keys)
+        x = json.loads(raw.decode('utf-8'), object_pairs_hook=_no_duplicate_keys, parse_float=_finite_float,
+                       parse_constant=_no_constant)
     except GateFileError as exc:
         raise GateFileError(f'{what} {ref["duong_dan"]!r}: {exc}')
     except (UnicodeDecodeError, ValueError) as exc:
@@ -1574,7 +1603,7 @@ def _node_scores(goc: str, fc: dict, w: str, cell: dict, fg: Optional[dict]) -> 
                                 'scoring (esp32_sha256, frames_sha256; GC6-6)')
         if hn[k] != (sc.get('outcome') == 'hong_he_do'):
             raise GateFileError(f'{w} node {k}: hong_nut {hn[k]} but the node score says {sc.get("outcome")!r} (GC6-6)')
-        if 'offset_s' in sc and not (_isnum(sc['offset_s']) and _close(sc['offset_s'], nd[k])):
+        if 'offset_s' in sc and not _same(sc['offset_s'], nd[k]):          # a copy (SD3-1 round 4)
             raise GateFileError(f'{w} node {k}: offset_s {sc["offset_s"]!r} is not nodes_s[{k}] (GC6-6)')
         kt = sc.get('khung_tuong_doi_v1')
         scores.append(sc)
@@ -1595,7 +1624,7 @@ def _node_scores(goc: str, fc: dict, w: str, cell: dict, fg: Optional[dict]) -> 
                                 'of this scoring (GC6-6)')
         mpp = kt.get('mien_phai_phu')
         _obj(mpp, ('nut', 'D_s', 'id_khung', 'id_khung_sha256'), f'{w} node {k} mien_phai_phu')
-        if mpp['nut'] != k or not _close(mpp['D_s'], nd[k]) or not isinstance(mpp['id_khung'], list) \
+        if mpp['nut'] != k or not _same(mpp['D_s'], nd[k]) or not isinstance(mpp['id_khung'], list) \
                 or not mpp['id_khung'] or sha256_ids(mpp['id_khung']) != mpp['id_khung_sha256']:
             raise GateFileError(f'{w} node {k}: mien_phai_phu {{nut {k}, D_s = nodes_s[{k}], a non-empty id_khung, its '
                                 'ids_sha}')

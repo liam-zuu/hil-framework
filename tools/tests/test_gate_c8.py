@@ -3075,6 +3075,36 @@ def test_sd3_1_grid_offsets_are_those_of_the_time_file_exactly():
         GC._node_scores('.', dict(nodes_s=list(ns), trang_thai_luot='cham'), 'w', cell, dict(nodes_s=ns))
 
 
+def test_round4_copies_and_numbers_of_the_files(tmp_path):
+    # Codex round 4. _same: finite numbers, an int and a float compared exactly, never an OverflowError
+    assert GC._same(1.5, 1.5) and GC._same(2, 2.0) and GC._same(None, None) and not GC._same(None, 0)
+    assert not GC._same(9007199254740992.0, 9007199254740993) and not GC._same(float('inf'), float('inf'))
+    assert not GC._same(10 ** 400, 10 ** 400) and not GC._same(True, 1) and not GC._fin(10 ** 400)
+    assert GC._count(0) and GC._count(0.0) and GC._count(3) and not GC._count(False) and not GC._count(-1)
+    assert not GC._count(1.5) and not GC._count(None) and not GC._count(10 ** 400)
+    # a referenced JSON file with a number that is not finite as a float, or a constant, is refused when opened
+    for i, text in enumerate(['{"nodes_s": [0.0, 1e400]}', '{"q": NaN}', '{"q": -Infinity}']):
+        p = tmp_path / f'f{i}.json'
+        p.write_text(text, encoding='utf-8')
+        ref = dict(duong_dan=p.name, sha256=GC.sha256_file(str(p)))
+        with pytest.raises(GC.GateFileError, match='not finite|not a JSON number'):
+            GC._open_ref(str(tmp_path), ref, 'file')
+    # SD3-1: the offset of a node score and D_s of its mien_phai_phu are copies of nodes_s (5 ns apart refused)
+    d, goc = build_c8(tmp_path / 'a')
+    x = d['o_c8'][0]['chuoi'][0]
+    _rewrite_nodes(goc, d, x, lambda y: y.update(offset_s=y['khung_tuong_doi_v1']['mien_phai_phu']['D_s'] + 5e-13)
+                   if y['khung_tuong_doi_v1']['mien_phai_phu']['nut'] == 1 else None)
+    with pytest.raises(GC.GateFileError, match='offset_s'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'b')
+    x = d['o_c8'][0]['chuoi'][0]
+    _rewrite_nodes(goc, d, x, lambda y: y['khung_tuong_doi_v1']['mien_phai_phu'].update(
+        D_s=y['khung_tuong_doi_v1']['mien_phai_phu']['D_s'] + 5e-13)
+        if y['khung_tuong_doi_v1']['mien_phai_phu']['nut'] == 1 else None)
+    with pytest.raises(GC.GateFileError, match='mien_phai_phu'):
+        GC.check_nguon(d, goc)
+
+
 def test_sd1_3_q_so_do_required_and_bounded():
     g = _gate_v32(theta=7.4, u_t=0.015)
     a = GC.apply_so_do(g, ['g5'], 'O1-F08', 'a' * 64)
@@ -3089,6 +3119,12 @@ def test_sd1_3_q_so_do_required_and_bounded():
                       (lambda x: (x['g5']['q_so_do'].update(q=None, q_chung=None),
                                   x['g5'].update(state='chua_ket_luan')), 'is undefined'),
                       (lambda x: (x['g5']['q_so_do'].update(q=7.3, q_chung=7.3)), 'is undefined'),
+                      # round 4 (Codex): a number of the defined frames without the q of its domain; a count that
+                      # is no count
+                      (lambda x: (x['g5'].update(q=None, lo=None, hi=None),
+                                  x['g5']['chung'].update(q=None, lo=None, hi=None)), 'needs that number'),
+                      (lambda x: x['g5']['chung'].update(n_undef=False), 'a whole number'),
+                      (lambda x: x['g5'].update(n_undef=None), 'a whole number|n_undef'),
                       # round 3 (Codex): the count written 0.0 is still no undefined frame
                       (lambda x: (x['g5'].update(n_undef=0.0), x['g5']['chung'].update(n_undef=0.0),
                                   x['g5']['q_so_do'].update(q=7.3, q_chung=7.3)), 'is undefined'),
@@ -3166,7 +3202,10 @@ def test_sd2_1_node_q_so_do_tied_to_the_node_numbers(tmp_path):
                                                       q_so_do=dict(nut=None, q=5.0, q_chung=4.999999999)),
              'not the q_so_do'),                                       # q_chung alone differs
             ('e', lambda y: y['gate_v3']['g5'].update(n_undef=0.0, q=8.0, chung=dict(q=8.0, n_undef=0.0)),
-             'is undefined')]:
+             'is undefined'),
+            # round 4 (Codex): the count of the common domain written false frees q_chung from its q
+            ('f', lambda y: y['gate_v3']['g5'].update(chung=dict(q=5.0, n_undef=False)), 'a whole number'),
+            ('g', lambda y: y['gate_v3']['g5'].update(q=None, chung=dict(q=None, n_undef=0)), 'needs that number')]:
         d, goc = build_c8(tmp_path / name)
         x = next(c for c in d['o_c8'] if c['muc'] == 'O1-F08')['chuoi'][0]
         _rewrite_nodes(goc, d, x, edit)
