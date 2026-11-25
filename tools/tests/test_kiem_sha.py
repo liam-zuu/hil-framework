@@ -900,9 +900,12 @@ def test_c3_22_v2_ban_do_hash_bien_do_dai():
 def test_c3_22_v2_canh_ban_do_duong_dan():
     cap, kh, rong = KS.tim_cap({'doi_ten': {'a.csv': 'b/c.csv'}})
     assert not cap and not kh and rong == 0
-    # ban do toan null khong phai ban do hash: khong kh, khong rong
+    # C3-22 vong 3 (de G-SHA): khoa duong dan mang null la ban do hash, null o
+    # truong bat buoc -> sha_rong_bat_buoc (truoc vong 3: khong kh, khong rong)
     cap, kh, rong = KS.tim_cap({'outputs': {'a.csv': None}})
-    assert not cap and not kh and rong == 0
+    assert not cap and rong == 0
+    assert [(e['khoa'], e['ly_do']) for e in kh] == [
+        ('outputs["a.csv"]', 'sha_rong_bat_buoc')]
 
 
 def test_c3_22_v2_cli_ban_do_duong_dan_ma_0(tmp_path):
@@ -1260,3 +1263,299 @@ def test_05_data_thieu_o_goc_repo(tmp_path):
 def test_05_data_khong_co_goc_repo(tmp_path):
     assert KS.ung_vien('05_DATA/r/a.csv', tmp_path, None) == []
     assert KS.kiem_cap('05_DATA/r/a.csv', sha(b'x\n'), tmp_path, None)[0] == 'khong_co_goc_luot'
+
+
+# ---------- C3-22 vong 3: ban do hash suy tu khoa, loi tung muc ----------
+
+def _chay(goc, repo, out):
+    ma = KS.main(['--goc', str(goc), '--goc-repo', str(repo),
+                  '--ra', str(out)])
+    return ma, _doc_csv(out / 'bang.csv'), _doc_csv(out / 'khong_hieu.csv')
+
+
+def test_c3_22_v3_codex_a_da_doi_cli(tmp_path):
+    # phan vi du Codex: {"anh":{"a.png":"<SHA hop le>","b.png":5}}, a.png doi
+    repo, goc = _lam_repo(tmp_path)
+    (goc / 'a.png').write_bytes(b'moi')
+    (goc / 'r.json').write_text(json.dumps(
+        {'anh': {'a.png': sha(b'cu'), 'b.png': 5}}), encoding='utf-8')
+    ma, rows, kh = _chay(goc, repo, tmp_path / 'out')
+    assert ma == 1
+    assert [(r['khoa'], r['ket_qua']) for r in rows] == [
+        ('anh["a.png"]', 'khong_khop')]
+    assert [(e['khoa'], e['ly_do']) for e in kh] == [
+        ('anh["b.png"]', 'sha_khong_hop_le')]
+
+
+def test_c3_22_v3_codex_a_dung_cli_ma_3(tmp_path):
+    # a.png dung SHA, b.png=5: truoc sua ra ma 0 (b.png bi bo qua)
+    repo, goc = _lam_repo(tmp_path)
+    (goc / 'a.png').write_bytes(b'cu')
+    (goc / 'r.json').write_text(json.dumps(
+        {'anh': {'a.png': sha(b'cu'), 'b.png': 5}}), encoding='utf-8')
+    ma, rows, kh = _chay(goc, repo, tmp_path / 'out')
+    assert ma == 3
+    assert [(r['khoa'], r['ket_qua']) for r in rows] == [
+        ('anh["a.png"]', 'tho')]
+    assert [(e['khoa'], e['gia_tri'], e['ly_do']) for e in kh] == [
+        ('anh["b.png"]', '5', 'sha_khong_hop_le')]
+    tt = json.loads((tmp_path / 'out' / 'tom_tat.json').read_text(
+        encoding='utf-8'))
+    assert tt['so_chua_xac_minh'] == 1 and tt['ma'] == 3
+
+
+@pytest.mark.parametrize('sai', [
+    5, 0, 1.5, True, False, {'x': 1}, {}, [H_B], [], 'b/c.csv',
+    'z' * 64, 'a' * 63, 'a' * 65, ' ' + 'a' * 64, ''])
+def test_c3_22_v3_tung_muc_sai_kieu(sai):
+    cap, kh, rong = KS.tim_cap({'anh': {'a.png': H_A, 'b.png': sai}})
+    assert [(c['khoa'], c['duong_dan'], c['dang']) for c in cap] == [
+        ('anh["a.png"]', 'a.png', 'manifest')]
+    assert [(e['khoa'], e['ly_do']) for e in kh] == [
+        ('anh["b.png"]', 'sha_khong_hop_le')]
+    assert rong == 0
+
+
+def test_c3_22_v3_bien_hex64_viet_hoa_hop_le():
+    cap, kh, _ = KS.tim_cap({'anh': {'a.png': H_A, 'b.png': 'F' * 64}})
+    assert [c['duong_dan'] for c in cap] == ['a.png', 'b.png'] and not kh
+
+
+@pytest.mark.parametrize('sai', [{'x': 1}, [1, 2]])
+def test_c3_22_v3_cli_object_list(tmp_path, sai):
+    repo, goc = _lam_repo(tmp_path)
+    (goc / 'a.png').write_bytes(b'cu')
+    (goc / 'r.json').write_text(json.dumps(
+        {'anh': {'a.png': sha(b'cu'), 'b.png': sai}}), encoding='utf-8')
+    ma, rows, kh = _chay(goc, repo, tmp_path / 'out')
+    assert ma == 3
+    assert [e['ly_do'] for e in kh] == ['sha_khong_hop_le']
+
+
+def test_c3_22_v3_null_nhan_dien_ban_do():
+    cap, kh, rong = KS.tim_cap({'anh': {'a.png': None, 'b.png': 5}})
+    assert not cap and rong == 0
+    assert [(e['khoa'], e['ly_do']) for e in kh] == [
+        ('anh["a.png"]', 'sha_rong_bat_buoc'),
+        ('anh["b.png"]', 'sha_khong_hop_le')]
+
+
+def test_c3_22_v3_cli_null_va_so_ma_3(tmp_path):
+    repo, goc = _lam_repo(tmp_path)
+    (goc / 'r.json').write_text(json.dumps(
+        {'anh': {'a.png': None, 'b.png': 5}}), encoding='utf-8')
+    ma, rows, kh = _chay(goc, repo, tmp_path / 'out')
+    assert ma == 3 and not rows
+    assert sorted(e['ly_do'] for e in kh) == [
+        'sha_khong_hop_le', 'sha_rong_bat_buoc']
+
+
+def test_c3_22_v3_khoa_khong_phai_duong_dan_van_duyet():
+    obj = {'anh': {'a.png': H_A, 'ghi_chu': 5, 'n': None,
+                   'sub': {'file': 'c.txt', 'sha256': H_B},
+                   'b_sha256': None}}
+    cap, kh, rong = KS.tim_cap(obj)
+    assert [(c['khoa'], c['duong_dan']) for c in cap] == [
+        ('anh["a.png"]', 'a.png'), ('anh.sub.sha256', 'c.txt')]
+    assert not kh and rong == 1
+
+
+def test_c3_22_v3_khong_phai_ban_do_giu_luat_cu():
+    # khong co khoa duong dan mang hex64/null: khong phai ban do, khong loi
+    for obj in ({'meta': {'n.x': 5, 'ten': 'abc'}},
+                {'doi_ten': {'a.csv': 'b/c.csv', 'd.csv': 3}},
+                {'cfg': {'a.png': {'w': 1}}}):
+        cap, kh, rong = KS.tim_cap(obj)
+        assert not cap and not kh and rong == 0, obj
+
+
+def test_c3_22_v3_cli_metadata_tuy_chon_ma_0(tmp_path):
+    # hash khong kem duong dan van chi la thong tin
+    repo, goc = _lam_repo(tmp_path)
+    (goc / 'a.png').write_bytes(b'cu')
+    (goc / 'r.json').write_text(json.dumps(
+        {'anh': {'a.png': sha(b'cu')}, 'a_sha256': None,
+         'script': {'commit': 'abc', 'sha256': H_A},
+         'meta': {'n.x': 5}}), encoding='utf-8')
+    ma, rows, kh = _chay(goc, repo, tmp_path / 'out')
+    assert ma == 0
+    assert [e['ly_do'] for e in kh] == ['khong_co_duong_dan']
+    tt = json.loads((tmp_path / 'out' / 'tom_tat.json').read_text(
+        encoding='utf-8'))
+    assert tt['so_rong'] == 1 and tt['so_chua_xac_minh'] == 0
+
+
+def test_c3_22_v3_ban_do_khai_bao_object_khoa_duong_dan(tmp_path):
+    cap, kh, _ = KS.tim_cap(
+        {'sha256': {'a.csv': H_A, 'b.csv': {'lf': H_B}}})
+    assert [c['duong_dan'] for c in cap] == ['a.csv']
+    assert [(e['khoa'], e['ly_do']) for e in kh] == [
+        ('sha256["b.csv"]', 'kieu_khong_ho_tro')]
+    # khoa khong phai duong dan van duyet tiep nhu cu
+    cap, kh, _ = KS.tim_cap({'sha256': {'F2': {'a.csv': H_A}}})
+    assert [c['duong_dan'] for c in cap] == ['a.csv'] and not kh
+    repo, goc = _lam_repo(tmp_path)
+    (goc / 'a.csv').write_bytes(b'x\n')
+    (goc / 'r.json').write_text(json.dumps(
+        {'sha256': {'a.csv': sha(b'x\n'), 'b.csv': [H_B]}}),
+        encoding='utf-8')
+    ma, rows, kh = _chay(goc, repo, tmp_path / 'out')
+    assert ma == 3
+    assert [r['ket_qua'] for r in rows] == ['tho']
+
+
+# ---------- C3-34: stat trong khoi bat loi, st_nlink tren descriptor ----------
+
+def _chen_open(monkeypatch, dich, hanh_dong):
+    # goi hanh_dong(f) ngay sau khi mo dung file dich (truoc khi doc)
+    import builtins
+    import io
+    open_goc = builtins.open
+    dich = os.path.normcase(os.path.realpath(str(dich)))
+
+    def mo(file, *a, **kw):
+        trung = (isinstance(file, (str, os.PathLike))
+                 and os.path.normcase(os.path.realpath(os.fspath(file)))
+                 == dich)
+        f = open_goc(file, *a, **kw)
+        if trung:
+            hanh_dong(f)
+        return f
+
+    monkeypatch.setattr(builtins, 'open', mo)
+    monkeypatch.setattr(io, 'open', mo)
+
+
+def test_c3_34_json_bien_mat_sau_liet_ke(tmp_path, monkeypatch):
+    repo, goc = _lam_repo(tmp_path)
+    (goc / 'b.txt').write_bytes(b'bb')
+    (goc / 'ok.json').write_text(json.dumps(
+        {'file': 'b.txt', 'sha256': sha(b'bb')}), encoding='utf-8')
+    mat = goc / 'mat.json'
+    mat.write_text('{}', encoding='utf-8')
+    walk_goc = os.walk
+
+    def walk(top, *a, **kw):
+        yield from walk_goc(top, *a, **kw)
+        mat.unlink()
+
+    monkeypatch.setattr(KS.os, 'walk', walk)
+    ma, rows, kh = _chay(goc, repo, tmp_path / 'out')
+    assert ma == 3
+    assert [(e['file_ghi'], e['ly_do']) for e in kh] == [
+        ('mat.json', 'khong_doc_duoc')]
+    assert [(r['file_ghi'], r['ket_qua']) for r in rows] == [
+        ('ok.json', 'tho')]
+
+
+def test_c3_34_json_khong_mo_duoc(tmp_path, monkeypatch):
+    repo, goc = _lam_repo(tmp_path)
+    pj = goc / 'r.json'
+    pj.write_text('{}', encoding='utf-8')
+
+    def cam(f):
+        f.close()
+        raise PermissionError('gia lap')
+
+    _chen_open(monkeypatch, pj, cam)
+    ma, rows, kh = _chay(goc, repo, tmp_path / 'out')
+    assert ma == 3
+    assert [(e['file_ghi'], e['ly_do']) for e in kh] == [
+        ('r.json', 'khong_doc_duoc')]
+
+
+def test_c3_34_file_tham_chieu_bien_mat(tmp_path, monkeypatch):
+    # is_file() thay file, roi file mat truoc khi mo: thieu_file, khong vang
+    repo, goc = _lam_repo(tmp_path)
+    dich = goc / 'a.txt'
+    (goc / 'r.json').write_text(json.dumps(
+        {'file': 'a.txt', 'sha256': H_A}), encoding='utf-8')
+    is_file_goc = Path.is_file
+    nd = os.path.normcase(os.path.realpath(str(dich)))
+
+    def is_file(self):
+        if os.path.normcase(os.path.realpath(str(self))) == nd:
+            return True
+        return is_file_goc(self)
+
+    monkeypatch.setattr(Path, 'is_file', is_file)
+    ma, rows, kh = _chay(goc, repo, tmp_path / 'out')
+    assert ma == 1
+    assert [(r['khoa'], r['ket_qua']) for r in rows] == [
+        ('sha256', 'thieu_file')]
+    assert KS.kiem(dich, H_A) == 'thieu_file'
+
+
+def test_c3_34_file_tham_chieu_khong_doc_duoc(tmp_path, monkeypatch):
+    repo, goc = _lam_repo(tmp_path)
+    dich = goc / 'a.txt'
+    dich.write_bytes(b'x\n')
+    (goc / 'r.json').write_text(json.dumps(
+        {'file': 'a.txt', 'sha256': sha(b'x\n')}), encoding='utf-8')
+
+    def cam(f):
+        f.close()
+        raise PermissionError('gia lap')
+
+    _chen_open(monkeypatch, dich, cam)
+    ma, rows, kh = _chay(goc, repo, tmp_path / 'out')
+    assert ma == 3 and not rows
+    assert [(e['khoa'], e['ly_do']) for e in kh] == [
+        ('sha256', 'khong_doc_duoc')]
+
+
+def test_c3_34_json_hard_link_sau_khi_mo(tmp_path, monkeypatch):
+    # hard link xuat hien sau stat, truoc doc: kiem tren descriptor da mo
+    repo, goc = _lam_repo(tmp_path)
+    (goc / 'b.txt').write_bytes(b'bb')
+    pj = goc / 'r.json'
+    pj.write_text(json.dumps({'file': 'b.txt', 'sha256': sha(b'bb')}),
+                  encoding='utf-8')
+    khac = tmp_path / 'khac.json'
+    _hard_link(pj, tmp_path / 'thu.json')
+    os.unlink(tmp_path / 'thu.json')
+    _chen_open(monkeypatch, pj,
+               lambda f: None if khac.exists() else os.link(pj, khac))
+    ma, rows, kh = _chay(goc, repo, tmp_path / 'out')
+    assert khac.exists()
+    assert ma == 3 and not rows
+    assert [(e['file_ghi'], e['ly_do']) for e in kh] == [
+        ('r.json', 'hard_link')]
+
+
+def test_c3_34_file_hard_link_sau_khi_mo(tmp_path, monkeypatch):
+    repo, goc = _lam_repo(tmp_path)
+    dich = goc / 'a.txt'
+    dich.write_bytes(b'x\n')
+    (goc / 'r.json').write_text(json.dumps(
+        {'file': 'a.txt', 'sha256': sha(b'x\n')}), encoding='utf-8')
+    khac = tmp_path / 'khac.txt'
+    _hard_link(dich, tmp_path / 'thu.txt')
+    os.unlink(tmp_path / 'thu.txt')
+    _chen_open(monkeypatch, dich,
+               lambda f: None if khac.exists() else os.link(dich, khac))
+    ma, rows, kh = _chay(goc, repo, tmp_path / 'out')
+    assert khac.exists()
+    assert ma == 3 and not rows
+    assert [(e['khoa'], e['ly_do']) for e in kh] == [
+        ('sha256', 'hard_link')]
+
+
+def test_c3_34_sha_cac_dang_khong_f_va_co_f(tmp_path):
+    f = tmp_path / 'a.txt'
+    f.write_bytes(b'a\r\nb\n')
+    d1 = KS.sha_cac_dang(f)
+    KS._BO_NHO.clear()
+    with open(f, 'rb') as fh:
+        d2 = KS.sha_cac_dang(f, fh)
+    assert d1 == d2 and d1['tho'] == sha(b'a\r\nb\n')
+    g = tmp_path / 'b.png'
+    g.write_bytes(b'x\r\n' * 10)
+    with open(g, 'rb') as fh:
+        assert KS.sha_cac_dang(g, fh) == {'tho': sha(b'x\r\n' * 10)}
+
+
+def test_docstring_gioi_han_05_data():
+    doc = KS.__doc__
+    assert "'05_DATA/x' de chi '<run>/05_DATA/x'" in doc
+    assert 'Quet 23/11: khong thu muc luot nao co thu muc con 05_DATA' in doc
