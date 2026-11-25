@@ -335,3 +335,97 @@ def test_factor_covers_its_own_rows_after_rounding(tmp_path):
     for rho in (1.0, 1.615, 0.37):
         rows, _ = H.rows_neo(neo, rho, 1.25, d['hang'])
         assert all(abs(float(r['sai_m'])) <= float(r['chi_so_m']) for r in rows), rho
+
+
+# ── L165 (Liam 25/11 at CODE: "Bo kiem, ghi gioi han (Recommended)"): a place measured in one session only ──────
+
+def _neo_cho(tmp_path, b, cho_frames):
+    """neo_luot.json + frame CSV of session b with one run per place: cho_frames {cho: [(dx, dy, dpsi), ...]} (all
+    valid); P_neo_m, A_neo_rad of a run / place = the largest of its frames (as KIEMCHEO writes them)."""
+    d = tmp_path / f'neo_{b}'
+    d.mkdir()
+    luot, theo, rows = {}, {}, []
+    for cho, fr in cho_frames.items():
+        P, A = max(math.hypot(x, y) for x, y, _ in fr), max(abs(p) for _, _, p in fr)
+        luot[f'L_{b}_{cho}'] = dict(cho=cho, P_neo_m=P, A_neo_rad=A)
+        theo[cho] = dict(P_neo_m=P, A_neo_rad=A)
+        rows += [dict(luot_id=f'L_{b}_{cho}', khung=i, t_s=i / 60, la_W=0, sau_W=1, trang_thai='hop_le', dx_m=x, dy_m=y,
+                      dpsi_rad=p, n_R=8, ly_do='') for i, (x, y, p) in enumerate(fr)]
+    nj, s = _w(d / 'neo_luot.json', dict(luot=luot, theo_cho=theo))
+    kc = d / 'khung.csv'
+    with open(kc, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    return nj, s, str(kc)
+
+
+def test_l165_place_of_one_session_gives_no_row_and_is_a_limit(tmp_path):
+    import c8b_he_so_giu_ngoai as HS
+    import c8b_khoa_v5 as K
+    p = _setup(tmp_path)
+    B2, B3 = '2026-11-20_run02', '2026-11-23_run03'
+    # session 2: goc and K1, K2 (the K frames far larger than any goc frame); session run03: goc only
+    n1, s1, c1 = _neo_cho(tmp_path, B2, dict(goc=[(3e-5, 0.0, 1e-5)], K1=[(9e-4, 0.0, 9e-4)], K2=[(0.0, 8e-4, -8e-4)]))
+    n2, s2, c2 = _neo_cho(tmp_path, B3, dict(goc=[(0.0, 3.3e-5, -2e-5)]))
+    k1, ks1 = _kc(tmp_path, f'{B2}/doan2', 0.004, 0.2, [(0.004, 0.0)], [0.2])
+    k2, ks2 = _kc(tmp_path, f'{B3}/doan1', 0.0045, 0.21, [(0.0045, 0.0)], [0.21])
+    kcv = ['--kiem-cheo', f'{B2}/doan2={k1}', '--kiem-cheo', f'{B3}/doan1={k2}']
+    neov = ['--neo', f'{B2}={n1},{c1}', '--neo', f'{B3}={n2},{c2}']
+    # the rows: the K frames give no row; the goc frames are held out as before
+    mb = []
+    items = [(B2, json.load(open(n1, encoding='utf-8')), list(csv.DictReader(open(c1, encoding='utf-8')))),
+             (B3, json.load(open(n2, encoding='utf-8')), list(csv.DictReader(open(c2, encoding='utf-8'))))]
+    rows, thieu = H.rows_neo(items, 1.0, 1.25, None, mb)
+    assert mb == [f'{B2}:K1', f'{B2}:K2'] and thieu == []
+    assert sorted({r['mien'] for r in rows}) == [f'{B2}:goc', f'{B3}:goc'] and len(rows) == 4
+    assert H.rows_neo(items, 1.0, 1.25)[0] == rows                      # without the list: the same rows, no error
+    # the factor file: computed with the neo of session 2 (the lock asks for it), the K frames outside the ratios
+    hs = tmp_path / 'hs.json'
+    assert HS.main(kcv + neov + ['--out', str(hs)]) == 0
+    hd = json.load(open(hs, encoding='utf-8'))
+    assert hd['ti_le']['P_neo_m']['ti_le'] == pytest.approx(1.1) and hd['ti_le']['P_neo_m']['mien'] == f'{B3}:goc'
+    assert hd['ti_le']['A_neo_rad']['ti_le'] == pytest.approx(2.0) and hd['hang']['P_neo_m'] == 1.0
+    assert hd['neo_cho_mot_buoi']['mien'] == [f'{B2}:K1', f'{B2}:K2'] and 'L165' in hd['neo_cho_mot_buoi']['luat']
+    ng = [dict(vai='neo', file='n', sha256=s1), dict(vai='kiem_cheo', file='k', sha256=ks1)]
+    assert K.doc_he_so(hd, ng) == hd['hang']                            # the lock of session 2 takes the file
+    # D3: the rows file and its limit; c8b_kiem_vi_tri writes the limit, the state does not change
+    k = json.load(open(p['kh'], encoding='utf-8'))
+    k['khoa_truoc']['nguon'] += [dict(vai='neo', sha256=s1), dict(vai='neo', sha256=s2),
+                                 dict(vai='kiem_cheo', sha256=ks1), dict(vai='kiem_cheo', sha256=ks2),
+                                 dict(vai='he_so_giu_ngoai', sha256=H.cu.sha256(str(hs)))]
+    _w(tmp_path / 'khoa.json', k)
+    out = tmp_path / 'd3.csv'
+    assert H.main(_argv(p, out) + kcv + neov + ['--he-so', str(hs)]) == 0
+    rr = [r for r in csv.DictReader(open(out, encoding='utf-8')) if r['nguon'] == 'replay_neo']
+    assert sorted({r['mien'] for r in rr}) == [f'{B2}:goc', f'{B3}:goc']
+    meta = json.load(open(str(out) + '.nguon.json', encoding='utf-8'))
+    assert meta['thong_tin']['replay_neo_cho_mot_buoi']['mien'] == [f'{B2}:K1', f'{B2}:K2']
+    assert 'L165' in meta['thong_tin']['replay_neo_cho_mot_buoi']['luat'] and meta['thong_tin']['khung_thieu_replay_neo'] == []
+    kv = tmp_path / 'kvt.json'
+    assert KV.main(['--rows', str(out), '--khoa', p['kh'], '--out', str(kv)]) == 0
+    d3 = json.load(open(kv, encoding='utf-8'))
+    gh = [g for g in d3['gioi_han'] if 'L165' in g['ly_do']]
+    assert sorted((g['mien'], g['dai_luong']) for g in gh) == [(f'{B2}:K1', 'A_neo'), (f'{B2}:K1', 'P_neo'),
+                                                              (f'{B2}:K2', 'A_neo'), (f'{B2}:K2', 'P_neo')]
+    assert not [m for m in d3['mien_thieu'] if m['nguon'] == 'replay_neo']
+    d3b = KV.build(KV.read_rows(str(out)), k, 'x' * 64)
+    assert d3['trang_thai'] == d3b['trang_thai'] and d3['ly_do'] == d3b['ly_do']    # a limit, not a reason
+
+
+def test_l165_no_place_shared_gives_no_ratio(tmp_path):
+    # every place of one session only: no replay_neo row at all, so no ratio and no factor file (as before L165 for a
+    # file without rows); without a place of one session the file says so (empty list)
+    import c8b_he_so_giu_ngoai as HS
+    B2, B3 = '2026-11-20_run02', '2026-11-23_run03'
+    k1, _ = _kc(tmp_path, f'{B2}/doan2', 0.004, 0.2, [(0.004, 0.0)], [0.2])
+    k2, _ = _kc(tmp_path, f'{B3}/doan1', 0.0045, 0.21, [(0.0045, 0.0)], [0.21])
+    kcv = ['--kiem-cheo', f'{B2}/doan2={k1}', '--kiem-cheo', f'{B3}/doan1={k2}']
+    n1, _, c1 = _neo_cho(tmp_path, B2, dict(K1=[(3e-5, 0.0, 1e-5)]))
+    n2, _, c2 = _neo_cho(tmp_path, B3, dict(goc=[(0.0, 3.3e-5, -2e-5)]))
+    assert HS.main(kcv + ['--neo', f'{B2}={n1},{c1}', '--neo', f'{B3}={n2},{c2}', '--out', str(tmp_path / 'a.json')]) == 2
+    sub = tmp_path / 's'
+    sub.mkdir()
+    n3, _, c3 = _neo_cho(sub, B2, dict(goc=[(3e-5, 0.0, 1e-5)]))
+    assert HS.main(kcv + ['--neo', f'{B2}={n3},{c3}', '--neo', f'{B3}={n2},{c2}', '--out', str(tmp_path / 'b.json')]) == 0
+    assert json.load(open(tmp_path / 'b.json', encoding='utf-8'))['neo_cho_mot_buoi'] == dict(mien=[], luat=None)

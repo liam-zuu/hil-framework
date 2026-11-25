@@ -68,7 +68,8 @@ def ti_le(rows):
 def build(segs, neo, le=khoa.LE):
     """segs, neo as c8b_d3_hang.rows_p1a3 / rows_neo take them (rho 1: a ratio has no lever arm)."""
     tl = ti_le(d3.rows_p1a3(segs, 1.0))
-    rn, thieu = d3.rows_neo(neo, 1.0)
+    mb = []                                      # L165: places of one session only, not held out (a limit)
+    rn, thieu = d3.rows_neo(neo, 1.0, mot_buoi=mb)
     tl.update(ti_le(rn))
     miss = [k for k in TEN if k not in tl]
     if miss:
@@ -94,6 +95,7 @@ def build(segs, neo, le=khoa.LE):
                    'enters u_beta_cam)')
     return dict(schema=SCHEMA, le=le, ti_le={TEN[k]: v for k, v in tl.items()}, hang=hang,
                 trang_thai='dat' if not why else 'thieu', ly_do=why, n_khung_neo_khong_so=len(thieu),
+                neo_cho_mot_buoi=dict(mien=sorted(mb), luat=d3.LIAM_CHO_MOT_BUOI if mb else None),
                 quy_tac='ti le = max qua buoi s va mien cua (|sai| lon nhat cua s) / (chi so cua cac buoi KHAC, truoc '
                         'le); ti le <= le: he so 1; ti le > le: he so = ti le / le (U lon len, khong noi nguong)')
 

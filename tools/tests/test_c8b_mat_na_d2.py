@@ -331,8 +331,8 @@ def test_cat_checked_for_any_masked_frame_before_t1(tmp_path):
 
 
 def test_branches_the_rows_cannot_rebuild_are_refused(tmp_path):
-    """D2-7: plate-changed case (G5 on the IMU heading). D2-5: t_som case with a masked frame in the union domain
-    (open everywhere: applied)."""
+    """D2-7: plate-changed case (G5 on the IMU heading): refused. D2-5: t_som case with a masked frame in the union
+    domain: the whole run not concluded (L166, Liam 25/11; before: refused); open everywhere: applied."""
     fr = frames()
     d, gp = grid(tmp_path, [fr], ktd=dict(tam_doi='doi'))
     nodes = LU.load_nodes(json.load(open(gp, encoding='utf-8')), d)
@@ -343,8 +343,11 @@ def test_branches_the_rows_cannot_rebuild_are_refused(tmp_path):
     d2, gp2 = grid(sub, [fr], g1=dict(ca_t_som=True, t_som_s=1.0), ktd=dict(tam_doi='khong_doi'))
     nodes = LU.load_nodes(json.load(open(gp2, encoding='utf-8')), d2)
     assert nodes[0]['ok']
-    with pytest.raises(M.MatNaError, match='t_som'):
-        M.ap_dung(nodes, d2, M.doc_mat_na(mask_file(sub, [100, 101, 102, 103, 104]), 'r1'), LU._state_from_numbers)
+    out, tom = M.ap_dung(nodes, d2, M.doc_mat_na(mask_file(sub, [100, 101, 102, 103, 104]), 'r1'),
+                         LU._state_from_numbers)
+    assert out[0]['ok'] and set(out[0]['states'].values()) == {'chua_ket_luan'}
+    assert tom['ca_luot_chua_ket_luan']['nut_t_som_co_khung_che'] == [0] and tom['nut'][0]['che_ca_luot']
+    assert tom['nut'][0]['n_che'] == 1 and out[0]['nums']['g2']['n_undef'] == 6
     nodes = LU.load_nodes(json.load(open(gp2, encoding='utf-8')), d2)
     out, _ = M.ap_dung(nodes, d2, M.doc_mat_na(mask_file(sub, range(100, 106), name='mo.json'), 'r1'),
                        LU._state_from_numbers)
@@ -429,16 +432,18 @@ def test_so_do_decides_on_the_open_defined_frames_through_combine(tmp_path):
     assert LU.combine(out, {'g5'}, gio['nodes_s'])['states']['g5'] == 'chua_ket_luan'
 
 
-def test_t_som_node_refused_for_a_masked_frame_outside_its_domain(tmp_path):
+def test_t_som_node_with_a_masked_frame_outside_its_domain(tmp_path):
     """Codex round 2 D2v2-3: a frame outside the union domain of a t_som node can still be a sample of the turn rate
-    that places t_som: any masked frame of such a node is refused."""
+    that places t_som: any masked frame of such a node counts (L166: the whole run not concluded; before: refused)."""
     fr = frames()
     fr[5] = (fr[5][0], fr[5][1], 0, 0, fr[5][4])                        # frame 105 outside both domains
     d, gp = grid(tmp_path, [fr], g1=dict(ca_t_som=True, t_som_s=1.0), ktd=dict(tam_doi='khong_doi'))
     nodes = LU.load_nodes(json.load(open(gp, encoding='utf-8')), d)
     assert nodes[0]['ok']
-    with pytest.raises(M.MatNaError, match='t_som'):
-        M.ap_dung(nodes, d, M.doc_mat_na(mask_file(tmp_path, [100, 101, 102, 103, 104]), 'r1'), LU._state_from_numbers)
+    out, tom = M.ap_dung(nodes, d, M.doc_mat_na(mask_file(tmp_path, [100, 101, 102, 103, 104]), 'r1'),
+                         LU._state_from_numbers)
+    assert tom['ca_luot_chua_ket_luan'] and tom['nut'][0]['n_che'] == 1 and tom['nut'][0]['n_che_mien_hop'] == 0
+    assert set(out[0]['states'].values()) == {'chua_ket_luan'}
 
 
 def test_luoi_json_must_be_the_grid_of_these_node_files(tmp_path, capsys):
@@ -518,3 +523,91 @@ def test_mask_on_a_so_do_condition_refused_before_sd1_1(tmp_path, capsys):
     rc = LU.main(['--gio', gp, '--out-dir', d, '--gop-only', '--mat-na-d2', mask_file(tmp_path, range(100, 106)),
                   '--luot', 'r1'])
     assert rc == 2 and 'SD1-1' in capsys.readouterr().err
+
+
+# ── L166 (Liam 25/11 at CODE: "Chua ket luan (Recommended)"): a t_som node with a masked frame -> the whole run ──
+
+T_SOM = dict(g1=dict(ca_t_som=True, t_som_s=1.0), ktd=dict(tam_doi='khong_doi'))
+
+
+def test_l166_t_som_run_with_a_masked_frame_is_not_concluded_as_a_whole(tmp_path):
+    # frame 104: a G2 violation on an OPEN frame (without the mask: khong_dat); frame 102 masked. Every node t_som
+    fr = frames(viol={104: {'g2': 0.14}})
+    d, gp = grid(tmp_path, [fr, fr, fr], **T_SOM)
+    rc0, r0 = run(d, gp)
+    assert rc0 == 0 and r0['states']['g2'] == 'khong_dat' and r0['outcome'] == 'khong_dat'
+    rc, r = run(d, gp, mask_file(tmp_path, [100, 101, 103, 104, 105]))
+    assert rc == 0                                                    # the masked grid is still written
+    assert set(r['states'].values()) == {'chua_ket_luan'} and r['outcome'] == 'chua_ket_luan'
+    assert r['trang_thai_luot'] == 'cham' and r['nodes_ok'] == [True] * 3
+    assert all(set(s.values()) == {'chua_ket_luan'} for s in r['node_states'])
+    e = r['mat_na_d2']
+    assert e['ca_luot_chua_ket_luan']['nut_t_som_co_khung_che'] == [0, 1, 2] and 'L166' in e['ca_luot_chua_ket_luan']['luat']
+    assert [(n['n_khung'], n['n_che'], n['che_ca_luot'], n['g1_che']) for n in e['nut']] == [(6, 1, True, True)] * 3
+    assert r['nums']['g2']['n_undef'] == 6                             # every frame undefined, not only the masked one
+    assert r['nums']['g2']['q'] == pytest.approx(0.14)                 # q kept as a diagnostic
+    # the same run with every frame open: nothing changes, no whole-run flag
+    sub = tmp_path / 'mo'
+    os.makedirs(sub)
+    d2, gp2 = grid(sub, [fr, fr, fr], **T_SOM)
+    assert run(d2, gp2)[0] == 0
+    rc, r2 = run(d2, gp2, mask_file(sub, range(100, 106)))
+    assert rc == 0 and r2['states'] == r0['states'] and r2['mat_na_d2']['ca_luot_chua_ket_luan'] is None
+    assert all('che_ca_luot' not in n for n in r2['mat_na_d2']['nut'])
+
+
+def test_l166_one_t_som_node_is_enough_and_a_frame_outside_its_domain_counts(tmp_path):
+    """Codex round 2 D2v2-3 kept: ANY masked frame of a t_som node, also one outside its domains (it can be a sample
+    of the turn rate that places t_som). One such node makes the whole run not concluded (L166), the other nodes too."""
+    fr = frames()
+    fr5 = list(fr)
+    fr5[5] = (fr[5][0], fr[5][1], 0, 0, fr[5][4])                        # frame 105 outside both domains
+    d, gp = grid(tmp_path, [fr, fr, fr])
+    gio = json.load(open(gp, encoding='utf-8'))
+    write_node(d, 1, fr5, D=gio['nodes_s'][1], **T_SOM)                  # only node 1 is t_som
+    nodes = LU.load_nodes(gio, d)
+    assert all(x['ok'] for x in nodes)
+    out, tom = M.ap_dung(nodes, d, M.doc_mat_na(mask_file(tmp_path, [100, 101, 102, 103, 104]), 'r1'),
+                         LU._state_from_numbers)
+    assert tom['ca_luot_chua_ket_luan']['nut_t_som_co_khung_che'] == [1]
+    assert all(x['ok'] and set(x['states'].values()) == {'chua_ket_luan'} for x in out)
+    assert [n['n_che_mien_hop'] for n in tom['nut']] == [1, 0, 1] and all(n['che_ca_luot'] for n in tom['nut'])
+    assert all(x['nums']['g4']['n_undef'] == x['nums']['g4']['n_frames'] for x in out)
+    # no t_som node has a masked frame (frame 105 masked only at the nodes that are not t_som): the normal mask
+    sub = tmp_path / 'b'
+    os.makedirs(sub)
+    d2, gp2 = grid(sub, [fr, fr, fr])
+    fr_ = [f for f in fr if f[0] != 105]                                  # node 1 (t_som) has no frame 105 at all
+    write_node(d2, 1, fr_, D=gio['nodes_s'][1], **T_SOM)
+    nodes = LU.load_nodes(json.load(open(gp2, encoding='utf-8')), d2)
+    out, tom = M.ap_dung(nodes, d2, M.doc_mat_na(mask_file(sub, [100, 101, 102, 103, 104]), 'r1'),
+                         LU._state_from_numbers)
+    assert tom['ca_luot_chua_ket_luan'] is None and out[1]['states']['g1'] == 'dat'
+    assert out[0]['states']['g1'] == 'chua_ket_luan' and out[0]['states']['g2'] == 'chua_ket_luan'
+
+
+def test_l166_cat_t1_branch_is_not_kept(tmp_path, capsys):
+    # cat_t1 nodes (violation before t1 at frame 101): without the mask the run is khong_dat by that branch; a t_som
+    # node with a masked frame (105) -> the whole run not concluded: the nodes stay scored, the cat branch is dropped
+    fr = frames(viol={101: {'g2': 0.14}})
+    d, gp = grid(tmp_path, [fr, fr], cat=True, t1=0.2, **T_SOM)
+    rc0, r0 = run(d, gp)
+    assert rc0 == 0 and r0['outcome'] == 'khong_dat' and r0['cat_nut'] == [True, True]
+    rc, r = run(d, gp, mask_file(tmp_path, [100, 101, 102, 103, 104]))
+    assert rc == 0 and r['outcome'] == 'chua_ket_luan' and r['fail_cause'] == ''
+    assert r['cat_nut'] == [False, False] and r['nodes_ok'] == [True, True]
+    assert set(r['states'].values()) == {'chua_ket_luan'}
+
+
+@pytest.mark.skipif('q_sd' not in __import__('inspect').getsource(LU.combine),
+                    reason='c8b_luoi.combine before SD1-1 (GATE 2ae87ad): runs after the merge')
+def test_l166_so_do_condition_not_concluded_through_combine(tmp_path):
+    d, gio, nodes = _nodes_sd(tmp_path, n_nodes=3)
+    assert LU.combine(nodes, {'g5'}, gio['nodes_s'])['states']['g5'] == 'khong_dat'
+    d, gio, nodes = _nodes_sd(tmp_path / 'b', n_nodes=3)
+    for x in nodes:
+        x['gate']['g1'] = dict(x['gate'].get('g1') or {}, ca_t_som=True)
+    out, tom = M.ap_dung(nodes, d, M.doc_mat_na(mask_file(tmp_path / 'b', [100]), 'r1'), LU._state_from_numbers)
+    assert tom['ca_luot_chua_ket_luan'] and all(math.isnan(x['nums']['g5']['q_sd']) for x in out)
+    res = LU.combine(out, {'g5'}, gio['nodes_s'])
+    assert set(res['states'].values()) == {'chua_ket_luan'} and res['outcome'] == 'chua_ket_luan'

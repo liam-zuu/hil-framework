@@ -286,12 +286,20 @@ def rows_e(a6, rho):
     return out
 
 
-def rows_neo(items, rho, le=1.0, he_so=None):
+LIAM_CHO_MOT_BUOI = ('L165, Liam 25/11 ~14:20 o CODE local_4932073c, hop chon, nguyen van: "Bo kiem, ghi gioi han '
+                     '(Recommended)" (bo sung L155): cho chi do o mot buoi thi khong so giu ngoai theo buoi tai cho do, '
+                     'khong sinh hang; gioi han: replay_neo cua cho do khong duoc kiem giu ngoai theo buoi')
+
+
+def rows_neo(items, rho, le=1.0, he_so=None, mot_buoi=None):
     """replay_neo (2) held out BY SESSION, the rule of P1_A3_H32 (CODE 24/11 khuya): every valid frame of the replay of
     anchors of a run of session s (KIEMCHEO neo_luot --khung-csv: trang_thai hop_le, dx_m, dy_m = e_t - mean_W,
     dpsi_rad) against the index of the OTHER sessions (neo_luot.json theo_cho.<cho>.P_neo_m, A_neo_rad: the max over
     their own frames). items [(buoi, neo_luot dict, khung rows)]. A frame mat_W / khong_hop_le has no number: listed in
-    khung_thieu (design 8 (2): that quantity thieu on that frame), not a row. mien = '<buoi>:<cho>'."""
+    khung_thieu (design 8 (2): that quantity thieu on that frame), not a row. mien = '<buoi>:<cho>'.
+    A place measured in ONE session only (no other session has an index there; real data: K1, K2 of session 2) has
+    nothing to be held out against: its valid frames give no row (L165, LIAM_CHO_MOT_BUOI); the domains
+    '<buoi>:<cho>' left out are added to the list mot_buoi when one is given (the caller writes them as a limit)."""
     hs = he_so or {}
     k_p, k_a = le * hs.get('P_neo_m', 1.0), le * hs.get('A_neo_rad', 1.0)      # L155, as rows_p1a3
     if len({b for b, _, _ in items}) < 2:
@@ -328,8 +336,10 @@ def rows_neo(items, rho, le=1.0, he_so=None):
                 thieu.append([b, lid, r.get('khung'), r.get('trang_thai'), r.get('ly_do')])
                 continue
             o = [idx[x][cho] for x in idx if x != b and cho in idx[x]]
-            if not o:
-                raise HangError(f'--neo {b}: no other session has an index at place {cho}')
+            if not o:                            # L165: a place of one session only, no row (a limit, not thieu)
+                if mot_buoi is not None and f'{b}:{cho}' not in mot_buoi:
+                    mot_buoi.append(f'{b}:{cho}')
+                continue
             dx, dy, dp = _fnum(r.get('dx_m')), _fnum(r.get('dy_m')), _fnum(r.get('dpsi_rad'))
             if dx is None or dy is None or dp is None:
                 raise HangError(f'--neo {b}: valid frame {lid}/{r.get("khung")} without finite dx, dy, dpsi')
@@ -445,8 +455,11 @@ def main(argv=None):
                     dict(vai=f'neo_khung {b}', duong_dan=os.path.abspath(pc), sha256=ks)]
         khong_lap([(x['vai'], x['sha256']) for x in src if x['vai'].startswith('neo ')], '--neo')
         if neo:
-            r, info['khung_thieu_replay_neo'] = rows_neo(neo, _rho(a6), le, he_so)
+            mb = []
+            r, info['khung_thieu_replay_neo'] = rows_neo(neo, _rho(a6), le, he_so, mb)
             rows += r
+            if mb:                               # L165: written as a limit of the rows file (not a missing domain)
+                info['replay_neo_cho_mot_buoi'] = dict(mien=sorted(mb), luat=LIAM_CHO_MOT_BUOI)
         if a.he_so:
             # Codex D3-4: the factors are those of exactly the files compared here (session labels and SHA of every
             # kiem_cheo, pair CSV, neo_luot and frame CSV); the lock already asks its own sources among them

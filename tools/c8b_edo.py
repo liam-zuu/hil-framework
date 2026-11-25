@@ -28,7 +28,24 @@ plate changed or not known); mat_neo; log without the rising edge of run_active,
 timestamp_us falls back; not reset_n, the IMU chip reset count), a log
 hole in the run window.
 
+D2 cell mask (design C8B v7 section 7c line 166: a frame of a cell over the bound, or of a cell short of frames, is
+n_undef for e_do too; CODE 25/11, after merge 6; no rule, threshold or scoring changed): `luot --mat-na-d2 O_D2.json
+--luot ID` reads the mask through the masked grid of the same folder, DIR/luoi_d2.json (c8b_luoi --gop-only
+--mat-na-d2, block mat_na_d2): the mask file, the run, the scoring id (lan_cham), the clock file, the node score files
+and the rows files must be the ones that grid was made from, and the frames masked here must be the frames masked
+there (n_khung, n_che per node), else refused. A frame whose frame_id is not in khung_mo of the run is undefined
+(counted in n_undef and n_che of its node): it is never in khung_vuot, never in the cell rule, and its node is not
+bounded, so a masked frame makes no conclusion; a finite lower bound of another frame stays. A node the mask turned
+into "not scored" (cat_t1 whose certain violation stood only on masked frames) is not scored here either. A masked
+grid without a node used (clock file not bounded): chua_ket_luan. A masked grid whose whole run is not concluded
+(L166, Liam 25/11: a t_som node with a masked frame, every node of a K run on real data): chua_ket_luan too. The file
+written carries mat_na_d2 {sha256, sha_noi_dung, luot, lan_cham, n_khung_mo, nut_khong_cham,
+ca_luot_chua_ket_luan} and luoi_d2_sha256 (both null without the mask).
+`chung-cu`: a masked grid (a file with the key mat_na_d2) goes with an e_do file made with that grid's mask, and a
+grid without the mask with an e_do file without it; mixed pairs are refused.
+
   python tools/c8b_edo.py luot --gio gio.json --luoi-dir DIR --esp32 log.csv --out edo.json
+      [--mat-na-d2 o_d2.json --luot RUN_ID]
   python tools/c8b_edo.py chung-cu --luoi luoi.json [--luoi luoi_H1.json] --edo edo.json [--edo ...] \n      --ban-cham-cuoi true|false --out chung_cu.json   (F17 chung_cu_c8)
   python tools/c8b_edo.py muc --luot edo1.json [--luot ...] --out edo_muc.json
 Last line: #ket_qua,ma=0 written / 2 refused or error.
@@ -176,7 +193,14 @@ def node_frames(score, rows):
             continue
         k = r.get('frame_id') or r.get('t_cam_s')
         out[str(k)] = {c: _f(r.get(c)) for c in ('x', 'y', 's_perp', 'w_lo', 'w_hi', 'U_p_k', 't_cam_s')}
+        out[str(k)]['fid'] = _fid(r)
     return out
+
+
+def _fid(r):
+    """frame_id of a rows line as the D2 mask keeps it (an integer), else None (c8b_mat_na_d2.doc_hang)."""
+    v = _f(r.get('frame_id'))
+    return int(v) if math.isfinite(v) and v == int(v) else None
 
 
 def run_reasons(kt):
@@ -208,11 +232,18 @@ def cell_rule(per_node, thr=D_M):
     return True
 
 
-def analyse_run(gio, nodes, L, task, thr=D_M):
-    """nodes: list of (score dict, rows list) per node in the order of gio['nodes_s'] (None: node not scored)."""
+def analyse_run(gio, nodes, L, task, thr=D_M, mat_na=None):
+    """nodes: list of (score dict, rows list) per node in the order of gio['nodes_s'] (None: node not scored).
+    mat_na (the D2 cell mask, from doc_mat_na_luoi; None: no mask): mo (set of the frame ids of the run left open),
+    nut_khong_cham ({node index: reason}: nodes the mask turned into not scored), ly_do_luot (reasons the run is not
+    concluded under the mask). A scored frame whose frame_id is not in mo is undefined."""
     why = []
     lw, _ = log_checks(L)
     why += lw
+    mo = None if mat_na is None else mat_na['mo']
+    bo = {} if mat_na is None else dict(mat_na.get('nut_khong_cham') or {})
+    if mat_na is not None:
+        why += list(mat_na.get('ly_do_luot') or [])
     lane = lane_of(task)
     step = float(gio.get('step_s') or 0.0)
     u_m = gio.get('u_cham_minus_s') or [step / 2] * len(gio['nodes_s'])
@@ -225,6 +256,11 @@ def analyse_run(gio, nodes, L, task, thr=D_M):
             per_node.append({})
             theo_nut.append(dict(i=i, cham=False))
             continue
+        if i in bo:                              # not scored in the masked grid (the mask took its violation away)
+            all_bounded = False
+            per_node.append({})
+            theo_nut.append(dict(i=i, cham=False, ly_do=[f'mat_na_d2: {bo[i]}']))
+            continue
         sc, rows = nd
         kt = sc.get('khung_tuong_doi_v1')       # F13 key of the scorer (data contract; Codex CAM CT5-3: the old name
         rr = run_reasons(kt)                     # khung_tuong_doi is not taken)
@@ -236,8 +272,21 @@ def analyse_run(gio, nodes, L, task, thr=D_M):
             theo_nut.append(dict(i=i, cham=False, ly_do=rr or ['no bien_doi']))
             continue
         p_dd, psi_dd = bd.get('p_dd') or [0.0, 0.0], float(bd.get('psi_dd') or 0.0)
-        res, n_undef = {}, 0
-        for k, fr in node_frames(sc, rows).items():
+        res, n_undef, n_che = {}, 0, 0
+        frs = node_frames(sc, rows)
+        if mo is not None:
+            # from the rows, not from frs: node_frames keeps one frame per key, a repeated id would not show
+            ids = [_fid(r) for r in rows if str(r.get('scored', '1')) in ('1', 'True', 'true')]
+            if any(f is None for f in ids) or len(set(ids)) != len(ids):
+                raise EdoError(f'node {i}: scored rows with an empty or repeated frame_id: the D2 mask goes by '
+                               'frame_id (not a relative C8 scoring)')
+        for k, fr in frs.items():
+            if mo is not None and fr['fid'] not in mo:
+                # design 7c: a frame of a masked cell is undefined for e_do (no bound taken from it, whatever it is)
+                res[k] = (math.nan, math.inf)
+                n_undef += 1
+                n_che += 1
+                continue
             if not all(math.isfinite(fr[c]) for c in ('x', 'y', 's_perp', 'w_lo', 'w_hi', 'U_p_k', 't_cam_s')):
                 res[k] = (math.nan, math.inf)
                 n_undef += 1
@@ -258,6 +307,8 @@ def analyse_run(gio, nodes, L, task, thr=D_M):
         theo_nut.append(dict(i=i, D_s=D, cham=True, n_khung=len(res), n_undef=n_undef,
                              lo_max_m=max(los) if los else None, hi_max_m=max(his) if his else None,
                              khung_vuot=sorted(k for k, v in res.items() if math.isfinite(v[0]) and v[0] > thr)))
+        if mo is not None:
+            theo_nut[-1]['n_che'] = n_che
     if why:
         return dict(version=VERSION, task=task, trang_thai='chua_ket_luan', ly_do=why, theo_nut=theo_nut,
                     vuot_moi_nut=False, can_xac_dinh_moi_nut=False, nguong_m=thr)
@@ -314,13 +365,36 @@ def g4_finite_every_node(luoi):
     return isinstance(hi, (int, float)) and math.isfinite(hi) and nums.get('n_undef') == 0
 
 
-def chung_cu(luois, edos, ban_cham_cuoi):
+def kiem_cap_mat_na(luoi, edo, luoi_sha256=None, w=''):
+    """The grid file and the e_do file of one scoring are both with the D2 mask (the same mask) or both without it;
+    EdoError otherwise. A masked grid is a file with the key mat_na_d2 (luoi_d2.json; the block is None when the
+    clock file is not bounded). luoi_sha256: SHA of the grid file, compared with luoi_d2_sha256 of the e_do file."""
+    che = isinstance(luoi, dict) and 'mat_na_d2' in luoi
+    m = edo.get('mat_na_d2') if isinstance(edo, dict) else None
+    if che != (m is not None):
+        raise EdoError(f'{w}the grid file is {"with" if che else "without"} the D2 mask, the e_do file '
+                       f'{"with" if m is not None else "without"} it: both from the same masked grid, or neither')
+    if not che:
+        return
+    blk = luoi['mat_na_d2']
+    bad = [] if blk is None else [k for k in ('sha256', 'sha_noi_dung', 'luot', 'lan_cham')
+                                  if not isinstance(m, dict) or m.get(k) != blk.get(k) or m.get(k) is None]
+    if luoi_sha256 is not None and edo.get('luoi_d2_sha256') != luoi_sha256:
+        bad.append('luoi_d2_sha256')
+    if bad:
+        raise EdoError(f'{w}the e_do file was not made with the mask of this masked grid ({bad} differ)')
+
+
+def chung_cu(luois, edos, ban_cham_cuoi, luoi_sha256=None):
     """chung_cu_c8 of a run (data contract F17, GATE design v6_C8 section 7): one bo_so per scoring (two when scored
     again with the two calibrations), each {e_do_lo_vuot_D_moi_nut, e_do_xac_dinh_moi_nut,
     g4_can_huu_han_mien_hop_moi_nut}; phan_loai_du: G1-G5 classified at every scoring (before the 2b mask);
-    ban_cham_cuoi: from the calibration drift check of CAM (false when thieu_H1)."""
+    ban_cham_cuoi: from the calibration drift check of CAM (false when thieu_H1). luoi_sha256: SHA of each grid
+    file (the CLI gives them), for the D2 mask pair check (kiem_cap_mat_na)."""
     if len(luois) != len(edos) or not 1 <= len(luois) <= 2:
         raise EdoError('one or two scorings, the same number of luoi and edo files')
+    for j, (L, e) in enumerate(zip(luois, edos)):
+        kiem_cap_mat_na(L, e, None if luoi_sha256 is None else luoi_sha256[j], f'scoring {j + 1}: ')
     bo, phan = [], True
     for L, e in zip(luois, edos):
         st = L.get('states') or {}
@@ -348,6 +422,75 @@ def _load_nodes(gio, d):
     return nodes
 
 
+LUOI_D2 = 'luoi_d2.json'
+
+
+def doc_mat_na_luoi(gio, gio_path, luoi_dir, mat_na_path, luot, nodes):
+    """The D2 cell mask for `luot` as the masked grid luoi_dir/luoi_d2.json applied it. Returns (mat_na for
+    analyse_run, block for the e_do file, SHA of luoi_d2.json). EdoError when the mask file, the run, the scoring id,
+    the clock file, a node score file or a rows file is not the one of that grid, or the frames masked here are not
+    the frames masked there. nodes: the list of _load_nodes (the rows this e_do run reads)."""
+    import c8b_mat_na_d2 as md2                              # MatNaError is a ValueError (refused by main)
+    mn = md2.doc_mat_na(mat_na_path, luot)
+    lp = os.path.join(luoi_dir, LUOI_D2)
+    if not os.path.isfile(lp):
+        raise EdoError(f'{lp}: the masked grid must be there first (c8b_luoi --gop-only --mat-na-d2 --luot)')
+    with open(lp, encoding='utf-8') as f:
+        g = json.load(f)
+    if not isinstance(g, dict) or 'mat_na_d2' not in g:
+        raise EdoError(f'{lp}: not a masked grid file (no mat_na_d2)')
+    if g.get('gio_sha256') != cu.sha256(gio_path):
+        raise EdoError(f'{lp}: made for another clock file (gio_sha256)')
+    lsha = cu.sha256(lp)
+    blk = g['mat_na_d2']
+    n = len(gio['nodes_s'])
+    tin = dict(sha256=mn['sha256'], sha_noi_dung=mn['sha_noi_dung'], luot=luot, lan_cham=mn['lan_cham'],
+               n_khung_mo=len(mn['mo']), nut_khong_cham=[], ca_luot_chua_ket_luan=False)
+    if blk is None:                                          # clock file not bounded: no node used by the grid
+        return (dict(mo=mn['mo'], nut_khong_cham={},
+                     ly_do_luot=['mat_na_d2: the masked grid has no node used (clock file not bounded)']), tin, lsha)
+    bad = [k for k in ('sha256', 'sha_noi_dung', 'luot', 'lan_cham') if blk.get(k) != tin[k] or tin[k] is None]
+    if bad:
+        raise EdoError(f'{lp}: its mask is not {mat_na_path} for run {luot!r} ({bad} differ)')
+    nut = blk.get('nut')
+    if not isinstance(nut, list) or len(nut) != n or any(not isinstance(e, dict) or e.get('nut') != k
+                                                         or not isinstance(e.get('cham'), bool)
+                                                         for k, e in enumerate(nut)):
+        raise EdoError(f'{lp}: mat_na_d2.nut is not one entry per node of the clock file ({n})')
+
+    def sha_nut(k):
+        return cu.sha256(os.path.join(luoi_dir, f'nut_{k:03d}.json'))
+    src = {x.get('nut'): x.get('sha256') for x in g.get('nguon_nut') or [] if isinstance(x, dict)}
+    co = {k for k in range(n) if os.path.isfile(os.path.join(luoi_dir, f'nut_{k:03d}.json'))}
+    if set(src) != co or any(src[k] != sha_nut(k) for k in co):
+        raise EdoError(f'{lp}: the node score files of {luoi_dir} are not the ones the masked grid was made from '
+                       '(nguon_nut)')
+    if md2.ma_lan_cham((k, sha_nut(k)) for k, e in enumerate(nut) if e['cham']) != blk['lan_cham']:
+        raise EdoError(f'{lp}: the node score files here do not give the scoring id of the mask (lan_cham)')
+    bo = {}
+    for k, e in enumerate(nut):
+        if not e['cham']:
+            continue
+        rp = os.path.join(luoi_dir, f'nut_{k:03d}_rows.csv')
+        if (e.get('rows') or {}).get('sha256') != cu.sha256(rp) or nodes[k] is None:
+            raise EdoError(f'{lp}: node {k}: {rp} is not the rows file the mask was applied on')
+        ids = [_fid(r) for r in nodes[k][1]]
+        che = sum(1 for f in ids if f not in mn['mo'])
+        if len(ids) != e.get('n_khung') or che != e.get('n_che'):
+            raise EdoError(f'{lp}: node {k}: {che} of {len(ids)} frames masked here, the masked grid says '
+                           f'{e.get("n_che")} of {e.get("n_khung")}')
+        if e.get('trang_thai_sau') is None:
+            bo[k] = str(e.get('ly_do') or 'node not scored in the masked grid')
+    tin['nut_khong_cham'] = sorted(bo)
+    # L166 (Liam 25/11 at CODE, "Chua ket luan (Recommended)"): a run with a t_som node that has a masked frame is
+    # not concluded as a whole in the masked grid (c8b_mat_na_d2: ca_luot_chua_ket_luan); so is its e_do
+    ca = blk.get('ca_luot_chua_ket_luan')
+    tin['ca_luot_chua_ket_luan'] = bool(ca)
+    why = [] if not ca else ['mat_na_d2: the whole run is not concluded in the masked grid (L166: t_som node with a '
+                             f'masked frame, nodes {(ca or {}).get("nut_t_som_co_khung_che")})']
+    return dict(mo=mn['mo'], nut_khong_cham=bo, ly_do_luot=why), tin, lsha
+
+
 def _clean(o):
     if isinstance(o, dict):
         return {k: _clean(v) for k, v in o.items()}
@@ -366,6 +509,9 @@ def main(argv=None):
     a1.add_argument('--luoi-dir', required=True)
     a1.add_argument('--esp32', required=True)
     a1.add_argument('--out', required=True)
+    a1.add_argument('--mat-na-d2', default=None,
+                    help='c8b_a6_o d2 file: the D2 cell mask, read through --luoi-dir/luoi_d2.json (with --luot)')
+    a1.add_argument('--luot', default=None, help='run id of this scoring in the D2 mask (target set)')
     a3 = sub.add_parser('chung-cu')
     a3.add_argument('--luoi', action='append', required=True)
     a3.add_argument('--edo', action='append', required=True)
@@ -382,13 +528,20 @@ def main(argv=None):
                 gio = json.load(f)
             if gio.get('format') != 'c8b_gio_v1':
                 raise EdoError(f'{a.gio}: not a c8b_gio_v1 file')
-            res = analyse_run(gio, _load_nodes(gio, a.luoi_dir), read_log(a.esp32), gio['task'])
-            res.update(gio_sha256=cu.sha256(a.gio), esp32_sha256=cu.sha256(a.esp32))
+            if bool(a.mat_na_d2) != bool(a.luot):
+                raise EdoError('--mat-na-d2 goes with --luot (the run id of this scoring in the mask)')
+            nodes = _load_nodes(gio, a.luoi_dir)
+            mat_na, tin, lsha = (None, None, None) if not a.mat_na_d2 else doc_mat_na_luoi(
+                gio, a.gio, a.luoi_dir, a.mat_na_d2, a.luot, nodes)
+            res = analyse_run(gio, nodes, read_log(a.esp32), gio['task'], mat_na=mat_na)
+            res.update(gio_sha256=cu.sha256(a.gio), esp32_sha256=cu.sha256(a.esp32), mat_na_d2=tin,
+                       luoi_d2_sha256=lsha)
         elif a.cmd == 'chung-cu':
             def _j(p):
                 with open(p, encoding='utf-8') as f:
                     return json.load(f)
-            res = dict(chung_cu_c8=chung_cu([_j(p) for p in a.luoi], [_j(p) for p in a.edo], a.ban_cham_cuoi == 'true'),
+            res = dict(chung_cu_c8=chung_cu([_j(p) for p in a.luoi], [_j(p) for p in a.edo], a.ban_cham_cuoi == 'true',
+                                            luoi_sha256=[cu.sha256(p) for p in a.luoi]),
                        nguon=[dict(file=os.path.basename(p), sha256=cu.sha256(p)) for p in a.luoi + a.edo])
         else:
             runs = []

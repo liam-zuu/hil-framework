@@ -191,3 +191,290 @@ def test_ct5_3_f13_key_of_the_scorer():
     old['khung_tuong_doi'] = old.pop('khung_tuong_doi_v1')
     r2 = E.analyse_run(GIO, [(old, rows), (old, rows)], _log(), TASK)
     assert r2['trang_thai'] == 'chua_ket_luan' and any('khung_tuong_doi_v1' in w for w in r2['ly_do'])
+
+
+# ── the D2 cell mask (design C8B v7 section 7c line 166; CODE 25/11 after merge 6) ───────────────────────────────
+
+sys.path.insert(0, os.path.dirname(__file__))
+import c8_u_imu  # noqa: E402
+import test_c8b_mat_na_d2 as TM  # noqa: E402   (the node, mask-file and grid helpers of the mask tests)
+
+
+def _mn(mo, **kw):
+    return dict(dict(mo=set(mo), nut_khong_cham={}, ly_do_luot=[]), **kw)
+
+
+def _node_off(off_of):
+    """A node whose camera centre is off_of(j) beside the lane at frame j (frame_id j)."""
+    sc, rows = _node(0.0)
+    for j, r in enumerate(rows):
+        r['x'] = off_of(j)
+    return sc, rows
+
+
+def test_mask_none_and_mask_open_everywhere_change_nothing():
+    nd = [_node(0.12), _node(0.12)]
+    r0 = E.analyse_run(GIO, nd, _log(), TASK)
+    r1 = E.analyse_run(GIO, nd, _log(), TASK, mat_na=_mn(range(1000)))
+    assert all(n.pop('n_che') == 0 for n in r1['theo_nut']) and r1 == r0 and r0['vuot_moi_nut']
+
+
+def test_masked_frame_is_undefined_and_makes_no_conclusion():
+    # only frame 7 is over D (0.12 m), at both nodes: without the mask the run is over D at every node
+    nd = [_node_off(lambda j: 0.12 if j == 7 else 0.0)] * 2
+    r0 = E.analyse_run(GIO, nd, _log(), TASK)
+    assert r0['vuot_moi_nut'] and r0['can_xac_dinh_moi_nut'] and r0['theo_nut'][0]['khung_vuot'] == ['7']
+    n = r0['theo_nut'][0]['n_khung']
+    # frame 7 masked: not over D any more (the masked frame was the only evidence), and the node is not bounded
+    r = E.analyse_run(GIO, nd, _log(), TASK, mat_na=_mn(set(range(n)) - {7}))
+    assert r['trang_thai'] == 'dat' and not r['vuot_moi_nut'] and not r['can_xac_dinh_moi_nut']
+    assert [(x['n_che'], x['n_undef'], x['khung_vuot']) for x in r['theo_nut']] == [(1, 1, [])] * 2
+    assert r['theo_nut'][0]['lo_max_m'] < 0.01
+    # another frame masked: the finite lower bound of frame 7 stays (design 7c), the node still not bounded
+    r = E.analyse_run(GIO, nd, _log(), TASK, mat_na=_mn(set(range(n)) - {3}))
+    assert r['vuot_moi_nut'] and not r['can_xac_dinh_moi_nut'] and r['theo_nut'][1]['khung_vuot'] == ['7']
+
+
+def test_mask_cell_rule_needs_an_open_frame_over_d():
+    # frames 7 and 9 over D at both nodes: the cell has a frame over D as long as one of them is open
+    nd = [_node_off(lambda j: 0.12 if j in (7, 9) else 0.0)] * 2
+    n = len(nd[0][1])
+    assert E.analyse_run(GIO, nd, _log(), TASK, mat_na=_mn(set(range(n)) - {7}))['vuot_moi_nut']
+    assert not E.analyse_run(GIO, nd, _log(), TASK, mat_na=_mn(set(range(n)) - {7, 9}))['vuot_moi_nut']
+    # every frame masked: nothing concluded from the frames
+    r = E.analyse_run(GIO, nd, _log(), TASK, mat_na=_mn(()))
+    assert not r['vuot_moi_nut'] and not r['can_xac_dinh_moi_nut'] and r['theo_nut'][0]['lo_max_m'] is None
+
+
+def test_mask_node_turned_not_scored_and_run_reason():
+    nd = [_node(0.12), _node(0.12)]
+    r = E.analyse_run(GIO, nd, _log(), TASK, mat_na=_mn(range(1000), nut_khong_cham={1: 'cat_t1 on masked frames'}))
+    assert r['trang_thai'] == 'dat' and not r['vuot_moi_nut'] and not r['can_xac_dinh_moi_nut']
+    assert r['theo_nut'][1] == dict(i=1, cham=False, ly_do=['mat_na_d2: cat_t1 on masked frames'])
+    r = E.analyse_run(GIO, nd, _log(), TASK, mat_na=_mn(range(1000), ly_do_luot=['mat_na_d2: no node used']))
+    assert r['trang_thai'] == 'chua_ket_luan' and not r['vuot_moi_nut'] and 'mat_na_d2: no node used' in r['ly_do']
+
+
+def test_mask_needs_a_frame_id_once_on_every_scored_row():
+    for keys in (lambda j: '', lambda j: str(j // 2), lambda j: f'{j}.5'):
+        with pytest.raises(E.EdoError):
+            E.analyse_run(GIO, [_node(0.12, keys=keys)] * 2, _log(), TASK, mat_na=_mn(range(1000)))
+    r = E.analyse_run(GIO, [_node(0.12, keys=lambda j: '')] * 2, _log(), TASK)      # without the mask: as before
+    assert r['trang_thai'] == 'dat'
+
+
+def _write_log(p, L):
+    with open(p, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['timestamp_us', 'pos_x', 'pos_y', 'run_active', 'reset_n'])
+        for i in range(len(L['t'])):
+            w.writerow([int(round(L['t'][i] * 1e6)), L['x'][i], L['y'][i], int(L['run'][i]), L['reset'][i]])
+
+
+KTD = dict(schema='khung_tuong_doi_v1', phi_ok=True, t_som_s=None, ca_t_som=None, tam_doi='khong_doi', mat_neo=False,
+           bien_doi=dict(p_dd=[0.0, 0.0], psi_dd=0.0))
+
+
+def _luoi_that(tmp_path, over=(102,), n_nodes=2, viol=None, **kw):
+    """A grid folder as c8b_luoi reads it (the node helpers of the mask tests) whose rows also carry the e_do columns:
+    6 frames 100..105 per node, the camera centre 0.12 m beside the lane on the frames in `over`. Returns
+    (dir, clock file, log file)."""
+    d = str(tmp_path / 'luoi')
+    os.makedirs(d)
+    gp, lp = str(tmp_path / 'gio.json'), str(tmp_path / 'log.csv')
+    nodes_s = [0.001 * k for k in range(n_nodes)]
+    json.dump(dict(format='c8b_gio_v1', task=TASK, ok=True, nodes_s=nodes_s, step_s=0.001),
+              open(gp, 'w', encoding='utf-8'))
+    _write_log(lp, _log())
+    fr = [(100 + i, 5.5 + i / 60.0, 1, 1, dict({'g2': 0.03, 'g3': 0.04, 'g4': 0.05, 'g5': -2.0},
+                                               **(viol or {}).get(100 + i, {}))) for i in range(6)]
+    for k in range(n_nodes):
+        json.dump(dict(scorer=dict(commit='abc1234', dirty=False), gio_sha256=c8_u_imu.sha256(gp), D_s=nodes_s[k]),
+                  open(os.path.join(d, f'nut_{k:03d}_nguon.json'), 'w', encoding='utf-8'))
+        TM.write_node(d, k, fr, D=nodes_s[k], ktd=KTD, **kw)
+        rp = os.path.join(d, f'nut_{k:03d}_rows.csv')
+        rows = list(csv.DictReader(open(rp, newline='', encoding='utf-8')))
+        for r in rows:
+            y = 0.4 * (float(r['t_cam_s']) - 5.0)
+            r.update(x=0.12 if int(r['frame_id']) in over else 0.0, y=y, s_perp=y, w_lo=y - 0.05, w_hi=y + 0.05,
+                     U_p_k=0.005, scored=1)
+        with open(rp, 'w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0]))
+            w.writeheader()
+            w.writerows(rows)
+        TM.resha(d, k)
+    return d, gp, lp
+
+
+def _edo(tmp_path, d, gp, lp, mp=None, name='edo.json', luot='r1'):
+    out = str(tmp_path / name)
+    rc = E.main(['luot', '--gio', gp, '--luoi-dir', d, '--esp32', lp, '--out', out]
+                + (['--mat-na-d2', mp, '--luot', luot] if mp else []))
+    return rc, (json.load(open(out, encoding='utf-8')) if rc == 0 else None)
+
+
+def test_cli_luot_reads_the_mask_through_the_masked_grid(tmp_path, capsys):
+    d, gp, lp = _luoi_that(tmp_path, over=(102,))
+    assert TM.run(d, gp)[0] == 0
+    rc, r0 = _edo(tmp_path, d, gp, lp, name='edo0.json')
+    assert rc == 0 and r0['vuot_moi_nut'] and r0['can_xac_dinh_moi_nut']
+    assert r0['mat_na_d2'] is None and r0['luoi_d2_sha256'] is None
+    mp = TM.mask_file(tmp_path, [100, 101, 103, 104, 105])
+    # the mask before its masked grid: refused
+    assert _edo(tmp_path, d, gp, lp, mp, name='e_som.json')[0] == 2
+    assert 'masked grid must be there first' in capsys.readouterr().err
+    rc, g = TM.run(d, gp, mp)
+    assert rc == 0 and g['mat_na_d2']['nut'][0]['n_che'] == 1
+    rc, r = _edo(tmp_path, d, gp, lp, mp)
+    assert rc == 0 and r['trang_thai'] == 'dat' and not r['vuot_moi_nut'] and not r['can_xac_dinh_moi_nut']
+    assert [(x['n_khung'], x['n_che'], x['n_undef'], x['khung_vuot']) for x in r['theo_nut']] == [(6, 1, 1, [])] * 2
+    assert r['mat_na_d2'] == dict(sha256=c8_u_imu.sha256(mp), sha_noi_dung=g['mat_na_d2']['sha_noi_dung'], luot='r1',
+                                  lan_cham=g['mat_na_d2']['lan_cham'], n_khung_mo=5, nut_khong_cham=[],
+                                  ca_luot_chua_ket_luan=False)
+    assert r['luoi_d2_sha256'] == c8_u_imu.sha256(os.path.join(d, 'luoi_d2.json'))
+    assert r['gio_sha256'] == r0['gio_sha256'] and r['esp32_sha256'] == r0['esp32_sha256']
+    # --mat-na-d2 without --luot, and a run that is not in the target set of the mask
+    assert E.main(['luot', '--gio', gp, '--luoi-dir', d, '--esp32', lp, '--out', str(tmp_path / 'x.json'),
+                   '--mat-na-d2', mp]) == 2
+    assert E.main(['luot', '--gio', gp, '--luoi-dir', d, '--esp32', lp, '--out', str(tmp_path / 'x1.json'),
+                   '--luot', 'r1']) == 2                 # --luot alone would run without the mask, silently
+    assert not os.path.exists(tmp_path / 'x1.json')
+    assert _edo(tmp_path, d, gp, lp, mp, name='x2.json', luot='r7')[0] == 2
+    # chung-cu: the masked grid with the e_do file made with its mask; mixed pairs refused
+    p0, p2 = os.path.join(d, 'luoi.json'), os.path.join(d, 'luoi_d2.json')
+    e0, e2 = str(tmp_path / 'edo0.json'), str(tmp_path / 'edo.json')
+
+    def cc(lu, ed, name):
+        return E.main(['chung-cu', '--luoi', lu, '--edo', ed, '--ban-cham-cuoi', 'true', '--out', str(tmp_path / name)])
+    assert cc(p2, e2, 'cc.json') == 0 and cc(p0, e0, 'cc0.json') == 0
+    c = json.load(open(tmp_path / 'cc.json', encoding='utf-8'))
+    assert c['chung_cu_c8']['bo_so'] == [dict(e_do_lo_vuot_D_moi_nut=False, e_do_xac_dinh_moi_nut=False,
+                                              g4_can_huu_han_mien_hop_moi_nut=False)]
+    assert [x['sha256'] for x in c['nguon']] == [c8_u_imu.sha256(p2), c8_u_imu.sha256(e2)]
+    c0 = json.load(open(tmp_path / 'cc0.json', encoding='utf-8'))
+    assert c0['chung_cu_c8']['bo_so'] == [dict(e_do_lo_vuot_D_moi_nut=True, e_do_xac_dinh_moi_nut=True,
+                                               g4_can_huu_han_mien_hop_moi_nut=True)]
+    capsys.readouterr()
+    assert cc(p2, e0, 'cc_x1.json') == 2 and cc(p0, e2, 'cc_x2.json') == 2
+    assert capsys.readouterr().err.count('both from the same masked grid') == 2
+
+
+def test_cli_luot_open_frame_over_d_stays_under_the_mask(tmp_path):
+    d, gp, lp = _luoi_that(tmp_path, over=(102, 104))
+    assert TM.run(d, gp)[0] == 0
+    mp = TM.mask_file(tmp_path, [100, 101, 103, 104, 105])
+    assert TM.run(d, gp, mp)[0] == 0
+    rc, r = _edo(tmp_path, d, gp, lp, mp)
+    assert rc == 0 and r['vuot_moi_nut'] and not r['can_xac_dinh_moi_nut']
+    assert r['theo_nut'][0]['khung_vuot'] == ['104'] and r['theo_nut'][0]['n_che'] == 1
+
+
+def test_cli_luot_refuses_what_is_not_of_the_masked_grid(tmp_path, capsys):
+    d, gp, lp = _luoi_that(tmp_path)
+    assert TM.run(d, gp)[0] == 0
+    mp = TM.mask_file(tmp_path, [100, 101, 103, 104, 105])
+    assert TM.run(d, gp, mp)[0] == 0
+    assert _edo(tmp_path, d, gp, lp, mp, name='ok.json')[0] == 0
+    capsys.readouterr()
+
+    def tu_choi(name, txt, mp_=mp, gp_=gp):
+        assert _edo(tmp_path, d, gp_, lp, mp_, name=name)[0] == 2
+        assert txt in capsys.readouterr().err
+    # another mask file of the same run (other open frames): not the mask of the grid
+    tu_choi('a.json', 'its mask is not', mp_=TM.mask_file(tmp_path, [100, 101, 102, 103], name='o2.json'))
+    # another clock file
+    gp2 = str(tmp_path / 'gio2.json')
+    json.dump(dict(json.load(open(gp, encoding='utf-8')), step_s=0.002), open(gp2, 'w', encoding='utf-8'))
+    tu_choi('b.json', 'another clock file', gp_=gp2)
+    # a rows file edited after the masked grid (one frame id changed: another frame would be masked)
+    rp = os.path.join(d, 'nut_001_rows.csv')
+    old = open(rp, encoding='utf-8', newline='').read()
+    assert '\n105,' in old
+    open(rp, 'w', encoding='utf-8', newline='').write(old.replace('\n105,', '\n205,'))
+    tu_choi('c.json', 'not the rows file the mask was applied on')
+    open(rp, 'w', encoding='utf-8', newline='').write(old)
+    assert _edo(tmp_path, d, gp, lp, mp, name='ok2.json')[0] == 0
+    # a node score file edited after the masked grid
+    sp = os.path.join(d, 'nut_000.json')
+    old = open(sp, encoding='utf-8', newline='').read()
+    json.dump(dict(json.loads(old), U_t_s=0.04), open(sp, 'w', encoding='utf-8'))
+    tu_choi('d.json', '(nguon_nut)')
+    open(sp, 'w', encoding='utf-8', newline='').write(old)
+    assert _edo(tmp_path, d, gp, lp, mp, name='ok3.json')[0] == 0
+    capsys.readouterr()
+    # the block of the masked grid says other frame counts than the rows give under this mask
+    lp2 = os.path.join(d, 'luoi_d2.json')
+    g = json.load(open(lp2, encoding='utf-8'))
+    g['mat_na_d2']['nut'][0]['n_che'] = 0
+    json.dump(g, open(lp2, 'w', encoding='utf-8'))
+    tu_choi('e.json', 'frames masked here')
+
+
+def test_cli_luot_node_the_mask_turned_not_scored(tmp_path):
+    # cat_t1 nodes whose certain violation (G2 at frame 101) stands only on a masked frame: not scored in the masked
+    # grid (c8b_mat_na_d2 step 5), so not scored for e_do either, though frame 104 (open) is over D
+    d, gp, lp = _luoi_that(tmp_path, over=(104,), viol={101: {'g2': 0.14}}, cat=True, t1=0.2)
+    assert TM.run(d, gp)[0] == 0
+    mp = TM.mask_file(tmp_path, [100, 102, 103, 104, 105])
+    rc, g = TM.run(d, gp, mp)
+    assert rc == 0 and g['nodes_ok'] == [False, False]
+    rc, r = _edo(tmp_path, d, gp, lp, mp)
+    assert rc == 0 and not r['vuot_moi_nut'] and not r['can_xac_dinh_moi_nut']
+    assert all(x['cham'] is False and 'mat_na_d2' in x['ly_do'][0] for x in r['theo_nut'])
+    assert r['mat_na_d2']['nut_khong_cham'] == [0, 1]
+    assert _edo(tmp_path, d, gp, lp, name='e0.json')[1]['vuot_moi_nut']           # without the mask: over D
+
+
+def test_cli_luot_masked_grid_without_a_node(tmp_path):
+    # clock file not bounded: the masked grid has no node used (mat_na_d2 null) -> e_do not concluded under the mask
+    d, gp, lp = _luoi_that(tmp_path)
+    mp = TM.mask_file(tmp_path, [100, 101, 103, 104, 105])
+    json.dump(dict(mat_na_d2=None, gio_sha256=c8_u_imu.sha256(gp), states={}),
+              open(os.path.join(d, 'luoi_d2.json'), 'w', encoding='utf-8'))
+    rc, r = _edo(tmp_path, d, gp, lp, mp)
+    assert rc == 0 and r['trang_thai'] == 'chua_ket_luan' and not r['vuot_moi_nut']
+    assert any('no node used' in w for w in r['ly_do']) and r['mat_na_d2']['luot'] == 'r1'
+
+
+def test_chung_cu_mask_pairs():
+    e1 = dict(trang_thai='dat', vuot_moi_nut=False, can_xac_dinh_moi_nut=False)
+    blk = dict(sha256='a' * 64, sha_noi_dung='b' * 64, luot='r1', lan_cham='c' * 16)
+    em = dict(e1, mat_na_d2=dict(blk, n_khung_mo=5, nut_khong_cham=[]), luoi_d2_sha256='d' * 64)
+    lm = dict(_luoi(nu=1), mat_na_d2=dict(blk, nut=[]))
+    assert E.chung_cu([lm], [em], True)['bo_so'][0]['g4_can_huu_han_mien_hop_moi_nut'] is False
+    assert E.chung_cu([lm], [em], True, luoi_sha256=['d' * 64])
+    for lu, ed, sha in ((lm, e1, None), (lm, dict(e1, mat_na_d2=None), None), (_luoi(), em, None),
+                        (lm, em, ['e' * 64]),
+                        (lm, dict(em, mat_na_d2=dict(em['mat_na_d2'], lan_cham='0' * 16)), None),
+                        (lm, dict(em, mat_na_d2=dict(em['mat_na_d2'], sha256='0' * 64)), None),
+                        (lm, dict(em, mat_na_d2=dict(em['mat_na_d2'], luot='r2')), None)):
+        with pytest.raises(E.EdoError):
+            E.chung_cu([lu], [ed], True, luoi_sha256=sha)
+    # a masked grid without a node used (block null): the pair goes by the SHA of the grid file
+    l0 = dict(_luoi(st='chua_ket_luan_khong_nut'), mat_na_d2=None)
+    assert E.chung_cu([l0], [em], True, luoi_sha256=['d' * 64])['phan_loai_du'] is False
+    with pytest.raises(E.EdoError):
+        E.chung_cu([l0], [em], True, luoi_sha256=['e' * 64])
+    # two scorings: the first with the mask, the second (H1, no mask of its own) without
+    assert len(E.chung_cu([lm, _luoi()], [em, e1], True)['bo_so']) == 2
+
+
+def test_cli_luot_whole_run_not_concluded_in_the_masked_grid(tmp_path):
+    # L166 (Liam 25/11): a t_som node with a masked frame -> the masked grid has the whole run not concluded; so has
+    # e_do, though frame 104 (open) is over D and the run is over D at every node without the mask
+    d, gp, lp = _luoi_that(tmp_path, over=(104,), g1=dict(ca_t_som=True, t_som_s=1.0))
+    assert TM.run(d, gp)[0] == 0
+    assert _edo(tmp_path, d, gp, lp, name='e0.json')[1]['vuot_moi_nut']
+    mp = TM.mask_file(tmp_path, [100, 101, 103, 104, 105])
+    rc, g = TM.run(d, gp, mp)
+    assert rc == 0 and g['mat_na_d2']['ca_luot_chua_ket_luan'] and g['outcome'] == 'chua_ket_luan'
+    rc, r = _edo(tmp_path, d, gp, lp, mp)
+    assert rc == 0 and r['trang_thai'] == 'chua_ket_luan' and not r['vuot_moi_nut'] and not r['can_xac_dinh_moi_nut']
+    assert any('L166' in w for w in r['ly_do']) and r['mat_na_d2']['ca_luot_chua_ket_luan'] is True
+    assert [x['n_che'] for x in r['theo_nut']] == [1, 1]                # the frames outside khung_mo, as the grid says
+    out = str(tmp_path / 'cc.json')
+    assert E.main(['chung-cu', '--luoi', os.path.join(d, 'luoi_d2.json'), '--edo', str(tmp_path / 'edo.json'),
+                   '--ban-cham-cuoi', 'true', '--out', out]) == 0
+    c = json.load(open(out, encoding='utf-8'))['chung_cu_c8']
+    assert c['phan_loai_du'] is True and c['bo_so'] == [dict(e_do_lo_vuot_D_moi_nut=False, e_do_xac_dinh_moi_nut=False,
+                                                             g4_can_huu_han_mien_hop_moi_nut=False)]
