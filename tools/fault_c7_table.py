@@ -86,6 +86,10 @@ fault_check_<run>.json. The same columns as the fwsim table, from two clocks:
     are exactly bench_ticks(duration) rows (j x 10 ms < duration; ticks_expected) with consecutive tick and log_seq and run_active 1, every ESP_COLS value
     finite, flags 0 / 1, counters whole (C7T1-6), gyro_n not decreasing from the row before the run (C7T2-2). wz_src, slip_flag, ws_flag edges, age_g_max_ms, r_max,
     sat_frac (|pwm| >= PWM_MAX of the ESP32 rows) and ticks (ESP32 rows in [0, duration)) come from it.
+     Before finding the run start, drop a line only if <log>.segments.csv marks it duplicate and its text
+     matches an earlier kept line with the same log_seq (L92). Segment marks must match the CSV rows. Drops
+     require the logger summary to confirm the segments SHA-256 and duplicate count. A named SHA-256 must
+     match even without drops. esp_dup_dropped and base_esp_dup_dropped count drops across each whole log.
   * Left blank on the bench (column blank lists them): r_th (no column in the ESP32 CSV); imu_rows,
     imu_dropped, base_imu_rows (the H7 builds the IMU reports, the Pi logs no report). esp_gyro_n,
     base_esp_gyro_n (C7T1-7): the firmware's gyro report counter gyro_n at the last row of [0, duration) minus
@@ -113,6 +117,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import io
 import json
 import math
 import os
@@ -377,9 +383,9 @@ def row_for(mode, case, f, base):
     return out
 
 
-def table(run_dir):
+def table(run_dir, *, report_duplicates=None):
     if os.path.isfile(os.path.join(run_dir, 'session.json')):
-        return bench_table(run_dir)
+        return bench_table(run_dir, report_duplicates=report_duplicates)
     subs =sorted(d for d in os.listdir(run_dir) if os.path.isfile(os.path.join(run_dir, d, 'log.csv')))
     if not subs:
         raise TableError(f'{run_dir}: no <MODE>_<CASE> sub-folder with log.csv')
@@ -488,10 +494,64 @@ def task_duration(args):
     return task, GROUP_A[task].duration + TAIL_S
 
 
+def _esp_segment_summary(path):
+    try:
+        with open(f'{path}.summary.json', encoding='utf-8') as fh:
+            summary = json.load(fh)
+        digest = ((summary.get('files') or {}).get('segments') or {}).get('sha256')
+        segments = summary.get('segments')
+    except (OSError, ValueError, AttributeError):
+        return None, None
+    count = None
+    if isinstance(segments, list) and all(isinstance(s, dict) and type(s.get('duplicates')) is int for s in segments):
+        count = sum(s['duplicates'] for s in segments)
+    return digest if isinstance(digest, str) else None, count
+
+
+def _drop_esp_duplicates(path, head, body, lines):
+    seg = f'{path}.segments.csv'
+    try:
+        with open(seg, 'rb') as fh:
+            blob = fh.read()
+        marks = list(csv.DictReader(io.StringIO(blob.decode('utf-8'), newline=''), strict=True))
+    except FileNotFoundError:
+        return body, []
+    except (OSError, csv.Error, UnicodeDecodeError) as exc:
+        raise TableError(f'{seg}: {exc}') from exc
+    if len(lines) != len(body):
+        raise TableError(f'{path}: {len(body)} CSV rows for {len(lines)} data lines')
+    if len(marks) != len(body):
+        raise TableError(f'{seg}: {len(marks)} rows for {len(body)} data lines')
+    named, count = _esp_segment_summary(path)
+    if named is not None and named != hashlib.sha256(blob).hexdigest():
+        raise TableError(f'{seg}: SHA-256 differs from the logger summary')
+
+    cols = {h: i for i, h in enumerate(head)}
+    kept, seen, dropped = [], set(), []
+    for i, (row, line, mark) in enumerate(zip(body, lines, marks), start=1):
+        seq, ts = row[cols['log_seq']], row[cols['timestamp_us']]
+        if mark.get('row') != str(i) or mark.get('log_seq') != seq or mark.get('timestamp_us') != ts:
+            raise TableError(f'{seg} row {i} does not match CSV data line {i}')
+        raw = line.rstrip('\r\n')
+        if mark.get('status') == 'duplicate':
+            if raw not in seen:
+                raise TableError(f'{seg} row {i}: log_seq {seq} marked duplicate but no earlier identical kept line')
+            dropped.append(seq)
+        else:
+            kept.append(row)
+            seen.add(raw)
+    if dropped and named is None:
+        raise TableError(f'{seg}: logger summary must name its SHA-256 to drop duplicate lines')
+    if dropped and count != len(dropped):
+        raise TableError(f'{seg}: dropped {len(dropped)} lines, logger summary counts {count} duplicates')
+    return kept, dropped
+
+
 def read_esp(path):
-    """ESP32 CSV (agv_logger) as {column: float array}; every ESP_COLS column must be there."""
+    """ESP32 CSV (agv_logger) as ({column: float array}, log_seq of each dropped line)."""
     with open(path, newline='') as fh:
-        rows = list(csv.reader(fh))
+        lines = fh.readlines()
+    rows = list(csv.reader(lines))
     if len(rows) < 2:
         raise TableError(f'{path}: no data row')
     head, body = rows[0], rows[1:]
@@ -501,8 +561,9 @@ def read_esp(path):
     miss = [c for c in ESP_COLS if c not in head]
     if miss:
         raise TableError(f'{path}: no column {miss}')
+    body, dropped = _drop_esp_duplicates(path, head, body, lines[1:])
     data = np.array(body, dtype=float)
-    return {h: data[:, i] for i, h in enumerate(head)}
+    return {h: data[:, i] for i, h in enumerate(head)}, dropped
 
 
 def read_gain(path):
@@ -625,7 +686,8 @@ def load_bench_run(run_dir, srun, clean):
     # ESP32 clock = the firmware tick counter from the first run_active row; rows of [0, duration) only
     # (the fwsim run ends at duration; the ESP32 log goes on through the motor-off switch)
     n_ticks = bench_ticks(dur)
-    esp, pre = esp_run_rows(name, read_esp(os.path.join(run_dir, 'pi', f'{name}.csv')), n_ticks, first_seq)
+    esp_all, dup_seqs = read_esp(os.path.join(run_dir, 'pi', f'{name}.csv'))
+    esp, pre = esp_run_rows(name, esp_all, n_ticks, first_seq)
     te = np.round((esp['tick'] - esp['tick'][0]) * TICK_S, 6)
     plant = None
     pr = (faults or {}).get('plant_record')
@@ -636,7 +698,7 @@ def load_bench_run(run_dir, srun, clean):
         plant = (rec[:, cols.index('step')] - t0,
                  rec[:, [cols.index(c) for c in ('mask', 'x', 'y', 'theta')]])
     return dict(name=name, args=srun['args'], task=task, dur=dur, man=man, faults=faults, S=S, R=R, k=k,
-                esp=esp, esp_pre=pre, te=te, gain=gain, npz=npz, esp32_fw=srun.get('esp32_fw'),
+                esp=esp, esp_pre=pre, esp_dup_seqs=dup_seqs, te=te, gain=gain, npz=npz, esp32_fw=srun.get('esp32_fw'),
                 h7_fw=srun.get('h7_fw'), run_s=(steps['STOPPING'] - t0) / 1000.0, plant=plant)
 
 
@@ -798,11 +860,12 @@ def bench_row(mode, case, f, base, H_fwd):
                esp_gyro_n=cnt['']['gyro'], base_esp_gyro_n=cnt['base_']['gyro'],
                ref_first_s=_first_change(f['k'] / 1000.0, f['R']),
                esp_sp_first_s=_first_change(te, np.column_stack([e['sp_vx'], e['sp_vy'], e['sp_wz']])),
+               esp_dup_dropped=len(f['esp_dup_seqs']), base_esp_dup_dropped=len(base['esp_dup_seqs']),
                blank=';'.join(BENCH_BLANK))
     return out
 
 
-def bench_table(run_dir):
+def bench_table(run_dir, *, report_duplicates=None):
     with open(os.path.join(run_dir, 'session.json')) as fh:
         session = json.load(fh)
     with open(os.path.join(run_dir, 'bench_summary.json')) as fh:
@@ -838,6 +901,10 @@ def bench_table(run_dir):
         rows.append(bench_row(mode, case, f, base, H_fwd))
     if not rows:
         raise TableError(f'{run_dir}: no fault case')
+    if report_duplicates is not None:
+        for run in runs.values():
+            if run['esp_dup_seqs']:
+                report_duplicates(run['name'], run['esp_dup_seqs'])
     return rows
 
 
@@ -855,8 +922,12 @@ def main(argv=None) -> int:
     ap.add_argument('run_dir')
     ap.add_argument('--out', default=None, help='default: <run_dir>/c7_table.csv')
     a = ap.parse_args(argv)
+
+    def report_duplicates(name, seqs):
+        print(f'fault_c7_table: {name}: dropped {len(seqs)} duplicate ESP32 line(s) (log_seq {", ".join(seqs)})')
+
     try:
-        rows = table(a.run_dir)
+        rows = table(a.run_dir, report_duplicates=report_duplicates)
     except (TableError, OSError, ValueError, KeyError) as exc:
         print(f'fault_c7_table: cannot table: {exc}', file=sys.stderr)
         return 2

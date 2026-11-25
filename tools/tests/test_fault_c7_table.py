@@ -3,7 +3,9 @@ of one (controller, case) row against its baseline on synthetic logs whose answe
 that cannot be tabled (no baseline, a baseline with rows, a different seed / firmware / tick times); bench
 folders (hil_bench_session.py: Pi frame log + ESP32 CSV) on a synthetic session and on FAULT_C7 run02, run03.
 Run: python -m pytest tools/tests"""
+import csv
 import functools
+import hashlib
 import json
 import math
 import os
@@ -397,7 +399,188 @@ def test_bench_columns_extend_the_fwsim_ones(tmp_path, fake_check):
     kf, kb = list(ct.table(str(tmp_path / 'fw'))[0]), list(ct.table(str(tmp_path / 'hil'))[0])
     assert kb[:len(kf)] == kf
     assert kb[len(kf):] == ['run_s', 'tick_gaps', 'esp_gyro_n', 'base_esp_gyro_n', 'ref_first_s', 'esp_sp_first_s',
-                            'blank']
+                            'esp_dup_dropped', 'base_esp_dup_dropped', 'blank']
+
+
+def insert_esp_copy(log, source, dest, r=None):
+    """Copy one 1-based data line to another, with a different line ending."""
+    lines = log.read_bytes().splitlines(keepends=True)
+    copy = lines[source].rstrip(b'\r\n')
+    if r is not None:
+        fields = copy.split(b',')
+        fields[lines[0].rstrip().split(b',').index(b'r')] = r.encode('ascii')
+        copy = b','.join(fields)
+    lines.insert(dest, copy + b'\r\n')
+    log.write_bytes(b''.join(lines))
+
+
+def write_esp_segments(log, duplicates=()):
+    seg = log.with_suffix('.csv.segments.csv')
+    with log.open(newline='') as fh, seg.open('w', newline='') as out:
+        writer = csv.writer(out)
+        writer.writerow(['row', 'log_seq', 'timestamp_us', 'segment', 'status'])
+        for i, row in enumerate(csv.DictReader(fh), start=1):
+            writer.writerow([i, row['log_seq'], row['timestamp_us'], 0, 'duplicate' if i in duplicates else 'ok'])
+    return seg
+
+
+def write_esp_summary(log, counts):
+    seg = log.with_suffix('.csv.segments.csv')
+    summary = dict(files=dict(segments=dict(file=seg.name, sha256=hashlib.sha256(seg.read_bytes()).hexdigest())),
+                   segments=[dict(segment=i, duplicates=count) for i, count in enumerate(counts)])
+    log.with_suffix('.csv.summary.json').write_text(json.dumps(summary), encoding='utf-8')
+
+
+@pytest.mark.parametrize('source,dest', [
+    pytest.param(ESP_PRE + 400, ESP_PRE + 401, id='adjacent'),
+    pytest.param(ESP_PRE + 400, ESP_PRE + 404, id='late'),
+    pytest.param(ESP_PRE - 2, ESP_PRE + 1, id='before-first-seq'),
+])
+def test_bench_drops_marked_esp_copies(tmp_path, fake_check, capsys, source, dest):
+    write_bench(str(tmp_path))
+    log = tmp_path / 'pi' / 'PID_enc_FL.csv'
+    out = tmp_path / 'c7_table.csv'
+    write_esp_segments(log)
+    write_esp_summary(log, [0])
+    assert ct.main([str(tmp_path)]) == 0
+    assert 'duplicate ESP32' not in capsys.readouterr().out
+    with out.open(newline='') as fh:
+        before, = csv.DictReader(fh)
+    assert (before['esp_dup_dropped'], before['base_esp_dup_dropped']) == ('0', '0')
+
+    insert_esp_copy(log, source, dest)
+    write_esp_segments(log, [dest])
+    write_esp_summary(log, [1])
+    assert ct.main([str(tmp_path)]) == 0
+    with out.open(newline='') as fh:
+        after, = csv.DictReader(fh)
+    assert after == dict(before, esp_dup_dropped='1')
+    stdout = capsys.readouterr().out.splitlines()
+    assert [line for line in stdout if 'duplicate ESP32' in line] == [
+        f'fault_c7_table: PID_enc_FL: dropped 1 duplicate ESP32 line(s) (log_seq {SEQ0 + source - 1})'
+    ]
+
+
+def test_bench_counts_esp_copies_in_baseline_after_the_run(tmp_path, fake_check, capsys):
+    write_bench(str(tmp_path))
+    before, = ct.table(str(tmp_path))
+    assert (before['esp_dup_dropped'], before['base_esp_dup_dropped']) == (0, 0)
+    log = tmp_path / 'pi' / 'PID_base.csv'
+    source = ESP_PRE + ESP_RUN + 1
+    insert_esp_copy(log, source, source + 1)
+    insert_esp_copy(log, source, source + 2)
+    write_esp_segments(log, [source + 1, source + 2])
+    write_esp_summary(log, [2])
+
+    after, = ct.table(str(tmp_path))
+    assert after == dict(before, base_esp_dup_dropped=2)
+    assert capsys.readouterr().out == ''
+    assert ct.main([str(tmp_path)]) == 0
+    stdout = capsys.readouterr().out.splitlines()
+    seq = SEQ0 + source - 1
+    assert [line for line in stdout if 'duplicate ESP32' in line] == [
+        f'fault_c7_table: PID_base: dropped 2 duplicate ESP32 line(s) (log_seq {seq}, {seq})'
+    ]
+
+
+@pytest.mark.parametrize('status,r,msg', [
+    pytest.param('duplicate', '9.9', 'no earlier identical kept line', id='changed-marked'),
+    pytest.param('duplicate', '"0.0"', 'no earlier identical kept line', id='same-field-different-text'),
+    pytest.param('ok', '9.9', 'log_seq gap', id='changed-unmarked'),
+    pytest.param('ok', None, 'log_seq gap', id='identical-unmarked'),
+    pytest.param(None, None, 'log_seq gap', id='no-segments'),
+])
+def test_bench_refuses_esp_copies_without_both_conditions(tmp_path, fake_check, status, r, msg):
+    write_bench(str(tmp_path))
+    log = tmp_path / 'pi' / 'PID_enc_FL.csv'
+    source = ESP_PRE + 400
+    insert_esp_copy(log, source, source + 1, r=r)
+    if status is not None:
+        duplicates = [source + 1] if status == 'duplicate' else []
+        write_esp_segments(log, duplicates)
+        write_esp_summary(log, [len(duplicates)])
+    with pytest.raises(ct.TableError, match=msg):
+        ct.table(str(tmp_path))
+
+
+def test_bench_refuses_esp_copy_marked_on_the_first_occurrence(tmp_path, fake_check):
+    write_bench(str(tmp_path))
+    log = tmp_path / 'pi' / 'PID_enc_FL.csv'
+    source = ESP_PRE + 400
+    insert_esp_copy(log, source, source + 1)
+    write_esp_segments(log, [source])
+    write_esp_summary(log, [1])
+    with pytest.raises(ct.TableError, match='no earlier identical kept line'):
+        ct.table(str(tmp_path))
+
+
+@pytest.mark.parametrize('kind', ['count', 'row', 'log_seq', 'timestamp_us'])
+def test_bench_refuses_esp_segments_that_do_not_match(tmp_path, fake_check, kind):
+    write_bench(str(tmp_path))
+    log = tmp_path / 'pi' / 'PID_enc_FL.csv'
+    seg = write_esp_segments(log)
+    with seg.open(newline='') as fh:
+        marks = list(csv.reader(fh))
+    if kind == 'count':
+        marks.pop()
+    else:
+        col = marks[0].index(kind)
+        marks[ESP_PRE + 400][col] = str(int(marks[ESP_PRE + 400][col]) + 1)
+    with seg.open('w', newline='') as fh:
+        csv.writer(fh).writerows(marks)
+    write_esp_summary(log, [0])
+    with pytest.raises(ct.TableError, match='rows for' if kind == 'count' else 'does not match'):
+        ct.table(str(tmp_path))
+
+
+@pytest.mark.parametrize('kind,duplicate,msg', [
+    ('wrong_sha', True, 'SHA-256 differs'),
+    ('wrong_sha', False, 'SHA-256 differs'),
+    ('missing_sha', True, 'must name its SHA-256'),
+    ('missing_summary', True, 'must name its SHA-256'),
+    ('wrong_count', True, 'counts 2 duplicates'),
+    ('missing_count', True, 'counts None duplicates'),
+])
+def test_bench_refuses_inconsistent_esp_summary(tmp_path, fake_check, kind, duplicate, msg):
+    write_bench(str(tmp_path))
+    log = tmp_path / 'pi' / 'PID_enc_FL.csv'
+    dest = ESP_PRE + 401
+    if duplicate:
+        insert_esp_copy(log, dest - 1, dest)
+    write_esp_segments(log, [dest] if duplicate else [])
+    if kind != 'missing_summary':
+        write_esp_summary(log, [1, 1] if kind == 'wrong_count' else [int(duplicate)])
+        path = log.with_suffix('.csv.summary.json')
+        summary = json.loads(path.read_text(encoding='utf-8'))
+        if kind == 'wrong_sha':
+            summary['files']['segments']['sha256'] = '0' * 64
+        elif kind == 'missing_sha':
+            del summary['files']['segments']['sha256']
+        elif kind == 'missing_count':
+            del summary['segments'][0]['duplicates']
+        path.write_text(json.dumps(summary), encoding='utf-8')
+    with pytest.raises(ct.TableError, match=msg):
+        ct.table(str(tmp_path))
+
+
+@pytest.mark.parametrize('col', ['log_seq', 'tick', 'run_active'])
+def test_bench_esp_segments_do_not_hide_run_gaps(tmp_path, fake_check, col):
+    write_bench(str(tmp_path))
+    log = tmp_path / 'pi' / 'PID_enc_FL.csv'
+    with log.open(newline='') as fh:
+        head, *rows = csv.reader(fh)
+    i = head.index(col)
+    if col == 'run_active':
+        rows[ESP_PRE + 400][i] = '0'
+    else:
+        for row in rows[ESP_PRE + 400:]:
+            row[i] = str(int(row[i]) + 1)
+    with log.open('w', newline='') as fh:
+        csv.writer(fh).writerows([head, *rows])
+    write_esp_segments(log)
+    write_esp_summary(log, [0])
+    with pytest.raises(ct.TableError, match='tick / log_seq gap, or run_active 0 inside'):
+        ct.table(str(tmp_path))
 
 
 @pytest.mark.parametrize('kind,msg', [
