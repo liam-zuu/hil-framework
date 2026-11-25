@@ -1028,14 +1028,38 @@ def yaw_bounds(t_log, psi_cam, wz, speed, t0, hs, level, log_path, t_end, mode='
     return upk, rep
 
 
-def certain_violations(lo, mask, so_do=frozenset(), q=None):
+def certain_violations(lo, mask, so_do=frozenset(), q=None, hi=None):
     """Conditions G2-G5 with a violation on the frames of mask (R2V-4): a finite lo_k above the threshold; for a
     condition of so_do (rule 2b decided by the measured value, CODE 23/11, Liam "duyệt bảng luật mới"; report only and
-    not looked at before) a finite q_k above it (q: the per-frame q of every condition, needed with so_do)."""
-    if so_do and q is None:
-        raise ValueError('certain_violations: so_do needs the per-frame q')
-    v = {c: (q if c in so_do else lo)[c][mask] for c in o1_gate.MEASURED}
+    not looked at before) q_k above it on a DEFINED frame (lo_k and hi_k finite: SD1-1, Codex 24/11; a frame that is
+    not defined keeps its q only as a diagnostic). q, hi: the per-frame q and hi of every condition, needed with
+    so_do."""
+    if so_do and (q is None or hi is None):
+        raise ValueError('certain_violations: so_do needs the per-frame q and hi')
+    v = {}
+    for c in o1_gate.MEASURED:
+        if c in so_do:
+            qc = np.where(np.isfinite(lo[c]) & np.isfinite(hi[c]), q[c], np.nan)
+            v[c] = qc[mask]
+        else:
+            v[c] = lo[c][mask]
     return [c for c in o1_gate.MEASURED if bool(np.any(np.isfinite(v[c]) & (v[c] > o1_gate.THRESHOLDS[c])))]
+
+
+def q_so_do_of(per, dom_common, dom_union, so_do) -> dict:
+    """SD1-1 (Codex 24/11; CODE 23/11 point (4)): q_so_do {nut: null, q, q_chung} of each so_do condition, the
+    largest q on the DEFINED frames (q, lo, hi finite) of the union and of the common domain; null when no frame of
+    that domain is defined."""
+    out = {}
+    for c in so_do:
+        q, lo, hi = per[c]
+        ok = np.isfinite(q) & np.isfinite(lo) & np.isfinite(hi)
+
+        def top(m):
+            v = q[m & ok]
+            return float(v.max()) if len(v) else None
+        out[c] = dict(nut=None, q=top(dom_union), q_chung=top(dom_common))
+    return out
 
 
 # ---------------------------------------------------------------- gate
@@ -2249,7 +2273,7 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         before = sc & ((gi['t'] <= t1 + 1e-12) if gap_case else (gi['t'] < t1 - 1e-12))
         if tsom_case:                    # J v6 5 (J3-3): the evidence must also lie in the common domain [0, t_som]
             before = before & (gi['t'] <= out['t_som_s'] + 1e-12)
-        viol_before = bool(certain_violations(gi['lo'], before, so_do if sd_sha else frozenset(), gi['q']))
+        viol_before = bool(certain_violations(gi['lo'], before, so_do if sd_sha else frozenset(), gi['q'], gi['hi']))
     reasons, fail_cause = (['thao tac: ' + '; '.join(thao_why)] if thao else []), ''
     if bumped:
         reasons.append(f'may quay bi va (dich moc {shift_max:.1f} px > {hs["bump_px"]:g} px)')
@@ -2298,7 +2322,7 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
             f'yaw check {"on" if yaw["compared"] else "off: " + yaw["reason"]}')
     gate = build_gate(per, dom_c, dom_u, lane, u_t, hs, g1, note)
     if sd_sha:
-        gate = gate_c8.apply_so_do(gate, so_do, task, sd_sha)
+        gate = gate_c8.apply_so_do(gate, so_do, task, sd_sha, q_so_do=q_so_do_of(per, dom_c, dom_u, sorted(so_do)))
     # C8b v4 3 (CODE 17/11, interface 1): per frame its camera time (the key that joins a frame across the nodes of
     # the C8b grid) and whether it is in the common / union domain at this node (cat_t1: the part before t1)
     tcv = t_cam[vi]

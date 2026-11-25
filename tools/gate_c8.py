@@ -74,6 +74,8 @@ MASK_HIL_STAGE = 'hil_check'            # S05 4.5: the HIL candidate check of pr
 PLATFORMS = ('SIM', 'HIL', 'HW')
 REL_TOL = 1e-9                          # recomputed numbers: relative difference allowed
 LICH = 'o1_feasibility.Schedule'        # the schedule of the comparison (G-7, owner CODE_GATE)
+J_V6_SHA256 = '98767aa41ac176363795ca87d37f8a7efb4944e6d8d2925d4da293ceafd29d00'   # = c7_score.J_V6_SHA256 (tested)
+SO_DO_KEYS = ('nut', 'q', 'q_chung')   # q_so_do of a so_do condition (SD1-1, SD1-3; Liam 24/11 "Sửa theo bảng")
 G5_F08 = 'O1-F08'                       # J v6 section 6 (Liam 19/11 "không làm bù"): G5 at F08 always in the mask,
 # decided by q since 23/11 (CODE, Liam "duyệt bảng luật mới": no longer "always report only")
 
@@ -105,8 +107,10 @@ KE_HOACH_FORMAT = 'ke_hoach_c8_v1'
 GIO_FORMAT = 'c8b_gio_v1'
 TIEN_DE_FORMAT = 'tien_de_buoi_v1'
 MANIFEST_FORMAT = 'u_moc_manifest_v1'
-HO_SO_FORMAT = 'ho_so_c8_v1'                             # F17: the U-standard dossier, written by ghep (GATE)
+HO_SO_FORMAT = 'ho_so_c8_v2'   # v2 (CODE 24/11): khoa_kiem_luc per C8 session (the S7 lock of each session)                             # F17: the U-standard dossier, written by ghep (GATE)
 KIEM_CHEO_VERSION = 'c7_kiem_cheo_v7'                    # KIEMCHEO 19/11: kiem_cheo.json with its khoa_s7 block
+KK_KEYS = ('buoi', 'kiem_cheo', 'khoa_s7', 'git_commit', 'git_time')   # one khoa_kiem_luc entry per C8 session
+S7_SAME = ('schema', 'hang_so_s7')    # the part of every session's khoa_s7 file that must be the same (CODE 24/11)
 LUOI_STATES = ('cham', 'chua_ket_luan_khong_nut', 'hong_he_do')     # c8b_luoi trang_thai_luot (F11, CODE_C8B)
 MOC_KEYS = ('U_moc_dong_xy_m', 'U_moc_tham_xy_m', 'U_moc_dong_psi_rad', 'U_moc_tham_psi_rad')
 MOC_NGUON = ('bo_lay_mau', 'car_pose')         # the part of the U manifest source the same for every scoring (CAM, ghep)
@@ -140,6 +144,15 @@ class GateFileError(ValueError):
     pass
 
 
+class CanLiamChon(GateFileError):
+    """CAN LIAM QUYET at a bien_nguong Uhat (J section 0b): ghep stops; .phieu is the decision sheet (phieu_chon_v1)
+    with both choices of every open case, written by main beside --out (CODE 24/11)."""
+
+    def __init__(self, msg: str, phieu: dict):
+        super().__init__(msg)
+        self.phieu = phieu
+
+
 # ── small readers ──────────────────────────────────────────────────────────────────────────────────────────────
 
 def _num(x, what: str, positive: bool = False) -> float:
@@ -163,6 +176,14 @@ def _num_or_null(x, what: str) -> Optional[float]:
 
 def _isnum(x) -> bool:
     return not isinstance(x, bool) and isinstance(x, (int, float))
+
+
+def _same(a, b) -> bool:
+    """Two copies of one number: both null, or both JSON numbers (not bool) of the same value; no tolerance (SD2-1,
+    SD3-1, Codex round 3: a number copied from another file is that number)."""
+    if a is None or b is None:
+        return a is None and b is None
+    return _fin(a) and _fin(b) and a == b              # Python compares an int and a float exactly (round 4)
 
 
 def _close(a, b) -> bool:
@@ -586,7 +607,18 @@ def so_do_of(level: str, uh: Dict[str, dict], quyet: Optional[dict] = None) -> T
 # ── the branch so_do on a run gate (CODE 23/11, Liam "duyệt bảng luật mới") ──────────────────────────────────────
 
 def _fin(x) -> bool:
-    return not isinstance(x, bool) and isinstance(x, (int, float)) and math.isfinite(x)
+    """A finite JSON number (not bool). A whole number too large for a float is not one (SD4-2: no OverflowError)."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return False
+    try:
+        return math.isfinite(x)
+    except OverflowError:
+        return False
+
+
+def _count(x) -> bool:
+    """A count as the tools write it: a whole number >= 0, not bool (0.0 is taken as 0; SD1-3, SD2-1 round 4)."""
+    return _fin(x) and x >= 0 and x == int(x)
 
 
 def so_do_state(q_common, q_union, n_undef_union, threshold: float) -> str:
@@ -603,9 +635,19 @@ def so_do_state(q_common, q_union, n_undef_union, threshold: float) -> str:
     return 'dat'
 
 
+# Two node distances to the middle of the grid within TIE_S are equal (SD1-2). Basis of 1 ns: the offsets are those
+# of c8b_gio.nodes, a linspace of k + 1 nodes over [c - h, c + h] with k = ceil(2h / STEP_S), STEP_S = 1 ms. Their
+# distances to the middle c are |i - k/2| * s with s = 2h / k, so two distances that are not equal differ by a whole
+# multiple of s, and s is about STEP_S / 2 = 0.5 ms or more for k >= 2 (2h > (k - 1) STEP_S; k = 1: two nodes, a tie).
+# Float noise of an offset is about 1e-16 s at 1 s (1e-13 s at a boot clock of 1000 s). 1 ns is 5e5 times below the
+# smallest real difference and 1e4 times above the noise.
+TIE_S = 1e-9
+
+
 def _nut_giua(nodes_s, ok) -> Optional[int]:
     """CODE 23/11 (2): the node of a so_do condition on a C8b grid, the scored node nearest the middle of the grid
-    ((first + last offset) / 2, the lower index on a tie; c8b_luoi.nut_giua, a test keeps the two equal)."""
+    ((first + last offset) / 2; the lower index on a tie, two distances within TIE_S being a tie; c8b_luoi.nut_giua, a
+    test keeps the two equal)."""
     scored = [i for i in range(len(ok or [])) if ok[i]]
     if not scored:
         return None
@@ -613,7 +655,12 @@ def _nut_giua(nodes_s, ok) -> Optional[int]:
         c = len(ok) // 2
         return min(scored, key=lambda i: (abs(i - c), i))
     mid = 0.5 * (float(nodes_s[0]) + float(nodes_s[-1]))
-    return min(scored, key=lambda i: (abs(float(nodes_s[i]) - mid), i))
+    # SD1-2 (Codex 24/11, rounds 1 and 2): a tie is two distances equal within TIE_S (the float noise of the node
+    # offsets, about 1e-16 s, is far below it; the node spacing, about 1 ms, far above); rounding the distances
+    # (round 1) still split a tie that fell on the rounding edge
+    d = {i: abs(float(nodes_s[i]) - mid) for i in scored}
+    dmin = min(d.values())
+    return min(i for i in scored if d[i] <= dmin + TIE_S)
 
 
 def q_common_of(b: dict):
@@ -622,15 +669,61 @@ def q_common_of(b: dict):
     return ch.get('q') if isinstance(ch, dict) else b.get('q')
 
 
+def q_so_do_default(b: dict) -> dict:
+    """q_so_do of a condition block without the frames (SD1-1, Codex 24/11): q of the defined frames is known only when
+    no frame of the domain is undefined (then it is q); else null, and so_do_state gives chua_ket_luan. The HIL
+    scorer (o1_gate block) takes this; the camera scorer gives the numbers from its frames."""
+    ch = b.get('chung') if isinstance(b.get('chung'), dict) else b
+    def known(x):
+        nu = x.get('n_undef')
+        return x.get('q') if isinstance(nu, int) and not isinstance(nu, bool) and nu == 0 and _fin(x.get('q')) else None
+    return dict(nut=None, q=known(b), q_chung=known(ch))
+
+
+def check_q_so_do(x, b: dict, w: str, grid: bool) -> dict:
+    """A q_so_do block {nut, q, q_chung} of a so_do condition checked against its condition block b (SD1-3): nut a
+    whole number on a grid, null without; q, q_chung null or finite; q_chung <= q <= the q of the block, q_chung <=
+    the q of its common domain, when the two are numbers (the defined frames are some of the frames; the numbers are
+    copies, compared without a tolerance: SD2-2). Without a grid (one scoring) a domain with no undefined frame has
+    every frame defined, so its q_so_do number is the q of that domain, never null or another number (SD1-3, SD2-1;
+    on a grid the block holds the maxima over the nodes and q_so_do the middle node's, so this is checked per node)."""
+    if not isinstance(x, dict) or set(x) != set(SO_DO_KEYS):
+        raise GateFileError(f'{w}.q_so_do {x!r}: an object {{nut, q, q_chung}} (SD1-3)')
+    if not ((type(x['nut']) is int) if grid else (x['nut'] is None)):     # SD1-3: null, nothing else, without a grid
+        raise GateFileError(f'{w}.q_so_do.nut {x["nut"]!r}: a node index on a C8b grid, null without one')
+    for k in ('q', 'q_chung'):
+        if x[k] is not None and not _fin(x[k]):
+            raise GateFileError(f'{w}.q_so_do.{k} {x[k]!r}: null or a finite number')
+    ch = b.get('chung') if isinstance(b.get('chung'), dict) else b
+    for lo_k, hi_v, what in (('q_chung', x['q'], 'q'), ('q', b.get('q'), 'q of the block'),
+                             ('q_chung', ch.get('q'), 'q of the common domain')):
+        if _fin(x[lo_k]) and not _fin(hi_v):             # round 4: a defined frame has a q, so the larger set has one
+            raise GateFileError(f'{w}.q_so_do.{lo_k} {x[lo_k]!r} with {what} {hi_v!r}: a number of the defined frames '
+                                'needs that number (SD1-3)')
+        if _fin(x[lo_k]) and _fin(hi_v) and x[lo_k] > hi_v:
+            raise GateFileError(f'{w}.q_so_do.{lo_k} {x[lo_k]!r} above {what} {hi_v!r} (SD1-3)')
+    if not grid:
+        for k, dom, what in (('q', b, 'the block'), ('q_chung', ch, 'the common domain')):
+            nu = dom.get('n_undef')
+            if not _count(nu):                           # round 4: false, null, text are no count
+                raise GateFileError(f'{w}: n_undef {nu!r} of {what}: a whole number >= 0 (SD2-1)')
+            all_defined = nu == 0 and _fin(dom.get('q'))     # 0 or 0.0 (SD1-3, round 3)
+            if all_defined and not (_fin(x[k]) and x[k] == dom['q']):
+                raise GateFileError(f'{w}.q_so_do.{k} {x[k]!r}: no frame of {what} is undefined, so it is its q '
+                                    f'{dom["q"]!r} (SD1-3, SD2-1)')
+    return x
+
+
 def apply_so_do(gate: dict, so_do: Iterable[str], level: str, gate_file_sha256: str,
-                q_nut: Optional[Dict[str, dict]] = None) -> dict:
+                q_so_do: Optional[Dict[str, dict]] = None) -> dict:
     """The run gate (o1_gate.gate: gate_v3.2, or gate_v3.3 without a mask; c7_score.build_gate) with the so_do
     conditions of its level: a new gate_v3.4 dict; each condition of so_do keeps its three-branch state as
-    state_ba_nhanh, lo and hi, and takes nhanh 'so_do' and the state of so_do_state; decide, the outcomes as
-    o1_gate.evaluate_outcomes (every condition decides; complete when decide is all five). level, gate_file_sha256:
-    the task and the C8 gate file (or the J source) giving so_do; written even when so_do is empty. q_nut (a C8b
-    grid, CODE 23/11 (2)): {cond: {nut, q, q_chung}} of the middle node of the grid (c8b_luoi.nut_giua), the q of a
-    so_do condition (kept as q_so_do), with n_undef of the grid; without it q and chung.q of the block."""
+    state_ba_nhanh, lo and hi, and takes nhanh 'so_do', q_so_do {nut, q, q_chung} (q of the DEFINED frames of the
+    union and of the common domain, CODE 23/11 point (4), SD1-1; nut the middle node of a C8b grid, null without one)
+    and the state so_do_state(q_chung, q, n_undef of the block); decide, the outcomes as o1_gate.evaluate_outcomes
+    (every condition decides; complete when decide is all five). q_so_do: from the scorer (camera: its frames; grid:
+    the middle node); missing: q_so_do_default. level, gate_file_sha256: the task and the C8 gate file (or the J
+    source) giving so_do; written even when so_do is empty."""
     sd = list(so_do)
     if len(set(sd)) != len(sd) or set(sd) - set(MASKABLE):
         raise GateFileError(f'so_do {sd!r}: distinct conditions of {MASKABLE}')
@@ -646,23 +739,20 @@ def apply_so_do(gate: dict, so_do: Iterable[str], level: str, gate_file_sha256: 
     if not isinstance(gate_file_sha256, str) or len(gate_file_sha256) != 64 \
             or any(ch not in '0123456789abcdef' for ch in gate_file_sha256):
         raise GateFileError(f'gate_file_sha256 {gate_file_sha256!r}: 64 lowercase hex digits')
+    if q_so_do is not None and (not isinstance(q_so_do, dict) or set(q_so_do) != set(sd)):
+        raise GateFileError(f'q_so_do {q_so_do!r}: one entry per so_do condition {sd}')
     g = json.loads(json.dumps(gate))                     # a copy; the caller's dict is not changed
     for k in ('report_only', 'required'):
         g.pop(k, None)
-    if q_nut is not None and (not isinstance(q_nut, dict) or set(q_nut) != set(sd)):
-        raise GateFileError(f'q_nut {q_nut!r}: one entry per so_do condition {sd}')
+    grid = g.get('luoi') is not None
     for c in sd:
         b = g[c]
+        x = json.loads(json.dumps(q_so_do[c])) if q_so_do is not None else q_so_do_default(b)
+        check_q_so_do(x, b, c, grid)
         b['state_ba_nhanh'] = b['state']
         b['nhanh'] = NHANH_SO_DO
-        if q_nut is None:
-            b['state'] = so_do_state(q_common_of(b), b.get('q'), b.get('n_undef'), o1_gate.THRESHOLDS[c])
-        else:
-            x = q_nut[c]
-            if not isinstance(x, dict) or set(x) != {'nut', 'q', 'q_chung'}:
-                raise GateFileError(f'q_nut.{c} {x!r}: {{nut, q, q_chung}}')
-            b['q_so_do'] = json.loads(json.dumps(x))
-            b['state'] = so_do_state(x['q_chung'], x['q'], b.get('n_undef'), o1_gate.THRESHOLDS[c])
+        b['q_so_do'] = x
+        b['state'] = so_do_state(x['q_chung'], x['q'], b.get('n_undef'), o1_gate.THRESHOLDS[c])
     g.update(o1_gate.evaluate_outcomes(g, list(g['decide']), o1_gate.CONDS))
     g.update(version=GATE_VERSION_SO_DO, so_do=sd, level=level, gate_file_sha256=gate_file_sha256)
     return g
@@ -682,16 +772,22 @@ def _level_terms(e: dict, w: str) -> dict:
     return dict(a_m=a_m, u_p=u_p, u_psi=u_psi)
 
 
-def level_block(level: str, a_m: float, u_p: dict, u_psi: dict, runs: list, quyet: Optional[dict] = None) -> dict:
-    """The dieu_2b.per_level block of a gate level for the writer (C8b script): a_m (m), u_p {hang_m, he_so_r,
-    u_phi_rad, hang_theo_u}, u_psi {hang_rad, hang_theo_u} (null for a term without a checked bound), runs the
-    eligible C8 runs of the level (runs_c8 entries, u_t_s each); U_t,C8, Uhat and the mask computed here."""
-    e = dict(a_m=a_m, u_p=u_p, u_psi=u_psi)
-    t = _level_terms(e, level)
+def level_uhat(level: str, a_m: float, u_p: dict, u_psi: dict, runs: list) -> Tuple[float, Dict[str, dict]]:
+    """(U_t,C8, Uhat of G2, G3, G5) of a gate level from its terms and its eligible C8 runs (level_block)."""
+    t = _level_terms(dict(a_m=a_m, u_p=u_p, u_psi=u_psi), level)
     if not runs:
         raise GateFileError(f'{level}: no eligible C8 run')
     u_t = max(_num(r['u_t_s'], f'{level} u_t_s', positive=True) for r in runs)
-    uh = uhat_level(level, t, u_t)
+    return u_t, uhat_level(level, t, u_t)
+
+
+def level_block(level: str, a_m: float, u_p: dict, u_psi: dict, runs: list, quyet: Optional[dict] = None,
+                uh: Optional[Tuple[float, Dict[str, dict]]] = None) -> dict:
+    """The dieu_2b.per_level block of a gate level for the writer (C8b script): a_m (m), u_p {hang_m, he_so_r,
+    u_phi_rad, hang_theo_u}, u_psi {hang_rad, hang_theo_u} (null for a term without a checked bound), runs the
+    eligible C8 runs of the level (runs_c8 entries, u_t_s each); U_t,C8, Uhat and the mask computed here (uh: the
+    result of level_uhat on the same inputs, not computed again)."""
+    u_t, uh = uh if uh is not None else level_uhat(level, a_m, u_p, u_psi, runs)
     sd, why = so_do_of(level, uh, quyet)
     return dict(a_m=a_m, u_p=u_p, u_psi=u_psi, u_t_c8_s=u_t, uhat=uh, so_do=list(sd), ly_do_so_do=why)
 
@@ -1151,7 +1247,13 @@ def _check_camera(d: dict) -> dict:
     for i, x in enumerate(ng['manifests']):
         _ref(x, f'{w}.moc_dich.nguon.manifests[{i}]')
     cp = car_pose_v2_of(ng['car_pose'], f'{w}.moc_dich.nguon')
-    mc = _obj(c8b['mien_car_pose'], ('side_m', 'phien_ban', 'h_m', 'kappa'), f'{w}.mien_car_pose')
+    # KG-1 (Codex N1 + merged lock round 1, CODE 24/11): the lock writes the domain with its state and reasons; the
+    # gate takes the six keys and needs the state dat (a domain C8B could not state is no domain)
+    mc = _obj(c8b['mien_car_pose'], ('side_m', 'phien_ban', 'h_m', 'kappa', 'trang_thai', 'ly_do'),
+              f'{w}.mien_car_pose')
+    if mc['trang_thai'] != 'dat':
+        raise GateFileError(f'{w}.mien_car_pose.trang_thai {mc["trang_thai"]!r}: dat needed (the C8b lock could not '
+                            f'state the camera domain: {mc["ly_do"]!r}); C8 is not locked')
     hl, hh = _range(mc['h_m'], f'{w}.mien_car_pose.h_m')
     kl, kh = _range(mc['kappa'], f'{w}.mien_car_pose.kappa')
     if mc['side_m'] != cp['side_m'] or mc['phien_ban'] != cp['phien_ban'] or not hl <= cp['h_m'] <= hh \
@@ -1274,13 +1376,26 @@ def _ref_bytes(goc: str, ref: dict, what: str) -> bytes:
     return raw
 
 
+def _finite_float(s: str) -> float:
+    """SD4-1 (Codex round 4): a JSON number that does not fit a float (1e400 reads as inf) is refused."""
+    v = float(s)
+    if not math.isfinite(v):
+        raise GateFileError(f'the number {s[:40]} is not finite as a float')
+    return v
+
+
+def _no_constant(s: str):
+    raise GateFileError(f'{s}: not a JSON number (the tools write null)')
+
+
 def _open_ref(goc: str, ref: dict, what: str, as_json: bool = True):
     """The file of a reference under goc, hashed again (realpath inside goc). Its JSON when as_json."""
     raw = _ref_bytes(goc, ref, what)
     if not as_json:
         return None
     try:
-        x = json.loads(raw.decode('utf-8'), object_pairs_hook=_no_duplicate_keys)
+        x = json.loads(raw.decode('utf-8'), object_pairs_hook=_no_duplicate_keys, parse_float=_finite_float,
+                       parse_constant=_no_constant)
     except GateFileError as exc:
         raise GateFileError(f'{what} {ref["duong_dan"]!r}: {exc}')
     except (UnicodeDecodeError, ValueError) as exc:
@@ -1454,7 +1569,8 @@ def _node_scores(goc: str, fc: dict, w: str, cell: dict, fg: Optional[dict]) -> 
     scored (nodes_ok false) and relies on no frame. Returns (node scores, mien_phai_phu of the kept nodes)."""
     nn, nd, hn, ok = fc.get('nguon_nut'), fc.get('nodes_s'), fc.get('hong_nut'), fc.get('nodes_ok')
     if fg is not None and (not isinstance(nd, list) or not isinstance(fg.get('nodes_s'), list)
-                           or len(nd) != len(fg['nodes_s']) or any(not _close(a, b) for a, b in zip(nd, fg['nodes_s']))):
+                           or len(nd) != len(fg['nodes_s']) or any(not _same(a, b) for a, b in zip(nd, fg['nodes_s']))):
+        # SD3-1 (Codex round 3): a copy, compared without a tolerance (the middle node is taken from these offsets)
         raise GateFileError(f'{w}: luoi.json nodes_s {nd!r} is not nodes_s of its time file (GC6-6)')
     if nn == [] and fc['trang_thai_luot'] != 'cham':
         return [], [], []
@@ -1487,7 +1603,7 @@ def _node_scores(goc: str, fc: dict, w: str, cell: dict, fg: Optional[dict]) -> 
                                 'scoring (esp32_sha256, frames_sha256; GC6-6)')
         if hn[k] != (sc.get('outcome') == 'hong_he_do'):
             raise GateFileError(f'{w} node {k}: hong_nut {hn[k]} but the node score says {sc.get("outcome")!r} (GC6-6)')
-        if 'offset_s' in sc and not (_isnum(sc['offset_s']) and _close(sc['offset_s'], nd[k])):
+        if 'offset_s' in sc and not _same(sc['offset_s'], nd[k]):          # a copy (SD3-1 round 4)
             raise GateFileError(f'{w} node {k}: offset_s {sc["offset_s"]!r} is not nodes_s[{k}] (GC6-6)')
         kt = sc.get('khung_tuong_doi_v1')
         scores.append(sc)
@@ -1508,7 +1624,7 @@ def _node_scores(goc: str, fc: dict, w: str, cell: dict, fg: Optional[dict]) -> 
                                 'of this scoring (GC6-6)')
         mpp = kt.get('mien_phai_phu')
         _obj(mpp, ('nut', 'D_s', 'id_khung', 'id_khung_sha256'), f'{w} node {k} mien_phai_phu')
-        if mpp['nut'] != k or not _close(mpp['D_s'], nd[k]) or not isinstance(mpp['id_khung'], list) \
+        if mpp['nut'] != k or not _same(mpp['D_s'], nd[k]) or not isinstance(mpp['id_khung'], list) \
                 or not mpp['id_khung'] or sha256_ids(mpp['id_khung']) != mpp['id_khung_sha256']:
             raise GateFileError(f'{w} node {k}: mien_phai_phu {{nut {k}, D_s = nodes_s[{k}], a non-empty id_khung, its '
                                 'ids_sha}')
@@ -1617,14 +1733,33 @@ def _grid_states(fc: dict, idx: list, cell: dict, w: str) -> None:
             raise GateFileError(f'{w}: luoi.json q_so_do.{c} {x!r}: the node is {m}, the scored node nearest the middle '
                                 'of the grid (CODE 23/11 (2))')
         nb = (idx[m].get('gate_v3') or {}).get(c) if m is not None and isinstance(idx[m], dict) else None
-        if m is not None and (not isinstance(nb, dict) or not _close(x.get('q'), nb.get('q'))
-                              or not _close(x.get('q_chung'), q_common_of(nb))):
-            raise GateFileError(f'{w}: luoi.json q_so_do.{c} {x!r}: not the q, chung.q of node {m} (its score file)')
+        nq = nb.get('q_so_do') if isinstance(nb, dict) else None
+        if m is not None and (not isinstance(nq, dict) or not _same(x.get('q'), nq.get('q'))
+                              or not _same(x.get('q_chung'), nq.get('q_chung'))):       # copies (SD2-1, round 3)
+            raise GateFileError(f'{w}: luoi.json q_so_do.{c} {x!r}: not the q_so_do (q, q_chung of the defined '
+                                f'frames) of node {m} (its score file; SD1-1)')
         if not isinstance(b, dict) or st[c] != so_do_state(x.get('q_chung'), x.get('q'), b.get('n_undef'),
                                                            o1_gate.THRESHOLDS[c]):
             raise GateFileError(f'{w}: luoi.json {c} state {st[c]!r}: so_do from the middle node q and the grid '
                                 'n_undef gives another (GC9-5; CODE 23/11)')
         st[c] = sb[c]                                    # the node rule below checks the three-branch grid state
+    for k, sc in enumerate(idx):                     # SD1-6 (Codex 24/11): every scored node with the so_do of J
+        if not ok[k] or not isinstance(sc, dict):
+            continue
+        g = sc.get('gate_v3') if isinstance(sc.get('gate_v3'), dict) else {}
+        want = (GATE_VERSION_SO_DO, sd, J_V6_SHA256) if sd else (None, [], None)
+        got = (g.get('version') if sd else (GATE_VERSION_SO_DO if 'so_do' in g else None),
+               list(g.get('so_do') or []), g.get('gate_file_sha256') or None)
+        if got != want or 'report_only' in g or 'report_only' in sc:
+            raise GateFileError(f'{w}: node {k} scored with so_do {got[1]} (source {got[2]}, version {g.get("version")!r}'
+                                f'{", report_only" if "report_only" in g or "report_only" in sc else ""}); the cell '
+                                f'needs {sd} from J v6 (SD1-6)')
+        for c in sd:                                     # SD2-1 (Codex 24/11 round 2): the node's own q_so_do and state
+            nb = g.get(c) if isinstance(g.get(c), dict) else {}
+            nq = check_q_so_do(nb.get('q_so_do'), nb, f'{w}: node {k} gate_v3.{c}', grid=False)
+            if nb.get('state') != so_do_state(nq['q_chung'], nq['q'], nb.get('n_undef'), o1_gate.THRESHOLDS[c]):
+                raise GateFileError(f'{w}: node {k} gate_v3.{c} state {nb.get("state")!r}: so_do from its q_so_do and '
+                                    'n_undef gives another (SD2-1)')
     node_st = {}
     for c in o1_gate.CONDS:
         v = []
@@ -2041,12 +2176,15 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
     # CODE 20/11 (the luot_c8 check of c8b_u cong, C8BU4-R1-3, now here): each run of the plan is scored once; its
     # scoring is the one first scoring of its clip under the C8 folder, and the clip H comparison, second scoring and
     # second time file of the chain are those that scoring names (so its time files are those of its gio_sha256)
-    first = _first_scorings(goc)
+    kl = _open_ref(goc, d['khoa_c8b'], 'khoa_c8b')
+    commit_bo = commit_bo_of(kl)
+    first = _first_scorings(goc, commit_bo)              # KG-6: only the scorings at commit_hil count
     for c in d['o_c8']:
         for x in c['chuoi']:
             w = f'cell {c["o"]} run {x["run_id"]}'
-            _one_first_scoring(first, x, w)
             fc = _open_ref(goc, x['file_cham'], f'{w}: file_cham')
+            _not_dropped(fc, commit_bo, w)
+            _one_first_scoring(first, x, w)
             for k in ('file_so_h', 'file_cham_h1', 'file_gio_h1'):
                 a, b = x[k], fc.get(k)
                 if (a is None) != (b is None) or (a is not None and (not isinstance(b, dict)
@@ -2089,14 +2227,80 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
                     raise GateFileError(f'{w}: luoi.json scorer: one clean commit of every node (GC10-2)')
                 scorers.add(sc.get('commit'))
         cham_luc[x['run_id']] = min(t for fk in fks for t in _scoring_times(fk, f'{w}: scoring'))
+        _not_dropped(fks[0], commit_bo, w)
         _one_first_scoring(first, x, w)
     return eligible, cham_luc, scorers, elig_seg
 
 
-def _first_scorings(goc: str) -> Dict[str, set]:
+def commit_bo_of(khoa: dict) -> Optional[str]:
+    """The commit the scorings of the gate were made at (KG-6): commit_hil of a bo_tick C8b lock when it is a commit
+    (40 hex); None with giu_tick, and None for a commit_hil that is no commit (nothing is dropped on such a string:
+    _check_commit_hil refuses the lock by its own message)."""
+    ch = khoa.get('commit_hil') if khoa.get('nhanh_tick') == 'bo_tick' else None
+    return ch if isinstance(ch, str) and re.fullmatch(r'[0-9a-f]{40}', ch) else None
+
+
+def luoi_commit(x: dict) -> Optional[str]:
+    """The commit a c8b_luoi file was made at (script.commit), None when not stated."""
+    sc = x.get('script')
+    return sc.get('commit') if isinstance(sc, dict) else None
+
+
+def _check_mien_theo_buoi(d: dict, khoa: dict, elig_seg: dict) -> None:
+    """KG-5 (Codex N1 + merged lock round 1; C8B 24/11: c8b_khoa_gop 887c109 writes mien_car_pose_theo_buoi
+    {session id: {side_m, phien_ban, h_m, kappa}}, mien_car_pose being their hull): with several C8 sessions the lock
+    names the camera domain of each session of the gate, and the car pose of the U manifests (one for every scoring)
+    lies in the domain of every session that has an eligible scoring, not only in the hull."""
+    mcb = khoa.get('mien_car_pose_theo_buoi')
+    buois = [t['buoi'] for t in d['tien_de_c8']]
+    if mcb is None and len(buois) == 1:
+        return                                          # one session: its domain is mien_car_pose itself
+    if not isinstance(mcb, dict) or set(mcb) != set(buois):
+        raise GateFileError(f'khoa_c8b.mien_car_pose_theo_buoi: the camera domain of each C8 session of the gate '
+                            f'{buois}, keyed by session id (KG-5)')
+    cp = car_pose_v2_of(d['camera']['c8b']['moc_dich']['nguon']['car_pose'], 'camera.c8b.moc_dich.nguon')
+    for b in sorted({seg['buoi'] for seg in elig_seg.values()}):
+        w = f'khoa_c8b.mien_car_pose_theo_buoi.{b}'
+        m = _obj(mcb[b], ('side_m', 'phien_ban', 'h_m', 'kappa'), w)
+        hl, hh = _range(m['h_m'], f'{w}.h_m')
+        kl, kh = _range(m['kappa'], f'{w}.kappa')
+        if m['side_m'] != cp['side_m'] or m['phien_ban'] != cp['phien_ban'] or not hl <= cp['h_m'] <= hh \
+                or not kl <= cp['kappa'] <= kh:
+            raise GateFileError(f'camera.c8b.moc_dich.nguon.car_pose: outside the camera domain of session {b} '
+                                '(inside the hull of the merged lock only; KG-5)')
+
+
+def scorings_dropped(goc: str, commit: Optional[str]) -> List[dict]:
+    """KG-6 (Codex 24/11; CODE 24/11, Liam A2 "Một khóa, lấy lớn nhất"): with a bo_tick lock (commit = its
+    commit_hil), the c8b_luoi luoi.json files under the C8 folder (also in folders _...) made at another commit: the
+    scorings before the N1 fix and the merged lock, dropped, never a scoring of the gate. [{duong_dan, sha256,
+    script_commit}] by path; [] when commit is None (giu_tick)."""
+    if commit is None:
+        return []
+    out = []
+    base = os.path.realpath(goc)
+    for root, dirs, names in os.walk(base):
+        dirs.sort()
+        if 'luoi.json' not in names:
+            continue
+        p = os.path.join(root, 'luoi.json')
+        try:
+            with open(p, 'rb') as f:
+                raw = f.read()
+            x = json.loads(raw.decode('utf-8'))
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        if isinstance(x, dict) and 'trang_thai_luot' in x and luoi_commit(x) != commit:
+            out.append(dict(duong_dan=os.path.relpath(p, base).replace(os.sep, '/'),
+                            sha256=hashlib.sha256(raw).hexdigest(), script_commit=luoi_commit(x)))
+    return sorted(out, key=lambda e: e['duong_dan'])
+
+
+def _first_scorings(goc: str, commit: Optional[str] = None) -> Dict[str, set]:
     """{clip name: sha256 of every first scoring of it} under the C8 folder: the c8b_luoi luoi.json files (as ghep
     finds them: named luoi.json, with trang_thai_luot) that no other luoi.json names as its second scoring
-    (file_cham_h1). Copies with the same bytes are one scoring. A file that is no UTF-8 JSON object is skipped."""
+    (file_cham_h1). Copies with the same bytes are one scoring. A file that is no UTF-8 JSON object is skipped.
+    commit (KG-6): with a bo_tick lock its commit_hil; a file made at another commit is no scoring (scorings_dropped)."""
     found, h1 = [], set()
     for root, dirs, names in os.walk(os.path.realpath(goc)):
         dirs.sort()
@@ -2110,6 +2314,8 @@ def _first_scorings(goc: str) -> Dict[str, set]:
             continue
         if not isinstance(x, dict) or 'trang_thai_luot' not in x:
             continue
+        if commit is not None and luoi_commit(x) != commit:
+            continue                                     # KG-6: a dropped scoring (scorings_dropped)
         found.append((hashlib.sha256(raw).hexdigest(), x))
         if isinstance(x.get('file_cham_h1'), dict):
             h1.add(x['file_cham_h1'].get('sha256'))
@@ -2119,6 +2325,15 @@ def _first_scorings(goc: str) -> Dict[str, set]:
         if sha not in h1 and isinstance(cl, dict) and isinstance(cl.get('ten'), str):
             out.setdefault(cl['ten'], set()).add(sha)
     return out
+
+
+def _not_dropped(fc: dict, commit_bo: Optional[str], w: str) -> None:
+    """KG-6: the scoring a run names (file_cham) is none of the dropped ones (made at another commit than commit_hil
+    of a bo_tick lock); said by its own message, before the count of first scorings."""
+    if commit_bo is not None and luoi_commit(fc) != commit_bo:
+        raise GateFileError(f'{w}: file_cham was made at commit {luoi_commit(fc)!r} (luoi.json script), not at '
+                            f'commit_hil {commit_bo[:12]}... of the C8b lock: a scoring made at another commit is '
+                            'dropped, never the scoring of the gate (KG-6)')
 
 
 def _one_first_scoring(first: Dict[str, set], x: dict, w: str) -> None:
@@ -2397,10 +2612,11 @@ def _check_bang_chung(d: dict, goc: str, scorers: set) -> None:
             raise GateFileError('chuan_u.dieu_kien.kiem_vi_tri_rieng: khoa_truoc_sha256 is not the C8b lock of the gate')
 
 
-def _check_premise(d: dict, goc: str, hs: dict, rec: dict) -> None:
+def _check_premise(d: dict, goc: str, hs: dict, recs: dict) -> None:
     """The premise of the C8 lock, one file per camera segment (design section 9; CODE 20/11 after C8 session 2): hs the
-    dossier ho_so_c8, rec the khoa_s7 record of its kiem_cheo.json. Apart from check_nguon to be run on a session's
-    premise files before the other sources exist."""
+    dossier ho_so_c8, recs {session id: (khoa_s7 record of the session's kiem_cheo.json in the dossier, its sha256)}
+    (CODE 24/11: the S7 lock per session). Apart from check_nguon to be run on a session's premise files before the
+    other sources exist."""
     # premise of the C8 lock (design section 9; GC6-4: by role, of this session, readable session files), one premise
     # file per camera segment that holds C8 runs (CODE 20/11 after C8 session 2; KIEMCHEO: roles dau1, dau2, cuoi)
     models, tmods, kc_segs = set(), set(), set()
@@ -2422,11 +2638,13 @@ def _check_premise(d: dict, goc: str, hs: dict, rec: dict) -> None:
         # commit of the dossier (KCJ1-14; CODE 20/11 after C8 session 2: one kiem_cheo result per segment)
         kcg = _open_ref(goc, seg['kiem_cheo'], f'{w}.kiem_cheo')
         r7 = kcg.get('khoa_s7') if isinstance(kcg.get('khoa_s7'), dict) else {}
+        rec = (recs.get(seg['buoi']) or ({}, None))[0]
         if kcg.get('version') != KIEM_CHEO_VERSION or (kcg.get('doan') or {}).get('ten') != seg['ten'] \
                 or any(r7.get(q) != rec.get(q) for q in ('sha256', 'git_commit', 'git_time')):
             raise GateFileError(f'{w}.kiem_cheo: a {KIEM_CHEO_VERSION} file of segment {seg["ten"]!r} (doan.ten) '
-                                'whose khoa_s7 {sha256, git_commit, git_time} is that of the dossier (KCJ1-14)')
-        kc_segs.add(seg['kiem_cheo']['sha256'])
+                                'whose khoa_s7 {sha256, git_commit, git_time} is that of its session in the dossier '
+                                '(KCJ1-14; CODE 24/11)')
+        kc_segs.add((seg['buoi'], seg['kiem_cheo']['sha256']))
         vt = td.get('vai_tro_clip_h')
         ses = td.get('sha256', {}).get('sessions') if isinstance(td.get('sha256'), dict) else None
         if not isinstance(vt, dict) or sorted(vt.values()) != sorted(TD_ROLES) or not isinstance(ses, dict) \
@@ -2449,9 +2667,10 @@ def _check_premise(d: dict, goc: str, hs: dict, rec: dict) -> None:
         for role, x in zip(TD_ROLES, clips):
             if by_role[role] != x['sha256']:
                 raise GateFileError(f'{w}: the clip of role {role} is not the session the premise gives for it (GC6-4)')
-    if hs['khoa_kiem_luc']['kiem_cheo']['sha256'] not in kc_segs:
-        raise GateFileError('chuan_u.ho_so_c8: khoa_kiem_luc.kiem_cheo is the kiem_cheo.json of no segment of '
-                            'tien_de_c8 (GC10-5)')
+    for b_, (_, kc_sha) in recs.items():
+        if (b_, kc_sha) not in kc_segs:
+            raise GateFileError(f'chuan_u.ho_so_c8: khoa_kiem_luc of session {b_!r}: its kiem_cheo is the kiem_cheo.json '
+                                'of no segment of that session in tien_de_c8 (GC10-5)')
     if len(models) != 1 or not tmods <= models:
         raise GateFileError(f'tien_de_c8: the clip H sessions of every segment use the models '
                             f'{sorted(map(str, models))} (premise models {sorted(map(str, tmods))}): one locked model '
@@ -2506,27 +2725,64 @@ def check_nguon(d: dict, goc: str) -> dict:
                             'GATE, approved; never a list typed by hand; GC9-2)')
     # J v6 section 6 condition (1), KCJ1-14 (CODE 19/11): the S7 check of KIEMCHEO locked by a manifest committed in
     # git before the held-out runs were scored; the commit is read back from git, not taken from the files
-    kk = _obj(hs.get('khoa_kiem_luc'), ('kiem_cheo', 'khoa_s7', 'git_commit', 'git_time'), 'chuan_u.ho_so_c8.khoa_kiem_luc')
-    kc = _open_ref(goc, _ref(kk['kiem_cheo'], 'khoa_kiem_luc.kiem_cheo'), 'khoa_kiem_luc.kiem_cheo')
-    ks = _ref(kk['khoa_s7'], 'khoa_kiem_luc.khoa_s7')
-    _ref_bytes(goc, ks, 'khoa_kiem_luc.khoa_s7')
-    rec = kc.get('khoa_s7')
-    if kc.get('version') != KIEM_CHEO_VERSION or not isinstance(rec, dict) or rec.get('sha256') != ks['sha256'] \
-            or rec.get('git_commit') != kk['git_commit'] or rec.get('git_time') != kk['git_time']:
-        raise GateFileError(f'khoa_kiem_luc: kiem_cheo.json ({KIEM_CHEO_VERSION}) khoa_s7 {{sha256, git_commit, '
-                            'git_time}} is not the manifest and commit of the dossier (KCJ1-14)')
-    t_lock = git_commit_of(goc, ks, kk['git_commit'], 'khoa_kiem_luc')
-    if t_lock != _iso_time(kk['git_time'], 'khoa_kiem_luc.git_time'):
-        raise GateFileError('khoa_kiem_luc: git_time is not the time of its commit')
-    first = min(cham_luc[g] for g in gn)
-    if not t_lock < first:
-        raise GateFileError(f'chuan_u: the check was locked at {t_lock.isoformat()}, not before the first scoring of a '
-                            f'held-out run ({first.isoformat()}; J v6 section 6 condition (1))')
+    # KG-6 (CODE 24/11): the scorings dropped (made at another commit than commit_hil) recomputed from the folder; the
+    # dossier lists them, with Liam's record when there is one
+    kl = _open_ref(goc, d['khoa_c8b'], 'khoa_c8b')
+    _check_mien_theo_buoi(d, kl, elig_seg)              # KG-5
+    bo_want = scorings_dropped(goc, commit_bo_of(kl))
+    cb = _obj(hs.get('cham_cu_bo'), ('luoi', 'liam'), 'chuan_u.ho_so_c8.cham_cu_bo')
+    if cb['luoi'] != bo_want:
+        raise GateFileError(f'chuan_u.ho_so_c8.cham_cu_bo.luoi: {len(cb["luoi"]) if isinstance(cb["luoi"], list) else cb["luoi"]!r} '
+                            f'files; the C8 folder has {len(bo_want)} c8b_luoi files made at another commit than '
+                            'commit_hil, every one listed (KG-6)')
+    if bo_want:
+        _liam(cb['liam'], 'chuan_u.ho_so_c8.cham_cu_bo.liam')
+    elif cb['liam'] is not None:
+        raise GateFileError('chuan_u.ho_so_c8.cham_cu_bo.liam: no dropped scoring, no record')
+    # CODE 24/11 (FABLE_C8 V2, GATE (d)): one S7 lock per C8 session, in session order; the S7 numbers the same in
+    # every session; each lock committed before the first scoring of a held-out run of its session
+    kkl = hs.get('khoa_kiem_luc')
+    buois = [t['buoi'] for t in d['tien_de_c8']]
+    if not isinstance(kkl, list) or len(kkl) != len(buois):
+        raise GateFileError(f'chuan_u.ho_so_c8.khoa_kiem_luc: a list, one entry per C8 session ({len(buois)}; CODE 24/11)')
+    rows_b, _ = _buoi_rows(goc, d['thu_tu_clip'])
+    b_of_clip = {r['clip']: r['_buoi'] for r in rows_b}
+    b_of_run = {e['run_id']: b_of_clip.get(e['clip']) for c in d['o_c8'] for e in c['chuoi']}
+    b_of_run.update({x['run_id']: b_of_clip.get(x['clip']) for x in d.get('luot_k') or []})
+    recs, s7_same = {}, None
+    for k, kk in enumerate(kkl):
+        w = f'khoa_kiem_luc[{k}]'
+        kk = _obj(kk, KK_KEYS, f'chuan_u.ho_so_c8.{w}')
+        if kk['buoi'] != buois[k]:
+            raise GateFileError(f'{w}.buoi {kk["buoi"]!r}: session {k} is {buois[k]!r} (tien_de_c8 order)')
+        kc = _open_ref(goc, _ref(kk['kiem_cheo'], f'{w}.kiem_cheo'), f'{w}.kiem_cheo')
+        ks = _ref(kk['khoa_s7'], f'{w}.khoa_s7')
+        _ref_bytes(goc, ks, f'{w}.khoa_s7')
+        rec = kc.get('khoa_s7')
+        if kc.get('version') != KIEM_CHEO_VERSION or not isinstance(rec, dict) or rec.get('sha256') != ks['sha256'] \
+                or rec.get('git_commit') != kk['git_commit'] or rec.get('git_time') != kk['git_time']:
+            raise GateFileError(f'{w}: kiem_cheo.json ({KIEM_CHEO_VERSION}) khoa_s7 {{sha256, git_commit, '
+                                'git_time}} is not the manifest and commit of the dossier (KCJ1-14)')
+        same = {q: _open_ref(goc, ks, f'{w}.khoa_s7').get(q) for q in S7_SAME}
+        if s7_same is None:
+            s7_same = same
+        elif same != s7_same:
+            raise GateFileError(f'{w}.khoa_s7: {list(S7_SAME)} differ from those of session 0; one S7 check for every '
+                                'session (CODE 24/11)')
+        t_lock = git_commit_of(goc, ks, kk['git_commit'], w)
+        if t_lock != _iso_time(kk['git_time'], f'{w}.git_time'):
+            raise GateFileError(f'{w}: git_time is not the time of its commit')
+        mine = [cham_luc[g] for g in gn if b_of_run.get(g) == k]
+        if mine and not t_lock < min(mine):
+            raise GateFileError(f'chuan_u: the check of session {k} ({buois[k]}) was locked at {t_lock.isoformat()}, '
+                                f'not before the first scoring of a held-out run of that session '
+                                f'({min(mine).isoformat()}; J v6 section 6 condition (1); CODE 24/11)')
+        recs[buois[k]] = (rec, kk['kiem_cheo']['sha256'])
     # shutter table sources
     for k, x in d['bo_cham']['bang_man_trap'].items():
         if x['nhanh'] == 'alpha':
             _open_ref(goc, x['nguon_3b'], f'bo_cham.bang_man_trap.{k}.nguon_3b', as_json=False)
-    _check_premise(d, goc, hs, rec)
+    _check_premise(d, goc, hs, recs)
     # shifted anchor (design section 10; GC6-6: one manifest for every scoring of every eligible run, the domain it
     # covered = the frames that scoring relies on, before the maximum is taken)
     md = d['camera']['c8b']['moc_dich']
@@ -2791,7 +3047,8 @@ def fake_gate(levels=('O1-F05',), u_p_m=0.002, u_psi_deg=2.0, u_t_s=0.010) -> di
                          manifests=[ref('u_moc_manifest.json')],
                          car_pose=dict(tag_offset=None, side_m=0.1445, h_m=0.20, kappa=0.0, phien_ban='FAKE')))
     cam = {'c8b': dict(moc_dich=md, khoa_sha256='f' * 64, eps_H=dict(mm=1.0, huong_deg=0.2),
-                       mien_car_pose=dict(side_m=0.1445, phien_ban='FAKE', h_m=[0.19, 0.21], kappa=[0.0, 0.0]))}
+                       mien_car_pose=dict(side_m=0.1445, phien_ban='FAKE', h_m=[0.19, 0.21], kappa=[0.0, 0.0],
+                                          trang_thai='dat', ly_do=[]))}
     lv = list(levels)
     return dict(format=FORMAT, c8_dir='FAKE', written_by=dict(script='FAKE', commit='', dirty=True),
                 levels=lv, muc_kha_thi=lv, muc_bo_theo_liam={}, quyet_liam={}, u_t_branch='bo_tick',
@@ -2912,6 +3169,59 @@ def _man_trap_rel(goc: str, v):
     return v
 
 
+def _terms_plain(x):
+    """u_p / u_psi of a level for the decision sheet (no parsed bands)."""
+    return {k: v for k, v in x.items() if not k.startswith('_')}
+
+
+def _json_plain(o):
+    """NaN / inf as null for a JSON file."""
+    if isinstance(o, dict):
+        return {k: _json_plain(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_json_plain(v) for v in o]
+    if isinstance(o, float) and not math.isfinite(o):
+        return None
+    return o
+
+
+def phieu_chon(open_cases: list) -> dict:
+    """The decision sheet (phieu_chon_v1, CODE 24/11: Liam chooses once, never the tool) of the bien_nguong cases:
+    per case the level, the condition, its inputs (a_m, u_p, u_psi, U_t,C8 and the u_t_s of the eligible runs), the
+    Uhat block (uhat null: not told within the budget; uhat_duoi the lower bound), the threshold and its half with the
+    strict comparison of rule 2b, and both choices with the so_do of the level each gives."""
+    ca = []
+    for x in open_cases:
+        lv, c, uh = x['muc'], x['dieu_kien'], x['uhat']
+        thr = o1_gate.THRESHOLDS[c]
+        opts = {}
+        for chon in ('so_do', 'quyet'):
+            q = dict(x['quyet_khac'])
+            q[c] = dict(chon=chon)
+            for o in x['mo_khac']:                     # the other open cases of the level: taken as 'quyet' here
+                q.setdefault(o, dict(chon='quyet'))
+            opts[chon] = dict(so_do_muc=list(so_do_of(lv, uh, q)[0]),
+                              nghia=('quyết bằng số đo q, chưa cộng U (khong_dat khi q > ngưỡng)' if chon == 'so_do'
+                                     else 'ba nhánh có U (đạt khi cận trên ≤ ngưỡng, không đạt khi cận dưới > ngưỡng, '
+                                          'còn lại chưa kết luận)'))
+        ca.append(dict(muc=lv, dieu_kien=c, nguong=thr, nua_nguong=0.5 * thr,
+                       so_sanh='Û > ½ ngưỡng (chặt) → so_do; Û ≤ ½ ngưỡng → quyet (thiết kế v6_C8 mục 4, 5)',
+                       uhat=uh[c], u_t_c8_s=x['u_t'],
+                       dau_vao=dict(a_m=x['a_m'], u_p=_terms_plain(x['u_p']), u_psi=_terms_plain(x['u_psi']),
+                                    luot=[dict(run_id=r.get('run_id'), u_t_s=r['u_t_s']) for r in x['runs']]),
+                       mo_khac_cung_muc=x['mo_khac'],
+                       gia_dinh=('so_do_muc của mỗi lựa chọn tính các ca biên khác cùng mức là quyet'
+                                 if x['mo_khac'] else ''),
+                       so_do_muc_moi_ca_bien_so_do=list(so_do_of(lv, uh, dict(
+                           x['quyet_khac'], **{o: dict(chon='so_do') for o in [c] + x['mo_khac']}))[0]),
+                       lua_chon=opts))
+    return dict(format='phieu_chon_v1', ly_do=('Û không tách được khỏi ½ ngưỡng trong ngân sách tính (bien_nguong): '
+                                               'J v6 không quyết mặt nạ, C8 chưa khóa; CAN LIAM QUYET (J mục 0b)'),
+                cach_ghi=('file --liam của ghep: quyet_liam.<muc>.<dieu_kien> = {chon: so_do | quyet, ngay, phien, '
+                          'nguyen_van}, rồi chạy lại ghep'),
+                ca=ca)
+
+
 def ghep_va_ghi(out: str, goc: str, *args, **kw) -> str:
     """ghep then write_gate; the dossier ghep wrote in this call is taken back when the gate is refused (GC9-8)."""
     p = os.path.join(goc, args[6] if len(args) > 6 else kw['ho_so'])
@@ -2924,9 +3234,10 @@ def ghep_va_ghi(out: str, goc: str, *args, **kw) -> str:
         raise
 
 
-def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem_cheo: str,
+def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem_cheo,
          bang_chung: Dict[str, str], ho_so: str, muc_bo_theo_liam: Optional[dict] = None,
-         quyet_liam: Optional[dict] = None, o_hong_theo_liam: Optional[dict] = None) -> dict:
+         quyet_liam: Optional[dict] = None, o_hong_theo_liam: Optional[dict] = None,
+         bo_cham_cu: Optional[dict] = None) -> dict:
     """The gate content of C8 assembled from its sources under the C8 folder goc (paths relative to it; F10-F19, the
     contract of 19/11 with C8B: the gate reads the C8B files, C8B does not call the gate):
       sessions     thu_tu_clip: the thu_tu_clip.csv of one C8 session (a path) or of each, in session order (a list;
@@ -2943,9 +3254,11 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
       kept lost    o_hong_theo_liam {cell: Liam's record}: the cells whose last run is lost to the measurement and Liam
                    keeps lost without a rerun (Liam 22/11, C8 contract section 3 (a)); hong_theo_liam, the record in
                    the cell, no eligible run there (a level then lacks that controller unless Liam drops it)
-      U standard   the four evidence files (bang_chung {condition: path}) and the dossier ho_so_c8_v1 written to ho_so
+      U standard   the four evidence files (bang_chung {condition: path}) and the dossier ho_so_c8_v2 written to ho_so
                    (cham_luc = the first scoring time of every run, _scoring_times; giu_ngoai = every C8 run, CODE
-                   20/11, GC9-2; khoa_kiem_luc = the khoa_s7 record of kiem_cheo.json, its file by the path it names)
+                   20/11, GC9-2; khoa_kiem_luc = per C8 session, in session order, the khoa_s7 record of the
+                   kiem_cheo.json of that session (kiem_cheo: a path or a list, one per session, each in the folder of
+                   its session), its file by the path it names; CODE 24/11: the S7 lock per session)
       premise      one tien_de_buoi_v1 file per camera segment that holds C8 runs (tien_de: a path or a list) and
                    the three session files each names by sha256, by role (dau1, dau2, cuoi; CODE 20/11); each with the
                    session whose folder holds it, its files and the logs of its rows found in that folder (CODE 22/11)
@@ -2956,9 +3269,17 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
     if _bad_rel(ho_so):                                  # GC9-8: never a file outside the C8 folder
         raise GateFileError(f'ghep: --ho-so {ho_so!r}: a path relative to the C8 folder, inside it')
     kho = _Kho(goc)
-    kh_ref, kc8_ref, kcj_ref = (kho.ref(p) for p in (ke_hoach, khoa_c8b, kiem_cheo))
+    kh_ref, kc8_ref = (kho.ref(p) for p in (ke_hoach, khoa_c8b))
     tt_refs = [kho.ref(p) for p in ([thu_tu_clip] if isinstance(thu_tu_clip, str) else list(thu_tu_clip))]
-    kh, khoa, kcj = kho.json(kh_ref), kho.json(kc8_ref), kho.json(kcj_ref)
+    kh, khoa = kho.json(kh_ref), kho.json(kc8_ref)
+    kcj_refs = [kho.ref(p) for p in ([kiem_cheo] if isinstance(kiem_cheo, str) else list(kiem_cheo))]
+    if len(kcj_refs) != len(tt_refs):
+        raise GateFileError(f'ghep: {len(kcj_refs)} kiem_cheo.json for {len(tt_refs)} C8 sessions: one per session, in '
+                            'session order (CODE 24/11: the S7 lock of each session)')
+    for k, (r_, t_) in enumerate(zip(kcj_refs, tt_refs)):
+        if not _under(r_['duong_dan'], _folder_of(t_)):
+            raise GateFileError(f'ghep: kiem_cheo {r_["duong_dan"]!r} is not in the folder of session {k} '
+                                f'({_folder_of(t_)!r})')
     td_refs = [kho.ref(p) for p in ([tien_de] if isinstance(tien_de, str) else list(tien_de))]   # one per segment
     if set(bang_chung) != set(CHUAN_U_DK):
         raise GateFileError(f'ghep: bang_chung needs exactly the four conditions {CHUAN_U_DK}')
@@ -2977,8 +3298,9 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
         b = re.sub(r'_lai\d+$', '', (r.get('buoc') or '').strip())
         if b in plan:
             order[b].append(r)
+    commit_bo = commit_bo_of(khoa)
     luois = kho.all_json(lambda x, rel: os.path.basename(rel) == 'luoi.json' and isinstance(x, dict)
-                         and 'trang_thai_luot' in x)
+                         and 'trang_thai_luot' in x and (commit_bo is None or luoi_commit(x) == commit_bo))   # KG-6
     h1_shas = {x['file_cham_h1']['sha256'] for _, x in luois if isinstance(x.get('file_cham_h1'), dict)}
     edos = kho.all_json(lambda x, rel: isinstance(x, dict) and 'vuot_moi_nut' in x and 'gio_sha256' in x)
     ccs = kho.all_json(lambda x, rel: isinstance(x, dict) and isinstance(x.get('chung_cu_c8'), dict))
@@ -3104,7 +3426,7 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
     loai = {k: evidence_of(runs[k])['loai'] for k in kt}
     levels = [k for k in kt if not loai[k] and k not in bo]
     muc = khoa.get('muc') or {}
-    per = {}
+    per, terms = {}, {}
     for lv in levels:
         hd, bands = (muc.get(lv) or {}).get('hang_dong'), (muc.get(lv) or {}).get('hang_theo_u')
         if not isinstance(hd, dict) or any(hd.get(q) is None for q in ('a_m', 'hang_m', 'he_so_r', 'u_phi_rad',
@@ -3114,32 +3436,25 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
         u_p = dict(hang_m=hd['hang_m'], he_so_r=hd['he_so_r'], u_phi_rad=hd['u_phi_rad'],
                    hang_theo_u=_band_list(bands, 'P4_m', float))
         u_psi = dict(hang_rad=hd['hang_rad'], hang_theo_u=_band_list(bands, 'A4_deg', math.radians))
-        per[lv] = level_block(lv, hd['a_m'], u_p, u_psi, runs[lv], ql.get(lv))
-    # the U standard and its dossier
-    bc_refs = {k: kho.ref(p) for k, p in bang_chung.items()}
-    rec = kcj.get('khoa_s7') if isinstance(kcj.get('khoa_s7'), dict) else {}
-    ks_ref = kho.ref(_rel_in(kho.goc, rec.get('file')))   # GC9-7: the very file kiem_cheo.json names
-    if ks_ref['sha256'] != rec.get('sha256'):
-        raise GateFileError(f'ghep: khoa_s7 {rec.get("file")!r} is not the manifest of sha256 {rec.get("sha256")!r} '
-                            'kiem_cheo.json names')
-    all_runs = [e['run_id'] for c in cells for e in c['chuoi']] + [x['run_id'] for x in luot_k]
-    hs = dict(format=HO_SO_FORMAT, bang_chung={k: v['sha256'] for k, v in bc_refs.items()},
-              ke_hoach_c8_sha256=kh_ref['sha256'], khoa_c8b_sha256=kc8_ref['sha256'],
-              giu_ngoai=all_runs, cham_luc=cham_luc,
-              khoa_kiem_luc=dict(kiem_cheo=kcj_ref, khoa_s7=ks_ref, git_commit=rec.get('git_commit'),
-                                 git_time=rec.get('git_time')))
-    raw = (json.dumps(hs, indent=1, ensure_ascii=False) + '\n').encode('utf-8')
-    p = os.path.join(kho.goc, ho_so)
-    q = os.path.realpath(os.path.dirname(p))
-    if not os.path.isdir(q) or os.path.commonpath([kho.goc, q]) != kho.goc:      # GC9-8: a link out of the folder
-        raise GateFileError(f'ghep: --ho-so {ho_so!r}: its folder must exist inside the C8 folder')
-    if os.path.exists(p):
-        with open(p, 'rb') as f:
-            if f.read() != raw:
-                raise GateFileError(f'ghep: {ho_so!r} exists with other bytes (a dossier is never replaced)')
-    else:
-        with open(p, 'xb') as f:
-            f.write(raw)
+        terms[lv] = (hd['a_m'], u_p, u_psi, level_uhat(lv, hd['a_m'], u_p, u_psi, runs[lv]))
+    # CODE 24/11: every bien_nguong without Liam's choice, of every level, on one decision sheet (both choices); no
+    # choice is made here
+    open_cases = []
+    for lv in levels:
+        a_m, u_p, u_psi, (u_t, uh) = terms[lv]
+        mo = [c for c in MASKABLE if uh[c]['trang_thai'] == 'bien_nguong' and not (lv == G5_F08 and c == 'g5')
+              and (ql.get(lv) or {}).get(c) is None]
+        for c in mo:
+            open_cases.append(dict(muc=lv, dieu_kien=c, uhat=uh, u_t=u_t, a_m=a_m, u_p=u_p, u_psi=u_psi,
+                                   runs=runs[lv], quyet_khac=dict(ql.get(lv) or {}),
+                                   mo_khac=[o for o in mo if o != c]))
+    if open_cases:
+        raise CanLiamChon(f'ghep: {len(open_cases)} Uhat cannot be told from half the threshold within the budget '
+                          f'({", ".join(x["muc"] + " " + x["dieu_kien"] for x in open_cases)}): C8 is not locked; CAN '
+                          'LIAM QUYET (J section 0b); both choices on the decision sheet', phieu_chon(open_cases))
+    for lv in levels:
+        a_m, u_p, u_psi, uhu = terms[lv]
+        per[lv] = level_block(lv, a_m, u_p, u_psi, runs[lv], ql.get(lv), uh=uhu)
     # premise: one tien_de file per camera segment, its three session files by role (CODE 20/11 after C8 session 2);
     # each in the folder of its session (CODE 22/11), the segments of a session in order (row of their clip H at the end
     # in its thu_tu_clip.csv)
@@ -3171,6 +3486,49 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
         doan = sorted((s_ for _, s_ in segs), key=lambda s_: _clip_row(
             kho.goc, s_['cuoi'], f'ghep: clip H at the end of {s_["ten"]!r}', rows[b0:b1]))
         tien_de_c8.append(dict(buoi=next(iter(ids)), doan=doan))
+    # the U standard and its dossier (after the premise: khoa_kiem_luc names each session)
+    bc_refs = {k: kho.ref(p) for k, p in bang_chung.items()}
+    kkl, s7_same = [], None
+    for k, kcj_ref in enumerate(kcj_refs):
+        kcj = kho.json(kcj_ref)
+        rec = kcj.get('khoa_s7') if isinstance(kcj.get('khoa_s7'), dict) else {}
+        ks_ref = kho.ref(_rel_in(kho.goc, rec.get('file')))   # GC9-7: the very file kiem_cheo.json names
+        if ks_ref['sha256'] != rec.get('sha256'):
+            raise GateFileError(f'ghep: khoa_s7 {rec.get("file")!r} is not the manifest of sha256 {rec.get("sha256")!r} '
+                                f'{kcj_ref["duong_dan"]!r} names')
+        ksj = kho.json(ks_ref)
+        same = {q: ksj.get(q) for q in S7_SAME}
+        if s7_same is None:
+            s7_same = same
+        elif same != s7_same:
+            raise GateFileError(f'ghep: khoa_s7 {ks_ref["duong_dan"]!r}: {list(S7_SAME)} differ from those of session 0; '
+                                'one S7 check for every session (CODE 24/11)')
+        kkl.append(dict(buoi=tien_de_c8[k]['buoi'], kiem_cheo=kcj_ref, khoa_s7=ks_ref,
+                        git_commit=rec.get('git_commit'), git_time=rec.get('git_time')))
+    all_runs = [e['run_id'] for c in cells for e in c['chuoi']] + [x['run_id'] for x in luot_k]
+    bo_cu = scorings_dropped(kho.goc, commit_bo)            # KG-6: the scorings before the merged lock, dropped
+    if bo_cu and bo_cham_cu is None:
+        raise GateFileError(f'ghep: {len(bo_cu)} c8b_luoi files under the C8 folder were made at another commit than '
+                            'commit_hil of the lock (scorings before the merged lock); the dossier lists them as '
+                            'dropped with Liam\'s record: --liam bo_cham_cu {ngay, phien, nguyen_van} (KG-6)')
+    if bo_cham_cu is not None:
+        _liam(bo_cham_cu, 'ghep: bo_cham_cu')
+    hs = dict(format=HO_SO_FORMAT, bang_chung={k: v['sha256'] for k, v in bc_refs.items()},
+              ke_hoach_c8_sha256=kh_ref['sha256'], khoa_c8b_sha256=kc8_ref['sha256'],
+              giu_ngoai=all_runs, cham_luc=cham_luc, khoa_kiem_luc=kkl,
+              cham_cu_bo=dict(luoi=bo_cu, liam=dict(bo_cham_cu) if bo_cu else None))
+    raw = (json.dumps(hs, indent=1, ensure_ascii=False) + '\n').encode('utf-8')
+    p = os.path.join(kho.goc, ho_so)
+    q = os.path.realpath(os.path.dirname(p))
+    if not os.path.isdir(q) or os.path.commonpath([kho.goc, q]) != kho.goc:      # GC9-8: a link out of the folder
+        raise GateFileError(f'ghep: --ho-so {ho_so!r}: its folder must exist inside the C8 folder')
+    if os.path.exists(p):
+        with open(p, 'rb') as f:
+            if f.read() != raw:
+                raise GateFileError(f'ghep: {ho_so!r} exists with other bytes (a dossier is never replaced)')
+    else:
+        with open(p, 'xb') as f:
+            f.write(raw)
     # camera: the U manifests of the eligible scorings
     mans = kho.all_json(lambda m, rel: isinstance(m, dict) and m.get('format') == MANIFEST_FORMAT
                         and m.get('file_cham_sha256') in eligible)
@@ -3230,10 +3588,12 @@ def main(argv=None) -> int:
     g.add_argument('--khoa-c8b', required=True, help='c8b_khoa_v5')
     g.add_argument('--tien-de', action='append', required=True,
                    help='tien_de_buoi_v1 of KIEMCHEO, once per camera segment that holds C8 runs')
-    g.add_argument('--kiem-cheo', required=True, help='kiem_cheo.json (c7_kiem_cheo_v7) with its khoa_s7 record')
+    g.add_argument('--kiem-cheo', action='append', required=True,
+                   help='kiem_cheo.json (c7_kiem_cheo_v7) with its khoa_s7 record, once per C8 session in session '
+                        'order, in the folder of its session (CODE 24/11: the S7 lock per session)')
     g.add_argument('--bang-chung', action='append', required=True, help='CONDITION=path, once for each of the four')
     g.add_argument('--ho-so', required=True, help='the dossier ho_so_c8_v1 to write (new, or the same bytes)')
-    g.add_argument('--liam', default=None, help='JSON {muc_bo_theo_liam, quyet_liam, o_hong_theo_liam} of Liam\'s '
+    g.add_argument('--liam', default=None, help='JSON {muc_bo_theo_liam, quyet_liam, o_hong_theo_liam, bo_cham_cu} of Liam\'s '
                    'recorded choices')
     g.add_argument('--out', required=True, help='the gate file (new, never replaced; not under the C8 folder)')
     a = ap.parse_args(argv)
@@ -3253,11 +3613,21 @@ def main(argv=None) -> int:
         if a.liam:
             with open(a.liam, encoding='utf-8') as f:
                 liam = json.load(f)
-            keys = ('muc_bo_theo_liam', 'quyet_liam', 'o_hong_theo_liam')
+            keys = ('muc_bo_theo_liam', 'quyet_liam', 'o_hong_theo_liam', 'bo_cham_cu')
             if not isinstance(liam, dict) or not set(liam) <= set(keys):
                 raise GateFileError(f'--liam {a.liam}: a JSON object with keys among {list(keys)}')
-        sha = ghep_va_ghi(a.out, a.goc, a.ke_hoach, a.thu_tu_clip, a.khoa_c8b, a.tien_de, a.kiem_cheo, bc, a.ho_so,
-                          liam.get('muc_bo_theo_liam'), liam.get('quyet_liam'), liam.get('o_hong_theo_liam'))
+        try:
+            sha = ghep_va_ghi(a.out, a.goc, a.ke_hoach, a.thu_tu_clip, a.khoa_c8b, a.tien_de, a.kiem_cheo, bc,
+                              a.ho_so, liam.get('muc_bo_theo_liam'), liam.get('quyet_liam'),
+                              liam.get('o_hong_theo_liam'), liam.get('bo_cham_cu'))
+        except CanLiamChon as exc:
+            # CODE 24/11: the decision sheet beside --out (never replaced), no gate file; exit 3
+            sp = os.path.splitext(a.out)[0] + '_phieu_chon.json'
+            with open(sp, 'x', encoding='utf-8', newline='\n') as f:
+                f.write(json.dumps(_json_plain(exc.phieu), indent=1, ensure_ascii=False) + '\n')
+            print(f'gate_c8: {exc}', file=sys.stderr)
+            print('phieu_chon', sp, sha256_file(sp))
+            return 3
         print('gate_c8_v2', a.out, sha)
     except (OSError, ValueError, GateFileError) as exc:
         print(f'gate_c8: {exc}', file=sys.stderr)

@@ -947,18 +947,16 @@ def _recompute(gate: dict, platform: Optional[str] = None, so_do=None) -> dict:
             if 'state_ba_nhanh' in gate[c] and gate[c]['state_ba_nhanh'] != st:
                 raise LogError(f'gate {c}: state_ba_nhanh {gate[c]["state_ba_nhanh"]!r}, recomputed from lo of the '
                                f'common domain, hi and n_undef of the union: {st!r}')
-            qs = gate[c].get('q_so_do')
-            if qs is None:
-                st = gate_c8.so_do_state(com[0], union[0], union[3], thr)
-            else:
-                # CODE 23/11 (2): on a C8b grid the q of the middle node (not lost), with n_undef of the grid; that the
-                # node is the one nearest the middle of the grid needs the node offsets (gate_c8 checks it at C8)
-                if lb is None or not isinstance(qs, dict) or set(qs) != {'nut', 'q', 'q_chung'}                         or type(qs['nut']) is not int or not 0 <= qs['nut'] < lb['n_nut'] or lb['hong_nut'][qs['nut']]:
-                    raise LogError(f'gate {c} q_so_do {qs!r}: {{nut, q, q_chung}} of a scored node of the grid')
-                qn, qc = _qnum(qs['q'], f'{c} q_so_do.q'), _qnum(qs['q_chung'], f'{c} q_so_do.q_chung')
-                if (not math.isnan(qn) and not math.isnan(union[0]) and qn > union[0])                         or (not math.isnan(qc) and not math.isnan(com[0]) and qc > com[0]):
-                    raise LogError(f'gate {c} q_so_do {qs!r}: above the grid maxima q {union[0]!r}, chung.q {com[0]!r}')
-                st = gate_c8.so_do_state(qc, qn, union[3], thr)
+            # SD1-1, SD1-3 (Codex 24/11; Liam "Sửa theo bảng"): q of the DEFINED frames (q_so_do), required; on a C8b
+            # grid that of the middle node (scored, not lost), with n_undef of the grid. That the node is the one
+            # nearest the middle needs the node offsets: checked by gate_c8 at C8 and by c8b_luoi (limit here)
+            try:
+                qs = gate_c8.check_q_so_do(gate[c].get('q_so_do'), gate[c], f'gate {c}', lb is not None)
+            except gate_c8.GateFileError as exc:
+                raise LogError(str(exc))
+            if lb is not None and (qs['nut'] >= lb['n_nut'] or qs['nut'] < 0 or lb['hong_nut'][qs['nut']]):
+                raise LogError(f'gate {c} q_so_do.nut {qs["nut"]!r}: a scored node of the grid (not lost)')
+            st = gate_c8.so_do_state(qs['q_chung'], qs['q'], union[3], thr)
             if st != gate[c].get('state'):
                 raise LogError(f'gate {c}: state {gate[c].get("state")!r} (so_do), recomputed from q of the common '
                                f'domain, q and n_undef of the union: {st!r} (CODE 23/11)')
@@ -1124,6 +1122,9 @@ def gate_from_row(row: dict) -> dict:
             raise LogError(f"{row.get('run_uid')}: {k} {s!r} is not true, false or empty")
         return None if s == '' else s == 'true'
 
+    if row.get('gate_report_only'):                    # SD1-7 (Codex 24/11): the column of before 23/11
+        raise LogError(f"{row.get('run_uid')}: gate_report_only {row.get('gate_report_only')!r}: report only is no "
+                       'rule since 23/11 (CODE, Liam "duyệt bảng luật mới"); the run is scored again with so_do')
     g = {'version': row.get('gate_version'), 'decide': [c for c in row.get('gate_decide', '').split(',') if c],
          'u_t': num(row.get('gate_u_t')), 'g1': {'q': row.get('g1_q'), 'state': row.get('g1_state')}}
     if row.get('gate_version') in (o1_gate.GATE_VERSION_V1133, gate_c8.GATE_VERSION_SO_DO):   # O1 v11.33
@@ -1178,14 +1179,12 @@ def gate_from_row(row: dict) -> dict:
         g[c].update(n_undef=num(row.get(f'{c}_n_undef'), whole=True), state=row.get(f'{c}_state'))
         if any(row.get(f'{c}_{k}_chung') for k in DOMAIN_FIELDS):
             g[c]['chung'] = {k: num(row.get(f'{c}_{k}_chung'), whole=k == 'n_undef') for k in DOMAIN_FIELDS}
-    for c in gate_c8.MASKABLE:                         # CODE 23/11 (2)
-        if row.get(f'{c}_so_do_nut', '') != '':
-            if c not in (g.get('so_do') or []):
-                raise LogError(f"{row.get('run_uid')}: {c}_so_do_nut on a condition that is not so_do")
-            g[c]['q_so_do'] = dict(nut=num(row.get(f'{c}_so_do_nut'), whole=True), q=num(row.get(f'{c}_so_do_q')),
-                                   q_chung=num(row.get(f'{c}_so_do_q_chung')))
-        elif row.get(f'{c}_so_do_q', '') != '' or row.get(f'{c}_so_do_q_chung', '') != '':
-            raise LogError(f"{row.get('run_uid')}: {c}_so_do_q without {c}_so_do_nut")
+    for c in gate_c8.MASKABLE:                         # CODE 23/11 (2); SD1-1, SD1-3: every so_do condition
+        cols = [row.get(f'{c}_so_do_{k}', '') for k in gate_c8.SO_DO_KEYS]
+        if c in (g.get('so_do') or []):
+            g[c]['q_so_do'] = dict(nut=num(cols[0], whole=True), q=num(cols[1]), q_chung=num(cols[2]))
+        elif any(cols):
+            raise LogError(f"{row.get('run_uid')}: {c}_so_do_* on a condition that is not so_do")
     return g
 
 
@@ -1196,7 +1195,7 @@ def map_refused(decide) -> bool:
     return bool(d) and d <= set(o1_gate.DECIDE_HIL)
 
 
-def outcome_vs_gate(outcome: str, ev: dict, decide, fail_cause: str = '') -> Optional[str]:
+def outcome_vs_gate(outcome: str, ev: dict, decide, fail_cause: str = '', gate: Optional[dict] = None) -> Optional[str]:
     """None when `outcome` (and its fail cause) agrees with the recomputed gate outcomes `ev`, else why not.
     Gate with all five deciding: hong_he_do is decided outside the gate (O1 3.5) but not for a refused
     mapping (the mapping was made); any other outcome equals outcome_decide.
@@ -1212,6 +1211,12 @@ def outcome_vs_gate(outcome: str, ev: dict, decide, fail_cause: str = '') -> Opt
     if fail_cause == MAP_REFUSED:
         return f'fail cause {MAP_REFUSED} but the gate has the mapping (all five decide)'
     if outcome == 'hong_he_do':
+        return None
+    if (gate is not None and gate.get('luoi') is not None and fail_cause == VIOL_BEFORE and outcome == 'khong_dat'
+            and viol_before_exception(gate)):
+        # SD1-4 (Codex 24/11): every node of the grid has the exception before t1, maybe on different conditions, so
+        # the per-condition grid states may stay chua_ket_luan; the run is khong_dat (c8b_luoi combine;
+        # viol_before_problem checks the pair)
         return None
     if ev['complete']:
         return None if outcome == od else f'gate outcome {od}'
@@ -1700,6 +1705,9 @@ def check_gate_rows(tun: List[dict], gate_file=None) -> None:
     O1 v11.33: gate_file (gate_c8.GateC8, the summary's --gate-file) gives the so_do set of every gate row
     (row_so_do) and the SHA its gate must carry (gate_file_problem)."""
     for r in tun:
+        if r.get('gate_report_only'):                   # SD1-7 (Codex 24/11 round 2): on every row, also one that
+            raise LogError(f"{r.get('run_uid')}: gate_report_only {r.get('gate_report_only')!r}: report only is no "
+                           'rule since 23/11; the column of before is refused on every row (SD1-7)')   # has no gate
         judged = r.get('run_outcome') in VALID
         camp = r.get('campaign') in CAMPAIGNS           # [CACH HIEU] historic rows (no campaign): SC3-2 note above
         # R134 (b); B81-2: a judged car / final_hil campaign row needs both boots, given or not
@@ -1740,7 +1748,7 @@ def check_gate_rows(tun: List[dict], gate_file=None) -> None:
             ev = _recompute(g, r.get('platform'), row_so_do(r, gate_file))
         except LogError as exc:
             raise LogError(f"{r.get('run_uid')}: {exc}")
-        why = (outcome_vs_gate(r.get('run_outcome', ''), ev, g['decide'], r.get('fail_cause', ''))
+        why = (outcome_vs_gate(r.get('run_outcome', ''), ev, g['decide'], r.get('fail_cause', ''), g)
                or viol_before_problem(r.get('run_outcome', ''), r.get('fail_cause', ''), g))
         if why:
             raise LogError(f"{r.get('run_uid')}: run_outcome {r.get('run_outcome')!r} disagrees with its gate "
@@ -1780,7 +1788,7 @@ def gate_columns(gate: dict, gate_sha256: str = '') -> dict:
         qs = (gate.get(g) or {}).get('q_so_do')
         out.update({f'{g}_so_do_{k}': '' for k in ('nut', 'q', 'q_chung')})
         if qs is not None:
-            out.update({f'{g}_so_do_nut': str(int(qs['nut'])), f'{g}_so_do_q': cell(qs['q']),
+            out.update({f'{g}_so_do_nut': '' if qs['nut'] is None else str(int(qs['nut'])), f'{g}_so_do_q': cell(qs['q']),
                         f'{g}_so_do_q_chung': cell(qs['q_chung'])})
     g1 = gate.get('g1') or {}
     if g1.get('t_done') is not None:                   # B81-3: the G1 fields (checked by validate_gate first)
@@ -1838,7 +1846,8 @@ def check_outcome_vs_gate(outcome: str, gate: dict, platform: Optional[str] = No
     """The run outcome typed by the operator against the gate, validated and recomputed first (GV3-5);
     so_do: the so_do set of the run from the gate file (row_so_do; None = no gate file, none)."""
     ev = validate_gate(gate, platform, so_do)
-    why = outcome_vs_gate(outcome, ev, gate['decide'], fail_cause) or viol_before_problem(outcome, fail_cause, gate)
+    why = (outcome_vs_gate(outcome, ev, gate['decide'], fail_cause, gate)
+           or viol_before_problem(outcome, fail_cause, gate))
     if why:
         raise LogError(f'--outcome {outcome} disagrees with the gate ({why}); check the scoring')
 

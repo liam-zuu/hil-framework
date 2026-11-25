@@ -119,7 +119,9 @@ def node_from_files(score_path, rows_path):
             return dict(out, ok=False, kind='loi', why=f'gate {c}: state_ba_nhanh {st[c]!r}')
         if c != 'g1':
             ch = b.get('chung') or {}
-            nums[c] = dict(q=_f(b.get('q')), lo=_f(b.get('lo')), hi=_f(b.get('hi')), n_undef=b.get('n_undef'),
+            qs = b.get('q_so_do') if isinstance(b.get('q_so_do'), dict) else {}
+            nums[c] = dict(q_sd=_f(qs.get('q')), q_sd_chung=_f(qs.get('q_chung')),   # SD1-1: defined frames only
+                           q=_f(b.get('q')), lo=_f(b.get('lo')), hi=_f(b.get('hi')), n_undef=b.get('n_undef'),
                            q_chung=_f(ch.get('q')), lo_chung=_f(ch.get('lo')), hi_chung=_f(ch.get('hi')),
                            n_undef_chung=ch.get('n_undef'), n_frames=b.get('n_frames'))
     for c in MEASURED:                                  # C8BS-9: the recorded state must follow the stored numbers
@@ -130,8 +132,21 @@ def node_from_files(score_path, rows_path):
         bien = domain_key(sc, gate)
     except LuoiError as exc:
         return dict(out, ok=False, kind='loi', why=str(exc))
-    out.update(states=st, nums=nums, gate=gate, bien=bien, so_do=list(sc.get('so_do') or []),
-               so_do_sha=gate.get('gate_file_sha256') if gate.get('version') == 'gate_v3.4' else None)
+    # SD1-6 (Codex 24/11): the so_do set and its source read from the node's own gate block (gate_v3.4), never from
+    # outside it; a node with report_only (the rule of before 23/11) is a tool error
+    if 'report_only' in gate or 'report_only' in sc:
+        return dict(out, ok=False, kind='loi', why='node scored with report_only (before 23/11): score it again')
+    v34 = gate.get('version') == 'gate_v3.4'
+    sd_n = list(gate.get('so_do') or []) if v34 else []
+    if not v34 and ('so_do' in gate or gate.get('gate_file_sha256') is not None):
+        # SD1-6 (round 2): c7_score writes so_do and its source only on a gate_v3.4 block (apply_so_do); another
+        # block carrying either was not written by the scorer of this run
+        return dict(out, ok=False, kind='loi',
+                    why=f'gate so_do / gate_file_sha256 on a {gate.get("version")!r} block (SD1-6)')
+    if any(not isinstance((gate.get(c) or {}).get('q_so_do'), dict) for c in sd_n):
+        return dict(out, ok=False, kind='loi', why=f'gate so_do {sd_n} without q_so_do on each (SD1-1)')
+    out.update(states=st, nums=nums, gate=gate, bien=bien, so_do=sd_n,
+               so_do_sha=gate.get('gate_file_sha256') if v34 else None)
     try:
         with open(rows_path, newline='', encoding='utf-8') as f:
             rr = list(csv.DictReader(f))
@@ -205,6 +220,15 @@ def g1_rule(node_st):
     return 'chua_ket_luan'
 
 
+# Two node distances to the middle of the grid within TIE_S are equal (SD1-2). Basis of 1 ns: the offsets are those
+# of c8b_gio.nodes, a linspace of k + 1 nodes over [c - h, c + h] with k = ceil(2h / STEP_S), STEP_S = 1 ms. Their
+# distances to the middle c are |i - k/2| * s with s = 2h / k, so two distances that are not equal differ by a whole
+# multiple of s, and s is about STEP_S / 2 = 0.5 ms or more for k >= 2 (2h > (k - 1) STEP_S; k = 1: two nodes, a tie).
+# Float noise of an offset is about 1e-16 s at 1 s (1e-13 s at a boot clock of 1000 s). 1 ns is 5e5 times below the
+# smallest real difference and 1e4 times above the noise.
+TIE_S = 1e-9                      # = gate_c8.TIE_S (a test keeps the two equal)
+
+
 def nut_giua(nodes_s, ok):
     """CODE 23/11 (2): the node of a so_do condition, the scored node nearest the middle of the time grid
     ((first + last node offset) / 2; the lower index on a tie); None when no node is scored."""
@@ -215,7 +239,11 @@ def nut_giua(nodes_s, ok):
         c = len(ok) // 2
         return min(scored, key=lambda i: (abs(i - c), i))
     mid = 0.5 * (float(nodes_s[0]) + float(nodes_s[-1]))
-    return min(scored, key=lambda i: (abs(float(nodes_s[i]) - mid), i))
+    # SD1-2 (Codex 24/11, rounds 1 and 2): a tie is two distances equal within TIE_S (float noise of the offsets is
+    # far below it, the node spacing far above); rounding the distances still split a tie on the rounding edge
+    d = {i: abs(float(nodes_s[i]) - mid) for i in scored}
+    dmin = min(d.values())
+    return min(i for i in scored if d[i] <= dmin + TIE_S)
 
 
 def combine(nodes, so_do=frozenset(), nodes_s=None):
@@ -288,8 +316,9 @@ def combine(nodes, so_do=frozenset(), nodes_s=None):
             states[c] = 'chua_ket_luan'
             continue
         nm = nodes[m]['nums'][c]
-        q_so_do[c] = dict(nut=m, q=nm['q'], q_chung=nm['q_chung'])
-        states[c] = gate_c8.so_do_state(nm['q_chung'], nm['q'], nums[c]['n_undef'], THRESHOLDS[c])
+        qn, qc = nm.get('q_sd', math.nan), nm.get('q_sd_chung', math.nan)     # SD1-1: the defined frames of the node
+        q_so_do[c] = dict(nut=m, q=qn if math.isfinite(qn) else None, q_chung=qc if math.isfinite(qc) else None)
+        states[c] = gate_c8.so_do_state(q_so_do[c]['q_chung'], q_so_do[c]['q'], nums[c]['n_undef'], THRESHOLDS[c])
     decide = list(CONDS)
     ds = [states[c] for c in decide]
     fail_cause = ''
@@ -367,7 +396,7 @@ def gate_block(nodes, res, gio, gio_sha, task='', gate_sha=None):
     g['luoi'] = luoi_block(res, gio, gio_sha)
     g['note'] = (g.get('note') or '') + f'; c8b_luoi: {len(nodes)} nodes, node {res["nut_tam"]} for G1 fields'
     if gate_sha:
-        g = gate_c8.apply_so_do(g, res['so_do'], task, gate_sha, q_nut=res['q_so_do'])
+        g = gate_c8.apply_so_do(g, res['so_do'], task, gate_sha, q_so_do=res['q_so_do'])
         if any(g[c]['state'] != res['states'][c] for c in CONDS):
             raise LuoiError(f'the so_do gate block disagrees with the grid states {res["states"]} (a bug)')
         if g['outcome_decide'] != res['outcome'] and res['fail_cause'] != 'vi_pham_truoc_loi_he_do' \
@@ -639,7 +668,8 @@ def main(argv=None):
                                nut=prov)
             for k, x in enumerate(nodes):
                 # CODE 23/11: every node scored with the so_do of the run and its source (also with --gop-only)
-                if x['ok'] and (sorted(x.get('so_do') or []) != sorted(ro) or (ro and x.get('so_do_sha') != gsha)):
+                if x['ok'] and (sorted(x.get('so_do') or []) != sorted(ro)
+                                or x.get('so_do_sha') != (gsha if ro else None)):
                     raise LuoiError(f'node {k}: scored with so_do {x.get("so_do")} ({x.get("so_do_sha")}), the run '
                                     f'needs {sorted(ro)} ({gsha}): score the nodes again')
             res = combine(nodes, ro, gio.get('nodes_s'))
