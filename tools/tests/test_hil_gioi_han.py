@@ -16,6 +16,7 @@ import math
 import os
 import struct
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -1005,52 +1006,29 @@ def test_c3_28_score_json_fields(tmp_path):
 
 
 def test_c3_28_same_npz_other_scoring_config(real_cham, tmp_path):
-    """Codex C3-28 counterexample: same NPZ and task, another scoring configuration (another
-    ESP32 log, other flags, another scorer source) used to pass; now refused."""
+    """The same NPZ and task require the same scorer flags and source blobs."""
     npz_a = real_cham['npz']['runA']
-    esp = {}
-    for name, pwm in (('x', 0), ('y', 100)):
-        p = tmp_path / f'{name}.csv'
-        with open(p, 'w', newline='', encoding='utf-8') as f:
-            w = csv.writer(f)
-            w.writerow(ESP_COLS)
-            w.writerow([E0_US, 1000, pwm, 0, 0, 0])
-        esp[name] = str(p)
-    sha_x = _sha256(esp['x'])
     bogus = 'f' * 40                              # a valid 40-hex blob, not the running one
     sc0 = real_cham['js']['runA']                 # lock: esp None, real 9-module scorer blobs
-    cases = [(copy.deepcopy(sc0), None, 3)]
-    cases.append((copy.deepcopy(sc0), esp['x'], 2))                    # log not locked
-    sc = copy.deepcopy(sc0)
-    sc['e2_khoa_cham'].update(esp_log='x.csv', esp_log_sha256=sha_x)
-    cases.append((sc, esp['x'], 3))                                    # matching log passes
-    sc = copy.deepcopy(sc0)
-    sc['e2_khoa_cham'].update(esp_log='x.csv', esp_log_sha256=sha_x)
-    cases.append((sc, esp['y'], 2))                                    # other file content
-    sc = copy.deepcopy(sc0)
-    sc['e2_khoa_cham'].update(esp_log='x.csv', esp_log_sha256=sha_x)
-    cases.append((sc, None, 2))                                        # locked log not given
+    cases = [(sc0, 3)]
     for c in ('allow_final_set', 'allow_pre_b81_15'):
         sc = copy.deepcopy(sc0)
         sc['e2_khoa_cham'][c] = False
-        cases.append((sc, None, 2))
+        cases.append((sc, 2))
     for m in ('gate_c8', 'protocol', 'o1_feasibility'):
         sc = copy.deepcopy(sc0)
         sc['e2_khoa_cham']['scorer'][m] = bogus
-        cases.append((sc, None, 2))
+        cases.append((sc, 2))
     for m in ('protocol', 'gate_c8'):
         sc = copy.deepcopy(sc0)
         sc['e2_khoa_cham']['scorer'].pop(m, None)                      # lock of the old version
-        cases.append((sc, None, 2))
-    for i, (sc, esp_path, code) in enumerate(cases):
+        cases.append((sc, 2))
+    for i, (sc, code) in enumerate(cases):
         sj = tmp_path / f's{i}.json'
         sj.write_text(json.dumps(sc), encoding='utf-8')
         out = tmp_path / f'o{i}'
-        argv = ['--frame-log', npz_a, '--task', 'O1-F08', '--score-json', str(sj),
-                '--out', str(out)]
-        if esp_path is not None:
-            argv += ['--esp-log', esp_path]
-        assert hg.main(argv) == code, i
+        assert hg.main(['--frame-log', npz_a, '--task', 'O1-F08', '--score-json', str(sj),
+                        '--out', str(out)]) == code, i
         if code == 3:
             row = read_one(out / 'o_gioi_han.csv')
             brow = real_cham['rows']['runA']
@@ -1058,9 +1036,77 @@ def test_c3_28_same_npz_other_scoring_config(real_cham, tmp_path):
                 row['win_ht_src'] == brow['win_ht_src'], i
 
 
+def test_c3_28_batch_locks_esp_edge(tmp_path, capsys):
+    """Create and read a score lock using the recorded CLOSED_LOOP frame and ESP logs."""
+    root = Path(os.environ.get('HIL_CLOSED_LOOP_ROOT',
+                               'D:/CLAUDE_THESIS/05_DATA/results/CLOSED_LOOP'))
+    run, name, task = '2026-11-15_run03', 'f08a', 'O1-F08'
+    npz = root / run / 'frames' / f'{name}_frames.npz'
+    esp = root / run / 'pi' / f'{name}.csv'
+    inputs = (npz, esp, *(Path(str(esp) + ext)
+                          for ext in ('.events.txt', '.raw.jsonl', '.segments.csv')))
+    if missing := [str(p) for p in inputs if not p.is_file()]:
+        pytest.skip(f'CLOSED_LOOP capture unavailable: {missing}')
+    s1 = tmp_path / 's1.csv'
+    s1.write_text(f'run,npz,name,task\n{run},{npz.name},{name},{task}\n', encoding='utf-8')
+    out = tmp_path / 'batch'
+
+    assert hg.main(['--batch-from-s1', str(s1), '--root', str(root),
+                    '--cham', '--out', str(out)]) == 0
+    sj = out / 'cham' / f'{run}__{name}_score.json'
+    score = json.loads(sj.read_text(encoding='utf-8'))
+    assert score[hg.LOCK_KEY]['esp_log'] == esp.name
+    assert score[hg.LOCK_KEY]['esp_log_sha256'] == _sha256(esp)
+    assert score['t0_src'] == 'esp32_run_active_edge'
+    assert score['t0_step'] == score['edge_map']['edge_step'] != score['k_run']
+    assert score['k0'] == math.ceil(score['t0_step'] - 1e-9)
+
+    reread = tmp_path / 'reread'
+    args = ['--frame-log', str(npz), '--task', task, '--out', str(reread)]
+    with_esp = ['--esp-log', str(esp)]
+    with_score = ['--score-json', str(sj)]
+    assert hg.main(args + with_score + with_esp) == 0
+    row = read_one(reread / f'{name}_gioi_han.csv')
+    batch_row = read_one(out / 'ket_qua_e2.csv')
+    assert row['win_ht_src'] == batch_row['win_ht_src']
+    assert row['win_ht_n'] == batch_row['win_ht_n']
+
+    assert hg.main(args + with_score) == 2
+    assert 'esp_log_sha256' in capsys.readouterr().err
+    plain_npz = str(npz)
+    plain = hg.hil_o1_score._json_safe(hg.hil_o1_score.score(plain_npz, task, **hg.CHAM_FLAGS))
+    plain[hg.LOCK_KEY] = hg.score_lock(plain_npz, task, None)
+    plain_path = tmp_path / 'plain.json'
+    plain_path.write_text(json.dumps(plain), encoding='utf-8')
+    assert hg.main(args + ['--score-json', str(plain_path)] + with_esp) == 2
+    assert 'esp_log_sha256' in capsys.readouterr().err
+
+    tampered = tmp_path / 'tampered.json'
+    score['t0_step'] = math.nextafter(score['t0_step'], math.inf)
+    tampered.write_text(json.dumps(score), encoding='utf-8')
+    assert hg.main(args + ['--score-json', str(tampered)] + with_esp) == 2
+    assert 't0_step' in capsys.readouterr().err
+
+    changed_esp = tmp_path / esp.name
+    changed_esp.write_bytes(esp.read_bytes() + b'\n')
+    assert hg.main(args + with_score + ['--esp-log', str(changed_esp)]) == 2
+    assert 'esp_log_sha256' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('t0_step', [1e30, 400.25])
+def test_c3_28_t0_step_disagrees_with_frame_log(real_cham, tmp_path, capsys, t0_step):
+    score = dict(real_cham['js']['runA'], t0_step=t0_step)
+    sj = tmp_path / 'score.json'
+    sj.write_text(json.dumps(score), encoding='utf-8')
+
+    assert hg.main(['--frame-log', real_cham['npz']['runA'], '--task', 'O1-F08',
+                    '--score-json', str(sj), '--out', str(tmp_path / 'out')]) == 2
+    assert 't0_step' in capsys.readouterr().err
+
+
 def test_c3_28_t_end_outside_window(real_cham, tmp_path):
     """Codex C3-28 counterexample: completed 'true' with a finite t_end before the completion
-    window passed. t_end (when present) must lie in [T_cmd; t_deadline] +-1e-9 whatever
+    window passed. t_end (when present) must lie in [T_cmd; t_deadline] whatever
     completed is."""
     npz_a, ja = real_cham['npz']['runA'], real_cham['js']['runA']
     npz = _speed_npz(tmp_path)                     # T_cmd 10, t_deadline 12, k0/t0_step 100
@@ -1070,9 +1116,10 @@ def test_c3_28_t_end_outside_window(real_cham, tmp_path):
         sc['completed'], sc['t_end'] = 'true', te
         cases.append((sc, npz_a, 2, None))
     for kw, code, n_ht in ((dict(t_end=10.0), 3, 1),
-                           (dict(t_end=10.0 - 5e-10), 3, 1),
+                           (dict(t_end=10.0 - 5e-10), 2, None),
                            (dict(t_end=10.0 - 2e-9), 2, None),
-                           (dict(t_end=12.0 + 5e-10), 3, 2000),
+                           (dict(t_end=12.0), 3, 2000),
+                           (dict(t_end=12.0 + 5e-10), 2, None),
                            (dict(t_end=12.0 + 2e-9), 2, None),
                            (dict(t_end=9.0, completed='false'), 2, None),
                            (dict(t_end=11.999, completed='false'), 3, 2000)):
@@ -1088,11 +1135,11 @@ def test_c3_28_t_end_outside_window(real_cham, tmp_path):
 
 
 def test_c3_28_k0_index(tmp_path):
-    """C3-28: k0 must be an integer frame index in [0, n); float, bool, str and out-of-range
-    values are refused (hil_o1_score._json_safe always writes an int)."""
+    """C3-28: k0 must be an integer frame index in [0, n) consistent with the origin."""
     npz = _speed_npz(tmp_path)                                        # n = 12200
     cases = [(-1, 12201, {}, 2, None), (12200, 0, {}, 2, None), (12201, -1, {}, 2, None),
-             (0, 12200, dict(t_end=None, completed='false'), 3, 2000), (12199, 1, {}, 3, None),
+             (100, 12100, dict(t_end=None, completed='false'), 3, 2000),
+             (0, 12200, {}, 2, None), (12199, 1, {}, 2, None),
              (100.5, 12100, {}, 2, None), (100.0, 12100, {}, 2, None), (True, 12199, {}, 2, None),
              ('100', 12100, {}, 2, None)]
     for i, (k0, fs, kw, code, n_ht) in enumerate(cases):

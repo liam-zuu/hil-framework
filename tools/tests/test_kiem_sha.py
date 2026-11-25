@@ -1304,6 +1304,21 @@ def test_c3_22_v3_codex_a_dung_cli_ma_3(tmp_path):
     assert tt['so_chua_xac_minh'] == 1 and tt['ma'] == 3
 
 
+def test_c3_22_outputs_toan_sha_sai_kieu(tmp_path):
+    repo, goc = _lam_repo(tmp_path)
+    (goc / 'a.png').write_bytes(b'cu')
+    (goc / 'r.json').write_text(json.dumps(
+        {'anh': {'a.png': sha(b'cu')},
+         'outputs': {'x.png': 5, 'y.png': {'w': 1}, 'z.png': 'b/c.csv'},
+         'doi_ten': {'a.csv': 'b/c.csv', 'd.csv': 3}}), encoding='utf-8')
+
+    ma, rows, kh = _chay(goc, repo, tmp_path / 'out')
+    assert ma == 3
+    assert [(r['khoa'], r['ket_qua']) for r in rows] == [('anh["a.png"]', 'tho')]
+    assert [(e['khoa'], e['ly_do']) for e in kh] == [
+        (f'outputs["{ten}.png"]', 'sha_khong_hop_le') for ten in ('x', 'y', 'z')]
+
+
 @pytest.mark.parametrize('sai', [
     5, 0, 1.5, True, False, {'x': 1}, {}, [H_B], [], 'b/c.csv',
     'z' * 64, 'a' * 63, 'a' * 65, ' ' + 'a' * 64, ''])
@@ -1502,6 +1517,30 @@ def test_c3_34_file_tham_chieu_khong_doc_duoc(tmp_path, monkeypatch):
     assert ma == 3 and not rows
     assert [(e['khoa'], e['ly_do']) for e in kh] == [
         ('sha256', 'khong_doc_duoc')]
+
+
+@pytest.mark.parametrize('lan, loi', [(1, PermissionError), (2, OSError)])
+def test_c3_34_is_file_khong_doc_duoc(tmp_path, monkeypatch, lan, loi):
+    repo, goc = _lam_repo(tmp_path)
+    dich = goc / 'a.txt'
+    dich.write_bytes(b'x\n')
+    (goc / 'r.json').write_text(json.dumps(
+        {'file': 'a.txt', 'sha256': sha(b'x\n')}), encoding='utf-8')
+    is_file = Path.is_file
+    so_goi = 0
+
+    def is_file_loi(p):
+        nonlocal so_goi
+        if p == dich:
+            so_goi += 1
+            if so_goi == lan:
+                raise loi('gia lap')
+        return is_file(p)
+
+    monkeypatch.setattr(Path, 'is_file', is_file_loi)
+    ma, rows, kh = _chay(goc, repo, tmp_path / 'out')
+    assert ma == 3 and not rows
+    assert [(e['khoa'], e['ly_do']) for e in kh] == [('sha256', 'khong_doc_duoc')]
 
 
 def test_c3_34_json_hard_link_sau_khi_mo(tmp_path, monkeypatch):

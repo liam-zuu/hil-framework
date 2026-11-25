@@ -212,9 +212,8 @@ def _job_safe(job):
 
 
 def _loi_row(k, error, het_han=False):
-    """Stand-in row of a key whose attempt gave no row (worker exception or no result within
-    HAN_CHO_WORKER_S): status 'loi_worker', so it is rerun (exception) and written as an
-    attempt of chay_lai.csv; main drops it from the final rows (the key is then missing)."""
+    """Stand-in for a key with no result. Non-timeout errors are retried once and both attempts
+    go into chay_lai.csv; main omits any stand-in that remains from the final rows."""
     ctrl, delay, omega_s, mu, v = k
     return dict(controller=ctrl, io_delay_ms=delay, slip_omega_s=omega_s,
                 la_moc=(delay == REF[0] and omega_s == REF[1]), mu=mu, v=v,
@@ -465,12 +464,14 @@ def fw_readable(fw):
 
 
 def commit_in_repo(fw, commit):
-    """True when commit names a commit object of the git repo fw (C3-20):
-    'git -C <fw> cat-file -e <commit>^{commit}' exits 0. False on any other exit code, when
-    git cannot be run or does not end within GIT_TIMEOUT_S."""
+    """True when fw is the Git worktree root and commit resolves there (C3-20)."""
     try:
-        r = subprocess.run(['git', '-C', fw, 'cat-file', '-e', f'{commit}^{{commit}}'],
-                           capture_output=True, text=True, timeout=GIT_TIMEOUT_S)
+        git = ['git', '-C', fw]
+        opts = dict(capture_output=True, text=True, encoding='utf-8', timeout=GIT_TIMEOUT_S)
+        root = subprocess.run(git + ['rev-parse', '--show-toplevel'], **opts)
+        if root.returncode != 0 or not os.path.samefile(fw, root.stdout.rstrip('\r\n')):
+            return False
+        r = subprocess.run(git + ['cat-file', '-e', f'{commit}^{{commit}}'], **opts)
     except (OSError, subprocess.SubprocessError):
         return False
     return r.returncode == 0
@@ -579,48 +580,62 @@ def main(argv=None):
     loi_worker = []          # C3-19: exceptions out of the pool, recorded instead of exiting
 
     def run_pool(js, tag='', lan=1):
-        """Rows of js; a worker exception or a key without result within HAN_CHO_WORKER_S
-        gives a _loi_row stand-in (C3-19 round 3) and a loi_worker entry."""
-        out, n_exc, ve = [], 0, set()
-        with mp.Pool(processes=n_workers, initializer=_init, initargs=(args.dll,)) as pool:
-            it = pool.imap_unordered(_job_safe, js)
-            i = 0
-            while True:
-                try:
-                    row = it.next(timeout=HAN_CHO_WORKER_S)
-                except StopIteration:
-                    break
-                except mp.TimeoutError:
-                    cho = [tuple(j) for j in js if tuple(j) not in ve]
-                    err = f'{HET_HAN}: no worker result within {HAN_CHO_WORKER_S} s'
-                    for k in cho:
-                        loi_worker.append(dict(khoa=_ks(k), lan=lan, error=err, ly_do=HET_HAN))
-                        out.append(_loi_row(k, err, het_han=True))
-                    print(f'{tag}WARNING: no worker result within {HAN_CHO_WORKER_S} s, '
-                          f'{len(cho)} keys not returned, pool terminated', flush=True)
-                    pool.terminate()
-                    break
-                except Exception as exc:     # noqa: BLE001 (raised by the iterator itself)
-                    n_exc += 1
-                    loi_worker.append(dict(khoa='', lan=lan,
-                                           error=f'{type(exc).__name__}: {exc}'))
-                    print(f'{tag}WARNING: pool iterator raised {type(exc).__name__}', flush=True)
-                    if n_exc > len(js):
+        """Keep the submitted keys in the parent until each returns a row or a keyed error."""
+        pending = dict.fromkeys(map(tuple, js))
+        out, errors = [], []
+        timeout_error = None
+
+        def add_error(k, err, het_han=False):
+            entry = dict(khoa=_ks(k), lan=lan, error=err)
+            if het_han:
+                entry['ly_do'] = HET_HAN
+            loi_worker.append(entry)
+            out.append(_loi_row(k, err, het_han=het_han))
+
+        try:
+            with mp.Pool(processes=n_workers, initializer=_init, initargs=(args.dll,)) as pool:
+                it = pool.imap_unordered(_job_safe, js)
+                i = 0
+                while True:
+                    try:
+                        row = it.next(timeout=HAN_CHO_WORKER_S)
+                    except StopIteration:
                         break
-                    continue
-                i += 1
-                if '_loi_worker' in row:
-                    k = tuple(row['_khoa'])
-                    ve.add(k)
-                    loi_worker.append(dict(khoa=_ks(k), lan=lan, error=row['_loi_worker']))
-                    out.append(_loi_row(k, row['_loi_worker']))
-                    print(f'{tag}[{i}/{len(js)}] {_ks(k)} worker exception', flush=True)
-                    continue
-                ve.add(key_of(row))
-                out.append(row)
-                print(f"{tag}[{i}/{len(js)}] {row['controller']} delay={row['io_delay_ms']} "
-                      f"omega_s={row['slip_omega_s']} mu={row['mu']} v={row['v']} "
-                      f"status={row['status']} t={row['t_chay_s']:.1f}s", flush=True)
+                    except mp.TimeoutError:
+                        timeout_error = f'{HET_HAN}: no worker result within {HAN_CHO_WORKER_S} s'
+                        print(f'{tag}WARNING: no worker result within {HAN_CHO_WORKER_S} s, '
+                              f'{len(pending)} keys not returned, pool terminated', flush=True)
+                        pool.terminate()
+                        break
+                    except Exception as exc:     # noqa: BLE001 (raised by the iterator itself)
+                        errors.append(f'{type(exc).__name__}: {exc}')
+                        print(f'{tag}WARNING: pool iterator raised {type(exc).__name__}', flush=True)
+                        if len(errors) > len(js):
+                            break
+                        continue
+                    i += 1
+                    if '_loi_worker' in row:
+                        k = tuple(row['_khoa'])
+                        pending.pop(k, None)
+                        add_error(k, row['_loi_worker'])
+                        print(f'{tag}[{i}/{len(js)}] {_ks(k)} worker exception', flush=True)
+                        continue
+                    pending.pop(key_of(row), None)
+                    out.append(row)
+                    print(f"{tag}[{i}/{len(js)}] {row['controller']} delay={row['io_delay_ms']} "
+                          f"omega_s={row['slip_omega_s']} mu={row['mu']} v={row['v']} "
+                          f"status={row['status']} t={row['t_chay_s']:.1f}s", flush=True)
+        except Exception as exc:                 # noqa: BLE001 (pool setup, submission, shutdown)
+            errors.append(f'{type(exc).__name__}: {exc}')
+            print(f'{tag}WARNING: pool raised {type(exc).__name__}', flush=True)
+        # Unordered iterator errors cannot be assigned individually. All pending keys share
+        # the pool diagnosis and are retried unless the wait limit was the only error.
+        het_han = timeout_error is not None and not errors
+        if timeout_error is not None:
+            errors.append(timeout_error)
+        err = '; '.join(dict.fromkeys(errors)) or 'pool ended without a worker result'
+        for k in pending:
+            add_error(k, err, het_han=het_han)
         return out
 
     rows = run_pool(jobs)

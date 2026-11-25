@@ -13,7 +13,8 @@ hoac truong duong dan cung khoi); null o truong bat buoc ->
 sha_rong_bat_buoc (ma 3). Null o hash khong kem duong dan -> so_rong
 (thong tin).
 
-Ban do hash suy tu khoa (C3-22 vong 3): dict co it nhat mot khoa duong dan
+Ban do outputs la bang SHA theo schema (C3-22). Ban do hash suy tu khoa:
+dict co it nhat mot khoa duong dan
 mang gia tri hex64 hay null la ban do; nhan dien truoc, roi moi muc khoa
 duong dan duoc xet rieng: hex64 -> kiem; null -> sha_rong_bat_buoc; so,
 bool, object, list, chuoi khong phai hex64 -> sha_khong_hop_le (ma 3).
@@ -117,9 +118,9 @@ def sha_cac_dang(path, f=None):
 
 def kiem(path, sha_ghi):
     p = Path(path)
-    if not p.is_file():
-        return 'thieu_file'
     try:
+        if not p.is_file():
+            return 'thieu_file'
         with open(p, 'rb') as f:
             if os.fstat(f.fileno()).st_nlink > 1:
                 return 'hard_link'
@@ -312,38 +313,31 @@ def _xu_sha(k, v, D, path, cap, kh, st):
                'ly_do': 'kieu_khong_ho_tro'})
 
 
-def _duyet(v, path, cap, kh, st):
+def _duyet(v, path, cap, kh, st, *, ban_do_sha=False):
     if isinstance(v, dict):
         if _la_manifest(v):
             for k2, v2 in v.items():
                 cap.append({'khoa': _manifest_con(path, k2),
                             'duong_dan': k2, 'sha': v2, 'dang': 'manifest'})
             return
-        if _la_ban_do_hash(v):
-            # C3-22 vong 3: moi muc khoa duong dan phai la hex64; sai kieu
-            # (so, object, list, chuoi khac) bao tung muc, khong duyet tiep
-            for k, v2 in v.items():
-                sub = _manifest_con(path, k)
-                if _la_khoa_duong_dan(k):
-                    if _hex64(v2):
-                        cap.append({'khoa': sub, 'duong_dan': k, 'sha': v2,
-                                    'dang': 'manifest'})
-                    elif v2 is None:
-                        kh.append({'khoa': sub, 'gia_tri': 'null',
-                                   'ly_do': 'sha_rong_bat_buoc'})
-                    else:
-                        kh.append({'khoa': sub, 'gia_tri': str(v2)[:200],
-                                   'ly_do': 'sha_khong_hop_le'})
-                elif isinstance(k, str) and 'sha256' in k.lower():
-                    _xu_sha(k, v2, v, path, cap, kh, st)
-                else:
-                    _duyet(v2, _con(path, k), cap, kh, st)
-            return
+        ban_do = ban_do_sha or _la_ban_do_hash(v)
         for k, v2 in v.items():
-            if isinstance(k, str) and 'sha256' in k.lower():
+            if ban_do and (_la_khoa_duong_dan(k) or (ban_do_sha and la_duong_dan(k))):
+                # C3-22: bao tung gia tri sai kieu, khong duyet tiep vao muc do.
+                sub = _manifest_con(path, k)
+                if _hex64(v2):
+                    cap.append({'khoa': sub, 'duong_dan': k, 'sha': v2,
+                                'dang': 'manifest'})
+                elif v2 is None:
+                    kh.append({'khoa': sub, 'gia_tri': 'null',
+                               'ly_do': 'sha_rong_bat_buoc'})
+                else:
+                    kh.append({'khoa': sub, 'gia_tri': str(v2)[:200],
+                               'ly_do': 'sha_khong_hop_le'})
+            elif isinstance(k, str) and 'sha256' in k.lower():
                 _xu_sha(k, v2, v, path, cap, kh, st)
             else:
-                _duyet(v2, _con(path, k), cap, kh, st)
+                _duyet(v2, _con(path, k), cap, kh, st, ban_do_sha=k == 'outputs')
     elif isinstance(v, list):
         for i, item in enumerate(v):
             _duyet(item, _chi_so(path, i), cap, kh, st)
@@ -413,22 +407,25 @@ def kiem_cap(duong_dan, sha, thu_muc_json, goc_repo, goc_luot=None):
         if tuong_doi and '/' in s.replace('\\', '/'):
             return 'khong_co_goc_luot', '', ''
         return 'thieu_file', '', ''
-    c0, p0 = ds[0]
-    if _la_sealed(p0):
+    cach, p = ds[0]
+    if _la_sealed(p):
         return 'bo_qua_sealed', '', ''
-    if p0.is_file():
-        return kiem(p0, sha), c0, str(p0)
     giu = []
-    da_co = {p0.resolve()}
-    for cach, p in ds[1:]:
-        if _la_sealed(p):
-            continue
-        pr = p.resolve()
-        if pr in da_co:
-            continue
+    try:
         if p.is_file():
-            giu.append((cach, p))
-            da_co.add(pr)
+            return kiem(p, sha), cach, str(p)
+        da_co = {p.resolve()}
+        for cach, p in ds[1:]:
+            if _la_sealed(p):
+                continue
+            pr = p.resolve()
+            if pr in da_co:
+                continue
+            if p.is_file():
+                giu.append((cach, p))
+                da_co.add(pr)
+    except OSError:
+        return 'khong_doc_duoc', cach, str(p)
     if len(giu) == 1:
         cach, p = giu[0]
         return kiem(p, sha), cach, str(p)

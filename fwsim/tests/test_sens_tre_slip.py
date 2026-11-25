@@ -432,6 +432,10 @@ def test_c3_19_missing_pair_no_crash(tmp_path, monkeypatch):
     assert kc['n_cap_can'] == 72 and kc['n_cap_thieu'] == 1 and kc['n_cap_du'] == 71
     assert kc['khoa_thieu'] == [sens._ks(X_SO)] and kc['cap_thieu'] == [sens._ks(X_SO)]
     assert kc['n_moc_thieu'] == 0 and kc['n_khoa_can'] == 81 and kc['n_khoa_co'] == 80
+    assert meta['loi_worker'] == [
+        dict(khoa=sens._ks(X_SO), lan=lan, error='pool ended without a worker result')
+        for lan in (1, 2)]
+    assert [r['attempt'] for r in _read_csv(out / 'chay_lai.csv')] == ['1', '2']
     assert meta['dung_lam_luot_xac_nhan'] is False
     assert len(_read_csv(out / 'bang.csv')) == 80
     tt = [r for r in _read_csv(out / 'tom_tat.csv')
@@ -727,10 +731,18 @@ class _RaisingIter:
         return self.__next__()
 
 
-def _raising_pool(bad, exc=ValueError('result not picklable')):
+def _raising_pool(bad, fail_twice):
     class P(_FakePool):
+        n_pools = 0
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            P.n_pools += 1
+
         def imap_unordered(self, func, jobs):
-            return _RaisingIter(func, jobs, bad, exc)
+            if fail_twice or P.n_pools == 1:
+                return _RaisingIter(func, jobs, bad, ValueError('result not picklable'))
+            return super().imap_unordered(func, jobs)
     return P
 
 
@@ -998,17 +1010,55 @@ def test_c3_19_r3_worker_os_exit(tmp_path):
     assert 'pool terminated' in r.stdout
 
 
-def test_c3_19_iterator_exception_recorded(tmp_path, monkeypatch):
-    """The pool iterator itself raises (no key known): the remaining results are still read,
-    meta.json loi_worker holds the error with an empty key, the key is missing in kiem_cap."""
-    out = _main_fakes(monkeypatch, tmp_path, pool=_raising_pool({X_SO}))
+@pytest.mark.parametrize('fail_twice', [False, True])
+def test_c3_19_iterator_exception_recorded(tmp_path, monkeypatch, fail_twice):
+    """Drain the other results, report the lost key and retry just that key once."""
+    pool = _raising_pool({X_SO}, fail_twice)
+    out = _main_fakes(monkeypatch, tmp_path, pool=pool)
     meta = _meta(out)
-    assert meta['loi_worker'] == [dict(khoa='', lan=1, error='ValueError: result not picklable')]
+    key = sens._ks(X_SO)
+    assert pool.n_pools == 2
+    assert meta['loi_worker'] == [
+        dict(khoa=key, lan=lan, error='ValueError: result not picklable')
+        for lan in range(1, 2 + fail_twice)]
+    attempts = _read_csv(out / 'chay_lai.csv')
+    assert [(r['attempt'], r['status']) for r in attempts] == [
+        ('1', 'loi_worker'), ('2', 'loi_worker' if fail_twice else 'ok')]
+    assert all(r['io_delay_ms'] == str(X_SO[1]) for r in attempts)
     kc = meta['kiem_cap']
-    assert kc['ket_luan'] == 'chưa kết luận' and kc['n_loi_worker'] == 1
-    assert kc['khoa_loi_worker'] == [] and kc['khoa_thieu'] == [sens._ks(X_SO)]
-    assert kc['n_khoa_co'] == 80 and len(_read_csv(out / 'bang.csv')) == 80
-    assert meta['dung_lam_luot_xac_nhan'] is False
+    assert kc['ket_luan'] == ('chưa kết luận' if fail_twice else 'đủ cặp')
+    assert kc['n_loi_worker'] == (2 if fail_twice else 0)
+    assert kc['khoa_thieu'] == ([key] if fail_twice else [])
+    assert kc['n_khoa_co'] == len(_read_csv(out / 'bang.csv')) == 81 - fail_twice
+
+
+@pytest.mark.parametrize('stage', ['create', 'submit'])
+def test_c3_19_pool_setup_failure(tmp_path, monkeypatch, stage):
+    class Pool(_FakePool):
+        n_pools = 0
+
+        def __init__(self, *a, **kw):
+            Pool.n_pools += 1
+            if Pool.n_pools == 1 and stage == 'create':
+                raise OSError('create')
+            super().__init__(*a, **kw)
+
+        def imap_unordered(self, func, jobs):
+            if Pool.n_pools == 1:
+                raise OSError('submit')
+            return super().imap_unordered(func, jobs)
+
+    out = _main_fakes(monkeypatch, tmp_path, pool=Pool)
+    meta = _meta(out)
+    jobs = sens.make_jobs(['ADRC'])
+    assert Pool.n_pools == 2
+    assert meta['loi_worker'] == [
+        dict(khoa=sens._ks(k), lan=1, error=f'OSError: {stage}') for k in jobs]
+    attempts = _read_csv(out / 'chay_lai.csv')
+    assert [(r['attempt'], r['status']) for r in attempts] == [
+        item for _ in jobs for item in (('1', 'loi_worker'), ('2', 'ok'))]
+    assert meta['kiem_cap']['ket_luan'] == 'đủ cặp'
+    assert len(_read_csv(out / 'bang.csv')) == len(jobs)
 
 
 def test_c3_19_rerun_exception(tmp_path, monkeypatch):
@@ -1195,26 +1245,50 @@ def test_c3_20_r3_fw_not_readable(tmp_path, monkeypatch):
         assert info['esp32_commit_trong_repo'] is None and info['nguon_build'] == 'đã xác minh'
 
 
-def test_c3_20_r3_commit_in_repo_git_call(monkeypatch):
-    """commit_in_repo runs 'git -C <fw> cat-file -e <commit>^{commit}' (subprocess stub):
-    exit 0 = True; other exit code, OSError (no git), timeout = False."""
+def test_c3_20_r3_commit_in_repo_git_call(monkeypatch, tmp_path):
+    """Both Git calls are bounded, and a failed command or unavailable Git returns False."""
     calls = []
+    fw = str(tmp_path)
 
     def run(argv, **kw):
         calls.append((argv, kw))
+        if argv[3] == 'rev-parse':
+            return subprocess.CompletedProcess(argv, 0, fw + '\n', '')
         return subprocess.CompletedProcess(argv, rc[0], '', '')
     monkeypatch.setattr(sens.subprocess, 'run', run)
     rc = [0]
-    assert sens.commit_in_repo('D:/x/AGV', '5bde4c5') is True
-    assert calls[0][0] == ['git', '-C', 'D:/x/AGV', 'cat-file', '-e', '5bde4c5^{commit}']
-    assert calls[0][1]['timeout'] == sens.GIT_TIMEOUT_S
+    assert sens.commit_in_repo(fw, '5bde4c5') is True
+    assert [argv for argv, _ in calls] == [
+        ['git', '-C', fw, 'rev-parse', '--show-toplevel'],
+        ['git', '-C', fw, 'cat-file', '-e', '5bde4c5^{commit}']]
+    assert all(kw['timeout'] == sens.GIT_TIMEOUT_S for _, kw in calls)
     rc[0] = 128
-    assert sens.commit_in_repo('D:/x/AGV', '5bde4c5') is False
+    assert sens.commit_in_repo(fw, '5bde4c5') is False
     for exc in (OSError('no git'), subprocess.TimeoutExpired('git', 1)):
         def run_exc(argv, exc=exc, **kw):
             raise exc
         monkeypatch.setattr(sens.subprocess, 'run', run_exc)
-        assert sens.commit_in_repo('D:/x/AGV', '5bde4c5') is False
+        assert sens.commit_in_repo(fw, '5bde4c5') is False
+
+
+def test_c3_20_fw_rejects_parent_repo(tmp_path, monkeypatch):
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    git = ['git', '-C', str(repo)]
+    subprocess.run(git + ['init', '--quiet'], check=True, timeout=5)
+    tree = subprocess.check_output(git + ['mktree'], input='', text=True, timeout=5).strip()
+    commit = subprocess.check_output(
+        git + ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+               'commit-tree', tree, '-m', 'test'], text=True, timeout=5).strip()[:12]
+    empty_fw = repo / 'AGV_FIRMWARE'
+    empty_fw.mkdir()
+
+    assert sens.commit_in_repo(str(repo), commit) is True
+    build = dict(dll_sha256=_SHA, esp32=dict(commit=commit, dirty=False))
+    meta = _meta(_main_fakes(monkeypatch, tmp_path, build=build, fw=empty_fw))
+    assert meta['dll']['esp32_commit_trong_repo'] is False
+    assert meta['dll']['nguon_esp32_du'] is False
+    assert meta['dung_lam_luot_xac_nhan'] is False
 
 
 def test_c3_20_r3_build_verified_doc():

@@ -1161,7 +1161,7 @@ def test_old_source_is_in_the_repo():
     assert isinstance(_doc_nguon_cu(), bytes)
 
 
-@pytest.mark.parametrize('case', ['thieu', 'sai_sha', 'crlf'])
+@pytest.mark.parametrize('case', ['thieu', 'sai_sha', 'crlf', 'crlf_checkout'])
 def test_old_source_check_rejects(tmp_path, monkeypatch, case):
     """_doc_nguon_cu fails (never skips) on a missing file or a wrong CR-stripped sha256; a CRLF
     copy still passes: the pinned sha is computed with CR stripped."""
@@ -1179,11 +1179,14 @@ def test_old_source_check_rejects(tmp_path, monkeypatch, case):
         monkeypatch.setattr(mod, 'NGUON_CU', path)
         with pytest.raises(AssertionError, match=NGUON_CU_SHA):
             _doc_nguon_cu()
-    else:                                        # crlf: the boundary case of the CR-stripped sha
+    else:
+        if case == 'crlf_checkout':
+            raw = raw.replace(b'\r\n', b'\n').replace(b'\n', b'\r\n')
+        crlf = raw.replace(b'\r\n', b'\n').replace(b'\n', b'\r\n')
         with open(path, 'wb') as f:
-            f.write(raw.replace(b'\n', b'\r\n'))
+            f.write(crlf)
         monkeypatch.setattr(mod, 'NGUON_CU', path)
-        assert _doc_nguon_cu() == raw.replace(b'\n', b'\r\n')
+        assert _doc_nguon_cu() == crlf
 
 
 def test_pair_fails_not_skips_without_the_old_source(fw, variants, tmp_path, monkeypatch):
@@ -1215,6 +1218,22 @@ def test_cap_runs_simulates_both_sides(fw, variants, monkeypatch):
     msg = f's03: {_dll_tin(ref_path)}; {_dll_tin(_DLL)}'
     assert r['n_lech'] == 0 and r['digest_win_bang'] and r['npz'], msg
     assert _RUNS['v08_mac_dinh'] is stale
+
+
+@pytest.fixture(scope='module')
+def wrap_linker(variants, tmp_path_factory):
+    """Check that GCC can link a shared library with --wrap before requiring a wrap DLL."""
+    out = tmp_path_factory.mktemp('c3_wrap')
+    original, wrapper = out / 'original.c', out / 'wrapper.c'
+    original.write_text('int c3_target(void) { return 1; }\n', encoding='ascii')
+    wrapper.write_text(
+        'int __real_c3_target(void);\n'
+        'int __wrap_c3_target(void) { return __real_c3_target(); }\n', encoding='ascii')
+    result = subprocess.run(
+        ['gcc', '-shared', str(original), str(wrapper), '-Wl,--wrap=c3_target',
+         '-o', str(out / 'wrap_probe.dll')], capture_output=True, text=True)
+    if result.returncode:
+        pytest.skip(f'linker cannot build a DLL with --wrap: {result.stderr.strip()}')
 
 
 def _bien_the(dll):
@@ -1255,6 +1274,7 @@ def _gia_lap_probe(monkeypatch, wrap_ld=True, wrap_bat=True, du_phong_bat=True):
     return built, cmds, probes
 
 
+@pytest.mark.usefixtures('wrap_linker')
 def test_trace_fallback_builds_a_separate_dll(variants, glog, monkeypatch):
     """Codex C3-33: when a --wrap trace DLL records no calls, the renamed-symbol fallback is built
     under its own name <name>_du_phong.dll: the first DLL stays loaded and is not overwritten."""
@@ -1298,6 +1318,7 @@ def test_trace_fallback_when_the_linker_rejects_wrap(variants, glog, monkeypatch
         assert _bits_eq(log[k], glog[k]), k
 
 
+@pytest.mark.usefixtures('wrap_linker')
 def test_trace_wrap_probe_ok(variants, monkeypatch):
     """The normal case: --wrap links and records calls: one build, one probe, no fallback file,
     _WRAP_OK ends True."""
@@ -1312,7 +1333,7 @@ def test_trace_wrap_probe_ok(variants, monkeypatch):
 
 
 @pytest.mark.parametrize('case', ['ld_tu_choi', 'ca_hai'])
-def test_trace_fallback_fails_too(variants, monkeypatch, case):
+def test_trace_fallback_fails_too(variants, monkeypatch, request, case):
     """When the fallback also records nothing the fixture must raise: ld rejects --wrap ('the
     trace records no pid_update calls'), or both variants probe empty ('renamed symbols too')."""
     if case == 'ld_tu_choi':
@@ -1321,6 +1342,7 @@ def test_trace_fallback_fails_too(variants, monkeypatch, case):
             variants('fwsim_trace_hong_ld', trace=True)
         assert probes == [('du_phong', built[1][0])]       # the wrap DLL was never probed
     else:
+        request.getfixturevalue('wrap_linker')
         built, cmds, probes = _gia_lap_probe(monkeypatch, wrap_bat=False, du_phong_bat=False)
         with pytest.raises(RuntimeError, match='renamed symbols too'):
             variants('fwsim_trace_hong_ca_hai', trace=True)

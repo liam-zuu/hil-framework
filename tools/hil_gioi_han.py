@@ -35,8 +35,9 @@ ESP32 (pwm -> duty MISO) khi có log phía Pi.
     --esp-log của lần chạy này (không có log -> cả hai phía None); blob git (CRLF -> LF) của
     mọi module SCORER_MODULES (kể cả rpi5/protocol.py và tools/gate_c8.py mà hil_o1_score
     import) = blob tính lại trên bản đang chạy; k0 là chỉ số frame nguyên trong [0, n); t_end
-    (khi có) nằm trong [T_cmd; t_deadline] ±1e-9. JSON thô của hil_o1_score.py --out không có
-    khối này -> mã 2. Thêm: frame_log bắt buộc; t0_step, T_cmd, t_deadline phải hữu hạn;
+    (khi có) nằm trong [T_cmd; t_deadline]. JSON thô của hil_o1_score.py --out không có
+    khối này -> mã 2. frame_log bắt buộc; t0_step và k0 phải khớp mốc RUN hoặc cạnh ESP32
+    theo quy tắc bộ chấm; T_cmd, t_deadline phải hữu hạn;
     completed 'true' cần t_end hữu hạn. win_ht_src = 'hil_o1_score:<t0_src>:completed=<..>:
     allow_final_set=<0|1>:allow_pre_b81_15=<0|1>:scorer_blob=<blob hil_o1_score>'.
 
@@ -438,12 +439,12 @@ def check_score_lock(score, npz_path, task, esp_path=None):
     return lock
 
 
-def score_window(score, npz_name, n, period, lock=None):
+def score_window(score, npz_name, n, period, origin, lock=None):
     """C3-17: mặt nạ cửa sổ hoàn thành (n,) bool từ kết quả hil_o1_score.score (docstring mục
     a) -> (mask, t_ht0, t_ht1, src). JSON không khớp log -> ValueError. C3-28: frame_log bắt
-    buộc; k0 phải là chỉ số frame nguyên trong [0, n); t0_step, T_cmd, t_deadline phải hữu
-    hạn; completed 'true' cần t_end hữu hạn; t_end khi có phải nằm trong
-    [T_cmd; t_deadline] +-1e-9. lock (check_score_lock): bộ cờ và blob bộ chấm ghi vào src."""
+    buộc; k0 phải là chỉ số frame nguyên trong [0, n); (k0, t0_step) phải khớp origin tính
+    từ log. T_cmd, t_deadline phải hữu hạn; completed 'true' cần t_end hữu hạn; t_end khi có
+    phải nằm trong [T_cmd; t_deadline]. lock (check_score_lock): bộ cờ và blob bộ chấm ghi vào src."""
     try:
         k0s, a = int(score['k0']), float(score['t0_step'])
         t_cmd, t_dl = float(score['T_cmd']), float(score['t_deadline'])
@@ -456,6 +457,9 @@ def score_window(score, npz_name, n, period, lock=None):
     k = score['k0']
     if not (isinstance(k, int) and not isinstance(k, bool) and 0 <= k < n):
         raise ValueError(f'ket qua cham k0={k!r} khong phai chi so frame trong [0, {n})')
+    if (k0s, a) != origin:
+        raise ValueError(f'ket qua cham k0={k0s}, t0_step={a} khong khop moc cua log '
+                         f'(k0={origin[0]}, t0_step={origin[1]})')
     fl = score.get('frame_log')
     if fl != npz_name:
         raise ValueError(f'ket qua cham cua {fl!r}, khong phai {npz_name!r}')
@@ -469,7 +473,7 @@ def score_window(score, npz_name, n, period, lock=None):
             raise ValueError(f'ket qua cham t_end={t_end!r} khong phai so') from None
         if not math.isfinite(t_end):
             raise ValueError(f'ket qua cham t_end={t_end} khong huu han')
-        if not (t_cmd - 1e-9 <= t_end <= t_dl + 1e-9):
+        if not (t_cmd <= t_end <= t_dl):
             raise ValueError(f'ket qua cham t_end={t_end} ngoai cua so [T_cmd={t_cmd}; '
                              f't_deadline={t_dl}]')
     if score.get('completed') == 'true' and t_end is None:
@@ -694,7 +698,16 @@ def count_run(npz_path, task, score=None, esp_path=None):
     # C3-17: cửa sổ hoàn thành của bộ chấm (mặt nạ trên mọi frame của log)
     if score is not None:
         lock = check_score_lock(score, npz_path, task, esp_path)         # C3-28
-        ht, t_ht0, t_ht1, src = score_window(score, os.path.basename(npz_path), n, period, lock)
+        origin = (k0, float(k0))
+        if esp_path:
+            # Dùng lại phép ánh xạ và quy tắc làm tròn k0 của hil_o1_score.score.
+            esp = hil_edge_map.read_esp_log(esp_path)
+            em = hil_edge_map.map_edge(duty, k0, esp, period,
+                                       dict(mosi=mosi, miso=miso, t_send_ns=t_ns))
+            if em['ok']:
+                step = float(em['edge_step'])
+                origin = (math.ceil(step - 1e-9), step)
+        ht, t_ht0, t_ht1, src = score_window(score, os.path.basename(npz_path), n, period, origin, lock)
         row.update(win_ht_src=src, t_ht0_s=round(t_ht0, 6), t_ht1_s=round(t_ht1, 6),
                    win_ht_n=int(ht.sum()),
                    n_vband_ht=int((in_speed_band(np.hypot(state[:, 7], state[:, 8])) & ht).sum()),
