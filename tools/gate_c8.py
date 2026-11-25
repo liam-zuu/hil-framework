@@ -810,9 +810,11 @@ DK_D2 = 'kiem_yaw_theo_hieu_mien_quyet'              # the U standard condition 
 D2_SAME = ('task', 'gio_sha256', 'gate_file_sha256', 'clip', 'nodes_s', 'scorer', 'hong_nut', 'so_do', 'loai_hong',
            'loai_hong_nut', 'u_t_nodes', 'u_max_s')
 D2_SAME_REF = ('file_so_h', 'file_cham_h1', 'file_gio_h1')     # {duong_dan, sha256} or null: the same file
-# rule 3 of CODE 24/11: the e_do file of a scored run is read with the mask of its masked grid; mat_na_d2 of the e_do
-# file (c8b_edo luot) states these keys of luoi_d2.json mat_na_d2
-EDO_D2_KEYS = ('version', 'sha256', 'luot', 'lan_cham')
+# rule 3 of CODE 24/11: the e_do file of a scored run is read with the mask of its masked grid. c8b_edo luot
+# --mat-na-d2 (C8B feat/c8b-edo-mat-na-d2 ed2f6a6, fields confirmed by C8B 25/11) writes mat_na_d2 {sha256,
+# sha_noi_dung, luot, lan_cham, n_khung_mo, nut_khong_cham} and luoi_d2_sha256 (the luoi_d2.json it read); both null
+# without a mask. These keys of its mat_na_d2 are those of luoi_d2.json mat_na_d2
+EDO_D2_KEYS = ('sha256', 'sha_noi_dung', 'luot', 'lan_cham')
 # GC6-1 (round 3): file_log, the ESP32 log of the run itself (hashed, not the SHA a time file states); GC6-2 (round 3,
 # CODE 19/11): file_thao_tac, the score.json the time file took its operations from (thao_tac_nguon; the one source of
 # the operator kinds, it wins over any other)
@@ -2100,11 +2102,12 @@ def _classified(fc: dict) -> bool:
     return fc['trang_thai_luot'] == 'cham' and isinstance(st, dict) and all(c in st for c in o1_gate.CONDS)
 
 
-def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.datetime], set, dict, list]:
+def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.datetime], set, dict, list, dict]:
     """The run sources of every C8 cell (GC6-1, GC6-2, GC6-3, GC6-6; F11, F17, F18). Returns ({scoring sha256 of an
     eligible run: mien_phai_phu of its kept nodes}, {run_id: time of its first scoring (script.luc_chay)}, {scorer
     commits of the scored grids}, {scoring sha256 of an eligible run: its camera segment}, [the scored runs that have
-    a second scoring: rule 2 of CODE 24/11, refused at the end of check_nguon])."""
+    a second scoring: rule 2 of CODE 24/11, refused at the end of check_nguon], {scored K run: index of its session}
+    for D3-1)."""
     plan_cells = {c['o'] for c in d['o_c8']}
     segs = _check_tien_de(d)                             # CODE 20/11 after C8 session 2: the camera segments
     rows, slices = _buoi_rows(goc, d['thu_tu_clip'])     # CODE 22/11: every C8 session, in session order
@@ -2346,8 +2349,12 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
                             raise GateFileError(f'{w}: {tag} was not read with the D2 mask of the masked grid of the run '
                                                 f'(mat_na_d2 {{{", ".join(EDO_D2_KEYS)}}} those of {D2_NAME}; c8b_edo luot '
                                                 'reads the mask, rule 3 of CODE 24/11)')
-                    elif em is not None:
-                        raise GateFileError(f'{w}: {tag} was read with a D2 mask (mat_na_d2), its scoring has none')
+                        if ed.get('luoi_d2_sha256') != cref['sha256']:
+                            raise GateFileError(f'{w}: {tag} luoi_d2_sha256 is not the masked grid of the run '
+                                                f'(file_cham_d2; c8b_edo luot reads {D2_NAME}, rule 3 of CODE 24/11)')
+                    elif em is not None or ed.get('luoi_d2_sha256') is not None:
+                        raise GateFileError(f'{w}: {tag} was read with a D2 mask (mat_na_d2, luoi_d2_sha256), its '
+                                            'scoring has none')
                     bo.append(_edo_set(fcx, ed, f'{w}: {tag}', c))
                 want_all = [p[0]['sha256'] for p in pairs] + [p[1]['sha256'] for p in pairs]
                 srcs = [s.get('sha256') for s in cc.get('nguon') or [] if isinstance(s, dict)]
@@ -2399,7 +2406,8 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
     if [(r['buoc'].strip(), r['clip']) for r in k_rows] != [(x['run_id'], x['clip']) for x in d['luot_k']]:
         raise GateFileError(f'luot_k {[x["run_id"] for x in d["luot_k"]]}: thu_tu_clip.csv has the K runs '
                             f'{[r["buoc"].strip() for r in k_rows]} with their clips, in that order (GC9-2)')
-    for x in d['luot_k']:
+    k_cham = {}                                          # D3-1: the scored K runs, each with its session
+    for x, kr in zip(d['luot_k'], k_rows):
         w = f'K run {x["run_id"]}'
         task = 'O1-' + x['run_id'].split('-')[2]
         fks = []
@@ -2434,6 +2442,8 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
         _one_first_scoring(first, x, w)
         # D2-1a, rules 1 and 2 of CODE 24/11 (the K runs too; L157 question 4, Liam 25/11: the K runs are in the
         # target set of D2)
+        if any(fk['trang_thai_luot'] == 'cham' for fk in fks):
+            k_cham[x['run_id']] = kr['_buoi']
         if fks[0]['trang_thai_luot'] == 'cham':
             if x['file_cham_d2'] is None:
                 raise GateFileError(f'{w}: a scored K run (luoi.json trang_thai_luot cham) without file_cham_d2, its '
@@ -2445,7 +2455,7 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
         if len(fks) > 1 and any(fk['trang_thai_luot'] == 'cham' for fk in fks):
             h1_cham.append(w)                           # rule 2 of CODE 24/11, as for a run of a cell
     _d2_targets(goc, d2_ref, luots)
-    return eligible, cham_luc, scorers, elig_seg, h1_cham
+    return eligible, cham_luc, scorers, elig_seg, h1_cham, k_cham
 
 
 def commit_bo_of(khoa: dict) -> Optional[str]:
@@ -2486,14 +2496,19 @@ def _check_mien_theo_buoi(d: dict, khoa: dict, elig_seg: dict) -> None:
                                 '(inside the hull of the merged lock only; KG-5)')
 
 
-def _check_muc_du_dai(d: dict, khoa: dict, elig_seg: dict) -> None:
+MUC_K = 'O1-F05'    # the level whose bounds a K run is scored with (L157 question 4, Liam 25/11 10:17 at CODE)
+
+
+def _check_muc_du_dai(d: dict, khoa: dict, elig_seg: dict, k_cham: dict) -> None:
     """D3-1 (Codex D3 round 1; CODE 24/11 khuya, 2026-11-24_CODE_chot_khoa_gop_dai_khong_co_khung.md, condition (a);
     C8B c8b_khoa_gop e7e00e6): the merged lock writes muc_du_dai_theo_buoi {session id: [levels at which that session
     has frames of its own in every band of hang_theo_u]}; a band a session has no frame in takes its bound from the
     other sessions, and a run of that session must not use it silently. Keyed as mien_car_pose_theo_buoi (KG-5): the
     sessions of the gate; the lock of one session without the field is left alone. Every eligible scoring (the run a
-    cell rests on) of session b at level lv needs lv in the list of b. Limit: the K runs are no eligible scoring of
-    the gate (only their scoring time is taken) and are not asked here."""
+    cell rests on) of session b at level lv needs lv in the list of b. The K runs too (CODE 25/11 13:50,
+    local_c65e48c9, after L157 question 4, Liam 25/11 10:17 at CODE "Co, dung can F05 (Recommended)": a K run is
+    scored with the bounds of O1-F05): every scored K run (k_cham {run id: index of its session}) of session b needs
+    O1-F05 in the list of b. Known effect: a session with a K run and a band of F05 missing stops the gate."""
     mdb = khoa.get('muc_du_dai_theo_buoi')
     buois = [t['buoi'] for t in d['tien_de_c8']]
     if mdb is None and len(buois) == 1:
@@ -2513,6 +2528,11 @@ def _check_muc_du_dai(d: dict, khoa: dict, elig_seg: dict) -> None:
                                 f'of its own in some band of level {c["muc"]} (khoa_c8b.muc_du_dai_theo_buoi '
                                 f'{mdb[seg["buoi"]]}): the band bound of that level comes from other sessions only '
                                 '(D3-1)')
+    for rid, k in sorted(k_cham.items()):
+        if MUC_K not in mdb[buois[k]]:
+            raise GateFileError(f'K run {rid}: scored with the bounds of {MUC_K} in session {buois[k]}, which has no '
+                                f'frame of its own in some band of that level (khoa_c8b.muc_du_dai_theo_buoi '
+                                f'{mdb[buois[k]]}): the band bound comes from other sessions only (D3-1; CODE 25/11)')
 
 
 def scorings_dropped(goc: str, commit: Optional[str]) -> List[dict]:
@@ -2851,9 +2871,11 @@ def _check_d3_dau_hc(d: dict, goc: str, b: dict) -> None:
     <rows>.nguon.json of the D3 rows (the rows file the D3 evidence names, vai rows, under the C8 folder); no
     'goc_a' source for anything else. A session without an HC_goc row is not asked (nothing to compare). No session
     with an HC_goc row: nothing to check; one such session and no end in the D3 rows: no later end to compare.
-    [CACH HIEU GATE, rule proposed to CODE 25/11: the unit is the session with an HC_goc row in its thu_tu_clip.csv.]
-    Limit: a session whose HC_goc clips are all unusable has no F7 and stops the gate here (a question for CODE /
-    Liam then); the F7 files themselves are not opened (c8b_d3_hang checked them when it wrote the rows)."""
+    Rule fixed by CODE 25/11 13:50 (local_c65e48c9; an input check that only refuses): the unit is the session with
+    an HC_goc row in its thu_tu_clip.csv; a session without one (run05) is not asked; a session whose HC_goc clips
+    are all unusable has no F7 and stops the gate here (reported to CODE then). The F7 of the first end is found
+    again under the folder of its session with the sha256 the sources file states (its session is told from a real
+    file); the F7 of the later ends are not opened (c8b_d3_hang checked them when it wrote the rows)."""
     rows, slices = _buoi_rows(goc, d['thu_tu_clip'])
     folders = [_folder_of(t) for t in d['thu_tu_clip']]
     co_hc = [k for k, (lo, hi) in enumerate(slices)
@@ -2890,6 +2912,8 @@ def _check_d3_dau_hc(d: dict, goc: str, b: dict) -> None:
     if len(k0) != 1:
         raise GateFileError(f'{w}: the F7 of the first HC_goc end {dau[0].get("duong_dan")!r} lies in the folder of '
                             f'{len(k0)} C8 sessions of the gate; one needed (D3-8)')
+    _ref_bytes(goc, _ref(dict(duong_dan=pd, sha256=dau[0].get('sha256')), f'{w}: the F7 of the first HC_goc end'),
+               f'{w}: the F7 of the first HC_goc end')
     want = sorted(posixpath.basename(folders[k]) for k in co_hc if k != k0[0])
     if got != want:
         raise GateFileError(f'{w}: the D3 rows compare the later HC_goc ends of the sessions {got} with the first one '
@@ -3011,7 +3035,7 @@ def check_nguon(d: dict, goc: str) -> dict:
         raise GateFileError(f'o_c8 cells {sorted(have)}: the plan locked before C8 has {sorted(plan)} (each once)')
     khoa, t_c8b = _check_khoa_c8b(d, goc)
     _check_a6(d, goc, khoa)
-    eligible, cham_luc, scorers, elig_seg, h1_cham = _check_runs_nguon(d, goc)
+    eligible, cham_luc, scorers, elig_seg, h1_cham, k_cham = _check_runs_nguon(d, goc)
     # GC6-1 (round 3): the C8b lock (its khoa_truoc) before the first scoring of any C8 run
     if cham_luc and not t_c8b < min(cham_luc.values()):
         raise GateFileError(f'khoa_c8b: khoa_truoc.luc {t_c8b.isoformat()} is not before the first scoring of a C8 run '
@@ -3044,7 +3068,7 @@ def check_nguon(d: dict, goc: str) -> dict:
     # dossier lists them, with Liam's record when there is one
     kl = _open_ref(goc, d['khoa_c8b'], 'khoa_c8b')
     _check_mien_theo_buoi(d, kl, elig_seg)              # KG-5
-    _check_muc_du_dai(d, kl, elig_seg)                  # D3-1
+    _check_muc_du_dai(d, kl, elig_seg, k_cham)          # D3-1
     bo_want = scorings_dropped(goc, commit_bo_of(kl))
     cb = _obj(hs.get('cham_cu_bo'), ('luoi', 'liam'), 'chuan_u.ho_so_c8.cham_cu_bo')
     if cb['luoi'] != bo_want:

@@ -636,8 +636,10 @@ def _d2_run(goc, x, fc, folder, mp):
     with open(os.path.join(goc, rel), 'w', encoding='utf-8', newline='\n') as f:
         json.dump(fd, f)
     x['file_cham_d2'] = dict(duong_dan=rel, sha256=GC.sha256_file(os.path.join(goc, rel)))
-    if x.get('file_edo') is not None:
-        _rewrite(goc, x['file_edo'], lambda y: y.update(mat_na_d2={q: fd['mat_na_d2'][q] for q in GC.EDO_D2_KEYS}))
+    if x.get('file_edo') is not None:                    # as c8b_edo luot --mat-na-d2 writes them (C8B ed2f6a6)
+        _rewrite(goc, x['file_edo'], lambda y: y.update(
+            mat_na_d2=dict({q: fd['mat_na_d2'][q] for q in GC.EDO_D2_KEYS}, n_khung_mo=fd['mat_na_d2']['n_khung_mo'],
+                           nut_khong_cham=[]), luoi_d2_sha256=x['file_cham_d2']['sha256']))
     if x.get('file_chung_cu') is not None:
         ls = [x['file_cham_d2']] + ([x['file_cham_h1']] if x['file_cham_h1'] else [])
         es = [x['file_edo']] + ([x['file_edo_h1']] if x['file_edo_h1'] else [])
@@ -1170,6 +1172,12 @@ def test_u_standard_evidence_files_c8b_signature(tmp_path):
         r = dk(d)[k]['bang_chung']
         _rewrite(goc, r, edit)
         _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: y['bang_chung'].update({k: r['sha256']}))
+        if k == GC.DK_D2:                          # D2-1a: the masked grids name the D2 file they were made with,
+            with pytest.raises(GC.GateFileError, match='is not the D2 evidence file of the gate'):   # refused first
+                GC.check_nguon(d, goc)
+            with pytest.raises(GC.GateFileError, match=f'{k}.bang_chung: a c8b_a6_o_v1 file with trang_thai dat'):
+                GC._check_bang_chung(d, goc, {'5' * 40})
+            continue
         with pytest.raises(GC.GateFileError, match=msg):
             GC.check_nguon(d, goc)
     for name, sc, msg in [('f', dict(commit='5' * 40, dirty=True, nut=[]), 'scorer'),
@@ -1548,8 +1556,9 @@ def test_round3_evidence_recomputed_from_the_edo_files(tmp_path, edit, field):
 def test_round3_evidence_g4_and_classification_from_the_grid(tmp_path):
     d, goc = build_c8(tmp_path / 'a')
     x = d['o_c8'][0]['chuoi'][0]
-    _rewrite(goc, x['file_cham'], lambda y: y['nums']['g4'].update(n_undef=1))
-    _relink(goc, d, x, old=None)
+    _d2_all(goc, d, che={x['run_id']: {2}})        # D2-1a: G4 of a scored run is that of its masked grid: a masked
+    x['ket_qua'] = 'chua_ket_luan'                 # frame is an undefined frame of G4 (and G1 is not concluded, L156)
+    assert _doc(goc, x['file_cham_d2'])['nums']['g4']['n_undef'] == 1
     with pytest.raises(GC.GateFileError, match='recomputed from the scorings'):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'b')
@@ -3029,6 +3038,7 @@ def test_code_23_11_bo_tick_needs_the_scoring_commit_of_the_lock(tmp_path):
     for commit, msg in (('6' * 40, 'K run time file'), ('5' * 40, None)):
         gk = _jw(goc, f'luot/K/gio_{commit[0]}.json', _gio('K_x', kcell, 0.005, script=dict(commit=commit, dirty=False)))
         _rewrite(goc, d['luot_k'][0]['file_cham'], lambda y: y.update(gio_sha256=gk['sha256']))
+        _d2_all(goc, d)                                                # D2-1a: the masked grid of that luoi.json
         if msg:
             with pytest.raises(GC.GateFileError, match=msg):
                 GC.check_nguon(d, goc)
@@ -3473,6 +3483,18 @@ def test_d3_1_levels_with_every_band_per_session(tmp_path):
     # one session, a lock without the field: left alone (as KG-5)
     d, goc = build_c8(tmp_path / 'g')
     GC.check_nguon(d, goc)
+    # the K runs (CODE 25/11 13:50; L157 question 4: scored with the bounds of O1-F05): a scored K run of a session
+    # without every band of F05 is refused; the list of the other session does not matter
+    d, goc = build_c8(tmp_path / 'k', levels=('O1-F02', 'O1-F08'), sub='b2')    # no cell at F05: the K run alone
+    _add_k(goc, d)                                                   # the K run is a row of session b2
+    _buoi3(goc, d, 'O1-F08_PID')
+    _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: (y['giu_ngoai'].append('C8-P-K1-1'),
+                                                       y['cham_luc'].update({'C8-P-K1-1': LUC_CHAM})))
+    _rewrite_khoa(goc, d, lambda k: k['muc_du_dai_theo_buoi'].update(C8_buoi3=['O1-F08']))
+    GC.check_nguon(d, goc)
+    _rewrite_khoa(goc, d, lambda k: k['muc_du_dai_theo_buoi'].update(C8_buoi2=['O1-F02', 'O1-F08']))
+    with pytest.raises(GC.GateFileError, match='K run C8-P-K1-1: scored with the bounds of O1-F05 in session C8_buoi2'):
+        GC.check_nguon(d, goc)
 
 
 def test_d3_2_position_check_file_thieu_or_with_mien_thieu(tmp_path):
@@ -3534,7 +3556,9 @@ def _sua_d2(goc, x, edit):
     """luoi_d2.json of run x rewritten by edit; its evidence file names the new bytes."""
     _rewrite(goc, x['file_cham_d2'], edit)
     if x.get('file_chung_cu') is not None:
-        _rewrite(goc, x['file_chung_cu'], lambda y: y['nguon'][0].update(sha256=x['file_cham_d2']['sha256']))
+        _rewrite(goc, x['file_edo'], lambda y: y.update(luoi_d2_sha256=x['file_cham_d2']['sha256']))
+        _rewrite(goc, x['file_chung_cu'], lambda y: (y['nguon'][0].update(sha256=x['file_cham_d2']['sha256']),
+                                                     y['nguon'][-1].update(sha256=x['file_edo']['sha256'])))
 
 
 def test_d2_versions_and_names_are_those_of_c8b():
@@ -3714,13 +3738,34 @@ def test_d2_rule_3_evidence_made_from_the_masked_grid(tmp_path):
     for tag, edit in (('b', lambda y: y.pop('mat_na_d2')),
                       ('c', lambda y: y['mat_na_d2'].update(luot='R_O1-F02_PID')),
                       ('d', lambda y: y['mat_na_d2'].update(sha256='0' * 64)),
-                      ('e', lambda y: y['mat_na_d2'].update(lan_cham='0' * 16))):
+                      ('e', lambda y: y['mat_na_d2'].update(lan_cham='0' * 16)),
+                      ('f', lambda y: y['mat_na_d2'].update(sha_noi_dung='0' * 64)),
+                      ('g', lambda y: y.update(luoi_d2_sha256='0' * 64))):
         d, goc = build_c8(tmp_path / tag)
         x = d['o_c8'][2]['chuoi'][0]
         _rewrite(goc, x['file_edo'], edit)
         _rewrite(goc, x['file_chung_cu'], lambda y: y['nguon'][1].update(sha256=x['file_edo']['sha256']))
-        with pytest.raises(GC.GateFileError, match='file_edo was not read with the D2 mask'):
+        with pytest.raises(GC.GateFileError, match='file_edo was not read with the D2 mask|file_edo luoi_d2_sha256'):
             GC.check_nguon(d, goc)
+    # a run without a scored node (its luoi.json taken as it is) with an e_do file that names a mask
+    d, goc = build_c8(tmp_path / 'h')
+    c = d['o_c8'][2]
+    x = c['chuoi'][0]
+    lu = _doc(goc, x['file_cham'])
+    for e in lu['nguon_nut']:                                          # every node a tool error: no node scored
+        r = dict(duong_dan=e['duong_dan'], sha256=e['sha256'])
+        _rewrite(goc, r, lambda y: y.pop('gate_v3'))
+        e['sha256'] = r['sha256']
+    keep = _doc(goc, x['file_edo'])
+    _relink_nodes(goc, d, x, lu, trang_thai_luot='chua_ket_luan_khong_nut', outcome='chua_ket_luan', nodes_ok=[False, False],
+                  states={q: 'chua_ket_luan' for q in o1_gate.CONDS})
+    assert x['file_cham_d2'] is None
+    x['ket_qua'] = 'chua_ket_luan'
+    _rewrite(goc, x['file_edo'], lambda y: (y.clear(), y.update(keep)))
+    _rewrite(goc, x['file_chung_cu'], lambda y: y.update(nguon=[dict(file='luoi.json', sha256=x['file_cham']['sha256']),
+                                                               dict(file='edo.json', sha256=x['file_edo']['sha256'])]))
+    with pytest.raises(GC.GateFileError, match='read with a D2 mask .mat_na_d2, luoi_d2_sha256., its scoring has none'):
+        GC.check_nguon(d, goc)
 
 
 def test_d2_ghep_takes_the_masked_grid_beside_luoi_json(tmp_path):
@@ -3788,8 +3833,11 @@ def _d3_nguon(goc, d, dau='b2/HC/F7_goc.json', sau=(('b3', 'b3/HC/F7_goc.json'),
     sha = GC.sha256_file(p)
     src = [dict(vai='khoa', duong_dan='x', sha256=d['khoa_c8b']['sha256'])]
     src += [dict(vai=f'goc_a {b}', duong_dan=os.path.join(goc, f), sha256=_h(f)) for b, f in sau]
-    if dau:
-        src.append(dict(vai='goc_a_dau', duong_dan=os.path.join(goc, dau), sha256=_h(dau)))
+    if dau:                                         # the F7 of the first end: a real file under goc
+        os.makedirs(os.path.dirname(os.path.join(goc, dau)), exist_ok=True)
+        with open(os.path.join(goc, dau), 'w', encoding='utf-8', newline='\n') as f:
+            json.dump(dict(schema='truc_xe_v1', trang_thai='khoa'), f)
+        src.append(dict(vai='goc_a_dau', duong_dan=os.path.join(goc, dau), sha256=GC.sha256_file(os.path.join(goc, dau))))
     ng = dict(version='c8b_d3_hang_v1', sha256=sha, nguon=src)
     if nguon_edit:
         nguon_edit(ng)
@@ -3833,6 +3881,11 @@ def test_d3_8_every_later_hc_goc_end_is_in_d3(tmp_path):
         _d3_nguon(goc, d, **kw)
         with pytest.raises(GC.GateFileError, match=msg):
             GC.check_nguon(d, goc)
+    _d3_nguon(goc, d)
+    with open(os.path.join(goc, 'b2/HC/F7_goc.json'), 'ab') as f:      # the F7 of the first end is not that file
+        f.write(b' ')
+    with pytest.raises(GC.GateFileError, match='F7 of the first HC_goc end.*sha256 differs'):
+        GC.check_nguon(d, goc)
     _d3_nguon(goc, d)
     os.remove(os.path.join(goc, 'b2/chuan_u/d3_rows.csv.nguon.json'))
     with pytest.raises(GC.GateFileError, match='no sources file'):
