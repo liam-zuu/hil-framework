@@ -2763,6 +2763,77 @@ def test_neo_luot_max_over_every_frame_independent(tmp_path, scene):
     assert o['theo_cho']['goc']['P_neo_m'] == r['P_neo_m'] and o['theo_cho']['goc']['luot_max_P'] == 'C8-P-F02-1'
 
 
+def _neo_run_bytes(tmp_path, csp, sp, name, khung_csv=None):
+    out = tmp_path / name
+    args = ['neo_luot', '--model', 'B1', '--cua-so', str(csp), '--track', str(tmp_path), '--session', str(sp),
+            '--out', str(out)]
+    if khung_csv:
+        args += ['--khung-csv', str(khung_csv)]
+    rc = kc.main(args)
+    return rc, out.read_bytes() if out.exists() else None
+
+
+@pytest.mark.parametrize('kind', ['doi_tap', 'moc_it'])
+def test_neo_luot_khung_csv_same_json_and_signed_rows(tmp_path, scene, kind):
+    """C8B D3 replay_neo (CODE 24/11): --khung-csv leaves neo_luot.json the same bytes; the hop_le rows carry the signed
+    e_t - mean_W whose hypot / |dpsi| maxima are P_neo_m / A_neo_rad; every run frame has one row and the frames not
+    valid carry the reason of info.khong_hop_le (doi_tap: mark 25 taped off and lost after W; moc_it: R_t < gate)."""
+    import c7_measure as cmeas
+    if kind == 'doi_tap':
+        csp, sp, *_ = _neo_files(tmp_path, scene, drop_b=(25,), tape_off=(25, 0.003))
+    else:
+        keep = sorted(scene[0])[:7]
+        csp, sp, *_ = _neo_files(tmp_path, scene, drop_b=[i for i in scene[0] if i not in keep and i != cmeas.CAR_ID])
+    rc0, b0 = _neo_run_bytes(tmp_path, csp, sp, 'neo0.json')
+    kp = tmp_path / 'khung.csv'
+    rc1, b1 = _neo_run_bytes(tmp_path, csp, sp, 'neo1.json', kp)
+    assert rc0 == 0 and rc1 == 0 and b0 == b1
+    o = json.loads(b1.decode('utf-8'))
+    r = o['luot']['C8-P-F02-1']
+    rows = kc._read_csv(str(kp))
+    assert list(rows[0]) == list(kc.KHUNG_CSV_COLS)
+    assert [x['luot_id'] for x in rows] == ['C8-P-F02-1'] * r['info']['n_khung']
+    ok = [x for x in rows if x['trang_thai'] == 'hop_le']
+    assert len(ok) == r['info']['n_khung_hop_le']
+    bad = {int(x['khung']): x['ly_do'] for x in rows if x['trang_thai'] != 'hop_le'}
+    assert bad == {x['khung']: x['ly_do'] for x in r['info']['khong_hop_le']}
+    assert all(x['la_W'] in ('True', 'False') and x['sau_W'] in ('True', 'False') for x in rows)
+    if kind == 'doi_tap':
+        assert r['trang_thai'] == 'dat' and not bad
+        assert max(math.hypot(float(x['dx_m']), float(x['dy_m'])) for x in ok) == r['P_neo_m'] > 1e-5
+        assert max(abs(float(x['dpsi_rad'])) for x in ok) == r['A_neo_rad'] > 0
+        top = max(ok, key=lambda x: math.hypot(float(x['dx_m']), float(x['dy_m'])))
+        assert int(top['khung']) == r['info']['khung_max_P'] and top['sau_W'] == 'True'
+        w = [x for x in ok if x['la_W'] == 'True']                # W rows average to 0 (deviation from mean_W)
+        assert len(w) == r['n_pre'] and abs(sum(float(x['dx_m']) for x in w)) < 1e-12
+    else:
+        assert r['trang_thai'] == 'chua_ket_luan' and set(bad) == {8, 9, 10}
+        assert all('moc_it' in v for v in bad.values())
+    rc2, _ = _neo_run_bytes(tmp_path, csp, sp, 'neo2.json', kp)       # an existing CSV is never replaced
+    assert rc2 != 0 and not (tmp_path / 'neo2.json').exists()
+
+
+def test_neo_luot_khung_csv_failure_leaves_neither_file(tmp_path, scene, monkeypatch):
+    """D3-12 (Codex C8B D3 v1, P3): --khung-csv into a missing directory is refused before anything is written; a CSV
+    export failing after the JSON is published takes the JSON back, so the same command can be run again."""
+    csp, sp, *_ = _neo_files(tmp_path, scene, drop_b=(25,), tape_off=(25, 0.003))
+    rc, b = _neo_run_bytes(tmp_path, csp, sp, 'neo.json', tmp_path / 'khong_co' / 'k.csv')
+    assert rc != 0 and b is None
+    real = kc.publish_new
+
+    def boom(path, write):
+        if str(path).endswith('.csv'):
+            raise OSError('disk full')
+        return real(path, write)
+    monkeypatch.setattr(kc, 'publish_new', boom)
+    rc, b = _neo_run_bytes(tmp_path, csp, sp, 'neo.json', tmp_path / 'k.csv')
+    assert rc != 0 and b is None and not (tmp_path / 'k.csv').exists()
+    monkeypatch.setattr(kc, 'publish_new', real)
+    rc, b = _neo_run_bytes(tmp_path, csp, sp, 'neo.json', tmp_path / 'k.csv')   # the same command, now fine
+    rc0, b0 = _neo_run_bytes(tmp_path, csp, sp, 'neo0.json')
+    assert rc == 0 and rc0 == 0 and b == b0 and (tmp_path / 'k.csv').exists()
+
+
 def test_neo_luot_sees_an_isolated_peak_between_the_windows(tmp_path, scene):
     """KCP4 test (Codex): a frame in the MIDDLE of the run (5, tag seen) loses the taped-off mark 25, the windows do
     not: the two-end number is 0 but P_neo, A_neo are the replay at frame 5 (independent oracle), so an implementation
