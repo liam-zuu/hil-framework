@@ -796,9 +796,23 @@ def level_block(level: str, a_m: float, u_p: dict, u_psi: dict, runs: list, quye
 
 CHAIN_KEYS = ('run_id', 'clip', 'ket_qua', 'loai_hong', 'kiem_gio_d1', 'dem_truot_kiem_gio', 'file_cham', 'file_gio',
               'file_chung_cu', 'file_so_h', 'file_cham_h1', 'file_gio_h1', 'file_edo', 'file_edo_h1', 'file_log',
-              'file_thao_tac', 'thieu_u_t')
+              'file_thao_tac', 'thieu_u_t', 'file_cham_d2')
 CHAIN_FILES = ('file_cham', 'file_gio', 'file_chung_cu', 'file_cham_h1', 'file_gio_h1', 'file_edo',
-               'file_edo_h1', 'file_log', 'file_thao_tac')                    # each used by one run only
+               'file_edo_h1', 'file_log', 'file_thao_tac', 'file_cham_d2')    # each used by one run only
+# D2-1a (design section 29; CODE 24/11 22:50): file_cham_d2, the grid of a scored run (trang_thai_luot cham) with the D2
+# cell mask, luoi_d2.json beside its luoi.json (c8b_luoi --gop-only --mat-na-d2); null for a run without a scored
+# node. file_cham stays the scoring of the run (its time, commit, node scores, the U manifest); the states, numbers
+# and outcome of a scored run are those of file_cham_d2
+D2_NAME = 'luoi_d2.json'
+D2_VERSION = 'c8b_mat_na_d2_v1'                      # c8b_mat_na_d2.VERSION (a test keeps the two equal)
+DK_D2 = 'kiem_yaw_theo_hieu_mien_quyet'              # the U standard condition whose evidence file is the D2 mask
+# what luoi_d2.json states again of its luoi.json, unchanged (the mask changes no source of the scoring)
+D2_SAME = ('task', 'gio_sha256', 'gate_file_sha256', 'clip', 'nodes_s', 'scorer', 'hong_nut', 'so_do', 'loai_hong',
+           'loai_hong_nut', 'u_t_nodes', 'u_max_s')
+D2_SAME_REF = ('file_so_h', 'file_cham_h1', 'file_gio_h1')     # {duong_dan, sha256} or null: the same file
+# rule 3 of CODE 24/11: the e_do file of a scored run is read with the mask of its masked grid; mat_na_d2 of the e_do
+# file (c8b_edo luot) states these keys of luoi_d2.json mat_na_d2
+EDO_D2_KEYS = ('version', 'sha256', 'luot', 'lan_cham')
 # GC6-1 (round 3): file_log, the ESP32 log of the run itself (hashed, not the SHA a time file states); GC6-2 (round 3,
 # CODE 19/11): file_thao_tac, the score.json the time file took its operations from (thao_tac_nguon; the one source of
 # the operator kinds, it wins over any other)
@@ -867,7 +881,7 @@ def _chain_entry(x, w: str) -> dict:
     if (x['file_edo'] is None) != (x['file_chung_cu'] is None) \
             or (x['file_edo_h1'] is not None) != (x['file_chung_cu'] is not None and x['file_cham_h1'] is not None):
         raise GateFileError(f'{w}: file_edo goes with file_chung_cu, file_edo_h1 with it and a second scoring')
-    for k in ('file_edo', 'file_edo_h1'):
+    for k in ('file_edo', 'file_edo_h1', 'file_cham_d2'):
         if x[k] is not None:
             _ref(x[k], f'{w}.{k}')
     return x
@@ -1126,9 +1140,10 @@ def _check_chuan_u(d: dict) -> None:
 
 
 def _check_luot_k(d: dict) -> list:
-    """GC9-2 (CODE 20/11: every C8 run is held out, the K runs too): luot_k [{run_id, clip, file_cham, file_cham_h1}],
-    the grid file of every K run of thu_tu_clip.csv (c8b_luoi, one per run; the second scoring with it), only for its
-    scoring time and code; K runs are no cells of rule 2b (G1-G5 always decide)."""
+    """GC9-2 (CODE 20/11: every C8 run is held out, the K runs too): luot_k [{run_id, clip, file_cham, file_cham_h1,
+    file_cham_d2}], the grid file of every K run of thu_tu_clip.csv (c8b_luoi, one per run; the second scoring with
+    it), only for its scoring time and code; K runs are no cells of rule 2b (G1-G5 always decide). file_cham_d2
+    (D2-1a, rule 1 of CODE 24/11): the masked grid of a scored K run, as for a run of a cell."""
     lk = d['luot_k']
     if not isinstance(lk, list):
         raise GateFileError('luot_k: a list of the K runs of C8')
@@ -1136,7 +1151,7 @@ def _check_luot_k(d: dict) -> list:
     chain_clips = {x['clip'] for c in d['o_c8'] for x in c['chuoi']}
     for i, x in enumerate(lk):
         w = f'luot_k[{i}]'
-        _obj(x, ('run_id', 'clip', 'file_cham', 'file_cham_h1'), w)
+        _obj(x, ('run_id', 'clip', 'file_cham', 'file_cham_h1', 'file_cham_d2'), w)
         if not isinstance(x['run_id'], str) or not RUN_CODE_K.match(x['run_id']) or x['run_id'] in seen:
             raise GateFileError(f'{w}.run_id {x["run_id"]!r}: a K run code C8-<P|L>-<K1|K2>-<n>[_lai<n>], once')
         seen.add(x['run_id'])
@@ -1144,8 +1159,9 @@ def _check_luot_k(d: dict) -> list:
             raise GateFileError(f'{w}.clip {x["clip"]!r}: the clip of a figure-8 run (one clip, one run)')
         chain_clips.add(x['clip'])
         _ref(x['file_cham'], f'{w}.file_cham')
-        if x['file_cham_h1'] is not None:
-            _ref(x['file_cham_h1'], f'{w}.file_cham_h1')
+        for k in ('file_cham_h1', 'file_cham_d2'):
+            if x[k] is not None:
+                _ref(x[k], f'{w}.{k}')
     return lk
 
 
@@ -1704,13 +1720,17 @@ def _grid_outcome(fc: dict, nodes: list, w: str) -> None:
                             f'it is {want!r} (c8b_luoi combine; GC9-5)')
 
 
-def _grid_states(fc: dict, idx: list, cell: dict, w: str) -> None:
+def _grid_states(fc: dict, idx: list, cell: dict, w: str, masked: bool = False) -> None:
     """GC9-5 (round 5): the states of a scored grid against its node states (the c8b_luoi combine rule, f613db9): a node
     not ok counts chua_ket_luan; G1 by g1_rule; a measured condition with one node is that node's state, dat only when
     every node is dat (a domain moving between nodes may still make it chua_ket_luan), else khong_dat or chua_ket_luan
     (the cell rule needs the cell numbers, not rebuilt here: limit). so_do is that of J for C8 (G5 at F08): its
     three-branch grid state (states_ba_nhanh) follows the node rule, its state is so_do_state of the grid numbers
-    (nums: chung.q, q, n_undef; CODE 23/11, Liam "duyệt bảng luật mới")."""
+    (nums: chung.q, q, n_undef; CODE 23/11, Liam "duyệt bảng luật mới").
+    masked (D2-1a): fc is luoi_d2.json. The node score files are those before the mask, so its q_so_do is not that of
+    the middle node file and its states are not the node rule on the node files: both are rebuilt with the mask by
+    _masked_grid; here only what the file says of itself (so_do of J, the middle node, the so_do state from its own
+    q_so_do and n_undef). The node checks (SD1-6, SD2-1) ran on luoi.json of the same node files."""
     if fc['trang_thai_luot'] != 'cham':
         return
     sd = ['g5'] if cell['muc'] == G5_F08 else []
@@ -1734,8 +1754,9 @@ def _grid_states(fc: dict, idx: list, cell: dict, w: str) -> None:
                                 'of the grid (CODE 23/11 (2))')
         nb = (idx[m].get('gate_v3') or {}).get(c) if m is not None and isinstance(idx[m], dict) else None
         nq = nb.get('q_so_do') if isinstance(nb, dict) else None
-        if m is not None and (not isinstance(nq, dict) or not _same(x.get('q'), nq.get('q'))
-                              or not _same(x.get('q_chung'), nq.get('q_chung'))):       # copies (SD2-1, round 3)
+        if not masked and m is not None and (
+                not isinstance(nq, dict) or not _same(x.get('q'), nq.get('q'))
+                or not _same(x.get('q_chung'), nq.get('q_chung'))):                     # copies (SD2-1, round 3)
             raise GateFileError(f'{w}: luoi.json q_so_do.{c} {x!r}: not the q_so_do (q, q_chung of the defined '
                                 f'frames) of node {m} (its score file; SD1-1)')
         if not isinstance(b, dict) or st[c] != so_do_state(x.get('q_chung'), x.get('q'), b.get('n_undef'),
@@ -1743,6 +1764,8 @@ def _grid_states(fc: dict, idx: list, cell: dict, w: str) -> None:
             raise GateFileError(f'{w}: luoi.json {c} state {st[c]!r}: so_do from the middle node q and the grid '
                                 'n_undef gives another (GC9-5; CODE 23/11)')
         st[c] = sb[c]                                    # the node rule below checks the three-branch grid state
+    if masked:
+        return
     for k, sc in enumerate(idx):                     # SD1-6 (Codex 24/11): every scored node with the so_do of J
         if not ok[k] or not isinstance(sc, dict):
             continue
@@ -1931,15 +1954,157 @@ def _edo_set(fc: dict, ed: dict, w: str, cell: dict) -> dict:
                 g4_can_huu_han_mien_hop_moi_nut=_g4_finite(fc))
 
 
+def _json_same(a, b) -> bool:
+    """Two JSON values equal as written (key order aside; no tolerance: one is the copy or the rerun of the other)."""
+    return json.dumps(a, sort_keys=True, ensure_ascii=False) == json.dumps(b, sort_keys=True, ensure_ascii=False)
+
+
+def _sha_of(x):
+    return x.get('sha256') if isinstance(x, dict) else None
+
+
+def _mat_na_plain(tom: dict) -> dict:
+    """The mat_na_d2 block without the absolute paths its writer states (file, nut[].rows.duong_dan): the files are
+    tied by their sha256."""
+    out = {k: v for k, v in tom.items() if k != 'file'}
+    nut = []
+    for e in tom.get('nut') if isinstance(tom.get('nut'), list) else []:
+        if isinstance(e, dict) and isinstance(e.get('rows'), dict):
+            e = dict(e, rows={k: v for k, v in e['rows'].items() if k != 'duong_dan'})
+        nut.append(e)
+    out['nut'] = nut
+    return out
+
+
+def _masked_grid(goc: str, cham_ref: dict, d2_ref: dict, fc: dict, mat_na_ref: dict, w: str) -> dict:
+    """D2-1a (Codex D2 round 1; design section 29, the three rules of CODE 24/11 22:50): luoi_d2.json of a scored run,
+    the grid of its luoi.json fc with the D2 cell mask. Returns its content, which the gate takes for the states,
+    numbers and outcome of the run.
+      Tied: beside its luoi.json, named luoi_d2.json; luoi_goc.sha256 = that luoi.json; what it states again of the
+            scoring (D2_SAME, D2_SAME_REF, the node scores by sha256) is that of luoi.json; mat_na_d2 {version
+            c8b_mat_na_d2_v1, sha256 = the D2 evidence file of the gate (mat_na_ref), luot}.
+      Rebuilt with the code of C8B, no rule copied (imported here: c8b_luoi imports gate_c8): the node files of the
+            folder loaded (c8b_luoi.load_nodes), the mask of that run read from the D2 evidence file
+            (c8b_mat_na_d2.doc_mat_na) and applied (ap_dung: also ties the mask to this scoring, lan_cham, D2v2-4,
+            and each rows file to its node score), the grid combined (c8b_luoi.combine); every key combine returns
+            (states, nums, q_so_do, nodes_ok, outcome, states_ba_nhanh, ...) and the mat_na_d2 block (per node: the
+            sha256 of its rows file, the frames masked, the states before and after) must be those of the file;
+            c8b_mat_na_d2.goc_luoi: luoi.json is the grid of these node files without the mask (D2v2-1) and the mask
+            made no conclusion (D2-2).
+    Limits: the gate_v3 block of luoi_d2.json (read by rq3_log on the campaign side, not by the gate) is not rebuilt;
+    a mask that leaves no scored node gives the state c8b_luoi writes then (chua_ket_luan_khong_nut)."""
+    wd = f'{w}: file_cham_d2'
+    fd = _open_ref(goc, d2_ref, wd)
+    if posixpath.dirname(d2_ref['duong_dan']) != posixpath.dirname(cham_ref['duong_dan']) \
+            or posixpath.basename(d2_ref['duong_dan']) != D2_NAME:
+        raise GateFileError(f'{wd} {d2_ref["duong_dan"]!r}: the masked grid is {D2_NAME} beside the luoi.json of the run '
+                            f'({cham_ref["duong_dan"]!r}; D2-1a)')
+    mn = fd.get('mat_na_d2')
+    if not isinstance(mn, dict) or mn.get('version') != D2_VERSION or not isinstance(mn.get('luot'), str) \
+            or not mn['luot'] or not isinstance(mn.get('nut'), list):
+        raise GateFileError(f'{wd}: no mat_na_d2 block {{version {D2_VERSION}, luot, nut}} (c8b_luoi --gop-only '
+                            '--mat-na-d2; D2-1a)')
+    if _sha_of(fd.get('luoi_goc')) != cham_ref['sha256']:
+        raise GateFileError(f'{wd}: luoi_goc.sha256 is not the luoi.json of the run (file_cham): the mask was applied on '
+                            'another grid file (D2-1a)')
+    if mn.get('sha256') != mat_na_ref['sha256']:
+        raise GateFileError(f'{wd}: mat_na_d2.sha256 {str(mn.get("sha256"))[:12]}... is not the D2 evidence file of the '
+                            f'gate (chuan_u.dieu_kien.{DK_D2}.bang_chung {mat_na_ref["sha256"][:12]}...; one D2 file for '
+                            'the whole of C8, rule 1 of CODE 24/11)')
+    bad = [k for k in D2_SAME if not _json_same(fd.get(k), fc.get(k))]
+    bad += [k for k in D2_SAME_REF if _sha_of(fd.get(k)) != _sha_of(fc.get(k))
+            or (fd.get(k) is None) != (fc.get(k) is None)]
+    nn = [[(e.get('nut'), e.get('sha256')) for e in x.get('nguon_nut') or [] if isinstance(e, dict)] for x in (fd, fc)]
+    if nn[0] != nn[1] or not isinstance(fd.get('nguon_nut'), list):
+        bad.append('nguon_nut')
+    if bad:
+        raise GateFileError(f'{wd}: {bad} differ from the luoi.json of the run: the masked grid restates the scoring it '
+                            'was made from, unchanged (D2-1a)')
+    nd = fc.get('nodes_s')
+    if not isinstance(nd, list) or not nd:
+        raise GateFileError(f'{wd}: the luoi.json of the run has no nodes_s (D2-1a)')
+    try:
+        import c8b_luoi
+        import c8b_mat_na_d2
+    except ImportError as exc:
+        raise GateFileError(f'{wd}: the masked grid is rebuilt with tools/c8b_luoi.py and tools/c8b_mat_na_d2.py of '
+                            f'CODE_C8B, which cannot be imported ({exc})')
+    base = os.path.realpath(goc)
+    folder = os.path.join(base, posixpath.dirname(cham_ref['duong_dan']))
+    gio = dict(nodes_s=nd)
+    sd = list(fc.get('so_do') or [])
+    try:
+        r0 = c8b_luoi.combine(c8b_luoi.load_nodes(gio, folder), sd, nd)
+        khong_che = c8b_luoi._clean(dict(states=r0['states'], nodes_ok=r0['nodes_ok']))
+        mask = c8b_mat_na_d2.doc_mat_na(os.path.join(base, mat_na_ref['duong_dan']), mn['luot'])
+        nodes, tom = c8b_mat_na_d2.ap_dung(c8b_luoi.load_nodes(gio, folder), folder, mask,
+                                           c8b_luoi._state_from_numbers, c8b_luoi.KEY_DEC)
+        res = c8b_luoi.combine(nodes, sd, nd)
+        goc_ref = c8b_mat_na_d2.goc_luoi(os.path.join(base, cham_ref['duong_dan']), fd, khong_che)
+    except (c8b_luoi.LuoiError, c8b_mat_na_d2.cu.InputError, OSError, ValueError, KeyError, TypeError) as exc:
+        # MatNaError is a ValueError
+        raise GateFileError(f'{wd}: the masked grid cannot be rebuilt from the node files of {folder!r} and the D2 '
+                            f'evidence file of the gate (run {mn["luot"]!r}): {exc} (D2-1a)')
+    if mask['sha256'] != mat_na_ref['sha256'] or goc_ref['sha256'] != cham_ref['sha256']:
+        raise GateFileError(f'{wd}: the D2 evidence file or luoi.json changed while it was read')
+    n_cham = sum(1 for v in res['nodes_ok'] if v)
+    if n_cham == 0:
+        # the rule of c8b_luoi main for a grid without a scored node (F11); the nodes of a scored luoi.json are not all
+        # lost, so the masked grid is closed not concluded
+        lost = all(res['hong_nut'])
+        res.update(outcome='hong_he_do' if lost else 'chua_ket_luan', fail_cause='he_do' if lost else '')
+        want_tt = 'hong_he_do' if lost else 'chua_ket_luan_khong_nut'
+    else:
+        want_tt = 'cham'
+        if any(not res['bieu_dien'][c] for c in c8b_luoi.MEASURED):
+            raise GateFileError(f'{wd}: the combined numbers do not give the grid states (c8b_luoi C8BS-9): no such '
+                                'file is written by c8b_luoi')
+    want = json.loads(json.dumps(c8b_luoi._clean(res), allow_nan=False))
+    bad = [k for k in sorted(want) if k not in fd or not _json_same(fd[k], want[k])]
+    if fd.get('trang_thai_luot') != want_tt or fd.get('n_nut_cham') != n_cham:
+        bad.append('trang_thai_luot / n_nut_cham')
+    if bad:
+        raise GateFileError(f'{wd}: {bad} are not those of the node files of the run with the D2 mask of the gate '
+                            f'applied (c8b_mat_na_d2.ap_dung, c8b_luoi.combine; states rebuilt {want["states"]}, '
+                            f'outcome {want["outcome"]!r}; D2-1a)')
+    want_mn = json.loads(json.dumps(c8b_luoi._clean(_mat_na_plain(tom)), allow_nan=False))
+    if not _json_same(_mat_na_plain(mn), want_mn):
+        raise GateFileError(f'{wd}: mat_na_d2 (the frames masked and the rows file of each node, by sha256) is not what '
+                            'the D2 mask of the gate gives on the node files of the run (D2-1a)')
+    return fd
+
+
+def _d2_targets(goc: str, mat_na_ref: dict, luots: list) -> None:
+    """Rule 1 of CODE (24/11 22:50; design section 29): one D2 file for the whole of C8, whose target set tap.dich is
+    exactly the scored runs (trang_thai_luot cham) of the gate, cells and K runs, each once. luots: [(run, the luot its
+    masked grid names)]."""
+    mf = _open_ref(goc, mat_na_ref, f'chuan_u.dieu_kien.{DK_D2}.bang_chung')
+    dich = (mf.get('tap') or {}).get('dich') if isinstance(mf.get('tap'), dict) else None
+    if not isinstance(dich, list) or any(not isinstance(v, str) for v in dich) or len(set(dich)) != len(dich):
+        raise GateFileError(f'chuan_u.dieu_kien.{DK_D2}.bang_chung: tap.dich, the runs the D2 mask was built for, each '
+                            'once (c8b_a6_o d2)')
+    names = [v for _, v in luots]
+    twice = sorted({v for v in names if names.count(v) > 1})
+    if twice:
+        raise GateFileError(f'the masked grids of two runs name the same run of the D2 mask {twice}: '
+                            f'{[w for w, v in luots if v in twice]} (rule 1 of CODE 24/11)')
+    if set(names) != set(dich):
+        raise GateFileError(f'the target set of the D2 mask (tap.dich, {len(dich)} runs) is not exactly the scored runs '
+                            f'of the gate ({len(names)} runs, cells and K): only in the mask '
+                            f'{sorted(set(dich) - set(names))}, only in the gate {sorted(set(names) - set(dich))} '
+                            '(rule 1 of CODE 24/11: one D2 file for the whole of C8)')
+
+
 def _classified(fc: dict) -> bool:
     st = fc.get('states')
     return fc['trang_thai_luot'] == 'cham' and isinstance(st, dict) and all(c in st for c in o1_gate.CONDS)
 
 
-def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.datetime], set]:
+def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.datetime], set, dict, list]:
     """The run sources of every C8 cell (GC6-1, GC6-2, GC6-3, GC6-6; F11, F17, F18). Returns ({scoring sha256 of an
     eligible run: mien_phai_phu of its kept nodes}, {run_id: time of its first scoring (script.luc_chay)}, {scorer
-    commits of the scored grids})."""
+    commits of the scored grids}, {scoring sha256 of an eligible run: its camera segment}, [the scored runs that have
+    a second scoring: rule 2 of CODE 24/11, refused at the end of check_nguon])."""
     plan_cells = {c['o'] for c in d['o_c8']}
     segs = _check_tien_de(d)                             # CODE 20/11 after C8 session 2: the camera segments
     rows, slices = _buoi_rows(goc, d['thu_tu_clip'])     # CODE 22/11: every C8 session, in session order
@@ -1967,6 +2132,9 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
             raise GateFileError(f'thu_tu_clip: clip {r["clip"]!r} twice ({by_clip[r["clip"]]["_vt"]}, {r["_vt"]})')
         by_clip[r['clip']] = r
     eligible, cham_luc, logs_seen, clip_shas, scorers, elig_seg = {}, {}, {}, {}, set(), {}
+    d2_ref, luots = d['chuan_u']['dieu_kien'][DK_D2]['bang_chung'], []       # D2-1a: the D2 mask, the runs it masks
+    h1_cham = []                                         # rule 2 of CODE 24/11: scored runs with a second scoring
+    _ref_bytes(goc, d2_ref, f'chuan_u.dieu_kien.{DK_D2}.bang_chung')     # the mask every scored run is rebuilt with
     spans = _doan_spans(goc, segs, rows, slices)
     part_drift = {}                                      # GC6-3 (round 3): one comparison per camera segment
     for c in d['o_c8']:
@@ -2100,6 +2268,22 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
                 if fg['dem_truot_kiem_gio'] != x['dem_truot_kiem_gio']:
                     raise GateFileError(f'{w}: dem_truot_kiem_gio {x["dem_truot_kiem_gio"]!r}, the time file says '
                                         f'{fg["dem_truot_kiem_gio"]!r} (F11, M2; CODE_C8B design v7 7a)')
+            # D2-1a (design section 29): a scored run has its masked grid; its states, numbers and outcome are taken
+            # there (fx). A run without a scored node takes luoi.json as it is
+            fx = fc
+            if fc['trang_thai_luot'] == 'cham':
+                if x['file_cham_d2'] is None:
+                    raise GateFileError(f'{w}: a scored run (luoi.json trang_thai_luot cham) without file_cham_d2, its '
+                                        f'grid with the D2 cell mask ({D2_NAME}; rule 1 of CODE 24/11: every scored run '
+                                        'of C8 is masked by the one D2 file)')
+                fx = _masked_grid(goc, x['file_cham'], x['file_cham_d2'], fc, d2_ref, w)
+                _grid_outcome(fx, nodes0, f'{w}: file_cham_d2')
+                _grid_states(fx, idx0, c, f'{w}: file_cham_d2', masked=True)
+                luots.append((w, fx['mat_na_d2']['luot']))
+            elif x['file_cham_d2'] is not None:
+                raise GateFileError(f'{w}: file_cham_d2 on a run without a scored node (luoi.json trang_thai_luot '
+                                    f'{fc["trang_thai_luot"]!r}): such a run takes luoi.json as it is (rule 1 of CODE '
+                                    '24/11)')
             # GC6-3: the outcome is the one after the clip H comparison of the part of the session
             dr = None
             if x['file_so_h'] is not None:
@@ -2121,20 +2305,20 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
                                         f'{"two" if fc1 is not None else "one"} (GC6-3)')
                 if not two and fc1 is not None:
                     raise GateFileError(f'{w}: a second scoring while the clip H comparison asks one')
-                final = _final_outcome(fc['outcome'], None if fc1 is None else fc1['outcome'], dr)
+                final = _final_outcome(fx['outcome'], None if fc1 is None else fc1['outcome'], dr)
                 if final == 'hong_he_do' and x['ket_qua'] != 'hong':
                     raise GateFileError(f'{w}: lost after the clip H comparison, the gate says {x["ket_qua"]!r}')
                 if x['thieu_u_t'] and final != 'hong_he_do':
                     final = 'chua_ket_luan'                   # GC9-6 (Liam 20/11)
                 if x['ket_qua'] != 'hong' and x['ket_qua'] != final:
                     raise GateFileError(f'{w}: ket_qua {x["ket_qua"]!r}, after the clip H comparison the outcome is '
-                                        f'{final!r} (first {fc["outcome"]!r}, second '
+                                        f'{final!r} (first {fx["outcome"]!r}, second '
                                         f'{None if fc1 is None else fc1["outcome"]!r}; GC6-3)')
             if c['chuoi'][-1] is x and c['trang_thai'] == 'co_luot':
                 r = next(r for r in d['runs_c8'][c['muc']] if r['run_id'] == x['run_id'])
-                if not _close(fg.get('h_s'), r['h_s']) or not _close(fc.get('u_max_s'), r['u_max_s']):
+                if not _close(fg.get('h_s'), r['h_s']) or not _close(fx.get('u_max_s'), r['u_max_s']):
                     raise GateFileError(f'{w}: h_s / u_max_s {r["h_s"]!r} / {r["u_max_s"]!r}, the time file says h_s '
-                                        f'{fg.get("h_s")!r}, the scoring file u_max_s {fc.get("u_max_s")!r} (F17)')
+                                        f'{fg.get("h_s")!r}, the scoring file u_max_s {fx.get("u_max_s")!r} (F17)')
                 h1, u1 = (None, None) if fc1 is None else (fg1.get('h_s'), fc1.get('u_max_s'))
                 if fc1 is not None and not (_isnum(h1) and _isnum(u1) and _close(h1 + u1, r['u_t_s'])):
                     raise GateFileError(f'{w}: the two scorings give two U_t (h_s + u_max_s); J v6 does not say which '
@@ -2142,23 +2326,37 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
                 cc = _open_ref(goc, x['file_chung_cu'], f'{w}: file_chung_cu')
                 # GC6-3 (round 2): each scoring with its e_do file, made from the same time file and log; (round 3) the
                 # evidence recomputed from those pairs, never taken from the evidence file alone
-                pairs = [(x['file_cham'], x['file_edo'], x['file_gio'])]
+                # rule 3 of CODE (24/11 22:50; design section 29): the evidence of a scored run is made from its masked
+                # grid (chung_cu.nguon names luoi_d2.json, not luoi.json) and from an e_do file read with the same mask
+                pairs = [(x['file_cham_d2'] or x['file_cham'], x['file_edo'], x['file_gio'])]
+                grids = [fx]
                 if fc1 is not None:
                     pairs.append((x['file_cham_h1'], x['file_edo_h1'], x['file_gio_h1']))
+                    grids.append(fc1)
                 bo = []
-                for (cref, eref, gref), (fcx, _, _), tag in zip(pairs, scorings, ('file_edo', 'file_edo_h1')):
+                for (cref, eref, gref), fcx, tag in zip(pairs, grids, ('file_edo', 'file_edo_h1')):
                     ed = _open_ref(goc, eref, f'{w}: {tag}')
                     if ed.get('gio_sha256') != gref['sha256'] or ed.get('esp32_sha256') != fg['sha256']['esp32']:
                         raise GateFileError(f'{w}: {tag} was not made from the time file and log of its scoring '
                                             '(gio_sha256, esp32_sha256; GC6-3)')
+                    em = ed.get('mat_na_d2')
+                    if 'mat_na_d2' in fcx:
+                        fm = fcx['mat_na_d2']
+                        if not isinstance(em, dict) or any(em.get(q) != fm.get(q) for q in EDO_D2_KEYS):
+                            raise GateFileError(f'{w}: {tag} was not read with the D2 mask of the masked grid of the run '
+                                                f'(mat_na_d2 {{{", ".join(EDO_D2_KEYS)}}} those of {D2_NAME}; c8b_edo luot '
+                                                'reads the mask, rule 3 of CODE 24/11)')
+                    elif em is not None:
+                        raise GateFileError(f'{w}: {tag} was read with a D2 mask (mat_na_d2), its scoring has none')
                     bo.append(_edo_set(fcx, ed, f'{w}: {tag}', c))
                 want_all = [p[0]['sha256'] for p in pairs] + [p[1]['sha256'] for p in pairs]
                 srcs = [s.get('sha256') for s in cc.get('nguon') or [] if isinstance(s, dict)]
                 if not isinstance(cc.get('chung_cu_c8'), dict) or srcs != want_all:
                     raise GateFileError(f'{w}: file_chung_cu is a c8b_edo chung-cu output (chung_cu_c8) made from '
                                         'exactly the scorings of this run then their e_do files, in that order (nguon; '
-                                        'F17, GC6-3)')
-                want_cc = dict(phan_loai_du=all(_classified(s[0]) for s in scorings),
+                                        f'F17, GC6-3; the scoring of a scored run is its masked grid {D2_NAME}, rule 3 '
+                                        'of CODE 24/11)')
+                want_cc = dict(phan_loai_du=all(_classified(s) for s in grids),
                                ban_cham_cuoi=not dr['thieu_H1'], bo_so=bo)
                 if cc['chung_cu_c8'] != r['chung_cu'] or r['chung_cu'] != want_cc:
                     raise GateFileError(f'{w}: chung_cu {r["chung_cu"]!r}; its evidence file says '
@@ -2173,6 +2371,11 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
                 if fc1 is not None:
                     eligible[x['file_cham_h1']['sha256']] = scorings[1][2]
                     elig_seg[x['file_cham_h1']['sha256']] = segs[part]
+            # rule 2 of CODE (24/11 22:50; design section 29): no rule yet says which frames a second scoring (H1) is
+            # masked with; a run scored twice with a scored grid is refused (safe stop; the 8 camera drift files of the
+            # four C8 sessions all say vuot false). Refused last (check_nguon), so every other fault is told first
+            if fc1 is not None and 'cham' in (fc['trang_thai_luot'], fc1['trang_thai_luot']):
+                h1_cham.append(w)
     # CODE 20/11 (the luot_c8 check of c8b_u cong, C8BU4-R1-3, now here): each run of the plan is scored once; its
     # scoring is the one first scoring of its clip under the C8 folder, and the clip H comparison, second scoring and
     # second time file of the chain are those that scoring names (so its time files are those of its gio_sha256)
@@ -2229,7 +2432,20 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
         cham_luc[x['run_id']] = min(t for fk in fks for t in _scoring_times(fk, f'{w}: scoring'))
         _not_dropped(fks[0], commit_bo, w)
         _one_first_scoring(first, x, w)
-    return eligible, cham_luc, scorers, elig_seg
+        # D2-1a, rules 1 and 2 of CODE 24/11 (the K runs too; L157 question 4, Liam 25/11: the K runs are in the
+        # target set of D2)
+        if fks[0]['trang_thai_luot'] == 'cham':
+            if x['file_cham_d2'] is None:
+                raise GateFileError(f'{w}: a scored K run (luoi.json trang_thai_luot cham) without file_cham_d2, its '
+                                    f'grid with the D2 cell mask ({D2_NAME}; rule 1 of CODE 24/11)')
+            fd = _masked_grid(goc, x['file_cham'], x['file_cham_d2'], fks[0], d2_ref, w)
+            luots.append((w, fd['mat_na_d2']['luot']))
+        elif x['file_cham_d2'] is not None:
+            raise GateFileError(f'{w}: file_cham_d2 on a K run without a scored node (rule 1 of CODE 24/11)')
+        if len(fks) > 1 and any(fk['trang_thai_luot'] == 'cham' for fk in fks):
+            h1_cham.append(w)                           # rule 2 of CODE 24/11, as for a run of a cell
+    _d2_targets(goc, d2_ref, luots)
+    return eligible, cham_luc, scorers, elig_seg, h1_cham
 
 
 def commit_bo_of(khoa: dict) -> Optional[str]:
@@ -2565,7 +2781,8 @@ def _check_commit_hil(d: dict, goc: str, khoa: dict, scorers: set) -> None:
     with the commit written in the C8b lock before the scoring: commit_hil (40 hex) at the top of the lock (and the
     same in khoa_truoc when it states one). Every luoi.json of C8 (cells and K runs) has scorer.commit (c7_score) and
     script {commit, dirty false} (c8b_luoi) = commit_hil, and so has the final time file of every scoring (c8b_gio,
-    the one luoi.json names by gio_sha256; the preliminary T5 file is not asked). giu_tick: nothing to check."""
+    the one luoi.json names by gio_sha256; the preliminary T5 file is not asked). The masked grid luoi_d2.json of a
+    scored run too (D2-1a: c8b_luoi and c8b_mat_na_d2 of that commit). giu_tick: nothing to check."""
     if khoa.get('nhanh_tick') != 'bo_tick':
         return
     ch = khoa.get('commit_hil')
@@ -2583,10 +2800,11 @@ def _check_commit_hil(d: dict, goc: str, khoa: dict, scorers: set) -> None:
     grids, gios, want_gio = [], [], set()
     for c in d['o_c8']:
         for x in c['chuoi']:
-            grids += [(f'cell {c["o"]} run {x["run_id"]}: {k}', x[k]) for k in ('file_cham', 'file_cham_h1') if x[k]]
+            grids += [(f'cell {c["o"]} run {x["run_id"]}: {k}', x[k])
+                      for k in ('file_cham', 'file_cham_h1', 'file_cham_d2') if x[k]]
             gios += [(f'cell {c["o"]} run {x["run_id"]}: {k}', x[k]) for k in ('file_gio', 'file_gio_h1') if x[k]]
     for x in d['luot_k']:
-        for k in ('file_cham', 'file_cham_h1'):
+        for k in ('file_cham', 'file_cham_h1', 'file_cham_d2'):
             if x[k]:
                 grids.append((f'K run {x["run_id"]}: {k}', x[k]))
                 g = _open_ref(goc, x[k], f'K run {x["run_id"]}: {k}').get('gio_sha256')
@@ -2619,6 +2837,66 @@ def _check_commit_hil(d: dict, goc: str, khoa: dict, scorers: set) -> None:
                                     'CODE 23/11)')
 
 
+D3_HANG_VERSION = 'c8b_d3_hang_v1'                 # the sources file <rows>.nguon.json of c8b_d3_hang
+BUOC_HC_GOC = 'HC_goc'                             # buoc of an HC_goc clip in thu_tu_clip.csv
+VAI_GOC_A_DAU, VAI_GOC_A = 'goc_a_dau', 'goc_a '   # c8b_d3_hang --goc-a-dau F7, --goc-a BUOI=F7: vai 'goc_a <BUOI>'
+
+
+def _check_d3_dau_hc(d: dict, goc: str, b: dict) -> None:
+    """D3-8 (Codex D3 round 1, deferred to the gate): the list of the HC_goc ends D3 must hold. Source
+    dau_cuoi_lan_lap of D3 compares the angle a of each later HC_goc with the first one (c8b_d3_hang --goc-a-dau F7,
+    --goc-a BUOI=F7, BUOI the folder name of the session); leaving a later end out still gave dat. Here: every C8
+    session of the gate whose thu_tu_clip.csv has an HC_goc row (buoc HC_goc), but the session whose folder holds the
+    F7 of the first end (goc_a_dau), has exactly one source 'goc_a <its folder name>' in the sources file
+    <rows>.nguon.json of the D3 rows (the rows file the D3 evidence names, vai rows, under the C8 folder); no
+    'goc_a' source for anything else. A session without an HC_goc row is not asked (nothing to compare). No session
+    with an HC_goc row: nothing to check; one such session and no end in the D3 rows: no later end to compare.
+    [CACH HIEU GATE, rule proposed to CODE 25/11: the unit is the session with an HC_goc row in its thu_tu_clip.csv.]
+    Limit: a session whose HC_goc clips are all unusable has no F7 and stops the gate here (a question for CODE /
+    Liam then); the F7 files themselves are not opened (c8b_d3_hang checked them when it wrote the rows)."""
+    rows, slices = _buoi_rows(goc, d['thu_tu_clip'])
+    folders = [_folder_of(t) for t in d['thu_tu_clip']]
+    co_hc = [k for k, (lo, hi) in enumerate(slices)
+             if any((r.get('buoc') or '').strip() == BUOC_HC_GOC for r in rows[lo:hi])]
+    if not co_hc:
+        return
+    w = 'chuan_u.dieu_kien.kiem_vi_tri_rieng.bang_chung'
+    src = [n for n in b.get('nguon') or [] if isinstance(n, dict) and n.get('vai') == 'rows']
+    if len(src) != 1:
+        raise GateFileError(f'{w}: nguon names {len(src)} rows file(s) (vai rows); one needed, the D3 rows of '
+                            'c8b_d3_hang whose sources file lists the HC_goc ends (D3-8)')
+    rref = _ref(dict(duong_dan=_rel_in(goc, src[0].get('file')), sha256=src[0].get('sha256')), f'{w}: nguon rows')
+    _ref_bytes(goc, rref, f'{w}: nguon rows')
+    nrel = rref['duong_dan'] + '.nguon.json'
+    npath = os.path.join(os.path.realpath(goc), nrel)
+    if not os.path.isfile(npath):
+        raise GateFileError(f'{w}: no sources file {nrel!r} beside the D3 rows (written by c8b_d3_hang; D3-8)')
+    ng = _open_ref(goc, dict(duong_dan=nrel, sha256=sha256_file(npath)), f'{w}: sources of the D3 rows')
+    ns = [n for n in ng.get('nguon') or [] if isinstance(n, dict)] if isinstance(ng.get('nguon'), list) else None
+    if ng.get('version') != D3_HANG_VERSION or ng.get('sha256') != rref['sha256'] or ns is None:
+        raise GateFileError(f'{w}: {nrel!r} is not the sources file c8b_d3_hang wrote for these D3 rows (version '
+                            f'{D3_HANG_VERSION}, sha256 of the rows, nguon; D3-8)')
+    dau = [n for n in ns if n.get('vai') == VAI_GOC_A_DAU]
+    got = sorted(n['vai'][len(VAI_GOC_A):] for n in ns
+                 if isinstance(n.get('vai'), str) and n['vai'].startswith(VAI_GOC_A))
+    if not dau and not got and len(co_hc) == 1:
+        return                                          # one session with HC_goc clips: no later end to compare
+    if len(dau) != 1:
+        raise GateFileError(f'{w}: the D3 rows have {len(dau)} first HC_goc end(s) (source goc_a_dau) and the later ends '
+                            f'{got}; the C8 sessions {[folders[k] for k in co_hc]} have HC_goc clips: one first end '
+                            'needed (D3-8)')
+    pd = _rel_in(goc, dau[0].get('duong_dan'))
+    k0 = [k for k, f in enumerate(folders) if isinstance(pd, str) and not _bad_rel(pd) and _under(pd, f)]
+    if len(k0) != 1:
+        raise GateFileError(f'{w}: the F7 of the first HC_goc end {dau[0].get("duong_dan")!r} lies in the folder of '
+                            f'{len(k0)} C8 sessions of the gate; one needed (D3-8)')
+    want = sorted(posixpath.basename(folders[k]) for k in co_hc if k != k0[0])
+    if got != want:
+        raise GateFileError(f'{w}: the D3 rows compare the later HC_goc ends of the sessions {got} with the first one '
+                            f'(session {posixpath.basename(folders[k0[0]])!r}); the C8 sessions of the gate with HC_goc '
+                            f'clips after it are {want}: each once, none left out, none added (D3-8)')
+
+
 def _check_bang_chung(d: dict, goc: str, scorers: set) -> None:
     """The four evidence files of the U standard (CODE_C8B design v7 section 0, D1-D4; signature agreed with C8B
     19/11): D1 (locked before the held-out part) and D4 (rule 2b masks only G2, G3, G5 at 8) are the C8b lock itself
@@ -2645,6 +2923,8 @@ def _check_bang_chung(d: dict, goc: str, scorers: set) -> None:
                                 'D3-2)')
         if k == 'kiem_vi_tri_rieng' and b.get('khoa_truoc_sha256') != d['khoa_c8b']['sha256']:
             raise GateFileError('chuan_u.dieu_kien.kiem_vi_tri_rieng: khoa_truoc_sha256 is not the C8b lock of the gate')
+        if k == 'kiem_vi_tri_rieng':
+            _check_d3_dau_hc(d, goc, b)                 # D3-8
 
 
 def _check_premise(d: dict, goc: str, hs: dict, recs: dict) -> None:
@@ -2731,7 +3011,7 @@ def check_nguon(d: dict, goc: str) -> dict:
         raise GateFileError(f'o_c8 cells {sorted(have)}: the plan locked before C8 has {sorted(plan)} (each once)')
     khoa, t_c8b = _check_khoa_c8b(d, goc)
     _check_a6(d, goc, khoa)
-    eligible, cham_luc, scorers, elig_seg = _check_runs_nguon(d, goc)
+    eligible, cham_luc, scorers, elig_seg, h1_cham = _check_runs_nguon(d, goc)
     # GC6-1 (round 3): the C8b lock (its khoa_truoc) before the first scoring of any C8 run
     if cham_luc and not t_c8b < min(cham_luc.values()):
         raise GateFileError(f'khoa_c8b: khoa_truoc.luc {t_c8b.isoformat()} is not before the first scoring of a C8 run '
@@ -2866,6 +3146,10 @@ def check_nguon(d: dict, goc: str) -> dict:
     for k in MOC_KEYS:
         if md[k] < tops[k]:
             raise GateFileError(f'camera.c8b.moc_dich.{k} {md[k]!r}: below the largest {tops[k]!r} of the U manifests')
+    if h1_cham:
+        raise GateFileError(f'{"; ".join(h1_cham)}: a second scoring (file_cham_h1) on a run with a scored grid: the D2 '
+                            'mask has no rule for the H1 scoring (rule 2 of CODE 24/11: refused; CAN CODE / LIAM QUYET '
+                            'when a clip H comparison goes above eps_H)')
     return d
 
 
@@ -3069,7 +3353,7 @@ def fake_gate(levels=('O1-F05',), u_p_m=0.002, u_psi_deg=2.0, u_t_s=0.010) -> di
                                           file_so_h=ref('drift.json'), file_cham_h1=None, file_gio_h1=None,
                                           file_edo=ref(f'{rid}_edo.json'), file_edo_h1=None,
                                           file_log=ref(f'{rid}.csv'), file_thao_tac=ref(f'{rid}_score.json'),
-                                          thieu_u_t=False)]))
+                                          thieu_u_t=False, file_cham_d2=ref(f'{rid}_luoi_d2.json'))]))
             runs[name].append(dict(run_id=rid, controller=ctrl, o=f'{name}_{ctrl}', h_s=u / 2.0, u_max_s=u / 2.0,
                                    u_t_s=u / 2.0 + u / 2.0, chung_cu=json.loads(json.dumps(ev))))
         t = fake_terms(u_p_m, u_psi_deg)
@@ -3258,6 +3542,19 @@ def phieu_chon(open_cases: list) -> dict:
                 ca=ca)
 
 
+def _d2_beside(kho: _Kho, fc_ref: dict, fc: dict, w: str) -> Tuple[Optional[dict], dict]:
+    """D2-1a (ghep): (the reference of luoi_d2.json beside the luoi.json of a scored run, its content); (None, fc) for
+    a run without a scored node. A scored run without it is refused (rule 1 of CODE 24/11)."""
+    if fc.get('trang_thai_luot') != 'cham':
+        return None, fc
+    rel = posixpath.join(posixpath.dirname(fc_ref['duong_dan']), D2_NAME)
+    if not os.path.isfile(os.path.join(kho.goc, rel)):
+        raise GateFileError(f'{w}: no {D2_NAME} beside {fc_ref["duong_dan"]!r}: every scored run of C8 has its grid with '
+                            'the D2 cell mask (c8b_luoi --gop-only --mat-na-d2; rule 1 of CODE 24/11)')
+    ref = kho.ref(rel)
+    return ref, kho.json(ref)
+
+
 def ghep_va_ghi(out: str, goc: str, *args, **kw) -> str:
     """ghep then write_gate; the dossier ghep wrote in this call is taken back when the gate is refused (GC9-8)."""
     p = os.path.join(goc, args[6] if len(args) > 6 else kw['ho_so'])
@@ -3350,6 +3647,7 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
             if len(h0) != 1:
                 raise GateFileError(f'{w}: {len(h0)} first scorings (luoi.json of that clip); one needed')
             fc_ref, fc = h0[0]
+            fd_ref, fx = _d2_beside(kho, fc_ref, fc, w)             # D2-1a: the masked grid of a scored run
             fg_ref = None if fc.get('gio_sha256') is None else kho.by(fc['gio_sha256'], f'{w}: time file')
             fg = None if fg_ref is None else kho.json(fg_ref)
             log_ref = tt_src = None
@@ -3387,14 +3685,14 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
             else:
                 if dr_ref is None:
                     raise GateFileError(f'{w}: no clip H comparison (luoi.json file_so_h) for a run that is not lost')
-                kq = _final_outcome(fc['outcome'], None if fc1 is None else fc1['outcome'], kho.json(dr_ref))
+                kq = _final_outcome(fx['outcome'], None if fc1 is None else fc1['outcome'], kho.json(dr_ref))
                 if kq is None:
                     raise GateFileError(f'{w}: above eps_H the second scoring is due (luoi.json file_cham_h1)')
                 if thieu and kq != 'hong_he_do':
                     kq = 'chua_ket_luan'                          # GC9-6 (Liam 20/11): no U_t at a node
             # GC9-7: the evidence file made from exactly these scorings names its e_do files (nguon: the scorings
             # then their e_do files, each made from the time file of its scoring); other e_do copies do not matter
-            pairs = [(fc_ref, fg_ref)] + ([(fc1_ref, fg1_ref)] if fc1_ref is not None else [])
+            pairs = [(fd_ref or fc_ref, fg_ref)] + ([(fc1_ref, fg1_ref)] if fc1_ref is not None else [])
             cc_ref, e_refs = None, [None] * len(pairs)
             if fg_ref is not None:
                 edo_of = {ref['sha256']: e for ref, e in edos}
@@ -3414,7 +3712,8 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
                        file_cham_h1=fc1_ref, file_gio_h1=fg1_ref,
                        file_edo=e_refs[0] if cc_ref else None,
                        file_edo_h1=(e_refs[1] if cc_ref and len(e_refs) > 1 else None),
-                       file_log=log_ref, file_thao_tac=tt_src, thieu_u_t=bool(thieu and not src))
+                       file_log=log_ref, file_thao_tac=tt_src, thieu_u_t=bool(thieu and not src),
+                       file_cham_d2=fd_ref)
             chain.append(ent)
             cham_luc[ent['run_id']] = min(t for s in (fc, fc1) if s is not None for t in _scoring_times(s, w)
                                           ).isoformat()
@@ -3454,7 +3753,8 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
                                 'that of a held-out run (CODE 20/11)')
         ref, l = h0[0]
         luot_k.append(dict(run_id=b, clip=r['clip'], file_cham=ref,
-                           file_cham_h1=_ref_of(kho, l.get('file_cham_h1'), f'{w}: file_cham_h1')))
+                           file_cham_h1=_ref_of(kho, l.get('file_cham_h1'), f'{w}: file_cham_h1'),
+                           file_cham_d2=_d2_beside(kho, ref, l, w)[0]))
         cham_luc[b] = min(t for s_ in [l] + ([kho.json(luot_k[-1]['file_cham_h1'])] if luot_k[-1]['file_cham_h1']
                                              else []) for t in _scoring_times(s_, w)).isoformat()
     bo = muc_bo_theo_liam or {}
