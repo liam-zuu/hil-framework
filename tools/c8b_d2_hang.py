@@ -26,8 +26,9 @@ hang (one target run, every scored node of its grid folder):
                     lock's bang_man_trap: K by F05, J v6 J4-7) [CACH HIEU C8B].
   U_imu_rad       U_IMU,D(k) of u_imu_dong_v3 (c8b_u_imu_v3 formula, the turn totals by prefix sums, checked
                     equal to c8b_u_imu_v3.u_imu_delta in the tests), omega / alpha from the camera yaw (frames.csv,
-                    as the E_noi table), clock pairing u- = u+ = U_t_s of the node [CACH HIEU C8B: gio.json carries no
-                    u_cham-/+; U_t bounds the camera-log time of a frame at that node, the safe side].
+                    as the E_noi table), clock pairing u- = u+ = U_t_s of the node (CODE 25/11 02:54, question 5 of
+                    C8B: gio.json carries no u_cham-/+; U_t bounds the camera-log time of a frame at that node, the
+                    safe side).
   x_m, y_m, psi_rad, u_mps  the lane pose and camera speed of the frame (rows x, y, psi, speed); a frame without a
                     finite pose has no cell: left out (counted), so c8b_luoi --mat-na-d2 masks it.
   mien_hop        1 when the frame is in the union (deciding) domain of that node (the scorer's rows): c8b_a6_o d2
@@ -39,6 +40,9 @@ hang (one target run, every scored node of its grid folder):
   e.g. <session>/L0 for an F8-empty session; two mountings under one name would be counted in one cell, D2-15),
   controller (gio.json). The rows file of a node must be the one its score names (rows_sha256, D2-6); the meta file
   lists the score and rows SHA of every node used.
+  cham_id         the id of this scoring of the run (c8b_mat_na_d2.ma_lan_cham over the scored nodes: node index and
+                    SHA of the node score file), the same on every row; the mask built from these rows is applied
+                    only on the node files of this id (Codex round 2 D2v2-4; CODE 25/11).
 noi-loo: c8b_u_imu_v3.noi_table on every held-out capture once, then for each target run the band maxima over the
   OTHER captures (design 7b "khoi giu ngoai = luot C8 khac luot dang cham"; the max over captures splits, so this is
   the table c8b_u_imu_v3 noi would give without that run); one file per target, c8b_u_imu_noi_v1.
@@ -77,7 +81,7 @@ import c8b_u_imu_v3 as v3                                                # noqa:
 
 VERSION = 'c8b_d2_hang_v1'
 COLS = ('luot', 'tap', 'id', 'nut', 'x_m', 'y_m', 'psi_rad', 'u_mps', 'lan_lap_id', 'd_rad', 'U_psi_rad', 'U_imu_rad',
-        'mien_hop', 'controller', 'ly_do')
+        'mien_hop', 'controller', 'ly_do', 'cham_id')
 TOL_C_RAD = 1e-9
 TURN_MAX_RAD = 100.0            # input check only (TurnSums): a turn of one report pair above it is not a number to sum
 
@@ -478,8 +482,14 @@ def hang(a):
         nodes.append(nk)
     if not out:
         raise D2Error('no row: no node of the grid could be used')
+    # Codex round 2 D2v2-4 (CODE 25/11): the id of this scoring of the run on every row; c8b_a6_o writes it in the
+    # mask and c8b_luoi --mat-na-d2 refuses a mask whose id is not that of the node files it masks
+    import c8b_mat_na_d2
+    cham_id = c8b_mat_na_d2.ma_lan_cham((n['nut'], n['score_sha256']) for n in nodes if n.get('cham'))
+    for r in out:
+        r['cham_id'] = cham_id
     return out, dict(version=VERSION, luot=a.luot, n_hang=len(out), n_khung_bo_vi_tri=n_left, nut=nodes, sha256=sha,
-                     u_lag_s=P3['u_lag_s'], lan_lap_id=a.lan_lap,
+                     u_lag_s=P3['u_lag_s'], lan_lap_id=a.lan_lap, cham_id=cham_id,
                      u_psi='can truoc le theo khung tu khoa (L156, Liam 25/11): hang_dong_truoc_le.hang_rad + '
                            'A4_deg cua dai toc do / le; khung dung yen (u < v_d) A4 = 0',
                      cach_hieu=['luot K lay khoi muc O1-F05 cua khoa (bang_man_trap: K theo F05)',

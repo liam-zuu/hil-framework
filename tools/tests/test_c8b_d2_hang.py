@@ -211,3 +211,21 @@ def test_turn_sums_absurd_gyro_value_is_an_error_of_its_pair(tmp_path):
         assert got == pytest.approx(want, abs=1e-12) and max(want) > 0.01
     with pytest.raises(U.InputError):
         ts(a - 0.1, b + 0.1)
+
+
+def test_cham_id_column_kept_by_ghep(tmp_path):
+    """Codex round 2 D2v2-4 (CODE 25/11): the D2 rows carry the scoring id of their run (column cham_id, the same
+    formula as c8b_mat_na_d2 checks); ghep keeps it per run."""
+    import csv
+    import c8b_mat_na_d2 as M
+    assert DH.COLS[-1] == 'cham_id'
+    r = dict({c: '' for c in DH.COLS}, luot='r1', tap='dich', id='1', nut='0',
+             cham_id=M.ma_lan_cham([(0, 'a' * 64), (2, 'b' * 64)]))
+    a, b, out = (str(tmp_path / x) for x in ('a.csv', 'b.csv', 'all.csv'))
+    DH.write_rows(a, [r])
+    DH.write_rows(b, [dict(r, luot='r2', cham_id=M.ma_lan_cham([(0, 'a' * 64)]))])
+    assert DH.main(['ghep', '--rows', a, '--rows', b, '--out', out]) == 0
+    with open(out, newline='', encoding='utf-8') as f:
+        got = [(x['luot'], x['cham_id']) for x in csv.DictReader(f)]
+    assert got == [('r1', r['cham_id']), ('r2', M.ma_lan_cham([(0, 'a' * 64)]))] and got[0][1] != got[1][1]
+    assert len(r['cham_id']) == 16 and int(r['cham_id'], 16) >= 0

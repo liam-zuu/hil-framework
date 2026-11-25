@@ -19,7 +19,10 @@ n_id >= N_ID_MIN, n_thieu = 0, ty_le_max <= 1. File, A6 held-out check (giu_ngoa
 the checked set dat) | truot (a cell with ty_le_max > 1) | thieu (otherwise). File, D2 (d2; design 7c line 166, CODE
 24/11 khuya): a cell not dat masks only its frames: trang_thai dat once cells exist, with mat_na {o_dat, o_thieu
 [{o_id, ly_do: vuot | thieu_mau | thieu_id}], ngoai_dai_u [[run, id]], khung_mo [[run, id]] (the frames whose cell
-is in o_dat)}: c8b_luoi --mat-na-d2 makes every other frame of a target run n_undef for G2-G5 (G1 per its rule).
+is in o_dat), lan_cham {run: cham_id}}: c8b_luoi --mat-na-d2 makes every other frame of a target run n_undef for
+G2-G5 (G1 per its rule). lan_cham (optional column cham_id of the rows, c8b_d2_hang; Codex round 2 D2v2-4, CODE
+25/11): the id of the scoring the rows of a target run come from; a run with rows of two scorings is refused; the mask
+is applied only on the node files of that id (a run without the column gets no id: its mask is refused there).
 The three sets (khop, kiem, dich) must be disjoint by run.
 
   python tools/c8b_a6_o.py --rows d2_rows.csv --muc-dich giu_ngoai_a6 --giu-ngoai-theo cho --khoa-truoc khoa.json \
@@ -104,7 +107,7 @@ def read_rows(path):
         out.append(dict(luot=r['luot'], tap=r['tap'], id=int(r['id']), nut=r['nut'], x=_f(r['x_m'], f'{w} x_m'),
                         y=_f(r['y_m'], f'{w} y_m'), psi=_f(r['psi_rad'], f'{w} psi_rad'),
                         u=_f(r['u_mps'], f'{w} u_mps'), lan=r['lan_lap_id'], d=d, up=up, ui=ui,
-                        ctrl=r.get('controller') or '', mh=mh != '0'))
+                        ctrl=r.get('controller') or '', mh=mh != '0', cham=r.get('cham_id') or ''))
     return out
 
 
@@ -214,7 +217,17 @@ def build(rows, muc_dich, giu_ngoai_theo, khoa_sha, cho_sha, dai_u=DAI_U):
             if k is not None and 'x{}_y{}_h{}_u{}_{}'.format(*k) in o_dat:
                 mo.append([luot, fid])
         mo.sort()
-        mat_na = dict(o_dat=[c['o_id'] for c in o if c['dat']], khung_mo=mo,
+        # lan_cham (Codex round 2 D2v2-4; CODE 25/11): the scoring id of the rows of each target run; the mask goes
+        # by (run, frame id), so it must not be applied on the node files of another scoring of the same run
+        cham = {}
+        for r in rows:
+            if r['tap'] == use:
+                cham.setdefault(r['luot'], set()).add(r.get('cham') or '')
+        hai = sorted(k for k, v in cham.items() if len(v) > 1)
+        if hai:
+            raise OError(f'runs {hai[:5]}: rows of more than one scoring (cham_id), or some rows without it')
+        lan_cham = {k: next(iter(v)) for k, v in sorted(cham.items()) if v != {''}}
+        mat_na = dict(o_dat=[c['o_id'] for c in o if c['dat']], khung_mo=mo, lan_cham=lan_cham,
                       o_thieu=[dict(o_id=c['o_id'], ly_do=ly_do(c)) for c in o if not c['dat']],
                       ngoai_dai_u=ngoai, n_ngoai_mien_quyet=ngoai_mien,
                       quy_tac='khung co o khong nam trong o_dat (o vuot, thieu mau, thieu id) hay ngoai dai u -> '

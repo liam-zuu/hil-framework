@@ -93,9 +93,25 @@ def grid(tmp_path, fr_by_node, **kw):
     return d, gp
 
 
-def mask_file(tmp_path, open_ids, luot='r1', name='o.json', drop_khung_mo=False):
+def lan_cham_cua(tmp_path):
+    """The scoring id of the node files of the grid under tmp_path as they are NOW (c8b_d2_hang writes it on the D2
+    rows, c8b_a6_o in the mask; D2v2-4); None when there is no grid there yet."""
+    d, gp = str(tmp_path / 'luoi'), str(tmp_path / 'gio.json')
+    if not (os.path.isdir(d) and os.path.isfile(gp)):
+        return None
+    nodes = LU.load_nodes(json.load(open(gp, encoding='utf-8')), d)
+    return M.ma_lan_cham((k, c8_u_imu.sha256(os.path.join(d, f'nut_{k:03d}.json')))
+                         for k, x in enumerate(nodes) if x.get('ok'))
+
+
+def mask_file(tmp_path, open_ids, luot='r1', name='o.json', drop_khung_mo=False, lan_cham='tu_luoi'):
+    """lan_cham 'tu_luoi': the id of the grid under tmp_path at the time of the call; None: a mask without ids."""
     mn = dict(o_dat=['A'], o_thieu=[dict(o_id='B', ly_do=['vuot'])], ngoai_dai_u=[],
               khung_mo=[[luot, i] for i in open_ids] + [['r9', 5]])
+    if lan_cham == 'tu_luoi':
+        lan_cham = lan_cham_cua(tmp_path)
+    if lan_cham is not None:
+        mn['lan_cham'] = {'r9': 'f' * 16, luot: lan_cham}      # another run first: the id is taken by run name
     if drop_khung_mo:
         mn.pop('khung_mo')
     d = A.with_sha(dict(schema=A.SCHEMA_O, version=A.SCHEMA_O, muc_dich='d2', trang_thai='dat',
@@ -183,7 +199,11 @@ def test_frame_not_in_d2_rows_is_masked(tmp_path):
     open(p, 'w', encoding='utf-8', newline='').write('\n'.join(lines))
     resha(d, 0)                                                         # refused for the repeated id, not the sha
     os.remove(os.path.join(d, 'luoi_d2.json'))
-    assert run(d, gp, str(tmp_path / 'o.json'))[0] == 2
+    nodes = LU.load_nodes(json.load(open(gp, encoding='utf-8')), d)
+    mn = M.doc_mat_na(mask_file(tmp_path, [100, 101, 102], name='o_sau.json'), 'r1')   # the mask of the new score
+    with pytest.raises(M.MatNaError, match='repeated frame_id'):
+        M.ap_dung(nodes, d, mn, LU._state_from_numbers)
+    assert run(d, gp, str(tmp_path / 'o_sau.json'))[0] == 2
 
 
 def test_mask_file_checks(tmp_path):
@@ -241,7 +261,9 @@ def test_rows_file_must_be_the_scorers(tmp_path):
     mp = mask_file(tmp_path, range(100, 106))
     assert run(d, gp, mp)[0] == 2
     resha(d, 0)
-    assert run(d, gp, mp)[0] == 2                    # the node score changed: luoi.json is of the old one (D2v2-1)
+    assert run(d, gp, mp)[0] == 2                    # the node score changed: the mask is of the old one (D2v2-4)
+    mp = mask_file(tmp_path, range(100, 106), name='o_sau.json')       # the mask of the node score as it is now
+    assert run(d, gp, mp)[0] == 2                    # luoi.json is still of the old node score (D2v2-1)
     os.remove(os.path.join(d, 'luoi.json'))
     assert run(d, gp)[0] == 0
     assert run(d, gp, mp)[0] == 0                                       # only the sha stood in the way
@@ -250,7 +272,11 @@ def test_rows_file_must_be_the_scorers(tmp_path):
     del sc['khung_tuong_doi_v1']['rows_sha256']
     json.dump(sc, open(sp, 'w', encoding='utf-8'))
     os.remove(os.path.join(d, 'luoi_d2.json'))
-    assert run(d, gp, mp)[0] == 2                                       # a score that names no rows file
+    nodes = LU.load_nodes(json.load(open(gp, encoding='utf-8')), d)
+    with pytest.raises(M.MatNaError, match='names no rows_sha256'):     # a score that names no rows file
+        M.ap_dung(nodes, d, M.doc_mat_na(mask_file(tmp_path, range(100, 106), name='o_3.json'), 'r1'),
+                  LU._state_from_numbers)
+    assert run(d, gp, str(tmp_path / 'o_3.json'))[0] == 2
 
 
 def test_self_check_refuses_numbers_on_the_other_side_of_the_threshold(tmp_path):
@@ -387,8 +413,9 @@ def test_q_sd_of_the_merged_grid_is_checked_and_recomputed_for_so_do_only(tmp_pa
     assert math.isnan(out[0]['nums']['g2']['q_sd'])                     # not a so_do condition: left as it was
     d2, gio2, nodes2 = _nodes_sd(tmp_path / 'b')
     nodes2[0]['nums']['g5']['q_sd'] = 7.0                               # not the rows' number: refused
-    with pytest.raises(M.MatNaError):
-        M.ap_dung(nodes2, d2, M.doc_mat_na(mask_file(tmp_path, [101], name='o2.json'), 'r1'), LU._state_from_numbers)
+    with pytest.raises(M.MatNaError, match='self-check'):
+        M.ap_dung(nodes2, d2, M.doc_mat_na(mask_file(tmp_path / 'b', [101], name='o2.json'), 'r1'),
+                  LU._state_from_numbers)
 
 
 @pytest.mark.skipif('q_sd' not in __import__('inspect').getsource(LU.combine),
@@ -398,7 +425,7 @@ def test_so_do_decides_on_the_open_defined_frames_through_combine(tmp_path):
     d, gio, nodes = _nodes_sd(tmp_path, n_nodes=3)
     assert LU.combine(nodes, {'g5'}, gio['nodes_s'])['states']['g5'] == 'khong_dat'
     d, gio, nodes = _nodes_sd(tmp_path / 'b', n_nodes=3)
-    out, _ = M.ap_dung(nodes, d, M.doc_mat_na(mask_file(tmp_path, [101]), 'r1'), LU._state_from_numbers)
+    out, _ = M.ap_dung(nodes, d, M.doc_mat_na(mask_file(tmp_path / 'b', [101]), 'r1'), LU._state_from_numbers)
     assert LU.combine(out, {'g5'}, gio['nodes_s'])['states']['g5'] == 'chua_ket_luan'
 
 
@@ -426,6 +453,8 @@ def test_luoi_json_must_be_the_grid_of_these_node_files(tmp_path, capsys):
     gio = json.load(open(gp, encoding='utf-8'))
     write_node(d, 1, frames(), D=gio['nodes_s'][1])                    # node 1 scored again: no violation there
     capsys.readouterr()
+    assert run(d, gp, mp)[0] == 2 and 'not of this scoring' in capsys.readouterr().err      # D2v2-4: the old mask
+    mp = mask_file(tmp_path, range(100, 106), name='o_sau.json')       # the mask of the node files as they are now
     assert run(d, gp, mp)[0] == 2 and 'not the grid of the node files' in capsys.readouterr().err
     os.remove(os.path.join(d, 'luoi.json'))
     assert run(d, gp)[0] == 0
@@ -441,6 +470,39 @@ def test_luoi_json_must_be_the_grid_of_these_node_files(tmp_path, capsys):
                             (g, dict(kc, nodes_ok=[True, False]))):
         with pytest.raises(M.MatNaError, match='not the grid'):
             M.goc_luoi(p, bad_res, bad_kc)
+
+
+def test_mask_must_be_of_this_scoring(tmp_path, capsys):
+    """Codex round 2 D2v2-4 (CODE 25/11, a refusal only): the mask goes by (run, frame_id), so it carries the id of
+    the scoring its D2 rows came from; a mask without the id of the run, or with the id of another scoring of the
+    same run (same frame ids, other node score files: e.g. the H1 plates), is refused."""
+    fr = frames(viol={102: {'g3': 0.15}})
+    d, gp = grid(tmp_path, [fr, fr])
+    assert run(d, gp)[0] == 0
+    capsys.readouterr()
+    assert run(d, gp, mask_file(tmp_path, range(100, 106), name='khong.json', lan_cham=None))[0] == 2
+    assert 'not of this scoring' in capsys.readouterr().err
+    assert run(d, gp, mask_file(tmp_path, range(100, 106), name='khac.json', lan_cham='0' * 16))[0] == 2
+    assert 'not of this scoring' in capsys.readouterr().err
+    assert not os.path.exists(os.path.join(d, 'luoi_d2.json'))
+    # the id: the scored nodes in order, each with the SHA of its score file
+    mn = M.doc_mat_na(mask_file(tmp_path, range(100, 106)), 'r1')
+    s = [c8_u_imu.sha256(os.path.join(d, f'nut_{k:03d}.json')) for k in (0, 1)]
+    assert len(mn['lan_cham']) == 16 and mn['lan_cham'] == M.ma_lan_cham([(0, s[0]), (1, s[1])])
+    assert M.ma_lan_cham([(0, s[1]), (1, s[0])]) != mn['lan_cham'] != M.ma_lan_cham([(0, s[0])])
+    assert M.ma_lan_cham([(0, s[0]), (2, s[1])]) != mn['lan_cham']      # the same files at other nodes of the grid
+    rc, r = run(d, gp, str(tmp_path / 'o.json'))
+    assert rc == 0 and r['mat_na_d2']['lan_cham'] == mn['lan_cham']
+    # the mask of the run as it was: one node scored again (other score file), the old mask no longer fits
+    os.remove(os.path.join(d, 'luoi_d2.json'))
+    write_node(d, 1, frames(viol={102: {'g3': 0.16}}), D=json.load(open(gp, encoding='utf-8'))['nodes_s'][1])
+    nodes = LU.load_nodes(json.load(open(gp, encoding='utf-8')), d)
+    with pytest.raises(M.MatNaError, match='not of this scoring'):
+        M.ap_dung(nodes, d, mn, LU._state_from_numbers)
+    # a run of the mask file without an id, and a block that is not {run: id}
+    assert M.doc_mat_na(str(tmp_path / 'khong.json'), 'r1')['lan_cham'] is None
+    with pytest.raises(M.MatNaError, match='lan_cham'):
+        M.doc_mat_na(mask_file(tmp_path, range(100, 106), name='hong.json', lan_cham=5), 'r1')
 
 
 @pytest.mark.skipif('q_sd' in __import__('inspect').getsource(LU.combine),

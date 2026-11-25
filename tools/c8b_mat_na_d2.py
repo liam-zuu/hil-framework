@@ -40,11 +40,19 @@ values e_perp, e_trk, e_bao, e_theta_cmd_deg):
      (Codex D2-1: flags not passed again would write null), and the mask may only take conclusions away: a
      condition or the run that is dat or khong_dat with the mask and was not so without it -> refused (the mask
      never makes a dat or a khong_dat; e.g. the middle node of a so_do condition replaced, D2-2).
-Library: doc_mat_na(path, luot), ap_dung(nodes, out_dir, mn, state_fn) -> (nodes, summary), goc_luoi(path, res).
+  0. One scoring (Codex round 2 D2v2-4; CODE 25/11 03:07, no rule changed, a refusal only): the mask goes by
+     (run, frame_id), so the mask built from one scoring of a run would fit the grid of another scoring of the same
+     run (e.g. a scoring again on the H1 plates). The D2 rows carry cham_id (ma_lan_cham: the node score SHA of the
+     scored nodes, in order), c8b_a6_o writes it per run in mat_na.lan_cham, and ap_dung computes it again from the
+     node files it is about to mask: a mask without the id of the run, or with another id, is refused. No mask of
+     its own for an H1 scoring is written: none of the 8 camera drift files of the four C8 sessions has vuot true.
+Library: doc_mat_na(path, luot), ap_dung(nodes, out_dir, mn, state_fn) -> (nodes, summary), goc_luoi(path, res),
+ma_lan_cham(pairs).
 """
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import os
@@ -77,8 +85,15 @@ def _f(x):
         return math.nan
 
 
+def ma_lan_cham(cap):
+    """The id of one scoring of a run (step 0): 16 hex of the sha256 of 'k:score_sha256;' over its scored nodes
+    (node index, SHA of nut_KKK.json), in order."""
+    return hashlib.sha256(''.join(f'{int(k)}:{s};' for k, s in cap).encode('ascii')).hexdigest()[:16]
+
+
 def doc_mat_na(path, luot):
-    """The D2 mask of a c8b_a6_o d2 file for run `luot`: {file, sha256, sha_noi_dung, luot, mo (frame ids)}."""
+    """The D2 mask of a c8b_a6_o d2 file for run `luot`: {file, sha256, sha_noi_dung, luot, mo (frame ids),
+    lan_cham (the scoring id of the run, None when the file has none)}."""
     cu.check_path(path)
     with open(path, encoding='utf-8') as f:
         d = json.load(f)
@@ -101,7 +116,11 @@ def doc_mat_na(path, luot):
             raise MatNaError(f'{path}: khung_mo entry {e!r}')
         if e[0] == luot:
             mo.add(e[1])
+    lc = mn.get('lan_cham')
+    if lc is not None and not (isinstance(lc, dict) and all(isinstance(v, str) and v for v in lc.values())):
+        raise MatNaError(f'{path}: mat_na.lan_cham {lc!r}')
     return dict(file=os.path.abspath(path), sha256=cu.sha256(path), sha_noi_dung=d['sha256'], luot=luot, mo=mo,
+                lan_cham=(lc or {}).get(luot),
                 n_o_dat=len(mn.get('o_dat') or []), n_o_thieu=len(mn.get('o_thieu') or []))
 
 
@@ -212,7 +231,14 @@ def _certain_before(H, so_do):
 
 
 def ap_dung(nodes, out_dir, mn, state_fn, key_dec=6):
-    """Steps 1-5 on every scored node (list from c8b_luoi.load_nodes, changed in place); returns (nodes, summary)."""
+    """Steps 0-5 on every scored node (list from c8b_luoi.load_nodes, changed in place); returns (nodes, summary)."""
+    # step 0 (D2v2-4): the mask is of THIS scoring of the run (the node score files about to be masked)
+    ma = ma_lan_cham((k, cu.sha256(os.path.join(out_dir, f'nut_{k:03d}.json')))
+                     for k, x in enumerate(nodes) if x.get('ok'))
+    if mn.get('lan_cham') != ma:
+        raise MatNaError(f'the mask is not of this scoring of run {mn.get("luot")!r}: mat_na.lan_cham '
+                         f'{mn.get("lan_cham")!r}, the node files here give {ma!r} (D2 rows of another scoring, e.g. '
+                         'H0 / H1, or written before cham_id): build the D2 rows and the cell file from these nodes')
     tom = []
     for k, x in enumerate(nodes):
         if not x.get('ok'):
@@ -276,8 +302,8 @@ def ap_dung(nodes, out_dir, mn, state_fn, key_dec=6):
                 r[c] = float(H['lo'][c][i])
         tom.append(dict(e, trang_thai_sau=st, g1_che=bool(np.any(che & H['mu']))))
     return nodes, dict(version=VERSION, file=mn['file'], sha256=mn['sha256'], sha_noi_dung=mn['sha_noi_dung'],
-                       luot=mn['luot'], n_khung_mo=len(mn['mo']), n_o_dat=mn['n_o_dat'], n_o_thieu=mn['n_o_thieu'],
-                       nut=tom,
+                       luot=mn['luot'], lan_cham=ma, n_khung_mo=len(mn['mo']), n_o_dat=mn['n_o_dat'],
+                       n_o_thieu=mn['n_o_thieu'], nut=tom,
                        quy_tac='khung (luot, frame_id) khong trong khung_mo -> lo -inf, hi +inf G2-G5 (q giu); so lieu '
                                'nut va trang thai ba nhanh tinh lai; G1 chua_ket_luan khi nut co khung bi che trong '
                                'mien hop (L156, Liam 25/11); cat_t1 mat vi pham chac chan -> nut khong cham; nut tam_doi doi, '

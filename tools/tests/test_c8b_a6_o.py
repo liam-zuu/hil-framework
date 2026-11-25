@@ -226,6 +226,33 @@ def test_d2_worst_node_over_every_comparison(tmp_path):
     assert o['mat_na']['o_thieu'][0]['ly_do'] == ['vuot']
 
 
+def test_d2_scoring_id_of_each_target_run(tmp_path):
+    """Codex round 2 D2v2-4 (CODE 25/11): mat_na.lan_cham = the cham_id of the rows of each target run; a run with
+    rows of two scorings (or with some rows without the id) is refused; rows without the column give no id."""
+    def d2(dich, name):
+        p = tmp_path / name
+        with open(p, 'w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=list(O.COLS) + ['mien_hop', 'controller', 'cham_id'], restval='')
+            w.writeheader()
+            w.writerows(dich + [dict(r, cham_id='dd' * 8) for r in _rows(n=3, tap='khop', luot='c1')]
+                        + _rows(n=3, tap='kiem', luot='c2'))             # an id on a run outside the target set
+        return O.build(O.read_rows(str(p)), 'd2', 'cho', KHOA, CHO)
+    r1 =[dict(r, cham_id='aa' * 8) for r in _dich(n=12)]
+    r2 = [dict(r, luot='r2', cham_id='bb' * 8) for r in _dich(n=12, x=0.7)]
+    r3 = [dict(r, luot='r3') for r in _dich(n=12, x=1.3)]                # rows without the id: no entry
+    o = d2(r1 + r2 + r3, 'a.csv')
+    assert o['mat_na']['lan_cham'] == {'r1': 'aa' * 8, 'r2': 'bb' * 8}
+    assert len(o['mat_na']['khung_mo']) == 36                           # the cells do not depend on the id
+    A._check_sha(o, 'o')
+    r1[5]['cham_id'] = 'cc' * 8                                         # one row of another scoring
+    with pytest.raises(O.OError, match='more than one scoring'):
+        d2(r1, 'b.csv')
+    r1[5]['cham_id'] = ''                                               # one row without the id
+    with pytest.raises(O.OError, match='more than one scoring'):
+        d2(r1, 'c.csv')
+    assert _d2(tmp_path, _dich(n=12), 'd.csv')['mat_na']['lan_cham'] == {}
+
+
 def test_d2_mien_hop_values_and_bands_of_the_code(tmp_path):
     rows = _dich(n=12)
     rows[0]['mien_hop'] = 'x'
