@@ -4235,3 +4235,89 @@ def test_l172_the_record_and_the_chain():
         GC._check_cells(d)
     del c[GC.SAU_HONG_KEY]
     GC._check_cells(d)
+
+
+# ── B5 (CODE 26/11, from L164 Liam 25/11 ~14:08 at CODE local_4932073c): extra runs of a cell for P6 ──────────────────
+LIAM_B5 = dict(ngay='2026-11-25', phien='local_4932073c (L164)', nguyen_van='Quay ba luot (Recommended)')
+
+
+def test_b5_extra_runs_of_a_cell(tmp_path):
+    """B5: without the record a run after a run that is not lost is refused, as before; with the record naming it (the
+    last runs of the chain) it stays in the chain, checked by its sources, and the cell counts with the run before."""
+    d, goc = build_c8(tmp_path / 'a')
+    c = _l172(goc, d)                                   # [the run of the cell, a run after it]
+    extra = c['chuoi'][1]['run_id']
+    with pytest.raises(GC.GateFileError, match='a rerun replaces a lost run only'):
+        GC.check(d)
+    c[GC.THEM_P6_KEY] = dict(LIAM_B5, luot=[extra])
+    GC.check(d)
+    GC.check_nguon(d, goc)
+    assert GC.eligible_run(c) is c['chuoi'][0] and GC.chain_counted(c) == [c['chuoi'][0]]
+    gx = f"{c['o']}_lai1"                                             # ghep: the run codes are the buoc of thu_tu_clip
+    rec = {c['o']: dict(LIAM_B5, luot=[gx])}
+    g = _ghep(goc, luot_them_p6_theo_liam=rec)
+    gc_ = next(x for x in g['o_c8'] if x['o'] == c['o'])
+    assert gc_['trang_thai'] == 'co_luot' and gc_[GC.THEM_P6_KEY] == rec[c['o']] and len(gc_['chuoi']) == 2
+    assert [r['run_id'] for r in g['runs_c8'][c['muc']] if r['o'] == c['o']] == [gc_['chuoi'][0]['run_id']]
+    assert all(GC.THEM_P6_KEY not in x for x in g['o_c8'] if x['o'] != c['o'])
+    GC.write_gate(str(tmp_path / 'g.json'), g, goc)
+    lp = str(tmp_path / 'liam.json')                                   # the command line: --liam carries the record
+    with open(lp, 'w', encoding='utf-8') as f:
+        json.dump({GC.THEM_P6_KEY: rec}, f)
+    out = str(tmp_path / 'gate_cli.json')
+    args = ['ghep', '--goc', goc, '--ke-hoach', 'ke_hoach_c8.json', '--thu-tu-clip', 'thu_tu_clip.csv',
+            '--khoa-c8b', 'c8b_khoa_v5.json', '--tien-de', 'tien_de_c8.json', '--kiem-cheo', 'kiem_cheo.json',
+            '--ho-so', 'chuan_u/ho_so_cli.json', '--liam', lp, '--out', out] + \
+        sum((['--bang-chung', f'{k}={p}'] for k, p in BANG_CHUNG.items()), [])
+    assert GC.main(args) == 0
+    assert next(x for x in json.load(open(out, encoding='utf-8'))['o_c8'] if x['o'] == c['o'])[GC.THEM_P6_KEY] \
+        == rec[c['o']]
+    # ghep: the record only for a cell of the plan, without another record of Liam, naming the last runs of the chain
+    first = c['o']
+    for kw, match in [(dict(luot_them_p6_theo_liam={'O1-F11_PID': rec[c['o']]}), 'keyed by cells of the plan'),
+                      (dict(luot_them_p6_theo_liam=rec, luot_sau_hong_theo_liam={c['o']: LIAM_L172}),
+                       'none with another record'),
+                      (dict(luot_them_p6_theo_liam={c['o']: dict(LIAM_B5, luot=[first])}), 'the last runs of the chain'),
+                      (dict(luot_them_p6_theo_liam={c['o']: dict(LIAM_B5, luot=[first, gx])}),
+                       'at least one run before them'),
+                      (dict(luot_them_p6_theo_liam={c['o']: dict(LIAM_B5, ngay='25/11', luot=[gx])}), 'YYYY-MM-DD')]:
+        with pytest.raises(GC.GateFileError, match=match):
+            _ghep(goc, ho_so='chuan_u/ho_so_b5.json', **kw)
+
+
+def test_b5_the_record_and_the_chain():
+    d = GC.fake_gate(LEVELS)
+    c = d['o_c8'][0]
+    good = c['chuoi'][-1]
+    c['chuoi'].append(dict(_e('them')))                                # an extra run that is NOT lost (run07 L-F08-2_lai1)
+    with pytest.raises(GC.GateFileError, match='a rerun replaces a lost run only'):
+        GC._check_cells(d)
+    c[GC.THEM_P6_KEY] = dict(LIAM_B5, luot=['them'])
+    GC._check_cells(d)
+    assert GC.eligible_run(c) is good and [x for _, x in GC._runs_from_cells(d['o_c8'], list(LEVELS))[c['muc']]
+                                           if x is good]
+    GC.check(d)                                                        # runs_c8 keeps the run before the extra run
+    kq = good['ket_qua']
+    good.update(thieu_u_t=True, ket_qua='chua_ket_luan')               # GC9-6 on the run the cell counts with
+    with pytest.raises(GC.GateFileError, match="recounted gives 'thieu_u_t'"):
+        GC._check_cells(d)
+    good.update(thieu_u_t=False, ket_qua=kq)
+    for luot, match in [([], 'the last runs of the chain'), (['x'], 'the last runs of the chain'),
+                        ([good['run_id']], 'the last runs of the chain'), ('them', 'the last runs of the chain'),
+                        ([x['run_id'] for x in c['chuoi']], 'at least one run before them')]:
+        c[GC.THEM_P6_KEY] = dict(LIAM_B5, luot=luot)
+        with pytest.raises(GC.GateFileError, match=match):
+            GC._check_cells(d)
+    c[GC.THEM_P6_KEY] = dict(LIAM_B5, luot=['them'])
+    c[GC.SAU_HONG_KEY] = dict(LIAM_L172)
+    with pytest.raises(GC.GateFileError, match='another record of Liam'):
+        GC._check_cells(d)
+    del c[GC.SAU_HONG_KEY]
+    c[GC.THEM_P6_KEY] = dict(ngay='2026-11-25', phien='x', luot=['them'])
+    with pytest.raises(GC.GateFileError, match='nguyen_van'):
+        GC._check_cells(d)
+    c[GC.THEM_P6_KEY] = dict(LIAM_B5, luot=['them'])
+    c['chuoi'] = [_e(f'tr{k}', 'hong', ['he_do'], d1='truot') for k in range(GC.RERUNS_MAX + 1)] + [_e('them')]
+    c['trang_thai'] = 'dong_tran'                                      # closed at its cap before the extra run
+    with pytest.raises(GC.GateFileError, match='on a cell whose chain gives'):
+        GC._check_cells(d)

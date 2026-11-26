@@ -153,6 +153,24 @@ THAY_THE_DOAN = ('ten', 'cuoi_goc', 'clip_thay_trong_doan', 'luot', 'luot_sau_cl
 # the cell counts with (eligible_run) is then the run that is not lost, not the last of the chain. Without the record
 # the rule stands: a run that is not lost ends the chain.
 SAU_HONG_KEY = 'luot_sau_hong_theo_liam'
+# B5 (CODE 26/11, from L164: Liam 25/11 ~14:08 at CODE local_4932073c, box "Quay ba luot (Recommended)": a run filmed
+# only so that the session has two runs for P6): by the record in the cell (luot_them_p6_theo_liam {ngay, phien,
+# nguyen_van, luot [run codes]}) the runs named, the LAST runs of the chain, are extra runs of the cell: they stay in
+# the chain (sources checked, scored runs in the D2 target set) but do not replace the run of the cell; the chain is
+# counted without them and the cell counts with the last run before them (eligible_run). Without the record: as before.
+THEM_P6_KEY = 'luot_them_p6_theo_liam'
+
+
+def them_p6_runs(c: dict) -> list:
+    """B5: the run codes a cell's record luot_them_p6_theo_liam names ([] without the record)."""
+    x = c.get(THEM_P6_KEY) if isinstance(c, dict) else None
+    return list(x.get('luot') or []) if isinstance(x, dict) else []
+
+
+def chain_counted(c: dict) -> list:
+    """B5: the chain of a cell without its extra runs (them_p6_runs)."""
+    ids = set(them_p6_runs(c))
+    return [x for x in c['chuoi'] if x['run_id'] not in ids]
 BAND_KEYS_C8B = ('u_lo_m_s', 'u_hi_m_s', 'P4_m', 'A4_deg', 'trang_thai')   # c8b_khoa_v5 M5b (CODE 19/11)
 BAND_STATES_C8B = ('dat', 'gioi_han', 'thieu')           # C8B term states (data contract 2.G (3))
 DRIFT_KIND = 'c7_calib_drift'                            # F18 (2): drift.json of c7_calib_drift so (CODE 19/11)
@@ -998,6 +1016,8 @@ def eligible_run(c: dict) -> dict:
     the run that is not lost (the runs after it are lost to the measurement, count_chain)."""
     if SAU_HONG_KEY in c:
         return next((x for x in c['chuoi'] if x['ket_qua'] != 'hong'), c['chuoi'][-1])
+    if THEM_P6_KEY in c:                                 # B5: the last run before the extra runs
+        return chain_counted(c)[-1]
     return c['chuoi'][-1]
 
 
@@ -1010,6 +1030,22 @@ def _runs_from_cells(cells: list, levels: list) -> Dict[str, list]:
     return out
 
 
+def _them_p6_check(c: dict, w: str, other: bool) -> None:
+    """B5: the record luot_them_p6_theo_liam of a cell: Liam's words (A1) and luot, the run codes of the LAST runs of
+    the chain, in chain order, at least one, leaving at least one run before them; not with another record of Liam on
+    the cell (hong_theo_liam, luot_sau_hong_theo_liam)."""
+    x = c[THEM_P6_KEY]
+    _liam(x, f'{w}.{THEM_P6_KEY}')
+    ids = x.get('luot')
+    ch = [e.get('run_id') for e in c['chuoi']] if isinstance(c.get('chuoi'), list) else []
+    if not isinstance(ids, list) or not ids or any(not isinstance(v, str) for v in ids) or len(ids) >= len(ch) \
+            or ch[-len(ids):] != ids:
+        raise GateFileError(f'{w}.{THEM_P6_KEY}.luot {ids!r}: the extra runs are the last runs of the chain {ch}, in '
+                            'that order, with at least one run before them (B5, L164)')
+    if other:
+        raise GateFileError(f'{w}: {THEM_P6_KEY} with another record of Liam on the cell (B5)')
+
+
 def _check_cells(d: dict) -> list:
     cells = d['o_c8']
     if not isinstance(cells, list) or not cells:
@@ -1019,12 +1055,15 @@ def _check_cells(d: dict) -> list:
         w = f'o_c8[{i}]'
         liam = isinstance(c, dict) and c.get('trang_thai') == 'hong_theo_liam'     # Liam 22/11: his record in the cell
         sau = isinstance(c, dict) and SAU_HONG_KEY in c  # L172: Liam's record for the lost runs after the cell's run
+        them = isinstance(c, dict) and THEM_P6_KEY in c  # B5: the extra runs of the cell (L164)
         _obj(c, ('o', 'muc', 'controller', 'trang_thai', 'chuoi') + (('liam',) if liam else ())
-             + ((SAU_HONG_KEY,) if sau else ()), w)
+             + ((SAU_HONG_KEY,) if sau else ()) + ((THEM_P6_KEY,) if them else ()), w)
         if liam:
             _liam(c['liam'], f'{w}.liam')
         if sau:
             _liam(c[SAU_HONG_KEY], f'{w}.{SAU_HONG_KEY}')
+        if them:
+            _them_p6_check(c, w, liam or sau)
         _text(c['o'], f'{w}.o')
         if c['o'] in seen:
             raise GateFileError(f'{w}.o {c["o"]!r}: each cell once')
@@ -1053,12 +1092,12 @@ def _check_cells(d: dict) -> list:
                                         'files of a run belong to that run only (GC6-1)')
                 files_seen[h] = f'{c["o"]} run {x["run_id"]} {k}'
         try:
-            st, _ = count_chain(ch, hong_theo_liam=liam, sau_hong_theo_liam=sau)
+            st, _ = count_chain(chain_counted(c) if them else ch, hong_theo_liam=liam, sau_hong_theo_liam=sau)
         except GateFileError as exc:
             raise GateFileError(f'{w} ({c["o"]}): {exc}')
-        if sau and st != 'co_luot':
-            raise GateFileError(f'{w} ({c["o"]}): {SAU_HONG_KEY} on a cell whose chain gives {st!r}: the record is for '
-                                'a cell that has its run (L172)')
+        if (sau or them) and st != 'co_luot':
+            raise GateFileError(f'{w} ({c["o"]}): {SAU_HONG_KEY if sau else THEM_P6_KEY} on a cell whose chain gives '
+                                f'{st!r}: the record is for a cell that has its run (L172, B5)')
         if st == 'co_luot' and eligible_run(c)['thieu_u_t'] and eligible_run(c)['ket_qua'] != 'hong':
             st = 'thieu_u_t'                             # GC9-6: no eligible run in the cell
         if c['trang_thai'] != st:
@@ -3787,7 +3826,7 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
          bang_chung: Dict[str, str], ho_so: str, muc_bo_theo_liam: Optional[dict] = None,
          quyet_liam: Optional[dict] = None, o_hong_theo_liam: Optional[dict] = None,
          bo_cham_cu: Optional[dict] = None, thay_the_h_cuoi=None,
-         luot_sau_hong_theo_liam: Optional[dict] = None) -> dict:
+         luot_sau_hong_theo_liam: Optional[dict] = None, luot_them_p6_theo_liam: Optional[dict] = None) -> dict:
     """The gate content of C8 assembled from its sources under the C8 folder goc (paths relative to it; F10-F19, the
     contract of 19/11 with C8B: the gate reads the C8B files, C8B does not call the gate):
       sessions     thu_tu_clip: the thu_tu_clip.csv of one C8 session (a path) or of each, in session order (a list;
@@ -3855,6 +3894,12 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
                             'kept lost by o_hong_theo_liam')
     for o, x in sau_hong.items():
         _liam(x, f'ghep: {SAU_HONG_KEY}.{o}')
+    them_p6 = luot_them_p6_theo_liam or {}              # B5
+    if not isinstance(them_p6, dict) or any(o not in plan or o in giu_hong or o in sau_hong for o in them_p6):
+        raise GateFileError(f'ghep: {THEM_P6_KEY} {them_p6!r}: an object keyed by cells of the plan, none with another '
+                            'record of Liam (B5)')
+    for o, x in them_p6.items():
+        _liam(x, f'ghep: {THEM_P6_KEY}.{o}')
     order = {o: [] for o in plan}
     for r in rows:
         b = re.sub(r'_lai\d+$', '', (r.get('buoc') or '').strip())
@@ -3946,12 +3991,16 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
             chain.append(ent)
             cham_luc[ent['run_id']] = min(t for s in (fc, fc1) if s is not None for t in _scoring_times(s, w)
                                           ).isoformat()
-            if o not in sau_hong or kq != 'hong' or last is None:    # L172: with the record, the run not lost
+            if (o not in sau_hong or kq != 'hong' or last is None) and \
+                    ent['run_id'] not in them_p6_runs({THEM_P6_KEY: them_p6.get(o)}):   # L172; B5: not an extra run
                 last = (ent, fc, fg, cc_ref)
         if not chain:
             raise GateFileError(f'ghep: cell {o}: no run in thu_tu_clip.csv')
         try:
-            st, _ = count_chain(chain, hong_theo_liam=o in giu_hong, sau_hong_theo_liam=o in sau_hong)
+            cx = dict(o=o, chuoi=chain, **({THEM_P6_KEY: dict(them_p6[o])} if o in them_p6 else {}))
+            if o in them_p6:
+                _them_p6_check(cx, f'ghep: cell {o}', False)
+            st, _ = count_chain(chain_counted(cx), hong_theo_liam=o in giu_hong, sau_hong_theo_liam=o in sau_hong)
         except GateFileError as exc:
             raise GateFileError(f'ghep: cell {o}: {exc}')
         if o in giu_hong and st != 'hong_theo_liam':
@@ -3960,7 +4009,8 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
             st = 'thieu_u_t'                                  # GC9-6: no eligible run in the cell
         cells.append(dict(o=o, muc=x['muc'], controller=x['controller'], trang_thai=st, chuoi=chain,
                           **({'liam': dict(giu_hong[o])} if o in giu_hong else {}),
-                          **({SAU_HONG_KEY: dict(sau_hong[o])} if o in sau_hong else {})))
+                          **({SAU_HONG_KEY: dict(sau_hong[o])} if o in sau_hong else {}),
+                          **({THEM_P6_KEY: dict(them_p6[o])} if o in them_p6 else {})))
         if st == 'co_luot':
             ent, fc, fg, cc_ref = last
             if fg is None or cc_ref is None:
@@ -4204,7 +4254,7 @@ def main(argv=None) -> int:
         if a.liam:
             with open(a.liam, encoding='utf-8') as f:
                 liam = json.load(f)
-            keys = ('muc_bo_theo_liam', 'quyet_liam', 'o_hong_theo_liam', 'bo_cham_cu', SAU_HONG_KEY)
+            keys = ('muc_bo_theo_liam', 'quyet_liam', 'o_hong_theo_liam', 'bo_cham_cu', SAU_HONG_KEY, THEM_P6_KEY)
             if not isinstance(liam, dict) or not set(liam) <= set(keys):
                 raise GateFileError(f'--liam {a.liam}: a JSON object with keys among {list(keys)}')
         try:
@@ -4212,7 +4262,8 @@ def main(argv=None) -> int:
                               a.ho_so, liam.get('muc_bo_theo_liam'), liam.get('quyet_liam'),
                               liam.get('o_hong_theo_liam'), liam.get('bo_cham_cu'),
                               thay_the_h_cuoi=a.thay_the_h_cuoi,
-                              luot_sau_hong_theo_liam=liam.get(SAU_HONG_KEY))
+                              luot_sau_hong_theo_liam=liam.get(SAU_HONG_KEY),
+                              luot_them_p6_theo_liam=liam.get(THEM_P6_KEY))
         except CanLiamChon as exc:
             # CODE 24/11: the decision sheet beside --out (never replaced), no gate file; exit 3
             sp = os.path.splitext(a.out)[0] + '_phieu_chon.json'
