@@ -29,6 +29,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import c7_clip_probe as cp
 import c7_measure as cm
 
 
@@ -71,15 +72,24 @@ def crop_car(detector, gray, centre, half):
     x1, y1 = min(w, x + half), min(h, y + half)
     if x1 <= x0 or y1 <= y0:
         return None, 'ngoai_anh'
-    corners = cm.detect_refined(detector, gray[y0:y1, x0:x1]).get(cm.CAR_ID)
-    if corners is None:
+    # Design 2.1.5 v1.2 (CAM 26/11, validation run of 5c9bceb): ArUco on the crop only finds the tag; the edge
+    # refinement runs on the FULL frame from those corners, as detect_refined does (same half width), because
+    # refine_edges on the crop moved a corner by up to 0.10 px from the full-frame result although the ArUco corners
+    # were identical (run02 C8-P-F02-1_lai1 frame 2813). Same start, same image -> the full-chain corners.
+    raw = cp.detect_markers(detector, gray[y0:y1, x0:x1]).get(cm.CAR_ID)
+    if raw is None:
         return None, 'khong_thay'
+    raw = raw + [x0, y0]
+    side_px = float(np.mean(np.linalg.norm(np.diff(np.vstack([raw, raw[:1]]), axis=0), axis=1)))
+    corners = cm.refine_edges(gray, raw, half=min(cm.HALF_CAR_PX, 0.75 * side_px / 6.0))
+    if corners is None:
+        return None, 'tinh_chinh_bo'
     margin = cm.HALF_CAR_PX + 3
-    cx, cy = corners.T
+    cx, cy = (corners - [x0, y0]).T
     if (x0 > 0 and cx.min() < margin or x1 < w and x1 - x0 - 1 - cx.max() < margin or
             y0 > 0 and cy.min() < margin or y1 < h and y1 - y0 - 1 - cy.max() < margin):
         return None, 'sat_mep'
-    return corners + [x0, y0], None
+    return corners, None
 
 
 def corner_error(a, b):

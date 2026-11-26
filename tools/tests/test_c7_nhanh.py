@@ -35,7 +35,8 @@ def test_clipped_origin_and_integer_translations(x, y):
     gray = tagged(x, y)
     car, reason = fast.crop_car(det, gray, (x + 31.2, y + 29.7), 80)
     assert reason is None
-    np.testing.assert_allclose(car, cm.detect_refined(det, gray)[0], rtol=0, atol=1e-6)
+    # design 2.1.5 v1.2: ArUco on the crop, refinement on the full frame -> exactly the full-chain corners
+    np.testing.assert_array_equal(car, cm.detect_refined(det, gray)[0])
     base, _ = fast.crop_car(det, tagged(110, 111), (141.2, 140.7), 80)
     np.testing.assert_array_equal(car, base + [x - 110, y - 111])
 
