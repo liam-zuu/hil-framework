@@ -6,7 +6,7 @@ python tools/c7_nhanh.py track --video V --session S --hang-so HS --out DIR
 python tools/c7_nhanh.py cham --cau-hinh C.json --frames DIR/frames.csv --out DIR2 [--luoi] [--nut K]
     [--dets D.npz (default dets_nhanh.npz beside the frames; the full chain's dets.npz for its frames)]
 python tools/c7_nhanh.py so --nhanh DIR --day frames.csv --dets dets.npz --out so.json
-    [--cham-nhanh ket_luan_nhanh.json --cham-day nut.json]
+    [--cham-nhanh ket_luan_nhanh.json --cham-day nut.json --rows-day rows.csv (of that node)]
 """
 import argparse
 from bisect import bisect_left
@@ -590,8 +590,9 @@ def delta(a, b, threshold):
 
 
 def compare_verdict(fast, node, frame_times):
-    """K3 compares both completion times and the union-domain G2–G5 values of the node. frame_times: t_s of the
-    reference frames (the G1 threshold is one real frame there, frame_step)."""
+    """K3 compares both completion times and the union-domain G2–G5 values of the node. frame_times: the frame times
+    of the reference node in ITS time base (column t of its rows.csv; t_done is one of them), the G1 threshold is one
+    real frame there (frame_step). The clip times t_s of frames.csv are another time base: not usable here."""
     ref = node_verdict(node)
     gate = node['gate_v3']
     checks = {'outcome': same(fast['outcome'], ref['outcome'])}
@@ -631,7 +632,13 @@ def so(a):
     if read_json(folder / 'track.json').get('thu') is True:
         ref, rd = ref[:len(fast)], rd[:len(fast)]
     k2 = compare_frames(fast, ref, fd, rd)
-    k3 = compare_verdict(read_json(a.cham_nhanh), read_json(a.cham_day), [r['t_s'] for r in ref]) if a.cham_day else None
+    k3 = None
+    if a.cham_day:
+        if not a.rows_day:
+            raise ValueError('--rows-day (rows.csv of the --cham-day node, its frame times) is needed for K3')
+        with open(a.rows_day, newline='', encoding='utf-8') as f:
+            times = [float(r['t']) for r in csv.DictReader(f)]
+        k3 = compare_verdict(read_json(a.cham_nhanh), read_json(a.cham_day), times)
     write_json(a.out, dict(K2=k2, K3=k3, dat=k2['dat'] and (k3 is None or k3['dat'])))
 
 
@@ -665,6 +672,7 @@ def main(argv=None):
         p.add_argument('--' + key, required=True)
     p.add_argument('--cham-nhanh')
     p.add_argument('--cham-day')
+    p.add_argument('--rows-day')
     try:
         a = ap.parse_args(argv)
         {'track': track, 'cham': cham, 'so': so}[a.cmd](a)

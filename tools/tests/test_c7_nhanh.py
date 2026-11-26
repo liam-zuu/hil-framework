@@ -379,8 +379,10 @@ def test_so_trial_domain_corner_on_invalid_frame_and_k3(tmp_path):
     fast.write_json(tmp_path / 'track.json', dict(thu=True))
     fast.write_json(tmp_path / 'node.json', NODE)
     fast.write_json(tmp_path / 'cham.json', fast.node_verdict(NODE))
+    (tmp_path / 'rows.csv').write_text('t,x\n' + ''.join(f'{i / 60},0\n' for i in range(1200)))
     args = ['so', '--nhanh', str(tmp_path), '--day', str(tmp_path / 'day.csv'), '--dets', str(tmp_path / 'dets.npz'),
-            '--cham-day', str(tmp_path / 'node.json'), '--cham-nhanh', str(tmp_path / 'cham.json')]
+            '--cham-day', str(tmp_path / 'node.json'), '--cham-nhanh', str(tmp_path / 'cham.json'),
+            '--rows-day', str(tmp_path / 'rows.csv')]
     output = tmp_path / 'so.json'
     assert fast.main(args + ['--out', str(output)]) == 0
     result = fast.read_json(output)
