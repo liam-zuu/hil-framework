@@ -38,7 +38,7 @@ def test_x3_1_c9h_phase_totals_and_s3(tmp_path):
     assert all(k[1] == 'RQ2' for k in grouped if k[0] == 'FAKE-S3')
     assert summary['B-chung']['N_SIM_diagnostic'] == '7'
     with pytest.raises(rl.LogError, match='controller/account'):
-        rl.machine(ds, 'B-chung', 'PID', 'bad-S3', 'r', 1, 1, '2026-11-20', '2026-11-21', script_kind='S3')
+        rl.machine_phases(ds, 'S3', 'bad-S3', 'r', [P1])
 
 
 P1 = ('B-chung', '2026-11-20T09:00:00', '2026-11-20T09:10:00', '100', '200', '1', '2',
@@ -303,10 +303,11 @@ def test_x3_18_so_h_requires_h1_for_heading_or_missing_quantity(tmp_path, headin
     path = Path(original['score_final_file'])
     d = json.loads(path.read_text(encoding='utf-8'))
     cd = d['calib_drift']
+    del cd['version']  # historical gop omitted both version and heading evidence
     cd.update(D_H_mm=.5, s0_session_sha256='0' * 64, s1_session_sha256='1' * 64)
     path.write_text(json.dumps(d), encoding='utf-8')
     drift = {k: cd[k] for k in ('s0_session_sha256', 's1_session_sha256', 'D_H_mm', 'eps_H_mm', 'thieu_H1', 'vuot')}
-    drift.update(kind='c7_calib_drift', version='c7_calib_drift_v2', D_H_huong_deg=heading, eps_H_huong_deg=1.,
+    drift.update(kind='c7_calib_drift', version='c7_calib_drift_v2', D_H_vi_tri_mm=.5, D_H_huong_deg=heading, eps_H_huong_deg=1.,
                  trang_thai_vi_tri='so', trang_thai_huong='thieu' if missing else 'so', vuot_do_thieu=missing)
     run = next(r for r in rl.read_rows(str(Path(ds) / rl.TUNING)) if r['run_uid'] == uid)
     path.write_text(json.dumps(dict(d, calib_drift={**cd, **drift})), encoding='utf-8')
@@ -323,3 +324,211 @@ def test_x3_18_so_h_requires_h1_for_heading_or_missing_quantity(tmp_path, headin
         'true', str(missing).lower(), 'chua_ket_luan')
     assert row['D_H_huong_deg'] == ('' if missing else '2.0')
     assert rl.apply_so_h(rl.read_rows(str(Path(ds) / rl.TUNING)), ds)
+
+
+@pytest.mark.parametrize('kind', ['S03', 'S3'])
+def test_x3_1_round3_machine_requires_phases(tmp_path, kind):
+    args = ('RQ2', 'PID', 'X', 'r', 1, 1, P1[1], P1[2])
+    with pytest.raises(rl.LogError, match='machine-phases'):
+        rl.machine(str(tmp_path), *args, script_kind=kind)
+    flags = ('campaign', 'controller', 'script-run-id', 'results-dir', 'n-sim-evals', 't-machine-s',
+             'wall-start', 'wall-end')
+    cli = [x for k, v in zip(flags, args) for x in ('--' + k, str(v))]
+    assert rl.main(['--dataset', str(tmp_path), 'machine', *cli, '--script-kind', kind]) != 0
+    assert not (tmp_path / rl.TUNING).exists()
+
+
+@pytest.mark.parametrize('ph,match', [(P1[:7] + ('x', P1[8]), 'source'), (P1, 'duplicate')])
+def test_x3_1_round3_phase_source_and_duplicate(tmp_path, ph, match):
+    with pytest.raises(rl.LogError, match=match):
+        rl.machine_phases(str(tmp_path), 'S03', 'X', 'r', [P1, ph])
+    assert not (tmp_path / rl.TUNING).exists()
+
+
+def test_x3_6_round3_hil_appendix_preserves_scorer_fields(tmp_path):
+    r = write_run(tmp_path, 'r', 'HIL', 'final_hil', 'PID', 'O1-F05', 'A-PID/G07', 'dat', .03)
+    path = Path(r['results_dir']) / 'score.json'
+    score = json.loads(path.read_text(encoding='utf-8'))
+    gate = score['gate_v3']
+    gate['g1'].update(t_done=[9.5], t_deadline=12., t1=None,
+                      prog_before_t1=None, cond25_before_deadline=None)
+    metrics = dict(e_trk_rms=.03, stop_dist_origin=.04, ds_min=-.01, n_upper_frames=3,
+                   tv_duty_h7_1khz=8., sat_any_frac=.1)
+    path.write_text(json.dumps(dict(score, **metrics)), encoding='utf-8')
+    r.update(rl.gate_columns(gate, rl.sha256_file(str(path))))
+    ds = _table_ds(tmp_path, [r])
+    table.write_table(LR(ds)[0], str(tmp_path))
+    with (tmp_path / 'S05_final_runs.csv').open(encoding='utf-8', newline='') as f:
+        saved = next(csv.DictReader(f))
+    assert {k: float(saved[k]) for k in metrics} == metrics
+    assert (saved['g1_t_done_1'], saved['g1_t_deadline']) == (r['g1_t_done_1'], r['g1_t_deadline'])
+    assert float(saved['tv_duty']) == pytest.approx(4.)
+
+
+def test_x3_8_round3_end_and_summary_check_final_hil_boot(tmp_path):
+    import s05_fake_runs as fr
+    ds = str(tmp_path)
+    d = tmp_path / 'run'
+    fr.write_trial_gain(str(d), boot='abcd')
+    rl.begin(ds, 'S', 'RQ2', 'HIL', 'PID', 'O1-F05', '.5', 'final_hil', gain_set='RQ2-INIT-PID/G1')
+    kw = dict(results_dir=str(d), gate=rl.fake_gate())
+    with pytest.raises(rl.LogError, match='boot'):
+        rl.end(ds, 'dat', queries=rl.fake_queries('dcba', folder=ds), **kw)
+    rl.end(ds, 'dat', queries=rl.fake_queries('abcd', folder=ds), **kw)
+    ep = d / 'esp32.csv.events.txt'
+    ep.write_text(ep.read_text(encoding='utf-8').replace('boot=abcd', 'boot=dcba'), encoding='utf-8')
+    with pytest.raises(rl.LogError, match='boot'):
+        rl.summary(ds)
+
+
+def test_x3_8_round3_gain_send_saves_query_tx(monkeypatch, capsys):
+    import gain_send
+    import s05_fake_runs as fr
+    gain = fr.sample_gain()
+    ack = dict(gain['gains'], ctrl='PID', id='1', applied_n='1', mac='aa:bb', boot='ab', sha='123abc',
+               env='pid', ok='1', tx='472')
+    monkeypatch.setattr(gain_send, 'exchange', lambda *a: (ack, 1))
+    assert gain_send.main(['--query', '--ip', 'localhost']) == 0
+    assert 'tx=472' in capsys.readouterr().out.split('#gain_running,')[1].splitlines()[0].split(',')
+
+
+def test_x3_9_round3_trial_gain_write_and_replay(tmp_path):
+    import s05_fake_runs as fr
+    ds = str(tmp_path)
+    d = tmp_path / 'run'
+    path = fr.write_trial_gain(str(d), 'LADRC')
+    args = (ds, 'S', 'B-LADRC', 'HIL', 'LADRC', 'O1-F05', '.5', 'hil_check')
+    rl.begin(*args, gain_set='B-LADRC/G1', gains='wc_xy=9999')
+    kw = dict(results_dir=str(d), gate=rl.fake_gate(), gain_file=path)
+    with pytest.raises(rl.LogError, match='g_wc_xy'):
+        rl.end(ds, 'dat', **kw)
+    rl.cancel(ds)
+    rl.begin(*args, gain_set='B-LADRC/G1', gains='wc_xy=2.00000001')
+    r = rl.end(ds, 'dat', **kw)
+    assert float(r['g_wo_xy']) == 6 and not r.get('g_kp_xy')
+    assert rl.summary(ds)
+    rl._write_all(str(tmp_path / rl.TUNING), rl.TUNING_COLS, [dict(r, g_wc_xy='9999')])
+    with pytest.raises(rl.LogError, match='g_wc_xy'):
+        rl.summary(ds)
+
+
+@pytest.mark.parametrize('bad,match', [(dict(gain_file='missing.json'), 'not found'),
+                                      (dict(gain_sha256='0' * 64), 'gain_sha256'),
+                                      (dict(frozen_at='bad'), 'frozen_at')])
+def test_x3_14_round3_replay_each_freeze(tmp_path, bad, match):
+    from test_s05_final_table import write_gains
+    ds = str(tmp_path)
+    rl.migrate(ds)
+    write_gains(ds)
+    p = str(tmp_path / rl.FREEZE)
+    rl._write_all(p, rl.FREEZE_COLS, [dict(rl.read_rows(p)[0], **bad)])
+    with pytest.raises(rl.LogError, match=match):
+        rl.summary(ds)
+    with pytest.raises(ValueError, match=match):
+        LR(ds)
+
+
+def test_x3_14_round3_begin_final_hil_requires_its_freeze(tmp_path):
+    from test_s05_final_table import write_gains
+    ds = str(tmp_path)
+    write_gains(ds)
+    with pytest.raises(rl.LogError, match='frozen'):
+        rl.begin(ds, 'S', 'RQ2', 'HIL', 'PID', 'O1-F05', '.5', 'final_hil', gain_set='A-PID/G999')
+    assert not (tmp_path / rl.OPEN_RUN).exists()
+
+
+def test_x3v2_1_round3_legacy_hours_are_reported_apart(tmp_path, capsys):
+    ds = str(tmp_path)
+    rl.append_row(str(tmp_path / rl.EFFORT), rl.EFFORT_COLS, dict(chien_dich='chua_biet', gio='1.17'))
+    rl.effort(ds, '2026-11-20', '10:00', '11:00', khoan='C_chung')
+    totals = {r['campaign']: float(r['T_operator_h']) for r in rl.summary(ds)}
+    assert sum(totals.values()) == totals['C_chung'] == 1
+    assert '1.17' in capsys.readouterr().err
+    with pytest.raises(rl.LogError):
+        rl.effort(ds, '2026-11-20', '10:00', '11:00', campaign='chua_biet')
+
+
+@pytest.mark.parametrize('outcome,n,match', [('dat', 6, 'more than 5 valid'), ('hong_he_do', 4, 'stopped after 3')])
+def test_x3v2_3_round3_initial_gain_one_cell(tmp_path, outcome, n, match):
+    rows = [write_run(tmp_path, f'r{i}', 'HIL', 'final_hil', 'PID', 'O1-F05', f'RQ2-INIT-PID/G{i % 2 + 1}',
+                      outcome, .03) for i in range(n)]
+    ds = _table_ds(tmp_path, rows[:-1])
+    summary = {r['campaign']: r for r in rl.summary(ds)}
+    field = 'n_valid' if outcome == 'dat' else 'stopped_n3'
+    assert summary['RQ2-INIT-PID']['final_hil_O1-F05@0.5_' + field] == ('5' if outcome == 'dat' else '1')
+    rl.append_row(str(Path(ds) / rl.TUNING), rl.TUNING_COLS, rows[-1])
+    with pytest.raises(rl.LogError, match=match):
+        rl.summary(ds)
+    with pytest.raises(ValueError, match=match):
+        LR(ds)
+
+
+@pytest.mark.parametrize('second_edge', [False, True])
+def test_x3v2_4_round3_t0_must_match_unique_edge(second_edge):
+    from test_s05_final_table import Log, zigzag
+    log = Log()
+    log.off(10)
+    log.on(15, zigzag)
+    active = [r for r in log.rows if r['run_active'] == '1']
+    if second_edge:
+        active[10]['run_active'] = '0'
+    t0 = int(active[0 if second_edge else 1]['timestamp_us'])
+    tv = table.tv_duty_esp32(log.rows, .05, t0_us=t0, check_gain_line=False, check_boot=False)
+    assert tv['tv_duty'] is None
+    assert ('run_active' if second_edge else 't0_log_us') in tv['reason']
+
+
+def test_x3v2_7_round3_query_names_check_logged_pair(tmp_path):
+    r = write_run(tmp_path, 'r', 'HIL', 'final_hil', 'PID', 'O1-F05', 'A-PID/G07', 'dat', .03)
+    ds = _table_ds(tmp_path, [r])
+    args = ['table', '--dataset', ds, '--out', str(tmp_path / 'out'),
+            '--query-before-name', 'gain_query_before.txt', '--query-after-name', 'gain_query_after.txt']
+    assert table.main(args) == 0
+    assert table.main(args[:-1] + ['gain_query_before.txt']) == 2
+    other = Path(r['results_dir']) / 'copy'
+    other.mkdir()
+    (other / 'gain_query_before.txt').write_bytes(Path(r['query_before_file']).read_bytes())
+    assert table.main(args[:5] + ['--query-before-name', 'copy/gain_query_before.txt']) == 2
+
+
+def test_x3v2_8_round3_bench_log_end_migrate_summary_table(tmp_path):
+    import s05_fake_runs as fr
+    ds = str(tmp_path)
+    old_cols = [c for c in rl.TUNING_COLS if c != 'esp32_log']
+    rl._write_all(str(tmp_path / rl.TUNING), old_cols, [])
+    assert rl.migrate(ds)[rl.TUNING] == 'migrated'
+    for stage, campaign, gs in [('hil_check', 'B-PID', 'B-PID/G1'), ('final_hil', 'RQ2', 'RQ2-INIT-PID/G1')]:
+        d = tmp_path / stage
+        d.mkdir()
+        gain = fr.sample_gain()
+        before, after = fr.write_final_run(str(d), 'HIL', gain, score_extra=dict(outcome='dat', gate_v3=rl.fake_gate()))
+        gf = fr.write_gain_file(str(d / 'gain_trial.json'), gain)
+        (d / 'pi').mkdir()
+        for suffix in ['', '.events.txt']:
+            (d / ('esp32.csv' + suffix)).rename(d / ('pi/F05-PID.csv' + suffix))
+        rl.begin(ds, 'S', campaign, 'HIL', 'PID', 'O1-F05', '.5', stage, gain_set=gs)
+        args = ['--dataset', ds, 'end', '--outcome', 'dat', '--gate-json', str(d / 'score.json'),
+                '--results-dir', str(d), '--esp32-log', 'pi/F05-PID.csv', '--gain-file', gf]
+        if stage == 'final_hil':
+            args += ['--query-before', before, '--query-after', after]
+        assert rl.main(args) == 0
+    rows = rl.read_rows(str(tmp_path / rl.TUNING))
+    assert all(r['esp32_log'].replace('\\', '/').endswith('pi/F05-PID.csv') for r in rows)
+    assert rl.summary(ds)
+    assert LR(ds, init_gain={'PID': gf})[0][0]['values']['tv_duty'] is not None
+    (tmp_path / 'hil_check/pi/F05-PID.csv.events.txt').unlink()
+    with pytest.raises(rl.LogError, match='events'):
+        rl.check_trial_gain(rows[0], ds)
+
+
+def test_x3v2_9_round3_freeze_and_final_same_second(tmp_path, monkeypatch):
+    import datetime as dt
+    ds = str(tmp_path)
+    t = dt.datetime(2026, 11, 20, 9, 0, 0, 123456)
+    clock = iter([t, t + dt.timedelta(microseconds=1)])
+    monkeypatch.setattr(rl, 'now', lambda: next(clock))
+    p = tmp_path / 'gain_PID.json'
+    p.write_text(json.dumps(GAIN7_FILE), encoding='utf-8')
+    frozen = rl.freeze(ds, 'A-PID', 'het_ung_vien', 'A-PID/G1', str(p))
+    run = rl.begin(ds, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '.5', 'final', gain_set='A-PID/G1')
+    assert (frozen['frozen_at'], run['row']['wall_start']) == (t.isoformat(), t.replace(microsecond=123457).isoformat())

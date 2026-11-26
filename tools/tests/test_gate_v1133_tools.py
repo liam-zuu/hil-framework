@@ -120,6 +120,7 @@ def test_end_refuses_an_exemption_without_any_gate_file(ds):
 
 def test_end_final_hil_cannot_carry_the_mask(ds):
     d, gf, tmp = ds
+    rl.freeze(d, 'A-PID', 'het_ung_vien', 'A-PID/G00', gain_file(d), at='2026-11-19T08:00:00')
     rl.begin(d, 'S', 'RQ2', 'HIL', 'PID', 'O1-F08', '0.8', 'final_hil', gain_set='A-PID/G00')
     rl.step(d, 'run')
     g = _gate(gf)                                                             # masked as for a B candidate check

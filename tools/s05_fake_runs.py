@@ -130,10 +130,10 @@ def sample_gain(controller='PID'):
                            pos_kp=6.0, pos_ki=3.0, k_psi=1.0))
 
 
-def write_trial_gain(d, controller='PID', boot=BOOT):
+def write_trial_gain(d, controller='PID', boot=BOOT, gain=None):
     """FAKE trial gain and its short ESP32 log, for tests of rq3_log end."""
     os.makedirs(d, exist_ok=True)
-    gain = sample_gain(controller)
+    gain = gain or sample_gain(controller)
     log = Log()
     log.off(10)
     log.on(5)

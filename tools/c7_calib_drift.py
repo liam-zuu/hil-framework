@@ -88,6 +88,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 for _p in (os.path.join(HERE, '..', 'rpi5'), os.path.join(HERE, '..', 'fwsim'), HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+import c7_drift_evidence as evidence
+from c7_drift_evidence import V2 as DRIFT_VERSION, V2_FIELDS
 import c7_clip_probe as cp                                               # noqa: E402
 import c7_measure as cm                                                  # noqa: E402
 import o1_lanes                                                          # noqa: E402
@@ -95,7 +97,6 @@ from o1_feasibility import Path8                                         # noqa:
 from o1_tasks import FIG8, FINAL_SET                                     # noqa: E402
 
 EPS_MM = 2.0           # eps_H [DE XUAT], locked at C8 (design Q1; O1 v11.28 4)
-DRIFT_VERSION = 'c7_calib_drift_v2'    # CAM v4 section 3 TC3-10: position and heading, a state per quantity (gate_c8)
 MARK_PX = 2.0          # own corner residual growth of one mark that names it [DE XUAT]
 STEP_M = 0.05          # spacing of the lane samples (arc length)
 MIN_MARKS = 6          # common floor marks needed for the pose refit (calibrate needs 6 too)
@@ -106,8 +107,6 @@ SCORE_SAME = ('version', 'task', 'hang_so', 'k_start', 'thresholds', 'esp32_sha2
 SCORE_VERSION = 'c7_score_v2'      # the scorer whose output this combines (U_m, D of the version before are gone)
 TRACK_SAME = ('video_sha256', 'tag_offset', 'frames', 'decoded_shapes')       # CD2-4: track options (gates: CC1-4)
 THRESH_TEXT = ('status',)          # the only text field of c7_score thresholds (metadata); the rest are numbers >= 0
-V2_FIELDS = ('D_H_vi_tri_mm', 'D_H_huong_deg', 'eps_H_huong_deg', 'trang_thai_vi_tri', 'trang_thai_huong',
-             'vuot_do_thieu')      # copied by gop into calib_drift (rq3_log so-h DRIFT_FIELDS + D_H_vi_tri_mm)
 
 
 def _finite(x, name, lo=None, strict=False):
@@ -438,11 +437,7 @@ def check_drift(d):
         raise ValueError('not a c7_calib_drift file')
     _need(d, ('vuot', 'thieu_H1', 'eps_H_mm', 's0_session_sha256', 's1_session_sha256', 'D_H_mm', 'tasks', 'k_start',
               'tag_offset'), 'drift.json')
-    for k in ('vuot', 'thieu_H1'):
-        if not isinstance(d[k], bool):
-            raise ValueError(f'drift.json: {k!r} not true/false')
-    eps = _finite(d['eps_H_mm'], 'drift.json eps_H_mm', 0.0, strict=True)
-    _sha(d['s0_session_sha256'], 'drift.json s0_session_sha256')
+    version = evidence.check(d)
     tasks = d['tasks']
     if not isinstance(tasks, list) or not tasks or not all(isinstance(t, str) for t in tasks):
         raise ValueError(f'drift.json: tasks {tasks!r}')
@@ -450,46 +445,7 @@ def check_drift(d):
     if any(t in FINAL_SET for t in tasks) or d['k_start'] is not None:
         _triple(d['k_start'], 'drift.json k_start')
     _triple(d['tag_offset'], 'drift.json tag_offset')
-    v2 = d.get('version') == DRIFT_VERSION
-    if d['thieu_H1']:
-        if not d['vuot'] or d['D_H_mm'] is not None or d['s1_session_sha256'] is not None:
-            raise ValueError('drift.json: thieu_H1 must come with vuot true, no D_H_mm, no s1 session')
-        if v2 and ((d.get('trang_thai_vi_tri'), d.get('trang_thai_huong')) != ('thieu', 'thieu')
-                   or d.get('vuot_do_thieu') is not True):
-            raise ValueError('drift.json v2: thieu_H1 comes with both quantities thieu and vuot_do_thieu true')
-    else:
-        _sha(d['s1_session_sha256'], 'drift.json s1_session_sha256')
-        if v2:
-            # J v6 J2-8 (section 4 eps_H.psi, section 5 clip H): the clip H at the end is there but one quantity (or both)
-            # could not be measured: state 'thieu', value null (never a number made up), vuot_do_thieu true, vuot true
-            # -> the run is scored twice like above eps_H (rq3_log so-h, gate_c8 _drift_vuot read the same states)
-            tv, th = d.get('trang_thai_vi_tri'), d.get('trang_thai_huong')
-            if tv not in ('so', 'thieu') or th not in ('so', 'thieu'):
-                raise ValueError(f'drift.json v2: trang_thai_vi_tri / trang_thai_huong {tv!r} / {th!r} (so or thieu)')
-            missing = 'thieu' in (tv, th)
-            if d.get('vuot_do_thieu') is not missing:
-                raise ValueError(f'drift.json v2: vuot_do_thieu {d.get("vuot_do_thieu")!r}: true exactly when a '
-                                 'quantity is missing (thieu)')
-            if 'D_H_vi_tri_mm' not in d or d['D_H_vi_tri_mm'] != d['D_H_mm']:
-                raise ValueError('drift.json v2: D_H_vi_tri_mm = D_H_mm')
-            want = missing
-            if tv == 'so':
-                want = want or _finite(d['D_H_mm'], 'drift.json D_H_mm', 0.0) > eps
-            elif d['D_H_mm'] is not None:
-                raise ValueError('drift.json v2: position thieu comes with D_H_mm null')
-            if th == 'so':
-                dpsi = _finite(d.get('D_H_huong_deg'), 'drift.json D_H_huong_deg', 0.0)
-                ep = d.get('eps_H_huong_deg')                  # null: heading threshold not locked, position only
-                if ep is not None:
-                    want = want or dpsi > _finite(ep, 'drift.json eps_H_huong_deg', 0.0, strict=True)
-            elif d.get('D_H_huong_deg') is not None:
-                raise ValueError('drift.json v2: heading thieu comes with D_H_huong_deg null')
-        else:
-            want = _finite(d['D_H_mm'], 'drift.json D_H_mm', 0.0) > eps
-        if d['vuot'] != want:
-            raise ValueError(f'drift.json: vuot {d["vuot"]} does not match D_H {d["D_H_mm"]} / eps_H {eps}'
-                             + (f', heading {d.get("D_H_huong_deg")} / {d.get("eps_H_huong_deg")}, states '
-                                f'{d.get("trang_thai_vi_tri")} / {d.get("trang_thai_huong")}' if v2 else ''))
+    return version
 
 
 def check_score(sc, tr, frames_sha, session_sha, drift, name):
@@ -561,14 +517,14 @@ def check_score(sc, tr, frames_sha, session_sha, drift, name):
 
 def combine(drift, sc0, tr0, fr0_sha, sc1=None, tr1=None, fr1_sha=None):
     """score_final dict of design section 3."""
-    check_drift(drift)
+    version = check_drift(drift)
     check_score(sc0, tr0, fr0_sha, drift['s0_session_sha256'], drift, 'H0')
     o0 = sc0['outcome']
     out = dict(sc0)
-    info = dict(eps_H_mm=drift['eps_H_mm'], D_H_mm=drift.get('D_H_mm'), vuot=drift['vuot'],
+    info = dict(version=version, eps_H_mm=drift['eps_H_mm'], D_H_mm=drift.get('D_H_mm'), vuot=drift['vuot'],
                 thieu_H1=drift['thieu_H1'], outcome_h0=o0, outcome_h1=None, flags=[],
                 s0_session_sha256=drift['s0_session_sha256'], s1_session_sha256=drift.get('s1_session_sha256'))
-    if drift.get('version') == DRIFT_VERSION:          # J2-8: the v2 states go along, a missing quantity marked thieu
+    if version == DRIFT_VERSION:          # J2-8: the v2 states go along, a missing quantity marked thieu
         info.update({k: drift.get(k) for k in V2_FIELDS})
     if not drift['vuot'] or drift['thieu_H1']:
         if sc1 is not None or tr1 is not None:

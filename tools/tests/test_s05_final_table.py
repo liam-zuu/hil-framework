@@ -200,7 +200,12 @@ def write_gains(ds, frozen=(('A-PID', 'A-PID/G07'),)):
     gain file of PID; returns the --init-gain map."""
     rows = []
     for camp, gs in frozen:
-        f = write_gain_file(os.path.join(ds, f'gain_{gs.replace("/", "_")}.json'))
+        import s05_fake_runs as fr
+        f = os.path.join(ds, f'gain_{gs.replace("/", "_")}.json')
+        if camp.endswith('-PID'):
+            write_gain_file(f)
+        else:
+            fr.write_gain_file(f, dict(fr.sample_gain('LADRC'), id=7))
         rows.append(dict.fromkeys(rl.FREEZE_COLS, '') | dict(campaign=camp, gain_set_id=gs,
                                                               frozen_at='2026-11-19T08:00:00',
                                                               gain_file=os.path.basename(f),
@@ -1045,19 +1050,19 @@ def test_c7_1_question_after_shows_the_file_id(tmp_path):
         LR(ds)
 
 
-def test_c7_2_a_frozen_set_without_judged_runs_does_not_stop_the_table(tmp_path):
-    """R134C7-2: the file of B-LADRC was moved after its freeze; the table of runs of other sets is made; a judged
-    run of B-LADRC is refused for it, a hong_he_do run of B-LADRC is not."""
+def test_x3_14_c7_2_validate_the_freeze_even_without_a_judged_run(tmp_path):
     a = write_run(tmp_path, 'a1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
     h = write_run(tmp_path, 'b0', 'HW', 'final', 'LADRC', 'O1-F05', 'B-LADRC/G02', 'hong_he_do', 0.9)
     ds = _table_ds(tmp_path, [a, h], frozen=(('A-PID', 'A-PID/G07'), ('B-LADRC', 'B-LADRC/G02')))
-    os.remove(os.path.join(ds, 'gain_B-LADRC_G02.json'))
     runs, _ = LR(ds)
     assert sorted(x['run_uid'] for x in runs) == ['a1', 'b0']
+    os.remove(os.path.join(ds, 'gain_B-LADRC_G02.json'))
+    with pytest.raises(ValueError, match='B-LADRC/G02.*not found'):
+        LR(ds)
     b = write_run(tmp_path, 'b1', 'HW', 'final', 'LADRC', 'O1-F05', 'B-LADRC/G02', 'dat', 0.02)
     ds = _table_ds(tmp_path, [a, h, b], frozen=(('A-PID', 'A-PID/G07'), ('B-LADRC', 'B-LADRC/G02')))
     os.remove(os.path.join(ds, 'gain_B-LADRC_G02.json'))
-    with pytest.raises(ValueError, match=r"run b1: file gain cua 'B-LADRC/G02': .*not found") as e:
+    with pytest.raises(ValueError, match=r'B-LADRC/G02.*not found') as e:
         LR(ds)
     assert 'run a1' not in str(e.value) and 'run b0' not in str(e.value)
 
@@ -1081,7 +1086,7 @@ def test_c7_3_relative_frozen_name_takes_the_candidate_with_the_sha(tmp_path, mo
     runs, _ = LR(ds)
     assert runs[0]['gain_file'] == 'gain_rel.json' and runs[0]['gain_sha256'] == rl.sha256_file(good)
     write_gain_file(good, gains=dict(kp_xy=1.75))                    # no candidate keeps the frozen sha256 now
-    with pytest.raises(ValueError, match=r'run c1: file gain cua .*khac gain_sha256'):
+    with pytest.raises(ValueError, match=r'A-PID/G07.*khac gain_sha256'):
         LR(ds)
 
 
@@ -1164,9 +1169,7 @@ def test_c8_1_every_start_in_the_events_shows_the_set(tmp_path):
 
 
 def test_c8_2_a_read_error_stays_with_its_candidate(tmp_path, monkeypatch):
-    """R134C8-2: a frozen file that cannot be read (PermissionError) stops neither the table of other sets nor a
-    run whose set has another readable candidate with the sha256; the candidate after the matching one is not
-    read."""
+    """X3-14 checks unused sets too. An unreadable candidate still allows a readable copy matching the SHA."""
     import rq3_log
     a = write_run(tmp_path, 'p1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
     ds = _table_ds(tmp_path, [a], frozen=(('A-PID', 'A-PID/G07'), ('B-LADRC', 'B-LADRC/G02')))
@@ -1181,7 +1184,8 @@ def test_c8_2_a_read_error_stays_with_its_candidate(tmp_path, monkeypatch):
             raise PermissionError(13, 'Permission denied', path)
         return real(path)
     monkeypatch.setattr(rq3_log, 'sha256_file', lambda p: sha(p, lambda x: x.endswith('gain_B-LADRC_G02.json')))
-    assert [x['run_uid'] for x in LR(ds)[0]] == ['p1']             # unused set unreadable: table made
+    with pytest.raises(ValueError, match='B-LADRC/G02.*khong doc duoc'):
+        LR(ds)
     # good copy in the dataset, unreadable copy of the same name in the work folder: never read
     work = tmp_path / 'work'
     os.makedirs(work)
@@ -1196,7 +1200,7 @@ def test_c8_2_a_read_error_stays_with_its_candidate(tmp_path, monkeypatch):
     assert runs[0]['gain_file'] == name
     # both unreadable: the run of the set is refused, the reason names both candidates
     monkeypatch.setattr(rq3_log, 'sha256_file', lambda p: sha(p, lambda x: x in (in_ds, name)))
-    with pytest.raises(ValueError, match=r'run p1: file gain cua .*khong doc duoc.*khong doc duoc'):
+    with pytest.raises(ValueError, match=r'A-PID/G07.*khong doc duoc.*khong doc duoc'):
         LR(ds)
 
 

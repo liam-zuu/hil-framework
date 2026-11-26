@@ -297,7 +297,7 @@ def main(argv=None):
             print('# INCOMPLETE answer: ' + '; '.join(errs))
             print('#ket_qua,ma=4')
             return 4
-        print('#gain_running,' + ','.join(f'{k}={v}' for k, v in ack.items() if k not in ('tx', 'req_id', 'ok', 'err')))
+        print('#gain_running,' + ','.join(f'{k}={v}' for k, v in ack.items() if k not in ('req_id', 'ok', 'err')))
         print('#ket_qua,ma=0')
         return 0
 

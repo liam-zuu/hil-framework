@@ -529,7 +529,7 @@ def test_gt1_2_a_level_stopped_by_the_c8b_time_check_is_not_confirmed(demo_ds, t
         rl.end(demo_ds, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=p, results_dir=folder)
     with pytest.raises(rl.LogError, match='C8b time check'):
         _freeze_ok(demo_ds, tmp_path)
-    gfile = fr.write_gain_file(str(tmp_path / 'FAKE_gain_L.json'), GAIN)
+    gfile = fr.write_gain_file(str(tmp_path / 'FAKE_gain_L.json'), fr.sample_gain('LADRC'))
     rl.append_row(os.path.join(demo_ds, rl.FREEZE), rl.FREEZE_COLS, dict(
         campaign='A-LADRC', frozen_at='2030-01-01T00:00:00', stop_reason='khoi_xac_nhan_dat', stop_cause='',
         gain_set_id='A-LADRC/G01', gain_file=gfile, gain_sha256=rl.sha256_file(gfile), notes='FAKE: by hand'))

@@ -267,7 +267,10 @@ def test_v3_33_final_hil_refused_mapping_counts_with_tool_errors(ds, order):
             rl.summary(d)                                                  # fewer than 3 in a row: not stopped
     with pytest.raises(rl.LogError, match='lost runs in a row'):
         rl.begin(d, 'H', 'RQ2', 'HIL', 'PID', 'O1-F05', '0.5', 'final_hil', gain_set='RQ2-INIT-PID/G0')
-    _final_hil_tool_error(d, clock, gain_set='RQ2-INIT-PID/G1')           # another gain set: its own streak
+    with pytest.raises(rl.LogError, match='lost runs in a row'):
+        _final_hil_tool_error(d, clock, gain_set='RQ2-INIT-PID/G1')       # same initial PID cell
+    rl.freeze(d, 'B-PID', 'het_ung_vien', 'B-PID/G1', gain_file(d), at='2026-11-19T08:00:00')
+    _final_hil_tool_error(d, clock, gain_set='B-PID/G1')                 # a distinct cell keeps its own streak
     rl.summary(d)
 
 
@@ -779,6 +782,8 @@ def test_cli_end_requires_the_query_files(ds, tmp_path, capsys, platform, stage,
     extra = ['--fail-cause', 'mat_khung'] if outcome == 'hong_he_do' else ['--gate-json', f, '--results-dir', 'r']
     if outcome in rl.VALID and platform in ('HW', 'HIL') and stage in ('screen', 'hil_check'):
         extra += ['--gain-file', fr.write_trial_gain(os.path.join(d, 'r'))]
+    if stage == 'final_hil':
+        fr.write_trial_gain(os.path.join(d, 'r'))
     qb, qa = _query_files(tmp_path)
     for q in ([], ['--query-before', qb]):
         rc = rl.main(['--dataset', d, 'end', '--outcome', outcome] + extra + q)

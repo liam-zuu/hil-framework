@@ -496,6 +496,44 @@ V2_MISS_H1 = dict(DRIFT_MISS, version=cd.DRIFT_VERSION, D_H_vi_tri_mm=None, D_H_
                   trang_thai_vi_tri='thieu', trang_thai_huong='thieu', vuot_do_thieu=True)
 
 
+@pytest.mark.parametrize('drift', [dict(V2_MISS_XY, eps_H_huong_deg=None),
+                                   dict(V2_MISS_PSI, eps_H_huong_deg=None), DRIFT_OK])
+def test_x3_18_x3v2_5_6_round3_gop_to_so_h(tmp_path, drift):
+    import rq3_log as rl
+    ds = str(tmp_path)
+    h0 = dict(sc('dat'), gate_v3=rl.floor_gate(rl.fake_gate()))
+    h1 = dict(sc('dat', frames='f1'), gate_v3=h0['gate_v3'])
+    both = (h1, tr('s1', frames='f1'), 'f1') if drift['vuot'] else ()
+    combined = cd.combine(drift, h0, tr('s0'), 'f0', *both)
+    version = drift.get('version', 'c7_calib_drift_v1')
+    assert combined['calib_drift']['version'] == version
+    p, raw, final = (tmp_path / name for name in ('h0.json', 'drift.json', 'score_final.json'))
+    p.write_text(json.dumps(h0), encoding='utf-8')
+    raw.write_text(json.dumps(drift), encoding='utf-8')
+    row = dict(run_uid='S:1', platform='HW', campaign='A-PID', run_outcome='dat', results_dir=ds,
+               **rl.gate_columns(h0['gate_v3'], rl.sha256_file(str(p))))
+    rl.append_row(str(tmp_path / rl.TUNING), rl.TUNING_COLS, row)
+    for external in ('', str(raw)):
+        if external and version.endswith('_v1'):
+            del combined['calib_drift']['version']   # historical unversioned gop + original v1 drift
+        final.write_text(json.dumps(combined), encoding='utf-8')
+        saved = rl.so_h(ds, 'S:1', str(final), external)
+        assert saved['outcome_sau'] == 'dat' and saved['vuot'] == str(bool(both)).lower()
+        assert rl.apply_so_h([row], ds)[0]['run_outcome'] == 'dat'
+        (tmp_path / rl.SO_H).unlink()
+
+
+@pytest.mark.parametrize('drift', [dict(V2_OK, D_H_mm=0, D_H_vi_tri_mm=0, eps_H_mm=0),
+                                   dict(V2_MISS_XY, eps_H_huong_deg=-1), dict(V2_MISS_PSI, eps_H_huong_deg=0),
+                                   _drop(V2_MISS_H1, 'D_H_huong_deg')])
+def test_x3v2_5_round3_gop_and_so_h_reject_invalid_evidence(drift):
+    import rq3_log as rl
+    with pytest.raises(rl.LogError):
+        rl.check_drift_thresholds(drift, 'run')
+    with pytest.raises(ValueError):
+        cd.check_drift(drift)
+
+
 @pytest.mark.parametrize('drift', [V2_MISS_PSI, V2_MISS_XY, dict(V2_MISS_XY, D_H_huong_deg=None, trang_thai_huong='thieu')])
 @pytest.mark.parametrize('o0,o1', [('dat', 'dat'), ('dat', 'khong_dat'), ('khong_dat', 'hong_he_do')])
 def test_j2_8_clip_h_end_there_one_quantity_missing_scored_twice(drift, o0, o1):

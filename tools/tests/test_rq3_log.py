@@ -82,14 +82,19 @@ def rows(path):
 
 def end_with_trial(ds, outcome, **kwargs):
     """Supply the L90 evidence for tests exercising other end rules."""
+    import gain_line_check as glc
     import s05_fake_runs as fr
     row = rl._require_open(ds)['row']
     results_dir = kwargs.get('results_dir')
     if (outcome in rl.VALID and results_dir and row['platform'] in ('HW', 'HIL')
-            and row['stage'] in (*rl.TUNE_STAGES, 'hil_check')):
+            and row['stage'] in (*rl.TUNE_STAGES, 'hil_check', 'final_hil')):
         before = (kwargs.get('queries') or (None,))[0] or {}
         boot = before.get('boot') or kwargs.get('boot_before') or fr.BOOT
-        kwargs['gain_file'] = fr.write_trial_gain(os.path.join(ds, results_dir), row['controller'], boot)
+        gains = fr.sample_gain(row['controller'])
+        for k in rl.GAINS:
+            if row.get('g_' + k):
+                gains['gains'][glc.ALIASES.get(k, k)] = float(row['g_' + k])
+        kwargs['gain_file'] = fr.write_trial_gain(os.path.join(ds, results_dir), row['controller'], boot, gains)
     return rl.end(ds, outcome, **kwargs)
 
 
@@ -108,13 +113,9 @@ def end_(d, outcome, gate=None, **kw):
         gate = rl.floor_gate(rl.fake_gate(e_trk=0.5 if outcome == 'khong_dat' else 0.03,
                                           completed='true' if outcome != 'chua_ket_luan' else 'inconclusive'))
         kw.setdefault('results_dir', 'r')
-    if outcome in rl.VALID and row.get('stage') in (*rl.TUNE_STAGES, 'hil_check'):
-        import s05_fake_runs as fr
-        results = os.path.join(d, 'trial_' + row['controller'])
-        kw['results_dir'] = results
-        before = (kw.get('queries') or (None,))[0]
-        kw['gain_file'] = fr.write_trial_gain(results, row['controller'], (before or {}).get('boot', fr.BOOT))
-    return rl.end(d, outcome, gate=gate, **kw)
+    if outcome in rl.VALID and row.get('stage') in (*rl.TUNE_STAGES, 'hil_check', 'final_hil'):
+        kw['results_dir'] = os.path.join(d, 'trial_' + row['controller'], row['run_uid'].replace(':', '_'))
+    return end_with_trial(d, outcome, gate=gate, **kw)
 
 
 def test_migrate_adds_columns_keeps_values_and_is_idempotent(ds):
@@ -158,7 +159,7 @@ def test_live_run_segments_pause_and_wait(ds):
     assert row['run_uid'] == 'A1:1' and row['t_flash_s'] == '100' and row['t_run_s'] == '80'
     assert row['t_analysis_s'] == '200' and row['t_operator_wait_s'] == '80' and row['t_setup_s'] == '0'
     assert row['g_kp_xy'] == '1.2' and row['g_k_psi'] == '1' and row['e_perp_max_m'] == '0.1230'
-    assert row['wall_start'] == '2026-11-20T08:00:00' and row['wall_end'] == '2026-11-20T08:21:20'
+    assert row['wall_start'] == '2026-11-20T08:00:00.000000' and row['wall_end'] == '2026-11-20T08:21:20'
     assert not os.path.exists(os.path.join(d, rl.OPEN_RUN))
     rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F08', '0.8', 'screen', gain_set='A-PID/G1')
     assert rl._load_open(d)['row']['iter_no'] == '2'
@@ -325,7 +326,7 @@ def test_bad_replacement_and_final_hil_account_are_errors(ds):
     d2 = os.path.join(d, 'b')
     os.makedirs(d2)
     rl.migrate(d2)
-    car_run(d2, clock, 'A-PID', 'final_hil', 'dat', platform='HIL')
+    car_run(d2, clock, 'A-PID', 'final_hil', 'dat', platform='HIL', gain_set='RQ2-INIT-PID/G0')
     with pytest.raises(rl.LogError, match='account RQ2'):
         rl.summary(d2)
 
@@ -405,12 +406,18 @@ def test_ea5_gain_set_prefix_and_final_hil_join(ds):
     # both campaigns freeze the same start gains: two ids, two homes (S05 v3.7 §6.3)
     rl.freeze(d, 'A-PID', 'cham_tran_xe', 'A-PID/G0', gain_file(d))
     rl.freeze(d, 'B-PID', 'het_ung_vien', 'B-PID/G0', gain_file(d))
+    tick(clock, 1)
     car_run(d, clock, 'RQ2', 'final_hil', 'dat', session='H', platform='HIL', gain_set='A-PID/G0')
     car_run(d, clock, 'RQ2', 'final_hil', 'khong_dat', session='H', platform='HIL', gain_set='B-PID/G0')
     s = {r['campaign']: r for r in rl.summary(d)}
     assert s['A-PID']['final_hil_O1-F05@0.5_pass'] == '1' and s['B-PID']['final_hil_O1-F05@0.5_fail'] == '1'
-    car_run(d, clock, 'RQ2', 'final_hil', 'dat', session='H', platform='HIL', gain_set='A-PID/G9')   # not frozen
-    with pytest.raises(rl.LogError, match='no frozen set'):
+    with pytest.raises(rl.LogError, match='frozen is'):
+        car_run(d, clock, 'RQ2', 'final_hil', 'dat', session='H', platform='HIL', gain_set='A-PID/G9')
+    path = os.path.join(d, rl.TUNING)
+    edited = rows(path)
+    edited[0]['gain_set_id'] = 'A-PID/G9'
+    rl._write_all(path, rl.TUNING_COLS, edited)
+    with pytest.raises(rl.LogError, match='frozen is'):
         rl.summary(d)
 
 
