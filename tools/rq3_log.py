@@ -45,7 +45,9 @@ Commands (the operator types them while working; every time stamp is the PC cloc
   machine --campaign C --controller PID --script-run-id ID --results-dir D --n-sim-evals N
          --t-machine-s S --wall-start T --wall-end T [--n-sim-diagnostic N]   allocated fwsim script row
   machine-phases --script-kind S03|S3 --script-run-id ID --results-dir D
-         --phase ACCOUNT START END N_PID N_LADRC DIAG_PID DIAG_LADRC   repeat for each elapsed phase, including bo
+         --phase ACCOUNT START END N_PID N_LADRC DIAG_PID DIAG_LADRC SOURCE_TIMES SOURCE_COUNTS
+                                         repeat for each elapsed phase, including bo; the two sources (file,
+                                         line the numbers were typed from) are required (X3-1)
   hoc-start --campaign C --ghi-chu X / hoc-end [--ghi-chu X]   a hoc segment, time stamps written
                                          by the script (S05 §3.1 R-2, EA-7)
   effort --date D --start HH:MM --end HH:MM (--campaign C | --khoan K) [--nhan hoc] --ghi-chu X
@@ -3058,10 +3060,32 @@ def machine(ds: str, campaign: str, controller: str, script_run_id: str, results
     return row
 
 
+def _phase_source(text, what, script_run_id):
+    """X3-1 (CODE 26/11): the source of a typed phase number, required, one line."""
+    s = text.strip() if isinstance(text, str) else ''
+    if not s or '\n' in s or '\r' in s:
+        raise LogError(f'{script_run_id}: the source of the phase {what} is required, on one line '
+                       f'(file and line of the run log or notes.json the numbers were typed from)')
+    return s
+
+
 def machine_phases(ds, script_kind, script_run_id, results_dir, phases, notes=''):
-    """Allocate each elapsed phase by actual counts, then write one row per controller and account."""
+    """Allocate each elapsed phase by actual counts, then write one row per controller and account.
+
+    A phase is (ACCOUNT, START, END, N_PID, N_LADRC, DIAG_PID, DIAG_LADRC, SOURCE_TIMES, SOURCE_COUNTS). The
+    numbers are typed by hand until S03 section 7 names a notes.json field for them (X3-1, CODE 26/11): each
+    phase carries the source of its START/END (file, line of the run log) and of its four counts (file, line of
+    sealed/notes.json); both are required and written, with the typed numbers, in the notes of every row the
+    phase goes into, after the [nhap_tay] flag."""
     totals = {}
-    for account, start, end_, pid, ladrc, pid_diag, ladrc_diag in phases:
+    cited = {}
+    for ph in phases:
+        if len(ph) != 9:
+            raise LogError(f'{script_run_id}: a phase needs 9 fields (ACCOUNT START END N_PID N_LADRC DIAG_PID '
+                           f'DIAG_LADRC SOURCE_TIMES SOURCE_COUNTS), got {len(ph)}')
+        account, start, end_, pid, ladrc, pid_diag, ladrc_diag, src_t, src_n = ph
+        src_t = _phase_source(src_t, 'start/end', script_run_id)
+        src_n = _phase_source(src_n, 'counts', script_run_id)
         try:
             t0, t1 = _parse_t(start), _parse_t(end_)
             elapsed = (t1 - t0).total_seconds()
@@ -3082,12 +3106,18 @@ def machine_phases(ds, script_kind, script_run_id, results_dir, phases, notes=''
             total[1] += diag
             total[2] += elapsed * (n / (pid + ladrc) if pid + ladrc else 0.5)
             total[3], total[4] = min(total[3], t0), max(total[4], t1)
+        cited.setdefault(account, []).append(
+            f'{start}..{end_} PID {pid}/{pid_diag} LADRC {ladrc}/{ladrc_diag} (gio: {src_t}; so: {src_n})')
     path = os.path.join(ds, TUNING)
     existing = read_rows(path)
     session = 'MACHINE'
     it = next_iter_no(ds, session)
+
+    def row_notes(account):
+        return (f'{notes} ' if notes else '') + f'{MANUAL} nguon pha {account}: ' + ' | '.join(cited[account])
+
     rows = [_machine_row(it + i, c, ctrl, script_run_id, results_dir, n, seconds, t0.isoformat(), t1.isoformat(),
-                         'SIM', 'script', session, notes, script_kind, diag, {})
+                         'SIM', 'script', session, row_notes(c), script_kind, diag, {})
             for i, ((c, ctrl), (n, diag, seconds, t0, t1)) in enumerate(totals.items())]
     if not rows:
         raise LogError('at least one phase is required')
@@ -3997,7 +4027,8 @@ def demo(out_dir: str, seed: int = 1, levels=('O1-F05',)) -> List[dict]:
 
         def phase(account, start, end_, pid, ladrc, pid_diag=0, ladrc_diag=0):
             return (account, (clock[0] + dt.timedelta(seconds=start)).isoformat(),
-                    (clock[0] + dt.timedelta(seconds=end_)).isoformat(), pid, ladrc, pid_diag, ladrc_diag)
+                    (clock[0] + dt.timedelta(seconds=end_)).isoformat(), pid, ladrc, pid_diag, ladrc_diag,
+                    f'FAKE console.txt t={start}..{end_} s', 'FAKE sealed/notes.json')
 
         machine_phases(out_dir, 'S03', 'FAKE-S03', 'results/S03/FAKE', [
             phase('B-chung', 0, 900, 100, 200),             # overlapping sweep: a single 15-minute interval
@@ -4108,8 +4139,9 @@ def main(argv=None) -> int:
     mp.add_argument('--script-kind', required=True, choices=('S03', 'S3'))
     mp.add_argument('--script-run-id', required=True)
     mp.add_argument('--results-dir', required=True)
-    mp.add_argument('--phase', nargs=7, action='append', required=True,
-                    metavar=('ACCOUNT', 'START', 'END', 'N_PID', 'N_LADRC', 'DIAG_PID', 'DIAG_LADRC'))
+    mp.add_argument('--phase', nargs=9, action='append', required=True,
+                    metavar=('ACCOUNT', 'START', 'END', 'N_PID', 'N_LADRC', 'DIAG_PID', 'DIAG_LADRC', 'SOURCE_TIMES',
+                             'SOURCE_COUNTS'))
     mp.add_argument('--notes', default='')
     hs = sub.add_parser('hoc-start')
     hs.add_argument('--campaign', required=True, choices=TUNED)

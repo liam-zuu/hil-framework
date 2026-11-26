@@ -41,6 +41,63 @@ def test_x3_1_c9h_phase_totals_and_s3(tmp_path):
         rl.machine(ds, 'B-chung', 'PID', 'bad-S3', 'r', 1, 1, '2026-11-20', '2026-11-21', script_kind='S3')
 
 
+P1 = ('B-chung', '2026-11-20T09:00:00', '2026-11-20T09:10:00', '100', '200', '1', '2',
+      'S03/run/console.txt:12-40', 'S03/run/sealed/notes.json:7')
+P2 = ('RQ2', '2026-11-20T09:10:00', '2026-11-20T09:20:00', '50', '50', '0', '0',
+      'S03/run/console.txt:41-60', 'S03/run/sealed/notes.json:9')
+
+
+def test_x3_1_machine_phases_sources_in_every_row(tmp_path):
+    # CODE 26/11: every typed number of machine-phases carries its source in the row
+    rows = rl.machine_phases(str(tmp_path), 'S03', 'S03-R1', 'results/S03/R1', [P1, P2], 'quet')
+    assert len(rows) == 4
+    for r in rows:
+        own = P1 if r['campaign'] == 'B-chung' else P2
+        assert r['notes'].startswith(f'quet {rl.MANUAL} nguon pha {own[0]}: ')
+        assert f'{own[1]}..{own[2]} PID {own[3]}/{own[5]} LADRC {own[4]}/{own[6]}' in r['notes']
+        assert f'gio: {own[7]}; so: {own[8]}' in r['notes']
+        other = P2 if own is P1 else P1
+        assert other[7] not in r['notes'] and other[8] not in r['notes']
+    on_disk = rl.read_rows(str(tmp_path / rl.TUNING))
+    assert [r['notes'] for r in on_disk] == [r['notes'] for r in rows]
+
+
+@pytest.mark.parametrize('i', [7, 8])
+@pytest.mark.parametrize('bad', ['', '   ', 'a\nb', 'a\rb', None])
+def test_x3_1_machine_phases_refuses_a_missing_source(tmp_path, i, bad):
+    ph = list(P1)
+    ph[i] = bad
+    with pytest.raises(rl.LogError, match='source of the phase'):
+        rl.machine_phases(str(tmp_path), 'S03', 'S03-R1', 'results/S03/R1', [tuple(ph)])
+    assert not (tmp_path / rl.TUNING).exists()
+
+
+def test_x3_1_machine_phases_refuses_a_second_import(tmp_path):
+    ds = str(tmp_path)
+    rl.machine_phases(ds, 'S03', 'S03-R1', 'results/S03/R1', [P1])
+    before = (tmp_path / rl.TUNING).read_bytes()
+    with pytest.raises(rl.LogError, match='duplicate script import'):
+        rl.machine_phases(ds, 'S03', 'S03-R1', 'results/S03/R1', [P2])     # other phase, same script run
+    assert (tmp_path / rl.TUNING).read_bytes() == before
+
+
+def test_x3_1_machine_phases_needs_nine_fields(tmp_path):
+    with pytest.raises(rl.LogError, match='9 fields'):
+        rl.machine_phases(str(tmp_path), 'S03', 'S03-R1', 'results/S03/R1', [P1[:7]])
+
+
+def test_x3_1_machine_phases_cli_takes_the_sources(tmp_path):
+    ds = str(tmp_path)
+    args = ['--dataset', ds, 'machine-phases', '--script-kind', 'S03', '--script-run-id', 'S03-R1',
+            '--results-dir', 'results/S03/R1', '--phase', *P1]
+    assert rl.main(args) == 0
+    (row_pid, row_ladrc) = rl.read_rows(str(tmp_path / rl.TUNING))
+    assert 'gio: S03/run/console.txt:12-40; so: S03/run/sealed/notes.json:7' in row_pid['notes']
+    with pytest.raises(SystemExit):
+        rl.main(['--dataset', str(tmp_path / 'x'), 'machine-phases', '--script-kind', 'S03', '--script-run-id', 'R',
+                 '--results-dir', 'r', '--phase', *P1[:7]])
+
+
 def test_x3_2_12b_is_budgeted_effort(tmp_path):
     ds = str(tmp_path)
     effort = ('2026-11-20', '09:00', '10:00')
@@ -167,6 +224,28 @@ def test_x3_11_k_speed_and_n3_share_condition_key(tmp_path):
     with pytest.raises(rl.LogError, match='stopped after 3'):
         rl._final_stops(rows)
     rl._check_replacements([rows[0], dict(rows[3], replaces_run_uid=rows[0]['run_uid'])])
+
+
+def test_x3_13_over_the_rerun_limit_only_post_freeze_or_explore(tmp_path):
+    # enough kiem_gio_c8b refusals to stop the level (> C8B_RERUNS_MAX), but each set only after frozen_at (screen)
+    # or in explore: neither is history of the block; the same refusals before frozen_at in screen do stop it
+    ds = str(tmp_path)
+    n = rl.C8B_RERUNS_MAX + 1
+    common = dict(campaign='A-PID', platform='HW', trajectory='O1-F05', speed_mps='0.5', gain_set_id='A-PID/G')
+    block = [dict(common, stage='confirm', block_id='B', run_uid=f'B:{i}', run_outcome='dat',
+                  wall_end='2026-11-20T09:00:00') for i in range(2)]
+    for r in block:
+        rl.append_row(str(tmp_path / rl.SO_H), rl.SO_H_COLS, dict(run_uid=r['run_uid'], ghi_luc='2026-11-20T09:10:00'))
+
+    def refused(stage, hour, tag):
+        return [dict(common, stage=stage, run_uid=f'{tag}:{i}', run_outcome='hong_he_do', fail_cause=rl.C8B_GIO_FAIL,
+                     wall_end=f'2026-11-20T{hour:02d}:{i:02d}:00') for i in range(n)]
+
+    frz = '2026-11-20T10:00:00'
+    for extra in (refused('screen', 11, 'S'), refused('explore', 8, 'E')):
+        assert rl.confirm_block_problem(block + extra, ds, 'A-PID', 'A-PID/G', frz, ['O1-F05']) is None
+    why = rl.confirm_block_problem(block + refused('screen', 8, 'P'), ds, 'A-PID', 'A-PID/G', frz, ['O1-F05'])
+    assert why and 'stopped after' in why
 
 
 def test_x3_13_confirm_ignores_post_freeze_and_explore(tmp_path):
