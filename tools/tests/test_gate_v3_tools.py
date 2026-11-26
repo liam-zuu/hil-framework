@@ -343,9 +343,9 @@ def test_s315_4_log_order_not_the_clock(ds):
     for _ in range(rl.MAP_RERUNS_MAX + 1):
         _hil_check(d, clock)
     rows = _rows(d)
-    late = dict(rows[0], run_uid='H:9', iter_no='9', wall_start='2026-11-20T07:59:00', run_outcome='dat')
-    late.update(rl.gate_columns(_gate(u_t=0.0015)))
-    late['fail_cause'] = ''
+    judged = _hil_check(d, clock, gain_set='B-PID/GA2', mapped=True)
+    late = dict(judged, gain_set_id=rows[0]['gain_set_id'], run_uid='H:9', iter_no='9',
+                wall_start='2026-11-20T07:59:00')
     rl._write_all(os.path.join(d, rl.TUNING), rl.TUNING_COLS, rows + [late])
     with pytest.raises(rl.LogError, match='no run after that'):
         rl.summary(d)

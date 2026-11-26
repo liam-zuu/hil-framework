@@ -498,7 +498,7 @@ V2_MISS_H1 = dict(DRIFT_MISS, version=cd.DRIFT_VERSION, D_H_vi_tri_mm=None, D_H_
 
 @pytest.mark.parametrize('drift', [dict(V2_MISS_XY, eps_H_huong_deg=None),
                                    dict(V2_MISS_PSI, eps_H_huong_deg=None), DRIFT_OK])
-def test_x3_18_x3v2_5_6_round3_gop_to_so_h(tmp_path, drift):
+def test_x3_18_x3v2_5_x3v2_6_round3_gop_to_so_h(tmp_path, drift):
     import rq3_log as rl
     ds = str(tmp_path)
     h0 = dict(sc('dat'), gate_v3=rl.floor_gate(rl.fake_gate()))
@@ -506,7 +506,6 @@ def test_x3_18_x3v2_5_6_round3_gop_to_so_h(tmp_path, drift):
     both = (h1, tr('s1', frames='f1'), 'f1') if drift['vuot'] else ()
     combined = cd.combine(drift, h0, tr('s0'), 'f0', *both)
     version = drift.get('version', 'c7_calib_drift_v1')
-    assert combined['calib_drift']['version'] == version
     p, raw, final = (tmp_path / name for name in ('h0.json', 'drift.json', 'score_final.json'))
     p.write_text(json.dumps(h0), encoding='utf-8')
     raw.write_text(json.dumps(drift), encoding='utf-8')
@@ -515,12 +514,21 @@ def test_x3_18_x3v2_5_6_round3_gop_to_so_h(tmp_path, drift):
     rl.append_row(str(tmp_path / rl.TUNING), rl.TUNING_COLS, row)
     for external in ('', str(raw)):
         if external and version.endswith('_v1'):
-            del combined['calib_drift']['version']   # historical unversioned gop + original v1 drift
+            combined['calib_drift'].pop('version', None)   # historical unversioned gop + original v1 drift
         final.write_text(json.dumps(combined), encoding='utf-8')
         saved = rl.so_h(ds, 'S:1', str(final), external)
         assert saved['outcome_sau'] == 'dat' and saved['vuot'] == str(bool(both)).lower()
         assert rl.apply_so_h([row], ds)[0]['run_outcome'] == 'dat'
         (tmp_path / rl.SO_H).unlink()
+        if not external:
+            assert combined['calib_drift']['version'] == version
+    if version.endswith('_v2'):
+        malformed = _drop(drift, 'tag_offset')
+        raw.write_text(json.dumps(malformed), encoding='utf-8')
+        with pytest.raises(rl.LogError, match='tag_offset'):
+            rl.so_h(ds, 'S:1', str(final), str(raw))
+        with pytest.raises(ValueError, match='tag_offset'):
+            cd.check_drift(malformed)
 
 
 @pytest.mark.parametrize('drift', [dict(V2_OK, D_H_mm=0, D_H_vi_tri_mm=0, eps_H_mm=0),

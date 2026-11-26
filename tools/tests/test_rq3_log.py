@@ -415,7 +415,7 @@ def test_ea5_gain_set_prefix_and_final_hil_join(ds):
         car_run(d, clock, 'RQ2', 'final_hil', 'dat', session='H', platform='HIL', gain_set='A-PID/G9')
     path = os.path.join(d, rl.TUNING)
     edited = rows(path)
-    edited[0]['gain_set_id'] = 'A-PID/G9'
+    next(r for r in edited if r['run_uid'] == 'H:1')['gain_set_id'] = 'A-PID/G9'
     rl._write_all(path, rl.TUNING_COLS, edited)
     with pytest.raises(rl.LogError, match='frozen is'):
         rl.summary(d)

@@ -16,6 +16,36 @@ def _number(value, name, positive=False):
     return value
 
 
+def pose_triple(values, name):
+    if not isinstance(values, (list, tuple)) or len(values) != 3:
+        raise ValueError(f'{name}: 3 numbers expected ({values!r})')
+    try:
+        values = [float(v) for v in values]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f'{name}: expected three finite numbers') from exc
+    if not all(math.isfinite(v) for v in values):
+        raise ValueError(f'{name}: expected three finite numbers')
+    return values
+
+
+def check_file(d, allowed_tasks):
+    """Additional fields of the original so output (not included in the combined score)."""
+    if not isinstance(d, dict) or d.get('kind') != 'c7_calib_drift':
+        raise ValueError('not a c7_calib_drift file')
+    for k in (*SESSIONS, 'tasks', 'k_start', 'tag_offset'):
+        if k not in d:
+            raise ValueError(f'drift: missing {k}')
+    tasks = d['tasks']
+    if not isinstance(tasks, list) or not tasks or any(t not in allowed_tasks for t in tasks):
+        raise ValueError(f'drift: invalid tasks {tasks!r}')
+    if d['k_start'] is not None or any(t.startswith('O1-K') for t in tasks):
+        pose_triple(d['k_start'], 'drift k_start')
+    pose_triple(d['tag_offset'], 'drift tag_offset')
+    if 'version' not in d and any(k in d for k in V2_FIELDS):
+        raise ValueError('drift: position and heading require the v2 version')
+    return check(d)
+
+
 def check(d):
     """Validate the recorded decision and return its schema version. Older gop blocks lack a version."""
     has_heading = any(k in d for k in V2_FIELDS)
@@ -30,12 +60,12 @@ def check(d):
         raise ValueError('thieu_H1 and vuot must be true/false')
     no_clip = d['thieu_H1']
     if 'version' in d or has_heading or any(k in d for k in SESSIONS):
-        for k in SESSIONS:
-            if k == 's1_session_sha256' and no_clip:
-                if k not in d or d[k] is not None:
-                    raise ValueError(f'thieu_H1 requires {k} null')
-            elif not isinstance(d.get(k), str) or not d[k]:
-                raise ValueError(f'drift: missing {k}')
+        for key in SESSIONS:
+            if key == 's1_session_sha256' and no_clip:
+                if key not in d or d[key] is not None:
+                    raise ValueError(f'thieu_H1 requires {key} null')
+            elif not isinstance(d.get(key), str) or not d[key]:
+                raise ValueError(f'drift: missing {key}')
 
     limit = _number(d['eps_H_mm'], 'eps_H_mm', positive=True)
     position = d['D_H_mm']

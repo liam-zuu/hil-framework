@@ -72,6 +72,8 @@ gop  --drift drift.json --s0-score score.json --s0-track <dir0>/track.json
      v2 drift with the clip H at the end there but a quantity not measured (trang_thai_vi_tri / _huong 'thieu', its
      value null, vuot_do_thieu true; J v6 J2-8): vuot, so the run is scored twice as above eps_H. gop copies the v2
      states and values (D_H_vi_tri_mm, D_H_huong_deg, eps_H_huong_deg, trang_thai_*, vuot_do_thieu) into calib_drift.
+     calib_drift.version identifies the v1 or v2 comparison. For an old position-only gop without a version,
+     give rq3_log so-h --drift the original so JSON.
 Last line: #ket_qua,ma=0 done / 2 error.
 """
 from __future__ import annotations
@@ -89,7 +91,7 @@ for _p in (os.path.join(HERE, '..', 'rpi5'), os.path.join(HERE, '..', 'fwsim'), 
     if _p not in sys.path:
         sys.path.insert(0, _p)
 import c7_drift_evidence as evidence
-from c7_drift_evidence import V2 as DRIFT_VERSION, V2_FIELDS
+from c7_drift_evidence import V2 as DRIFT_VERSION, V2_FIELDS, pose_triple as _triple
 import c7_clip_probe as cp                                               # noqa: E402
 import c7_measure as cm                                                  # noqa: E402
 import o1_lanes                                                          # noqa: E402
@@ -424,28 +426,9 @@ def _sha(x, name):
     return x
 
 
-def _triple(x, name):
-    if not isinstance(x, (list, tuple)) or len(x) != 3:
-        raise ValueError(f'{name}: 3 numbers expected ({x!r})')
-    return [_finite(v, name) for v in x]
-
-
 def check_drift(d):
     """Schema and consistency of a drift.json (CD1-7, CD2-6)."""
-    _dict(d, 'drift.json')
-    if d.get('kind') != 'c7_calib_drift':
-        raise ValueError('not a c7_calib_drift file')
-    _need(d, ('vuot', 'thieu_H1', 'eps_H_mm', 's0_session_sha256', 's1_session_sha256', 'D_H_mm', 'tasks', 'k_start',
-              'tag_offset'), 'drift.json')
-    version = evidence.check(d)
-    tasks = d['tasks']
-    if not isinstance(tasks, list) or not tasks or not all(isinstance(t, str) for t in tasks):
-        raise ValueError(f'drift.json: tasks {tasks!r}')
-    parse_tasks(','.join(tasks))
-    if any(t in FINAL_SET for t in tasks) or d['k_start'] is not None:
-        _triple(d['k_start'], 'drift.json k_start')
-    _triple(d['tag_offset'], 'drift.json tag_offset')
-    return version
+    return evidence.check_file(d, tuple(FIG8) + FINAL_SET)
 
 
 def check_score(sc, tr, frames_sha, session_sha, drift, name):

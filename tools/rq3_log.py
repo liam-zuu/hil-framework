@@ -19,7 +19,8 @@ Commands (the operator types them while working; every time stamp is the PC cloc
                                          (--wait: waiting for the machine, also in t_operator_wait_s)
   pause / resume                         other work in between: not counted (S05 §3.1)
   end    --outcome dat|khong_dat|chua_ket_luan|hong_he_do [--e-perp-max M] [--completed 0|1]
-         [--fail-cause X] [--results-dir D] [--gate-json F] [--gate-file C]   close the run, append its row;
+         [--fail-cause X] [--results-dir D] [--esp32-log CSV] [--gate-json F] [--gate-file C]
+                                         close the run and append its row; CSV defaults to D/esp32.csv
                                          C = the C8 gate file (O1 v11.33): the conditions that must
                                          decide are recomputed from it (level = task, platform, stage,
                                          campaign); needed when F was scored with it (gate_v3.3)
@@ -567,7 +568,7 @@ def begin(ds: str, session: str, campaign: str, platform: str, controller: str, 
         raise LogError(f'{task}@{speed} of {gain_set or campaign}: stopped after {FINAL_LOST_N} lost runs in a row '
                        '(S05 4.6), no further run')
     if stage in ('final', 'final_hil'):
-        check_final_freeze(row, freeze_rows(ds))
+        check_final_freeze(row, ds=ds)
     run = {'row': row, 'segments': [], 'current': None, 'paused_from': None}
     _save_open(ds, run)
     return run
@@ -1303,7 +1304,7 @@ def query_files_needed(row: dict, outcome: str) -> bool:
     return outcome in VALID and boot_needed(row.get('platform'), row.get('stage'))
 
 
-def check_query_rows(tun: List[dict], ds: str) -> dict:
+def check_query_rows(tun: List[dict], ds: str, query_before_name=None, query_after_name=None) -> dict:
     """R134 (1) (R134C4-1 summary part, deferred at round 4): the summary reads the two gain_send --query outputs of a
     row again. A judged car / final_hil campaign row (query_files_needed) must name both files with their sha256;
     every named file must be there with that sha256 (a file changed after 'end' is refused); the two answers must be
@@ -1336,6 +1337,12 @@ def check_query_rows(tun: List[dict], ds: str) -> dict:
                 raise LogError(f'{uid}: {cf} {p!r} not found (tried {cand}; R134 (1))')
             if sha256_file(f) != sha:
                 raise LogError(f'{uid}: {f} changed after the run was logged (sha256 differs from {cs}; R134 (1))')
+            name = query_before_name if when == 'before' else query_after_name
+            if name is not None and r.get('stage') in ('final', 'final_hil'):
+                folder = _results_dir(r, ds)
+                expected = os.path.join(folder, name) if folder else ''
+                if not expected or os.path.normcase(os.path.realpath(expected)) != os.path.normcase(os.path.realpath(f)):
+                    raise LogError(f'{uid}: --query-{when}-name {name!r} differs from the logged query file {p!r}')
             qs.append(glc.read_query(f))
         if not need:
             continue
@@ -1421,9 +1428,9 @@ def h0_file(r: dict, ds: str) -> str:
     raise LogError(f'run {uid}: no file under {d} with the gate_json_sha256 of the log (the H0 scorer file, C9D-1)')
 
 
-def check_drift_thresholds(cd, uid):
+def check_drift_thresholds(cd, uid, original=False):
     try:
-        return drift_evidence.check(cd)
+        return drift_evidence.check_file(cd, tuple(FINAL_SPEEDS)) if original else drift_evidence.check(cd)
     except ValueError as exc:
         raise LogError(f'run {uid}: {exc} (C9D-5)') from exc
 
@@ -1449,21 +1456,14 @@ def check_score_final(r: dict, path: str, ds: str, drift=None, new=False) -> tup
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise LogError(f'score_final {path!r}: not an output of c7_calib_drift.py gop ({exc})')
     if drift is not None:
-        if not isinstance(drift, dict) or drift.get('kind') != 'c7_calib_drift':
-            raise LogError(f'run {uid}: --drift must be an output of c7_calib_drift so')
-        version = check_drift_thresholds(drift, uid)
+        version = check_drift_thresholds(drift, uid, original=True)
         historical = 'version' not in cd and not any(k in cd for k in drift_evidence.V2_FIELDS)
-        if not historical and check_drift_thresholds(cd, uid) != version:
-            raise LogError(f'run {uid}: score_final and --drift disagree in version')
-        for k in drift_evidence.SESSIONS + drift_evidence.BASE_FIELDS:
-            if k not in cd or k not in drift or cd[k] != drift[k]:
+        if historical:
+            cd['version'] = version
+            cd.update({k: drift[k] for k in drift_evidence.V2_FIELDS if k in drift})
+        for k in (*drift_evidence.SESSIONS, *drift_evidence.BASE_FIELDS, *drift_evidence.V2_FIELDS):
+            if k in drift and (k not in cd or cd[k] != drift[k]):
                 raise LogError(f'run {uid}: score_final and --drift disagree in {k}')
-        if version == drift_evidence.V2:
-            for k in drift_evidence.V2_FIELDS:
-                if not historical and cd[k] != drift[k]:
-                    raise LogError(f'run {uid}: score_final and --drift disagree in {k}')
-                cd[k] = drift[k]
-        cd['version'] = version
     elif new and 'version' not in cd and not any(k in cd for k in drift_evidence.V2_FIELDS):
         raise LogError(f'run {uid}: unversioned position-only gop: give --drift with the original v1 or v2 comparison')
     if not isinstance(vuot, bool) or not isinstance(thieu, bool) or not set(flags) <= set(SO_H_FLAGS):
@@ -1483,7 +1483,9 @@ def check_score_final(r: dict, path: str, ds: str, drift=None, new=False) -> tup
             {k: v for k, v in h0.items() if k != 'outcome'}:
         raise LogError(f'run {uid}: score_final {path!r} is not the H0 scorer file of the run ({h0p}) with only '
                        f'outcome and calib_drift added (C9D-1)')
-    check_drift_thresholds(cd, uid)
+    combined_version = check_drift_thresholds(cd, uid)
+    if drift is not None and combined_version != version:
+        raise LogError(f'run {uid}: score_final and --drift disagree in version')
     if vuot and not thieu:
         h1 = cd.get('h1_score')
         if not isinstance(h1, dict) or h1.get('outcome') != o1:
@@ -1624,6 +1626,8 @@ def apply_so_h(tun: List[dict], ds: str) -> List[dict]:
             raise LogError(f"{SO_H}: run {r.get('run_uid')}: drift fields differ from the comparison file")
         if s.get('vuot') != ('true' if cd['vuot'] else 'false'):      # RC1-1: vuot decides the H1 scoring (apply_moc)
             raise LogError(f"{SO_H}: run {r.get('run_uid')}: vuot {s.get('vuot')!r} is not that of the score_final file")
+        if (s.get('D_H_mm') or '') != _num(cd['D_H_mm']):
+            raise LogError(f'{SO_H}: run {uid}: D_H_mm differs from the comparison file')
         if (final, sorted(want)) != (s.get('outcome_sau'), sorted(flags)):
             raise LogError(f"{SO_H}: run {r.get('run_uid')}: outcome_sau / flags disagree with the rule of O1 §4")
         r = dict(r, run_outcome=final, so_h_flags=','.join(flags))
@@ -2060,6 +2064,8 @@ def final_key(r: dict) -> tuple:
     gs = r.get('gain_set_id', '')
     if r.get('stage') in ('final', 'final_hil'):
         gs = final_gain_key(gs)
+        if not gs and r.get('stage') == 'final' and r.get('campaign') in ('RQ2-INIT-PID', 'RQ2-INIT-LADRC'):
+            gs = r['campaign']  # Historical floor rows can identify the initial set by campaign alone.
     return (r.get('stage', ''), r.get('campaign', ''), gs, r.get('platform', ''),
             *condition_key(r))
 
@@ -2758,6 +2764,8 @@ def final_hil_boot_problem(row, ds, boot):
 
 
 def check_trial_gain(row, ds, fill=False):
+    """Compare logged gains as firmware floats. At end, fill omitted gains from the SHA-verified file.
+    Pre-esp32_log rows could store just the tuned subset. Complete those in memory before counting."""
     if not (row.get('campaign') in TUNED and row.get('stage') in (*TUNE_STAGES, 'hil_check')
             and row.get('platform') in ('HW', 'HIL') and row.get('run_outcome') in VALID):
         return
@@ -2944,7 +2952,7 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
             raise LogError(f'--gain-file {gain_file!r}: {exc}') from exc
     check_account_row(row, TUNING)
     if stage in ('final', 'final_hil'):
-        check_final_freeze(row, freeze_rows(ds))
+        check_final_freeze(row, ds=ds)
     # Codex S315-5: the log as it will be, this row included, checked before the row is written
     check_trial_gain(row, ds, fill=True)
     after = live_rows(read_rows(os.path.join(ds, TUNING))) + [row]
@@ -3016,7 +3024,7 @@ def cancel(ds: str) -> dict:
     row = run['row']
     if active > 0:
         t0 = _parse_t(row['wall_start'])
-        eff = {'ngay': t0.date().isoformat(), 'bat_dau': t0.strftime('%H:%M:%S'), 'ket_thuc': t.strftime('%H:%M:%S'),
+        eff = {'ngay': t0.date().isoformat(), 'bat_dau': t0.time().isoformat(), 'ket_thuc': t.time().isoformat(),
                'gio': f'{active / 3600:.4f}', 'chien_dich': row['campaign'],
                'ghi_chu': f"rq3_log cancel truoc buoc run: {row['run_uid']} ({row['trajectory']} {row['speed_mps']}); "
                           f"gio = tong cac buoc da ghi"}
@@ -3092,9 +3100,14 @@ def _phase_source(text, what, script_run_id):
     s = text.strip() if isinstance(text, str) else ''
     # Accept a path (including a Windows drive) and a line/range or clock time.
     locator = r'(?:[1-9]\d*(?:-[1-9]\d*)?|(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?)'
-    if not re.fullmatch(r'(?:[A-Za-z]:)?[^:\r\n]+(?<![/\\])[:@]' + locator, s):
+    match = re.fullmatch(r'((?:[A-Za-z]:)?[^:*?"<>|\r\n]+)[:@](' + locator + ')', s)
+    if not match or re.split(r'[/\\]', match[1])[-1].strip() in ('', '.', '..'):
         raise LogError(f'{script_run_id}: source of the phase {what}: use FILE:LINE, FILE:FIRST-LAST '
                        'or FILE@HH:MM:SS on one line')
+    if '-' in match[2]:
+        first, last = map(int, match[2].split('-'))
+        if last < first:
+            raise LogError(f'{script_run_id}: source of the phase {what}: reversed line range {match[2]}')
     return s
 
 
@@ -3217,7 +3230,7 @@ def hoc_end(ds: str, ghi_chu: str = '') -> dict:
     if not seg:
         raise LogError('no open hoc segment: "hoc-start" first')
     t0, t1 = _parse_t(seg['start']), now()
-    row = {'ngay': t0.date().isoformat(), 'bat_dau': t0.strftime('%H:%M:%S'), 'ket_thuc': t1.strftime('%H:%M:%S'),
+    row = {'ngay': t0.date().isoformat(), 'bat_dau': t0.time().isoformat(), 'ket_thuc': t1.time().isoformat(),
            'gio': f'{(t1 - t0).total_seconds() / 3600:.4f}', 'chien_dich': seg['campaign'], 'nhan': 'hoc',
            'ghi_chu': (seg['ghi_chu'] + (' ' + ghi_chu if ghi_chu else '')).strip()}
     check_account_row(row, EFFORT)
@@ -3278,7 +3291,7 @@ def freeze(ds: str, campaign: str, stop_reason: str, gain_set: str, gain_file: s
         # L81 (Liam 11/11): .gitattributes keeps 05_DATA/**/*gain_*.json byte-exact (-text), so the
         # sha256 still matches after a checkout; another name would get its line ends converted
         raise LogError(f'--gain-file {base!r}: name must contain "gain_" and end in .json (.gitattributes L81)')
-    if campaign in freeze_rows(ds):
+    if campaign in freeze_rows(ds, campaign):
         raise LogError(f'{campaign} already frozen')
     from s05_final_table import _want
     try:
@@ -3302,10 +3315,12 @@ def freeze(ds: str, campaign: str, stop_reason: str, gain_set: str, gain_file: s
     return row
 
 
-def freeze_rows(ds):
+def freeze_rows(ds, campaign=None):
     rows = {}
     for r in read_rows(os.path.join(ds, FREEZE)):
-        c = r['campaign']
+        c = r.get('campaign')
+        if campaign is not None and c != campaign:
+            continue
         if c in rows:
             raise LogError(f'{FREEZE}: {c} is frozen twice')
         gs = r.get('gain_set_id')
@@ -3344,12 +3359,16 @@ def frozen_gain(ds, row):
     raise LogError(f'{FREEZE}: gain_file {path!r} of {gs}: {details}')
 
 
-def check_final_freeze(row, freezes):
+def check_final_freeze(row, freezes=None, *, ds=None):
     c, uid = row.get('campaign'), row.get('run_uid')
     if row.get('stage') == 'final_hil':
         c = gain_owner(row.get('gain_set_id'))
+        if row.get('controller') != c.split('-')[-1]:
+            raise LogError(f"{uid}: controller {row.get('controller')!r} does not match the gain set of {c}")
     if c not in TUNED:
         return
+    if freezes is None:
+        freezes = freeze_rows(ds, c)
     f = freezes.get(c)
     if not f:
         raise LogError(f'{uid}: final run of {c} needs a row in {FREEZE}')
@@ -3551,6 +3570,11 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
         gate, gate_sha256 = list(gate_file.levels), gate_file.sha256
     gate = None if gate is None else list(gate)     # used per campaign (gate_result, Q1)
     raw = live_rows(read_rows(os.path.join(ds, TUNING)))
+    check_gate_rows(raw, gate_file)                 # The provisional outcomes and query boots as originally logged.
+    check_query_rows(raw, ds)
+    check_map_rows(raw)                             # HIL scoring evidence is checked before counting candidates.
+    for r in raw:
+        check_trial_gain(r, ds)                     # Bind sparse historical g_* before copies, counts or post-scoring.
     tun = apply_after(raw, ds)                      # S05 v3.37 4.3 clip H comparison, then C8b v3 §5 (apply_moc)
     if gate_file is not None:                       # design 6: the U rows were checked with this gate file
         bad = sorted({x.get('run_uid') for x in read_rows(os.path.join(ds, U_MOC))
@@ -3587,8 +3611,6 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
                 raise LogError(f"{r.get('run_uid')}: {exc}")
     check_machine_rows(tun)
     stopped = check_finals(tun)
-    check_gate_rows(raw, gate_file)                 # GV3-1, GV3-R2-1: gate rows recomputed (logged outcome)
-    check_query_rows(raw, ds)                       # R134 (1): the two saved answers read again
     for r in raw:
         if r.get('platform') == 'HIL' and r.get('stage') == 'final_hil' and r.get('run_outcome') in VALID:
             why = final_hil_boot_problem(r, ds, r.get('boot_before'))
@@ -3597,7 +3619,6 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
     for r in tun:
         if r.get('stage') in ('final', 'final_hil'):
             check_final_freeze(r, frz)
-    check_map_rows(tun)                             # S05 v3.15 4.5 step 2 (Codex S315-1)
     check_c8b_rows(tun)                             # O1 v11.37 D1, S05 v3.43 D3
     check_khong_nut_rows(tun, ds)                   # GC6-12, GC7-4
     c8b_rep = defaultdict(lambda: {'n': 0, 'stopped': []})
@@ -3607,8 +3628,6 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
             if n > C8B_RERUNS_MAX:
                 c8b_rep[k[0]]['stopped'].append(f'{k[1]} {k[2]}@{k[3]}')
     map_n = map_refusals(tun)                       # refused mappings, levels stopped
-    for r in raw:
-        check_trial_gain(r, ds)
     map_rep = defaultdict(lambda: {'n': 0, 'stopped': []})
     for k, n in map_n.items():
         if not n:
@@ -3691,21 +3710,13 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
         if stage in ('final', 'final_hil') and r.get(RETRO_FLAG):     # S05 v3.38 4.3: time, N_HW above only
             finals[c][f'{RETRO_FLAG}_n'] += 1
         elif stage in ('final', 'final_hil'):
-            task, sp = condition_key(r)
+            _, _, key, _, task, sp = final_key(r)
             o = r.get('run_outcome', '')
-            gs = r.get('gain_set_id', '')
             if stage == 'final':
                 home, cond = c, f"final_{task}@{sp}"
                 final_tasks[c][task].append(o)
             else:
-                key = final_gain_key(gs)
-                if key in by_gain:
-                    home = by_gain[gs]
-                elif key in ('RQ2-INIT-PID', 'RQ2-INIT-LADRC'):
-                    home = key
-                else:
-                    raise LogError(f"{r.get('run_uid')}: final_hil gain set {gs!r} is no frozen set and no "
-                                   f"RQ2-INIT-* set (S05 v3.7 §6.3, EA-5)")
+                home = by_gain.get(key, key)  # check_final_freeze validated the frozen ID or the initial owner.
                 cond = f"final_hil_{task}@{sp}"
             f = finals[home]
             if o in VALID:

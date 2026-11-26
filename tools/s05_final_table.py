@@ -144,7 +144,7 @@ APPENDIX_QUANTITIES = (
     'sat_frac', 'sat_any_frac', 'tv_duty_h7_1khz', 'k0', 'k_run', 't0_step', 'frames_scored', 'pi_period_ppm',
     'pi_period_n', 'miso_crc_bad', 'miso_empty',
 )
-HIL_SCORE_BLOCKS = ('edge_map', 'start_pose', 'pi_period_steps', 'gate_v3')
+HIL_SCORE_BLOCKS = ('edge_map', 'start_pose', 'pi_period_steps', 'imu_noise', 'gate_v3')
 VALID = ('dat', 'khong_dat', 'chua_ket_luan')
 # t_end error (S05 4.7 (i), Liam 14/11 CODE_RS4 Q4)
 # ESP_PPM_NOISE: noise of the per-run esp_pi_ppm estimate, an estimate of Claude (not a bound). Source (recomputed
@@ -233,6 +233,9 @@ def tv_duty_esp32(rows, t_end_s, edge_max_ms=EDGE_MAX_MS, t0_us=None, queries=No
         out['reason'] = 'log thieu cot ' + ','.join(k for k in need if not rows or k not in rows[0])
         return out
     ts = [_int(r['timestamp_us']) for r in rows]
+    if any(r.get('run_active') not in ('0', '1') for r in rows):
+        out['reason'] = 'run_active khong phai 0/1: khong xac minh duoc canh len duy nhat'
+        return out
     ra = [r['run_active'] == '1' for r in rows]
     rises = [i for i in range(len(rows)) if ra[i] and (i == 0 or not ra[i - 1])]
     out['n_run_active_rises'] = len(rises)
@@ -244,7 +247,11 @@ def tv_duty_esp32(rows, t_end_s, edge_max_ms=EDGE_MAX_MS, t0_us=None, queries=No
         out['reason'] = 'dong dau file da run_active = 1: khong thay canh len'
         return out
     prev, first = rows[i0 - 1], rows[i0]
-    contiguous = _int(first['log_seq']) == _int(prev['log_seq']) + 1
+    prev_seq, first_seq = _int(prev['log_seq']), _int(first['log_seq'])
+    if None in (prev_seq, first_seq, ts[i0 - 1], ts[i0]) or first_seq <= prev_seq or ts[i0] <= ts[i0 - 1]:
+        out['reason'] = 'log_seq hay timestamp_us khong xac dinh duoc canh run_active'
+        return out
+    contiguous = first_seq == prev_seq + 1
     gap_ms = (ts[i0] - ts[i0 - 1]) / 1000
     out.update(t0_edge_contiguous=contiguous, t0_edge_gap_ms=gap_ms)
     if not contiguous and (t0_us is not None or gap_ms > edge_max_ms):
@@ -505,7 +512,7 @@ def load_runs(dataset, score_name, esp32_name, gain_ack_name='gain_ack.txt', ini
         # recomputed from it, the gate file SHA of every run (rq3_log.check_gate_rows)
         rl.check_gate_rows(rows, rl.read_gate_file(gate_file, gate_file_fake) if gate_file else None)   # GC6-14
         rl.check_map_rows(rows)
-        queries = rl.check_query_rows(rows, dataset)
+        queries = rl.check_query_rows(rows, dataset, query_before_name, query_after_name)
         miss = rl.so_h_missing(rows, dataset, stages=('final',))
         if miss:          # C9D-2 (Liam 17/11 at CODE_C13 "Sửa cả 7 + vòng 2 (Recommended)"): no table before so-h
             raise rl.LogError('luot xe kiem cuoi da phan chua so clip H (lenh rq3_log so-h, ca luot duoi nguong): '
@@ -529,13 +536,13 @@ def load_runs(dataset, score_name, esp32_name, gain_ack_name='gain_ack.txt', ini
         if plat is None:
             continue
         ctrl = r.get('controller', '')
-        task, speed = rl.condition_key(r)
-        gs = gain_set_of(r.get('gain_set_id'), ctrl)
+        _, _, gain_key, _, task, speed = rl.final_key(r)
+        gs = gain_set_of(gain_key, ctrl)
         if ctrl not in CONTROLLERS or task not in CONDITIONS or gs is None:
             problems.append(f"run {r.get('run_uid')}: controller {ctrl!r}, trajectory {task!r}, gain_set_id "
                             f"{r.get('gain_set_id')!r} khong vao bang")
             continue
-        gf = gain_file_of(r.get('gain_set_id'), files)
+        gf = files.get(gain_key)
         if r.get('stage') in ('final', 'final_hil'):
             try:
                 rl.check_final_freeze(r, frozen)
@@ -546,10 +553,7 @@ def load_runs(dataset, score_name, esp32_name, gain_ack_name='gain_ack.txt', ini
         ep = rl.esp32_path(r, d, esp32_name)
         qs = queries.get(r.get('run_uid'))
         if r.get('run_outcome') in VALID:           # R134C5-1, -3, R134C6-1: the run's evidence, whatever tv_duty
-            for which, name, query in zip(('before', 'after'), (query_before_name, query_after_name), qs):
-                if name is not None and (not d or os.path.realpath(os.path.join(d, name)) != query['_path']):
-                    raise ValueError(f"{r['run_uid']}: --query-{which}-name {name!r} differs from the logged query file")
-            why = run_evidence_problem(r, qs, gain_ack_name, ep, gf, d)
+            why = run_evidence_problem(r, qs, gain_ack_name, esp32_name, gf, d)
             if why:
                 bad.append(f"run {r.get('run_uid')}: {why}")
                 continue
@@ -559,7 +563,7 @@ def load_runs(dataset, score_name, esp32_name, gain_ack_name='gain_ack.txt', ini
                    stop_reason='N=3 hong_he_do lien tiep' if rl.final_key(r) in stopped else '',
                    **{k: r.get(k, '') for k in (*rl.G1_COLS, *GATE_RUN_FIELDS)},
                    cat_t1=r.get('g1_cat_t1') == 'true',      # R134C4-6: O1 3.5 R2V-4, counted per cell
-                   gain_set_id=r.get('gain_set_id', ''), gain_file=(gf or {}).get('file', ''),
+                   gain_set_id=r.get('gain_set_id') or gain_key, gain_file=(gf or {}).get('file', ''),
                    gain_sha256=(gf or {}).get('sha256', ''), gain_source=(gf or {}).get('source', ''),
                    so_h_flags=r.get('so_h_flags', ''),                 # S05 v3.37 4.3, O1 4 clip H
                    moc_flags=r.get('moc_flags', ''), U_moc_xy_m=r.get('U_moc_xy_m', ''),
@@ -574,8 +578,8 @@ def load_runs(dataset, score_name, esp32_name, gain_ack_name='gain_ack.txt', ini
                 run.update({k: json.dumps(score[k], ensure_ascii=False, separators=(',', ':'))
                             for k in HIL_SCORE_BLOCKS if score.get(k) is not None})
                 if score.get('gate_v3'):
-                    g1 = rl.gate_columns(score['gate_v3'])
-                    run.update({k: g1.get(k, '') for k in rl.G1_COLS})
+                    gate = rl.gate_columns(score['gate_v3'])
+                    run.update({k: gate.get(k, '') for k in (*rl.G1_COLS, *GATE_RUN_FIELDS)})
                 run['values'].update({k: score[k] for k in QUANTITIES if k != 'tv_duty' and _a_number(score.get(k))})
         if run['outcome'] in VALID:
             t0, t_end, reason = score_window(score, plat[0])
@@ -716,7 +720,7 @@ def run_gain_problem(esp32_path, want, expected_boot=None, exact_first_seq=False
     return None
 
 
-def run_evidence_problem(row, queries, gain_ack_name, esp32_path, gain_file, results_dir):
+def run_evidence_problem(row, queries, gain_ack_name, esp32_name, gain_file, results_dir):
     """R134C5-1, R134C5-3 (Codex round 5; Liam 14/11 CODE_R134 hop chon "Bat buoc ack moi luot (Recommended)"):
     None, or why a judged final run (car or HIL) lacks the evidence S05 4.7 (iv) asks for, checked at the level of
     the run, apart from tv_duty: the two answers checked by rq3_log.check_query_rows, and the '#gain_ack' of
@@ -750,7 +754,8 @@ def run_evidence_problem(row, queries, gain_ack_name, esp32_path, gain_file, res
     if not glc._dec(qa.get('id')) or int(qa['id']) != want['id']:                    # R134C7-1
         return (f'id dang chay {qa.get("id")!r} cua lan hoi sau khac id {want["id"]} cua file gain '
                 f'{gain_file["file"]}: bo gain doi trong luot')
-    return run_gain_problem(esp32_path, want, expected_boot=qb['boot'])
+    from rq3_log import esp32_path
+    return run_gain_problem(esp32_path(row, d, esp32_name), want, expected_boot=qb['boot'])
 
 
 def build_table(runs):
