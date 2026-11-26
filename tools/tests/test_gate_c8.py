@@ -4321,3 +4321,30 @@ def test_b5_the_record_and_the_chain():
     c['trang_thai'] = 'dong_tran'                                      # closed at its cap before the extra run
     with pytest.raises(GC.GateFileError, match='on a cell whose chain gives'):
         GC._check_cells(d)
+
+
+# ── B6 (CODE_CODEX 26/11): the log of a lost run without a time file at the path of the log_pi column ─────────────────
+def test_b6_log_of_a_lost_run_by_the_path_of_log_pi(tmp_path):
+    """ghep, a lost run without a time file: the log is the file at the path log_pi gives from the folder of its session
+    when it exists, even if another file of the session has the same file name (run02: a CAM blur table
+    chan_doan_doan_camera/nhoe/<run>.csv); without such a file the search by file name stands, and two files of that
+    name are refused as before."""
+    d, goc = build_c8(tmp_path / 'a')
+    x = _add_lost(goc, d, 0, 9, ['he_do'], gio=False, d1='khong_kiem')
+    lg = os.path.basename(x['file_log']['duong_dan'])
+    p = os.path.join(goc, 'chan_doan', 'nhoe', lg)                      # the same file name, other bytes
+    os.makedirs(os.path.dirname(p))
+    with open(p, 'w', encoding='utf-8') as f:
+        f.write('t_s,u_n_px_s\n0,1\n')
+    with pytest.raises(GC.GateFileError, match=f'the log {lg!r} thu_tu_clip.csv names is on 2 files'):
+        _ghep(goc)
+    _csv_edit(goc, d, lambda ls: [l.replace(f',{lg},', f',{x["file_log"]["duong_dan"]},') if l.startswith(x['clip'] + ',')
+                                  else l for l in ls])
+    g = _ghep(goc)
+    gx = next(e for c in g['o_c8'] for e in c['chuoi'] if e['clip'] == x['clip'])
+    assert gx['file_log'] == x['file_log'] and gx['file_gio'] is None
+    GC.write_gate(str(tmp_path / 'g.json'), g, goc)
+    _csv_edit(goc, d, lambda ls: [l.replace(f',{x["file_log"]["duong_dan"]},', ',log/khong_co.csv,')
+                                  if l.startswith(x['clip'] + ',') else l for l in ls])
+    with pytest.raises(GC.GateFileError, match="the log 'khong_co.csv' thu_tu_clip.csv names is on 0 files"):
+        _ghep(goc, ho_so='chuan_u/ho_so_b6.json')

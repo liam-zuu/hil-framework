@@ -3934,7 +3934,11 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
                 tt_src = _ref_of(kho, fg.get('thao_tac_nguon'), f'{w}: thao_tac_nguon')
             if fg is None and (r.get('log_pi') or '').strip():          # GC6-1 (round 5): by the name the CSV gives
                 ln = os.path.basename(r['log_pi'].strip().replace('\\', '/'))
-                hits = [q for qs in kho.by_sha.values() for q in qs if os.path.basename(q) == ln and _under(q, bf)]
+                lp_ = posixpath.normpath(posixpath.join(bf, r['log_pi'].strip().replace('\\', '/')))
+                hits = [q for qs in kho.by_sha.values() for q in qs if q == lp_ and _under(q, bf)]
+                if not hits:                                    # CODE_CODEX 26/11: the path of the CSV first, from the
+                    # folder of the session (a CAM blur table may share the file name); else by the file name
+                    hits = [q for qs in kho.by_sha.values() for q in qs if os.path.basename(q) == ln and _under(q, bf)]
                 if len(hits) != 1:
                     raise GateFileError(f'{w}: the log {ln!r} thu_tu_clip.csv names is on {len(hits)} files in the '
                                         f'folder {bf!r} of its session; one needed')
