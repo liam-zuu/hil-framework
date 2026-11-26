@@ -227,7 +227,8 @@ NODE = dict(outcome='hong_he_do', gate_v3=dict(
 
 
 def config(tmp_path):
-    cfg = dict(task='O1-F08', luot_id='test 1', f8=dict(neo='A:1,2,16,16;B:21,22,16,16', mau_n=500, tam_id='tam_c8_1'))
+    cfg = dict(task='O1-F08', luot_id='test 1', f8=dict(neo='A:1,2,16,16;B:21,22,16,16', mau_n=500, tam_id='tam_c8_1', mau_clip='clip_h'))
+    (tmp_path / 'clip_h').write_text('clip_h')
     for k in fast.CONFIG_FILES:
         (tmp_path / k).write_text(k)
         cfg[k] = k
@@ -236,7 +237,7 @@ def config(tmp_path):
 
 @pytest.mark.parametrize('key,bad', [('session', 'missing.json'), ('task', 'unknown'), ('sender', ''),
                                      ('f8', None), ('neo', 'A:1,2,3,4'), ('mau_n', True), ('mau_n', -1),
-                                     ('tam_id', ''), ('luot_id', None)])
+                                     ('tam_id', ''), ('luot_id', None), ('mau_clip', ''), ('mau_clip', 'missing_clip_h')])
 def test_config_validation(tmp_path, key, bad):
     cfg = config(tmp_path)
     (cfg['f8'] if key in cfg['f8'] else cfg)[key] = bad
@@ -267,7 +268,7 @@ def test_cham_steps_and_verdict(tmp_path, monkeypatch, grid, failed):
             assert Path(cmd[cmd.index('--dets') + 1]) == frames.with_name('dets_nhanh.npz')
         if step == 3:
             j = cmd.index('--mau')
-            assert cmd[j + 1:j + 4] == [str(tmp_path / 'clip'), str(tmp_path / 'session'), '500']
+            assert cmd[j + 1:j + 4] == [str(tmp_path / 'clip_h'), str(tmp_path / 'session'), '500']   # clip H, not the run clip
         if step == 6:
             assert cmd[cmd.index('--nut') + 1] == '2'
             fast.write_json(cmd[cmd.index('--out') + 1], NODE)

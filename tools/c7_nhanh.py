@@ -394,17 +394,25 @@ def load_config(path):
     f8 = cfg.get('f8')
     if not isinstance(f8, dict):
         raise ValueError('cau_hinh.f8 must be an object')
-    for key in ('neo', 'tam_id'):
+    # f8.mau_clip (design 2.2 v1.2, CAM 26/11): the template clip of hieu_chuan --mau is the clip H at the start of the
+    # camera segment, as C8B's empty F8 of run03-run07 (nhac_tam/f8_rong*/chay_f8_rong.sh: clip H, frame 500). The run
+    # clip refused on run07 C8-L-F08-2_lai1 ("template frame 500 belongs to held-out window 0").
+    for key in ('neo', 'tam_id', 'mau_clip'):
         if not isinstance(f8.get(key), str) or not f8[key].strip():
             raise ValueError(f'f8.{key}: expected nonempty string')
     if type(f8.get('mau_n')) is not int or f8['mau_n'] < 0:
         raise ValueError('f8.mau_n: expected nonnegative frame index')
     parse_neo(f8['neo'])
+    base = Path(path).resolve().parent
     for key in CONFIG_FILES:
-        file = (Path(path).resolve().parent / cfg[key]).resolve()
+        file = (base / cfg[key]).resolve()
         if not file.is_file():
             raise ValueError(f'{key}: no input file {file}')
         cfg[key] = str(file)
+    file = (base / f8['mau_clip']).resolve()
+    if not file.is_file():
+        raise ValueError(f'f8.mau_clip: no input file {file}')
+    f8['mau_clip'] = str(file)
     return cfg
 
 
@@ -434,6 +442,7 @@ def cham(a):
     # --dets: only hashed by c7_score cua-so; given when scoring frames of the full chain (K3a, design 4.2)
     dets = Path(a.dets).resolve() if a.dets else frames.with_name('dets_nhanh.npz')
     inputs = {key: cfg[key] for key in CONFIG_FILES}
+    inputs['f8_mau_clip'] = cfg['f8']['mau_clip']
     inputs.update(cau_hinh=a.cau_hinh, frames=frames, dets=dets, track=frames.with_name('track.json'))
     for suffix in ('events.txt', 'segments.csv'):
         p = Path(cfg['esp32'] + '.' + suffix)
@@ -472,7 +481,7 @@ def cham(a):
         step('2_cua_so', 'c7_score', 'cua-so', '--frames', frames, *task, *hs, *log, '--gio-c8b', gio,
              *run_id, '--clip', cfg['clip'], *session, '--dets', dets, '--out', cua)
         step('3_f8_hieu_chuan', 'c7_nhac_tam', 'hieu_chuan', '--cua-so', cua, *session, '--neo', f8['neo'],
-             '--mau', cfg['clip'], cfg['session'], f8['mau_n'], *a6, '--tam-id', f8['tam_id'], '--out', hc.parent)
+             '--mau', f8['mau_clip'], cfg['session'], f8['mau_n'], *a6, '--tam-id', f8['tam_id'], '--out', hc.parent)
         step('4_f8_lan_lap', 'c7_nhac_tam', 'lan_lap', '--hieu-chuan', hc, '--cua-so', cua, *session,
              *a6, '--tam-id', f8['tam_id'], '--out', ll.parent)
         step('5_f12', 'c7_score', 'tham-chieu', '--frames', frames, *task, *hs, '--cua-so', cua, *run_id,
