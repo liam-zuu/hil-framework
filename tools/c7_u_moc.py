@@ -36,7 +36,10 @@ sections 10, 23, 24; CAM v4 section 5):
   scored nodes = the nodes of luoi.json nguon_nut kept by the grid (nodes_ok true, hong_nut false), in node order, as
   gate_c8._node_scores reads them; mien_da_tinh = their khung_tuong_doi_v1.mien_phai_phu, exactly (gate: equal).
   Domain of the bound = union of their id_khung, widened on each side by the largest grid step (camera time; every
-  valid frame with the car seen in it), plus the reference window W (tham_chieu_v1 ids). Adjacent scored nodes whose
+  valid frame with the car seen in it), plus the reference window W (tham_chieu_v1 ids), plus (C8K-7, Codex C8 round 1,
+  26/11) the id_khung of the kept nodes of the two moved-frame scorings (--nhieu), widened the same way, so the bound
+  also covers the frames a moved-frame scoring relies on when its t_done moves (mien records the nominal part apart:
+  tu_s_danh_dinh, den_s_danh_dinh, n_khung_danh_dinh, n_khung_them_tu_nhieu). Adjacent scored nodes whose
   domains start or end more than one grid step + one frame apart: ok false (domain not stable, v4 section 5).
   Every frame of the domain must be in the khung file without loi; any (2a) flip of its worst refits: ok false.
   q of the run: the chain of the scoring (c7_chuoi_khung.chuoi_khung with the very sources of the node score:
@@ -499,6 +502,32 @@ def phu_thuoc(kept, luoi, nhieu, khung_sha, dt, goc):
     return rec, bad
 
 
+def mien_nhieu(kept, nhieu, goc):
+    """(frame ids, n nodes read) of the domains the moved-frame scorings rely on: the mien_phai_phu.id_khung of the node
+    scores of each luoi nhieu, at the nodes the scoring keeps (C8K-7). A node score that cannot be read adds nothing
+    here (phu_thuoc reports it)."""
+    ids, n = set(), 0
+    for loai in sorted(NHIEU_LOAI):
+        if loai not in nhieu:
+            continue
+        try:
+            L = _json(nhieu[loai])
+        except (OSError, ValueError):
+            continue
+        by = {e['nut']: e for e in L.get('nguon_nut') or [] if isinstance(e, dict) and 'nut' in e}
+        for k, _, _ in kept:
+            if k not in by:
+                continue
+            try:
+                s2 = _json(_doc_ref(by[k], goc, f'{loai} node {k}'))
+            except (OSError, ValueError):
+                continue
+            m = (s2.get('khung_tuong_doi_v1') or {}).get('mien_phai_phu') or {}
+            ids |= {int(i) for i in m.get('id_khung') or []}
+            n += 1
+    return ids, n
+
+
 def run_manifest(a):
     import c7_tuong_doi as ctd
     t_start = time.time()
@@ -539,6 +568,20 @@ def run_manifest(a):
     lo, hi = min(s for s, _ in spans) - step, max(e for _, e in spans) + step
     dom = {int(i) for m in mien for i in m['id_khung']}
     dom |= {int(r['idx']) for r in rows if r['valid'] and r['car_seen'] and lo - 1e-9 <= float(r['t_s']) <= hi + 1e-9}
+    # C8K-7 (Codex C8 round 1, 26/11; CODE: narrow fix): the domain of the bound also covers the frames the moved-frame
+    # scorings rely on (their kept nodes' mien_phai_phu, widened the same way), so a t_done that moves on the moved
+    # frames (recorded, not a block) cannot leave frames of that scoring outside the bound
+    nhieu = dict(x.split('=', 1) for x in (a.nhieu or []))
+    lo0, hi0, n_dom0 = lo, hi, len(dom)
+    ids_n, _ = mien_nhieu(kept, nhieu, goc)
+    miss_n = sorted(i for i in ids_n if i not in t_of)
+    if miss_n:
+        bad.append(f'mien_nhieu: {len(miss_n)} id khung cua luoi nhieu khong co trong frames.csv (dau {miss_n[:5]})')
+    sn = [t_of[i] for i in ids_n if i in t_of]
+    if sn:
+        lo, hi = min(lo, min(sn) - step), max(hi, max(sn) + step)
+        dom |= {i for i in ids_n if i in t_of}
+        dom |= {int(r['idx']) for r in rows if r['valid'] and r['car_seen'] and lo - 1e-9 <= float(r['t_s']) <= hi + 1e-9}
     tc_path = _doc_ref(src['tham_chieu_v1'], goc, 'tham_chieu_v1')
     tc = _json(tc_path)
     W = [int(i) for i in tc.get('ids') or []]
@@ -621,7 +664,6 @@ def run_manifest(a):
         U['U_moc_hieu_xy_m'] = U['U_moc_dong_xy_m'] + U['U_moc_tham_xy_m']
     if not all(isinstance(U[k], float) and math.isfinite(U[k]) and U[k] >= 0.0 for k in U) and not bad:
         bad.append('U_khong_huu_han')
-    nhieu = dict(x.split('=', 1) for x in (a.nhieu or []))
     pt, bad_pt = phu_thuoc(kept, luoi, nhieu, khung_sha, dt, goc)
     bad += bad_pt
     ses = _json(_path(ng['session']['duong_dan'], goc))
@@ -654,7 +696,8 @@ def run_manifest(a):
                a6_sha256=sha256(a6c_p), kiem_a6=kiem_a6,
                q=dict(q_m=q, abs_q_m=None if q is None else math.hypot(*q), nguon='c7_chuoi_khung (q_luot) cua lan cham'),
                mien=dict(n_khung=len(dom), n_W=len(W), buoc_luoi_s=step, dt_khung_s=dt, tu_s=lo, den_s=hi,
-                         n_nut=len(kept)),
+                         n_nut=len(kept), tu_s_danh_dinh=lo0, den_s_danh_dinh=hi0, n_khung_danh_dinh=n_dom0,
+                         n_khung_them_tu_nhieu=len(dom) - n_dom0),
                phu_thuoc=pt, gioi_han=gh,
                dau_vao=dict(khung=_ref(a.khung), nut=[r for _, _, r in kept], tham_chieu_v1=_ref(tc_path),
                             cua_so_v1=_ref(cs_p), xoay_v1=xo_p and _ref(xo_p), lan_lap_v1=ll_p and _ref(ll_p),

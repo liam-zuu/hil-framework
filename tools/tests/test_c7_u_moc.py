@@ -543,3 +543,34 @@ def test_luot_not_ok_on_a_khung_error_or_a_missing_w_frame(run, tmp_path):
     _edit_khung(w, lambda lines: lines.pop(1 + 2))                  # frame 2 of W gone from the khung file
     code, d = _luot(w, tcp, xp, tmp_path / 'b' / 'm.json')
     assert code == 3 and any(x.startswith('thieu_khung_W') for x in d['ly_do'])
+
+
+def test_manifest_domain_covers_the_frames_of_the_moved_frame_scorings(run, tmp_path, monkeypatch):
+    """C8K-7 (Codex C8 round 1, 26/11): a moved-frame scoring whose node relies on frames past the nominal domain (its
+    t_done moved): those frames are in the domain of the bound (U_moc_dong over them), and a khung file without them
+    gives thieu_khung (ok false). mien_da_tinh stays the nominal mien_phai_phu (gate: equal)."""
+    _fake_chain(monkeypatch)
+    rows = run[1]
+    w = _world(tmp_path, rows)
+    idx = [int(r['idx']) for r in rows]
+    code, m0 = _manifest(w, tmp_path, name='m0.json')
+    assert m0['ok'] is True and m0['mien']['n_khung_them_tu_nhieu'] == 0
+    L = _rd(w['nhieu']['xy'])
+    e = L['nguon_nut'][1]
+    sc = _rd(e['duong_dan'])
+    ids = [idx[i] for i in range(9, 19)]                                      # nominal node 1: 9..15, here to 18
+    sc['khung_tuong_doi_v1']['mien_phai_phu']['id_khung'] = ids
+    sc['khung_tuong_doi_v1']['mien_phai_phu']['id_khung_sha256'] = ctd.ids_sha(ids)
+    e.update(_w(e['duong_dan'], sc))
+    _w(w['nhieu']['xy'], L)
+    code, m = _manifest(w, tmp_path, name='m1.json')
+    assert code == 0 and m['ok'] is True, m['ly_do']
+    assert m['mien_da_tinh'] == m0['mien_da_tinh'] and m['mien']['n_khung_danh_dinh'] == m0['mien']['n_khung']
+    assert m['mien']['n_khung_them_tu_nhieu'] == 3 and m['mien']['den_s'] > m['mien']['den_s_danh_dinh']
+    aq = math.hypot(*Q_TEST)
+    assert m['U_moc_dong_xy_m'] == pytest.approx(max(0.001 + 1e-5 * idx[18] + 2 * aq * 1e-4,
+                                                     5e-4 + 2 * aq * math.sin(1e-4)), rel=1e-12)
+    assert m['U_moc_dong_xy_m'] > m0['U_moc_dong_xy_m']
+    _edit_khung(w, lambda lines: lines.__delitem__(1 + 18))                   # frame 18 not in the khung file
+    code, m = _manifest(w, tmp_path, name='m2.json')
+    assert code == 3 and m['ok'] is False and any(x.startswith('thieu_khung: 1') for x in m['ly_do'])
