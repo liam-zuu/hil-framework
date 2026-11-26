@@ -2146,9 +2146,21 @@ def _drift_file(goc: str, ref: dict, w: str, cell: dict, seg: dict, eps: dict) -
     return dr
 
 
-def _g4_finite(fc: dict) -> bool:
+KHUNG_MO_KEY = 'khung_mo_d2'      # (b) of CODE 26/11: the masked frames of every eligible masked grid, in the dossier
+
+
+def _g4_finite(fc: dict, goc_fc: Optional[dict] = None) -> bool:
     """G4 bound finite at every frame of the union domain at every node (J v6 section 5, J3-10), from the scoring
-    file: every node ok and the combined G4 numbers finite with no undefined frame (the rule of c8b_edo chung-cu)."""
+    file: every node ok and the combined G4 numbers finite with no undefined frame (the rule of c8b_edo chung-cu).
+    (b) of CODE 26/11 (no Liam question: the D2 mask, L151 23/11, came after J v6 19/11; a masked frame is taken out
+    of the conclusion by the rule, it is no frame the measurement left undefined): on a masked grid (luoi_d2.json, fc
+    with mat_na_d2) the frames of its union domain that the mask keeps OPEN; checked on the grid before the mask
+    goc_fc (its luoi.json, the same node files): every node ok and no undefined frame there, so no open frame is
+    undefined (conservative: an undefined frame that the mask also covers still refuses), and the masked grid has
+    every node ok and a finite G4 bound."""
+    if 'mat_na_d2' in fc and goc_fc is not None:
+        return _g4_finite(dict(fc, nums=dict(fc.get('nums') or {}, g4=dict(((fc.get('nums') or {}).get('g4') or {}),
+                                                                             n_undef=0)))) and _g4_finite(goc_fc)
     nums = fc.get('nums').get('g4') if isinstance(fc.get('nums'), dict) else None
     ok = fc.get('nodes_ok')
     if not isinstance(ok, list) or not ok or not all(v is True for v in ok) or not isinstance(nums, dict):
@@ -2157,9 +2169,35 @@ def _g4_finite(fc: dict) -> bool:
     return _isnum(hi) and math.isfinite(hi) and nums.get('n_undef') == 0
 
 
-def _edo_set(fc: dict, ed: dict, w: str, cell: dict) -> dict:
+def khung_mo_of(fd: dict) -> dict:
+    """(b) of CODE 26/11, for the dossier: the masked frames of a masked grid (luoi_d2.json mat_na_d2), per scored node
+    {nut, n_khung, n_che, n_che_mien_hop}, and the smallest share of open frames over its nodes."""
+    nut = [dict(nut=e.get('nut'), n_khung=e.get('n_khung'), n_che=e.get('n_che'), n_che_mien_hop=e.get('n_che_mien_hop'))
+           for e in (fd.get('mat_na_d2') or {}).get('nut') or [] if isinstance(e, dict) and e.get('cham')]
+    tl = [(e['n_khung'] - e['n_che']) / e['n_khung'] for e in nut
+          if isinstance(e['n_khung'], int) and isinstance(e['n_che'], int) and e['n_khung'] > 0]
+    return dict(nut=nut, ti_le_khung_mo_min=round(min(tl), 6) if tl else None)
+
+
+def _khung_mo_block(goc: str, cells: list, reader) -> dict:
+    """{run id: khung_mo_of(its luoi_d2.json)} for the run each co_luot cell counts with when it has a masked grid.
+    reader(ref) -> the JSON of a reference."""
+    out = {}
+    for c in cells:
+        if c.get('trang_thai') != 'co_luot':
+            continue
+        x = eligible_run(c)
+        if x.get('file_cham_d2') is not None:
+            out[x['run_id']] = khung_mo_of(reader(x['file_cham_d2']))
+    return out
+
+
+def _edo_set(fc: dict, ed: dict, w: str, cell: dict, goc_fc: Optional[dict] = None) -> dict:
     """One set of numbers of the evidence (F17 chung_cu_c8 bo_so) recomputed from a scoring file and its e_do file
-    (c8b_edo luot: trang_thai, vuot_moi_nut, can_xac_dinh_moi_nut; GC6-3 round 3): e_do counts only when dat."""
+    (c8b_edo luot: trang_thai, vuot_moi_nut, can_xac_dinh_moi_nut; GC6-3 round 3): e_do counts only when dat.
+    (b) of CODE 26/11: an e_do file read with the D2 mask (mat_na_d2 not null) states per node n_undef_mo, the
+    undefined frames among the frames the mask keeps open; can_xac_dinh_moi_nut then means no undefined OPEN frame.
+    goc_fc: the grid before the mask, for _g4_finite."""
     if ed.get('task') != cell['muc'] or ed.get('trang_thai') not in ('dat', 'chua_ket_luan') \
             or not isinstance(ed.get('vuot_moi_nut'), bool) or not isinstance(ed.get('can_xac_dinh_moi_nut'), bool):
         raise GateFileError(f'{w}: an e_do file of task {cell["muc"]} (c8b_edo luot: trang_thai dat / chua_ket_luan, '
@@ -2170,11 +2208,17 @@ def _edo_set(fc: dict, ed: dict, w: str, cell: dict) -> dict:
         raise GateFileError(f'{w}: e_do file theo_nut [{{cham, ...}}] per node (c8b_edo luot; GC10-4)')
     if ed['vuot_moi_nut'] and not all(n['cham'] and n.get('khung_vuot') for n in tn):
         raise GateFileError(f'{w}: e_do vuot_moi_nut true with a node not scored or without a frame above D (GC10-4)')
-    if ed['can_xac_dinh_moi_nut'] and not all(n['cham'] and n.get('n_undef') == 0 for n in tn):
-        raise GateFileError(f'{w}: e_do can_xac_dinh_moi_nut true with a node not scored or undefined frames (GC10-4)')
+    mo = ed.get('mat_na_d2') is not None              # (b): undefined frames counted among the open frames
+    key = 'n_undef_mo' if mo else 'n_undef'
+    if mo and any(n['cham'] and (type(n.get(key)) is not int or n[key] < 0) for n in tn):
+        raise GateFileError(f'{w}: e_do file read with the D2 mask without n_undef_mo per scored node (the undefined '
+                            'frames among the open frames; (b) of CODE 26/11)')
+    if ed['can_xac_dinh_moi_nut'] and not all(n['cham'] and n.get(key) == 0 for n in tn):
+        raise GateFileError(f'{w}: e_do can_xac_dinh_moi_nut true with a node not scored or undefined '
+                            f'{"open " if mo else ""}frames (GC10-4; (b) of CODE 26/11)')
     ok = ed['trang_thai'] == 'dat'
     return dict(e_do_lo_vuot_D_moi_nut=ok and ed['vuot_moi_nut'], e_do_xac_dinh_moi_nut=ok and ed['can_xac_dinh_moi_nut'],
-                g4_can_huu_han_mien_hop_moi_nut=_g4_finite(fc))
+                g4_can_huu_han_mien_hop_moi_nut=_g4_finite(fc, goc_fc))
 
 
 def _json_same(a, b) -> bool:
@@ -2586,7 +2630,7 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
                     elif em is not None or ed.get('luoi_d2_sha256') is not None:
                         raise GateFileError(f'{w}: {tag} was read with a D2 mask (mat_na_d2, luoi_d2_sha256), its '
                                             'scoring has none')
-                    bo.append(_edo_set(fcx, ed, f'{w}: {tag}', c))
+                    bo.append(_edo_set(fcx, ed, f'{w}: {tag}', c, fc if fcx is fx else None))
                 want_all = [p[0]['sha256'] for p in pairs] + [p[1]['sha256'] for p in pairs]
                 srcs = [s.get('sha256') for s in cc.get('nguon') or [] if isinstance(s, dict)]
                 if not isinstance(cc.get('chung_cu_c8'), dict) or srcs != want_all:
@@ -3289,6 +3333,11 @@ def check_nguon(d: dict, goc: str) -> dict:
             or any(_iso_time(cl[g], f'chuan_u.ho_so_c8.cham_luc.{g}') != cham_luc[g] for g in cl):
         raise GateFileError('chuan_u.ho_so_c8: cham_luc {run id: ISO time of its first scoring} of every C8 run, the '
                             'earliest script.luc_chay of its scoring files (GC6-1)')
+    km = _khung_mo_block(goc, d['o_c8'], lambda r: _open_ref(goc, r, 'khung_mo_d2'))   # (b) of CODE 26/11
+    if hs.get(KHUNG_MO_KEY) != km:
+        raise GateFileError(f'chuan_u.ho_so_c8: {KHUNG_MO_KEY} is not the masked frames of the masked grid of the run '
+                            'each cell counts with ({run: {nut [{nut, n_khung, n_che, n_che_mien_hop}], '
+                            'ti_le_khung_mo_min}}; (b) of CODE 26/11)')
     gn = hs.get('giu_ngoai')
     if not isinstance(gn, list) or not gn or len(set(gn)) != len(gn) or set(gn) != set(cham_luc):
         raise GateFileError('chuan_u.ho_so_c8: giu_ngoai, the held-out runs, every C8 run (CODE 20/11: the default of '
@@ -4158,7 +4207,8 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem
     hs = dict(format=HO_SO_FORMAT, bang_chung={k: v['sha256'] for k, v in bc_refs.items()},
               ke_hoach_c8_sha256=kh_ref['sha256'], khoa_c8b_sha256=kc8_ref['sha256'],
               giu_ngoai=all_runs, cham_luc=cham_luc, khoa_kiem_luc=kkl,
-              cham_cu_bo=dict(luoi=bo_cu, liam=dict(bo_cham_cu) if bo_cu else None))
+              cham_cu_bo=dict(luoi=bo_cu, liam=dict(bo_cham_cu) if bo_cu else None),
+              **{KHUNG_MO_KEY: _khung_mo_block(kho.goc, cells, kho.json)})
     raw = (json.dumps(hs, indent=1, ensure_ascii=False) + '\n').encode('utf-8')
     p = os.path.join(kho.goc, ho_so)
     q = os.path.realpath(os.path.dirname(p))

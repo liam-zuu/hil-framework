@@ -639,7 +639,8 @@ def _d2_run(goc, x, fc, folder, mp):
     if x.get('file_edo') is not None:                    # as c8b_edo luot --mat-na-d2 writes them (C8B ed2f6a6)
         _rewrite(goc, x['file_edo'], lambda y: y.update(
             mat_na_d2=dict({q: fd['mat_na_d2'][q] for q in GC.EDO_D2_KEYS}, n_khung_mo=fd['mat_na_d2']['n_khung_mo'],
-                           nut_khong_cham=[]), luoi_d2_sha256=x['file_cham_d2']['sha256']))
+                           nut_khong_cham=[]), luoi_d2_sha256=x['file_cham_d2']['sha256'],
+            theo_nut=[dict(n, n_undef_mo=n.get('n_undef_mo', n.get('n_undef'))) for n in y.get('theo_nut') or []]))
     if x.get('file_chung_cu') is not None:
         ls = [x['file_cham_d2']] + ([x['file_cham_h1']] if x['file_cham_h1'] else [])
         es = [x['file_edo']] + ([x['file_edo_h1']] if x['file_edo_h1'] else [])
@@ -687,7 +688,15 @@ def _d2_all(goc, d, che=None, mask_edit=None):
     _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: y['bang_chung'].update({GC.DK_D2: ref['sha256']}))
     for x, fc, folder in todo:
         _d2_run(goc, x, fc, folder, mp)
+    _ho_so_khung_mo(goc, d)
     return ref
+
+
+def _ho_so_khung_mo(goc, d):
+    """(b) of CODE 26/11: the dossier lists the masked frames of the masked grid of the run each cell counts with."""
+    km = GC._khung_mo_block(goc, d['o_c8'], lambda r: json.load(open(os.path.join(goc, r['duong_dan']),
+                                                                       encoding='utf-8')))
+    _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: y.update({GC.KHUNG_MO_KEY: km}))
 
 
 LUC_KHOA_C8B = '2026-11-21T08:00:00+07:00'
@@ -4348,3 +4357,70 @@ def test_b6_log_of_a_lost_run_by_the_path_of_log_pi(tmp_path):
                                   if l.startswith(x['clip'] + ',') else l for l in ls])
     with pytest.raises(GC.GateFileError, match="the log 'khong_co.csv' thu_tu_clip.csv names is on 0 files"):
         _ghep(goc, ho_so='chuan_u/ho_so_b6.json')
+
+
+# ── (b) of CODE 26/11: evidence (ii), (iii) on the masked grid at its open frames only ────────────────────────────────
+def test_kmo_g4_on_the_open_frames():
+    """(iii) on a masked grid: undefined frames that are masked do not refuse; an undefined frame of the grid before the
+    mask does (conservative); a node not ok or an infinite bound refuses as before."""
+    g4 = dict(hi=0.27, n_undef=34)
+    fd = dict(nodes_ok=[True, True], nums=dict(g4=g4), mat_na_d2=dict(nut=[]))
+    fc = dict(nodes_ok=[True, True], nums=dict(g4=dict(hi=0.27, n_undef=0)))
+    assert GC._g4_finite(fd, fc) and not GC._g4_finite(fd)            # without the grid before the mask: as before
+    assert not GC._g4_finite(fd, dict(fc, nums=dict(g4=dict(hi=0.27, n_undef=1))))
+    assert not GC._g4_finite(dict(fd, nodes_ok=[True, False]), fc)
+    assert not GC._g4_finite(fd, dict(fc, nodes_ok=[True, False]))
+    assert not GC._g4_finite(dict(fd, nums=dict(g4=dict(hi=float('inf'), n_undef=0))), fc)
+    assert GC._g4_finite(fc, fd) and not GC._g4_finite(dict(fc, nums=dict(g4=dict(hi=0.27, n_undef=3))), fc)
+
+
+def test_kmo_edo_on_the_open_frames():
+    cell = dict(muc='O1-F02')
+    tn = [dict(cham=True, n_undef=53, n_undef_mo=0, khung_vuot=[]) for _ in range(2)]
+    ed = dict(task='O1-F02', trang_thai='dat', vuot_moi_nut=False, can_xac_dinh_moi_nut=True, theo_nut=tn,
+              mat_na_d2=dict(sha256='a' * 64))
+    fc = dict(nodes_ok=[True, True], nums=dict(g4=dict(hi=0.27, n_undef=0)))
+    assert GC._edo_set(fc, ed, 'w', cell)['e_do_xac_dinh_moi_nut'] is True
+    tn[1]['n_undef_mo'] = 2                                            # an undefined open frame
+    with pytest.raises(GC.GateFileError, match='undefined open frames'):
+        GC._edo_set(fc, ed, 'w', cell)
+    del tn[1]['n_undef_mo']
+    with pytest.raises(GC.GateFileError, match='without n_undef_mo'):
+        GC._edo_set(fc, ed, 'w', cell)
+    tn[1]['n_undef_mo'] = 0
+    ed2 = dict(ed, mat_na_d2=None)                                     # no mask: n_undef as before
+    with pytest.raises(GC.GateFileError, match='undefined frames'):
+        GC._edo_set(fc, ed2, 'w', cell)
+    tn[0]['n_undef'] = tn[1]['n_undef'] = 0
+    assert GC._edo_set(fc, ed2, 'w', cell)['e_do_xac_dinh_moi_nut'] is True
+
+
+def test_kmo_masked_runs_are_evidence_and_the_dossier_lists_the_masked_frames(tmp_path):
+    """A gate whose every scored run has masked frames (here: one frame of every run masked) passes with the evidence of
+    its open frames; the dossier lists the masked frames of the run each cell counts with, recomputed."""
+    d, goc = build_c8(tmp_path / 'a')
+    che = {}
+    for c in d['o_c8']:
+        for x in c['chuoi']:
+            if x.get('file_cham_d2') is not None:
+                fd = json.load(open(os.path.join(goc, x['file_cham_d2']['duong_dan']), encoding='utf-8'))
+                k = next(e['nut'] for e in fd['mat_na_d2']['nut'] if e.get('cham'))
+                rows = MD.doc_hang(os.path.join(goc, posixpath.dirname(x['file_cham']['duong_dan']),
+                                                f'nut_{k:03d}_rows.csv'))
+                che[x['run_id']] = [next(f for f in rows['fid'] if f is not None)]
+    _d2_all(goc, d, che=che)
+    for c in d['o_c8']:                                                # G1 of a masked frame: the outcome follows
+        for x in c['chuoi']:
+            if x.get('file_cham_d2') is not None and x['ket_qua'] != 'hong':
+                x['ket_qua'] = json.load(open(os.path.join(goc, x['file_cham_d2']['duong_dan']), encoding='utf-8'))['outcome']
+    hs = json.load(open(os.path.join(goc, d['chuan_u']['ho_so_c8']['duong_dan']), encoding='utf-8'))
+    km = hs[GC.KHUNG_MO_KEY]
+    assert km and all(any(e['n_che'] > 0 for e in v['nut']) and 0 < v['ti_le_khung_mo_min'] < 1 for v in km.values())
+    GC.check_nguon(d, goc)
+    _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: y[GC.KHUNG_MO_KEY].popitem())
+    with pytest.raises(GC.GateFileError, match=GC.KHUNG_MO_KEY):
+        GC.check_nguon(d, goc)
+    g = _ghep(goc, ho_so='chuan_u/ho_so_kmo.json')
+    hg = json.load(open(os.path.join(goc, g['chuan_u']['ho_so_c8']['duong_dan']), encoding='utf-8'))
+    js = lambda m: sorted(json.dumps(v, sort_keys=True) for v in m.values())   # noqa: E731 (ghep names runs by buoc)
+    assert len(hg[GC.KHUNG_MO_KEY]) == len(km) and js(hg[GC.KHUNG_MO_KEY]) == js(km)
