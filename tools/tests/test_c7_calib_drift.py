@@ -488,6 +488,54 @@ def _drop(d, k):
     return {kk: v for kk, v in d.items() if kk != k}
 
 
+V2_OK = dict(DRIFT_OK, version=cd.DRIFT_VERSION, D_H_vi_tri_mm=0.5, D_H_huong_deg=0.01, eps_H_huong_deg=0.1,
+             trang_thai_vi_tri='so', trang_thai_huong='so', vuot_do_thieu=False)
+V2_MISS_PSI = dict(V2_OK, vuot=True, D_H_huong_deg=None, trang_thai_huong='thieu', vuot_do_thieu=True)
+V2_MISS_XY = dict(V2_OK, vuot=True, D_H_mm=None, D_H_vi_tri_mm=None, trang_thai_vi_tri='thieu', vuot_do_thieu=True)
+V2_MISS_H1 = dict(DRIFT_MISS, version=cd.DRIFT_VERSION, D_H_vi_tri_mm=None, D_H_huong_deg=None, eps_H_huong_deg=0.1,
+                  trang_thai_vi_tri='thieu', trang_thai_huong='thieu', vuot_do_thieu=True)
+
+
+@pytest.mark.parametrize('drift', [V2_MISS_PSI, V2_MISS_XY, dict(V2_MISS_XY, D_H_huong_deg=None, trang_thai_huong='thieu')])
+@pytest.mark.parametrize('o0,o1', [('dat', 'dat'), ('dat', 'khong_dat'), ('khong_dat', 'hong_he_do')])
+def test_j2_8_clip_h_end_there_one_quantity_missing_scored_twice(drift, o0, o1):
+    """J v6 J2-8: clip H at the end there, a quantity not measured (thieu, null): vuot, the run scored twice like above
+    eps_H (same table); gop copies the v2 states and nulls into calib_drift (rq3_log so-h reads them), no number made."""
+    r = cd.combine(drift, sc(o0), tr('s0'), 'f0', sc(o1, frames='f1'), tr('s1', frames='f1'), 'f1')
+    assert r['outcome'] == expected(o0, o1) and r['calib_drift']['h1_score']['outcome'] == o1
+    c = r['calib_drift']
+    assert {k: c[k] for k in cd.V2_FIELDS} == {k: drift[k] for k in cd.V2_FIELDS}
+    assert c['vuot'] and not c['thieu_H1'] and c['vuot_do_thieu'] and c['D_H_mm'] == drift['D_H_mm']
+    with pytest.raises(ValueError, match='--s1-score'):                 # H0 only is not enough
+        cd.combine(drift, sc(o0), tr('s0'), 'f0')
+
+
+def test_j2_8_v2_measured_and_missing_h1_carry_the_states():
+    r = cd.combine(V2_OK, sc('dat'), tr('s0'), 'f0')
+    assert r['outcome'] == 'dat' and r['calib_drift']['trang_thai_huong'] == 'so'
+    assert r['calib_drift']['D_H_huong_deg'] == 0.01 and r['calib_drift']['vuot_do_thieu'] is False
+    m = cd.combine(V2_MISS_H1, sc('dat'), tr('s0'), 'f0')
+    assert m['outcome'] == 'chua_ket_luan' and m['calib_drift']['flags'] == ['thieu_H1']
+    assert (m['calib_drift']['trang_thai_vi_tri'], m['calib_drift']['trang_thai_huong']) == ('thieu', 'thieu')
+    o = cd.combine(DRIFT_OK, sc('dat'), tr('s0'), 'f0')                  # v1 file: unchanged, no v2 keys
+    assert not any(k in o['calib_drift'] for k in cd.V2_FIELDS)
+
+
+@pytest.mark.parametrize('bad', [
+    dict(V2_MISS_PSI, vuot=False),                                     # missing written as below
+    dict(V2_MISS_PSI, vuot_do_thieu=False), dict(V2_OK, vuot_do_thieu=True, vuot=True),
+    dict(V2_MISS_PSI, D_H_huong_deg=0.0),                              # a number for a quantity not measured
+    dict(V2_MISS_XY, D_H_mm=0.5, D_H_vi_tri_mm=0.5),
+    dict(V2_MISS_XY, D_H_vi_tri_mm=0.5), dict(V2_OK, D_H_vi_tri_mm=0.6), _drop(V2_OK, 'D_H_vi_tri_mm'),
+    dict(V2_OK, trang_thai_huong='khong_ap_dung'), dict(V2_OK, trang_thai_vi_tri=None),
+    dict(V2_OK, D_H_huong_deg=None), dict(V2_OK, D_H_huong_deg=0.2),     # heading above its threshold, vuot false
+    dict(V2_MISS_H1, trang_thai_huong='so'), dict(V2_MISS_H1, vuot_do_thieu=False)])
+def test_j2_8_bad_v2_states_refused(bad):
+    args = (sc('dat', frames='f1'), tr('s1', frames='f1'), 'f1') if bad['vuot'] and not bad['thieu_H1'] else ()
+    with pytest.raises(ValueError):
+        cd.combine(bad, sc('dat'), tr('s0'), 'f0', *args)
+
+
 # each bad drift.json is given with the inputs its valid twin accepts (DRIFT_OK and DRIFT_MISS: H0 only;
 # DRIFT_OVER: both scores), so only the defect can make it fail (CD2-7)
 @pytest.mark.parametrize('bad,two', [
