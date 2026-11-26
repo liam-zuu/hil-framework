@@ -522,7 +522,22 @@ K2_ONE_VALID_PERCENT = 1.0
 K2_ONE_VALID_RUN = 6
 # Design 4.2 K3. The authoritative node records u_p in metres and u_psi_deg in degrees.
 K3_U_FRACTION = 0.05
-K3_TIME_S = 1 / 60
+# K3 G1 t_done (design 4.2 v1.2; Liam 27/11 ~01:4x at CODE_CAM, box: "Theo khung thật (Recommended)"): one REAL frame of
+# the clip at the reference t_done = the larger of the two frame intervals next to the frame nearest it (the clips are
+# variable frame rate: 18.33 ms on run02 C8-L-F02-2 where 1/60 s was written first). Changed after seeing the numbers;
+# the written basis was "one frame".
+
+
+def frame_step(times, t):
+    """Larger of the two frame intervals beside the frame of `times` (increasing) nearest t."""
+    if len(times) < 2:
+        raise ValueError('K3: at least two frame times needed for the G1 threshold')
+    j = min(max(bisect_left(times, t), 0), len(times) - 1)
+    if j and abs(times[j - 1] - t) <= abs(times[j] - t):
+        j -= 1
+    steps = [times[j] - times[j - 1]] if j else []
+    steps += [times[j + 1] - times[j]] if j + 1 < len(times) else []
+    return max(steps)
 
 
 def limit(value, threshold):
@@ -574,8 +589,9 @@ def delta(a, b, threshold):
     return limit(abs(a - b), threshold)
 
 
-def compare_verdict(fast, node):
-    """K3 compares both completion times and the union-domain G2–G5 values of the node."""
+def compare_verdict(fast, node, frame_times):
+    """K3 compares both completion times and the union-domain G2–G5 values of the node. frame_times: t_s of the
+    reference frames (the G1 threshold is one real frame there, frame_step)."""
     ref = node_verdict(node)
     gate = node['gate_v3']
     checks = {'outcome': same(fast['outcome'], ref['outcome'])}
@@ -591,7 +607,7 @@ def compare_verdict(fast, node):
                     raise ValueError('K3: expected the two G1 completion times')
                 return v
             for k, (x, y) in enumerate(zip(times(a), times(b)), 1):
-                checks[f'g1_t_done_{k}_s'] = delta(x, y, K3_TIME_S)
+                checks[f'g1_t_done_{k}_s'] = delta(x, y, None if y is None else frame_step(frame_times, y))
         else:
             uncertainty = None if gate is None else gate['u_psi_deg' if g == 'g5' else 'u_p']
             if gate is not None and (not math.isfinite(uncertainty) or uncertainty <= 0):
@@ -615,7 +631,7 @@ def so(a):
     if read_json(folder / 'track.json').get('thu') is True:
         ref, rd = ref[:len(fast)], rd[:len(fast)]
     k2 = compare_frames(fast, ref, fd, rd)
-    k3 = compare_verdict(read_json(a.cham_nhanh), read_json(a.cham_day)) if a.cham_day else None
+    k3 = compare_verdict(read_json(a.cham_nhanh), read_json(a.cham_day), [r['t_s'] for r in ref]) if a.cham_day else None
     write_json(a.out, dict(K2=k2, K3=k3, dat=k2['dat'] and (k3 is None or k3['dat'])))
 
 

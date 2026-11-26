@@ -330,17 +330,20 @@ def test_cham_node_and_dets_options(tmp_path, monkeypatch, nut, ok):
         assert 'nut' not in result and '--nut' in result['loi']
 
 
+T60 = [i / 60 for i in range(2000)]
+
+
 def test_k3_each_quantity_and_nulls():
     verdict = fast.node_verdict(NODE)
-    assert fast.compare_verdict(verdict, NODE)['dat']
+    assert fast.compare_verdict(verdict, NODE, T60)['dat']
     verdict['outcome'] = 'dat'
     verdict['g1']['t_done'] = [NODE['gate_v3']['g1']['t_done'][0], None]
     for g in fast.GATES[1:]:
         verdict[g] = dict(state='dat', q=10., lo=10., hi=10.)
-    result = fast.compare_verdict(verdict, NODE)
+    result = fast.compare_verdict(verdict, NODE, T60)
     assert not result['dat'] and not result['outcome']['dat']
     assert result['g1_t_done_1_s']['dat'] and not result['g1_t_done_2_s']['dat']
-    assert result['g1_t_done_2_s']['nguong'] == 1 / 60
+    assert result['g1_t_done_2_s']['nguong'] == pytest.approx(1 / 60)
     for g in fast.GATES[1:]:
         assert not result[g + '_state']['dat']
         unit, uncertainty = ('deg', 3.197749408164356) if g == 'g5' else ('m', 0.04243766250217123)
@@ -349,8 +352,8 @@ def test_k3_each_quantity_and_nulls():
             assert not entry['dat'] and entry['nguong'] == 0.05 * uncertainty
             assert entry['gia_tri'] == abs(10 - NODE['gate_v3'][g][k])
     lost = dict(outcome='hong_he_do', gate_v3=None)
-    assert fast.compare_verdict(fast.node_verdict(lost), lost)['dat']
-    assert not fast.compare_verdict(verdict, lost)['dat']
+    assert fast.compare_verdict(fast.node_verdict(lost), lost, T60)['dat']
+    assert not fast.compare_verdict(verdict, lost, T60)['dat']
 
 
 def test_so_trial_domain_corner_on_invalid_frame_and_k3(tmp_path):
@@ -391,3 +394,21 @@ def test_so_trial_domain_corner_on_invalid_frame_and_k3(tmp_path):
     assert k2['lien_tiep'] == dict(gia_tri=7, nguong=6, dat=False)
     (tmp_path / 'track.json').write_text(json.dumps(dict(thu=False)))
     assert fast.main(args + ['--out', str(tmp_path / 'bad.json')]) == 2
+
+
+def test_k3_g1_threshold_is_one_real_frame_of_a_variable_rate_clip():
+    """Design 4.2 v1.2 (Liam 27/11): the G1 t_done threshold is the real frame interval at the reference t_done."""
+    t_ref = 32.77264934894151                                      # run02 C8-L-F02-2: next frame 18.334 ms later
+    times = [t_ref - 0.05, t_ref - 1 / 60, t_ref, t_ref + 0.018334, t_ref + 0.018334 + 1 / 60]
+    assert fast.frame_step(times, t_ref) == pytest.approx(0.018334)
+    assert fast.frame_step(times, t_ref + 0.018334) == pytest.approx(0.018334)
+    node = copy.deepcopy(NODE)
+    node['gate_v3']['g1']['t_done'] = [t_ref, t_ref]
+    verdict = fast.node_verdict(node)
+    verdict['g1']['t_done'] = [t_ref + 0.0183289, t_ref + 0.0183289]   # one frame later: within one real frame
+    assert fast.compare_verdict(verdict, node, times)['dat']
+    assert not fast.compare_verdict(verdict, node, [i / 60 for i in range(3000)])['dat']   # 1/60 s spacing: not
+    verdict['g1']['t_done'] = [t_ref + 0.04, t_ref + 0.04]               # two frames later: refused
+    assert not fast.compare_verdict(verdict, node, times)['dat']
+    with pytest.raises(ValueError):
+        fast.frame_step([t_ref], t_ref)
