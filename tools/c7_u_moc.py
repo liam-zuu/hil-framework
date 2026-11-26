@@ -40,7 +40,8 @@ sections 10, 23, 24; CAM v4 section 5):
   domains start or end more than one grid step + one frame apart: ok false (domain not stable, v4 section 5).
   Every frame of the domain must be in the khung file without loi; any (2a) flip of its worst refits: ok false.
   q of the run: the chain of the scoring (c7_chuoi_khung.chuoi_khung with the very sources of the node score:
-  frames, A6, xoay, lan_lap, truc_xe, cho, u_psi_w_rad of tham_chieu_v1), recovered from its rows
+  frames, A6, xoay, lan_lap, truc_xe, cho, u_psi_w_rad of tham_chieu_v1, and the F8 rong branch decided as the
+  scorer decides it: ctd.f8_rong, CODE 26/11), recovered from its rows
   q = R(-psi') (t - p); no q: ok false. The A6 of the khung file vs the A6 of the scoring: dpsi_a6 of the chain
   equals dpsi_a6 of the khung file on EVERY frame of the khung file (1e-12 rad), else ok false.
   Per frame: U_xy = max(S_t + 2|q| S_sin, C_t + 2|q| sin(C_psi / 2)), U_psi = max(S_psi, C_psi).
@@ -48,8 +49,10 @@ sections 10, 23, 24; CAM v4 section 5):
   over W, R = |z|, S = mean 2 sin(min(U_psi, pi) / 2), asin(S / R) when S < R, else ok false; U_moc_hieu_xy_m =
   dong + tham. Dependence (TC3-12): the scoring run again by c8b_luoi on the frames moved to the worst refit of each
   frame (c7_score --khung-nhieu, once 'xy', once 'psi'); for every scored node: the reference window state (tap,
-  tham_chieu_trang_thai, hong_cua_so_tc), t1 and t_done (each way, within one frame) the same, else ok false; not
-  given: ok false (chua_kiem_phu_thuoc).
+  tham_chieu_trang_thai, hong_cua_so_tc) and t1 (within one frame) the same, else ok false; not given: ok false
+  (chua_kiem_phu_thuoc). t_done (each way) more than one frame apart: recorded (phu_thuoc_t_done, per node the two
+  times and the shift), NOT a block (CODE 26/11: U_moc is a bound from the khung file, it does not move with
+  t_done); the grid conclusion (outcome, states) of each moved-frame scoring against the scoring: ket_luan_luoi_khac.
 
 Step 'nhieu' (used by c7_score --khung-nhieu): frames.csv rows moved to the worst refit of the khung file.
 
@@ -460,7 +463,7 @@ def phu_thuoc(kept, luoi, nhieu, khung_sha, dt, goc):
             bad.append(f'{loai}: luoi nhieu of another grid (gio_sha256, nodes_s)')
             continue
         by = {e['nut']: e for e in L.get('nguon_nut') or []}
-        n_doi = []
+        n_doi, td_doi = [], []
         for k, sc, _ in kept:
             if k not in by:
                 n_doi.append(f'nut {k}: khong co diem nhieu')
@@ -481,10 +484,17 @@ def phu_thuoc(kept, luoi, nhieu, khung_sha, dt, goc):
             for w in range(2):
                 a_, b_ = (td1 + [None, None])[w], (td2 + [None, None])[w]
                 if not _t_eq(a_, b_, dt + 1e-9):
-                    n_doi.append(f'nut {k}: t_done cach {w + 1} {a_!r} -> {b_!r}')
+                    # CODE 26/11 (CODE_CODEX local_d84beb9a): U_moc is a bound from the khung file, it does not move
+                    # with t_done; a t_done more than one frame apart is recorded (flag phu_thuoc_t_done), not a block
+                    td_doi.append(dict(nut=k, cach=w + 1, goc_s=a_, nhieu_s=b_,
+                                       doi_s=None if a_ is None or b_ is None else float(b_) - float(a_)))
             if not _t_eq(g1.get('t1'), h1.get('t1'), dt + 1e-9):
                 n_doi.append(f'nut {k}: t1 {g1.get("t1")!r} -> {h1.get("t1")!r}')
-        rec[loai] = dict(luoi=_ref(p), n_nut=len(kept), doi=n_doi)
+        # CODE 26/11: the grid conclusion of the moved-frame scoring against the scoring (recorded, not a block)
+        kl = dict(goc=dict(outcome=luoi.get('outcome'), states=luoi.get('states')),
+                  nhieu=dict(outcome=L.get('outcome'), states=L.get('states')))
+        rec[loai] = dict(luoi=_ref(p), n_nut=len(kept), doi=n_doi, t_done_doi=td_doi,
+                         ket_luan_khac=kl['goc'] != kl['nhieu'], ket_luan=kl)
         bad += [f'{loai}: {x}' for x in n_doi]
     return rec, bad
 
@@ -561,8 +571,15 @@ def run_manifest(a):
     ll = ck.doc_lan_lap(ll_p, head.get('luot_id')) if ll_p else None
     tj = os.path.join(os.path.dirname(fpath), 'track.json')
     track = _json(tj) if os.path.isfile(tj) else None
-    chain = ck.chuoi_khung(fpath, a6c, xo_p, ll, track=track, cho=ctd.cho_of(task),
-                           truc_xe=_json(tr_p) if tr_p else None, u_psi_w_rad=tc.get('u_psi_w_rad'))
+    truc = _json(tr_p) if tr_p else None
+    # CODE 26/11 (CODE_CODEX local_d84beb9a): the F8 rong branch decided exactly as the scorer decides it (c7_score
+    # load_rel: ctd.f8_rong on the lan_lap, the A6 sha, a ref_12b window of the place in cua_so_v1, truc_xe), so the
+    # chain gives the q the scoring used (q_luot: q of xoay_v1 as for one mounting; K2 borrows F8_RONG_Q_TU)
+    cho = ctd.cho_of(task)
+    co_ref12 = any(r.get('loai') == 'ref_12b' and r.get('cho') == cho for r in ctd.read_jsonl(cs_p))  # c7_score.co_ref_12b
+    f8_ok = bool(ctd.f8_rong(ll, a6c['sha256'], co_ref12, truc)[0])
+    chain = ck.chuoi_khung(fpath, a6c, xo_p, ll, track=track, cho=cho, truc_xe=truc,
+                           u_psi_w_rad=tc.get('u_psi_w_rad'), f8_rong_ok=f8_ok)
     q, why_q = q_of_chain(chain)
     if q is None:
         bad.append(why_q)
@@ -616,12 +633,20 @@ def run_manifest(a):
     if lich.get('version') != 'c7_lich_v3' or lich.get('hoi_tu') is not True or not lich.get('tap_moc_file_sha256'):
         raise ValueError('lich.json: not a converged c7_lich_v3 with tap_moc_file_sha256')
     gh = []
-    if ll is not None and ll.get('cung_lan_lap') is not True:
+    td = {k: v['t_done_doi'] for k, v in pt.items() if v.get('t_done_doi')}
+    klk = sorted(k for k, v in pt.items() if v.get('ket_luan_khac'))
+    if td:
+        gh.append('t_done cua lan cham khung nhieu doi hon mot khung (phu_thuoc_t_done): ghi lai, khong chan (CODE 26/11; '
+                  'U_moc la can tu file khung, khong doi theo t_done)')
+    if f8_ok:
+        gh.append('q theo nhanh F8 rong nhu bo cham (q_luot: q cua xoay_v1 nhu mot lan lap, u_q + U_LECH_TAM_BUOI1_M)')
+    elif ll is not None and ll.get('cung_lan_lap') is not True:
         gh.append('q qua delta_c_B tho (NHACTAM cach (i), Liam chot 23/11 o NHACTAM: gia dinh tam khong doi cao): vi tri '
                   'lech them khoang dh*|P - F|/(H - h), 0,2*dh o goc toi 0,6*dh o K1; khong cong vao U')
     gh.append('can thuc nghiem (lon nhat quan sat duoc tren 8 huong va 200 to hop), khong phai can chung minh (v3 2)')
     man = dict(format=FORMAT_MANIFEST, ok=not bad, ly_do=bad, file_cham_sha256=sha256(a.luoi), file_cham=_ref(a.luoi),
                lan_cham=a.lan_cham, luot_id=head.get('luot_id'), task=task, mien_da_tinh=mien, **U,
+               phu_thuoc_t_done=td or False, ket_luan_luoi_khac=klk or False, f8_rong=f8_ok,
                nguon=dict(bo_lay_mau=head['bo_lay_mau'],
                           car_pose=dict(tag_offset=[0.0, 0.0, 0.0], side_m=cp['side_m'], h_m=float(ses['tag_h_m']),
                                         kappa=cp['kappa'], phien_ban=cp['phien_ban']),

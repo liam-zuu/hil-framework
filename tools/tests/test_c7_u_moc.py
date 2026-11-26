@@ -317,13 +317,15 @@ def test_manifest_domain_widened_by_the_largest_grid_step(run, tmp_path, monkeyp
     assert m['U_moc_dong_xy_m'] == pytest.approx(max(0.001 + 1e-5 * i16 + 2 * aq * 1e-4, 5e-4 + 2 * aq * math.sin(1e-4)))
 
 
-def test_manifest_not_ok_without_the_dependence_check_or_with_a_changed_t_done(run, tmp_path, monkeypatch):
+def test_manifest_not_ok_without_the_dependence_check_t_done_change_recorded_not_blocking(run, tmp_path, monkeypatch):
+    """CODE 26/11: a t_done more than one frame apart on a moved-frame scoring is recorded (phu_thuoc_t_done), not a
+    block; within one frame nothing is recorded. A changed t1 still blocks."""
     _fake_chain(monkeypatch)
     w = _world(tmp_path, run[1])
     code, m = _manifest(w, tmp_path, nhieu=False)
     assert code == 3 and m['ok'] is False and 'chua_kiem_phu_thuoc_xy' in m['ly_do']
     dt = 1.0 / 60
-    for n, (shift, ok) in enumerate(((0.9 * dt, True), (1.5 * dt, False))):
+    for n, (shift, flag) in enumerate(((0.9 * dt, False), (1.5 * dt, True))):
         L = _rd(w['nhieu']['psi'])
         e = L['nguon_nut'][1]
         sc = _rd(e['duong_dan'])
@@ -331,7 +333,60 @@ def test_manifest_not_ok_without_the_dependence_check_or_with_a_changed_t_done(r
         e.update(_w(e['duong_dan'], sc))
         _w(w['nhieu']['psi'], L)
         code, m = _manifest(w, tmp_path, name=f'm{n}.json')
-        assert m['ok'] is ok, m['ly_do']
+        assert code == 0 and m['ok'] is True, m['ly_do']
+        if flag:
+            assert list(m['phu_thuoc_t_done']) == ['psi'] and m['phu_thuoc_t_done']['psi'][0]['nut'] == 1
+            assert m['phu_thuoc_t_done']['psi'][0]['cach'] == 2
+            assert m['phu_thuoc_t_done']['psi'][0]['doi_s'] == pytest.approx(shift)
+            assert m['phu_thuoc']['psi']['doi'] == [] and m['ket_luan_luoi_khac'] is False
+        else:
+            assert m['phu_thuoc_t_done'] is False
+    L = _rd(w['nhieu']['xy'])                                         # t1 moved: still a block
+    e = L['nguon_nut'][0]
+    sc = _rd(e['duong_dan'])
+    sc['gate_v3']['g1']['t1'] = 0.5
+    e.update(_w(e['duong_dan'], sc))
+    _w(w['nhieu']['xy'], L)
+    code, m = _manifest(w, tmp_path, name='m_t1.json')
+    assert code == 3 and m['ok'] is False and any(x.startswith('xy: nut 0: t1') for x in m['ly_do'])
+
+
+def test_manifest_records_a_grid_conclusion_that_differs_on_moved_frames(run, tmp_path, monkeypatch):
+    _fake_chain(monkeypatch)
+    w = _world(tmp_path, run[1])
+    L = _rd(w['nhieu']['xy'])
+    L['outcome'] = 'khong_dat'
+    _w(w['nhieu']['xy'], L)
+    code, m = _manifest(w, tmp_path)
+    assert code == 0 and m['ok'] is True and m['ket_luan_luoi_khac'] == ['xy']
+    assert m['phu_thuoc']['xy']['ket_luan']['nhieu']['outcome'] == 'khong_dat'
+
+
+def test_manifest_takes_the_f8_rong_branch_the_scorer_takes(run, tmp_path, monkeypatch):
+    """CODE 26/11: the chain of the manifest gets f8_rong_ok from ctd.f8_rong on the same inputs as c7_score load_rel
+    (lan_lap, A6 sha, a ref_12b window of the place in cua_so_v1, truc_xe)."""
+    _fake_chain(monkeypatch)
+    seen = {}
+    fake = um.ck.chuoi_khung
+
+    def chain(*args, **kw):
+        seen['f8'] = kw.get('f8_rong_ok')
+        return fake(*args, **kw)
+    monkeypatch.setattr(um.ck, 'chuoi_khung', chain)
+    calls = []
+
+    def f8(ll, a6_sha, co_ref, truc):
+        calls.append((ll, a6_sha, co_ref, truc))
+        return True, ''
+    monkeypatch.setattr(ctd, 'f8_rong', f8)
+    w = _world(tmp_path, run[1])
+    code, m = _manifest(w, tmp_path)
+    assert code == 0 and seen['f8'] is True and m['f8_rong'] is True
+    assert calls and calls[0][1] == ck.sha256(str(tmp_path / 'a6.json')) and calls[0][2] is False
+    assert any('F8 rong' in g for g in m['gioi_han'])
+    monkeypatch.setattr(ctd, 'f8_rong', lambda *a: (False, 'x'))
+    code, m = _manifest(w, tmp_path, name='m2.json')
+    assert seen['f8'] is False and m['f8_rong'] is False
 
 
 def test_manifest_not_ok_on_a_gate_flip_a_missing_frame_or_no_q(run, tmp_path, monkeypatch):
