@@ -34,8 +34,13 @@ n_undef for e_do too; CODE 25/11, after merge 6; no rule, threshold or scoring c
 --mat-na-d2, block mat_na_d2): the mask file, the run, the scoring id (lan_cham), the clock file, the node score files
 and the rows files must be the ones that grid was made from, and the frames masked here must be the frames masked
 there (n_khung, n_che per node), else refused. A frame whose frame_id is not in khung_mo of the run is undefined
-(counted in n_undef and n_che of its node): it is never in khung_vuot, never in the cell rule, and its node is not
-bounded, so a masked frame makes no conclusion; a finite lower bound of another frame stays. A node the mask turned
+(counted in n_undef and n_che of its node): it is never in khung_vuot, never in the cell rule, so a masked frame
+makes no conclusion; a finite lower bound of another frame stays. (b) of CODE 26/11 (GATE 67958d8): a masked frame
+is out of the domain of the evidence, not undefined for it: per scored node n_undef_mo (open frames left undefined)
+and ti_le_khung_mo ((n_khung - n_che) / n_khung) are written, and can_xac_dinh_moi_nut under the mask asks every
+node scored with n_undef_mo 0 (n_undef, n_che kept as before). chung-cu: G4 of a masked grid by the gate rule
+(g4_finite_every_node: the masked grid's G4 finite at every node, and its luoi_goc, read and checked by sha256, with
+no undefined frame). A node the mask turned
 into "not scored" (cat_t1 whose certain violation stood only on masked frames) is not scored here either. A masked
 grid without a node used (clock file not bounded): chua_ket_luan. A masked grid whose whole run is not concluded
 (L166, Liam 25/11: a t_som node with a masked frame, every node of a K run on real data): chua_ket_luan too. The file
@@ -275,7 +280,7 @@ def analyse_run(gio, nodes, L, task, thr=D_M, mat_na=None):
             theo_nut.append(dict(i=i, cham=False, ly_do=rr or ['no bien_doi']))
             continue
         p_dd, psi_dd = bd.get('p_dd') or [0.0, 0.0], float(bd.get('psi_dd') or 0.0)
-        res, n_undef, n_che = {}, 0, 0
+        res, n_undef, n_che, n_undef_mo = {}, 0, 0, 0
         frs = node_frames(sc, rows)
         if mo is not None:
             # from the rows, not from frs: node_frames keeps one frame per key, a repeated id would not show
@@ -293,16 +298,21 @@ def analyse_run(gio, nodes, L, task, thr=D_M, mat_na=None):
             if not all(math.isfinite(fr[c]) for c in ('x', 'y', 's_perp', 'w_lo', 'w_hi', 'U_p_k', 't_cam_s')):
                 res[k] = (math.nan, math.inf)
                 n_undef += 1
+                n_undef_mo += 1
                 continue
             zs = fw_samples(L, fr['t_cam_s'] + D - u_p[i], fr['t_cam_s'] + D + u_m[i])
             if zs is None:
                 res[k] = (math.nan, math.inf)
                 n_undef += 1
+                n_undef_mo += 1
                 continue
             zx, zy = to_lane(zs[0], zs[1], p_dd, psi_dd)
             res[k] = frame_bounds(lane, fr['x'], fr['y'], np.asarray(zx), np.asarray(zy), fr['s_perp'], fr['w_lo'],
                                   fr['w_hi'], fr['U_p_k'])
-        if n_undef or not res:
+        # (b) of CODE 26/11 (GATE 67958d8): with the D2 mask a masked frame is out of the domain of the evidence, not
+        # undefined; the node is bounded when every OPEN frame is (n_undef_mo 0). Without the mask: as before
+        # a node with no open frame gives no evidence: not bounded (conservative; CODE_CODEX 26/11)
+        if (n_undef_mo if mo is not None else n_undef) or not res or (mo is not None and n_che == len(res)):
             all_bounded = False
         per_node.append(res)
         los = [v[0] for v in res.values() if math.isfinite(v[0])]
@@ -311,7 +321,8 @@ def analyse_run(gio, nodes, L, task, thr=D_M, mat_na=None):
                              lo_max_m=max(los) if los else None, hi_max_m=max(his) if his else None,
                              khung_vuot=sorted(k for k, v in res.items() if math.isfinite(v[0]) and v[0] > thr)))
         if mo is not None:
-            theo_nut[-1]['n_che'] = n_che
+            theo_nut[-1].update(n_che=n_che, n_undef_mo=n_undef_mo,
+                                ti_le_khung_mo=round((len(res) - n_che) / len(res), 6) if res else None)
     if why:
         return dict(version=VERSION, task=task, trang_thai='chua_ket_luan', ly_do=why, theo_nut=theo_nut,
                     vuot_moi_nut=False, can_xac_dinh_moi_nut=False, nguong_m=thr)
@@ -357,9 +368,16 @@ def muc(runs):
     return dict(version=VERSION_MUC, muc=sorted(levels.values(), key=lambda v: v['muc']), nguong_m=D_M)
 
 
-def g4_finite_every_node(luoi):
+def g4_finite_every_node(luoi, goc=None):
     """G4 bound finite at every frame of the union domain at every node (J v6 section 5 "Khoa muc", J3-10): every
-    node scored and the combined G4 numbers finite with no undefined frame."""
+    node scored and the combined G4 numbers finite with no undefined frame. (b) of CODE 26/11 (the rule of gate_c8
+    _g4_finite, GATE 67958d8): on a masked grid (key mat_na_d2) with goc, its grid before the mask (luoi.json): the
+    masked grid has every node ok and a finite G4 bound (its n_undef, which counts the masked frames, not asked) AND
+    goc has every node ok, a finite G4 bound and no undefined frame (conservative: an undefined frame the mask also
+    covers still fails)."""
+    if goc is not None and isinstance(luoi, dict) and 'mat_na_d2' in luoi:
+        g4 = dict(((luoi.get('nums') or {}).get('g4') or {}), n_undef=0)
+        return g4_finite_every_node(dict(luoi, nums=dict(luoi.get('nums') or {}, g4=g4))) and g4_finite_every_node(goc)
     nums = (luoi.get('nums') or {}).get('g4') if isinstance(luoi.get('nums'), dict) else None
     ok = luoi.get('nodes_ok') or []
     if not ok or not all(ok) or not isinstance(nums, dict):
@@ -388,6 +406,25 @@ def kiem_cap_mat_na(luoi, edo, luoi_sha256=None, w=''):
         raise EdoError(f'{w}the e_do file was not made with the mask of this masked grid ({bad} differ)')
 
 
+def luoi_goc_of(L):
+    """The grid before the mask of a masked grid (luoi_d2.json: luoi_goc {duong_dan, sha256}, c8b_mat_na_d2.goc_luoi),
+    read and checked by its sha256; None for a grid without the mask. EdoError when it cannot be read or changed."""
+    if not (isinstance(L, dict) and 'mat_na_d2' in L):
+        return None
+    g = L.get('luoi_goc')
+    if g is None:
+        return None                     # as gate_c8 _g4_finite without goc_fc: the rule before (b), n_undef 0 asked
+    if not isinstance(g, dict) or not g.get('duong_dan') or not g.get('sha256'):
+        raise EdoError(f'masked grid luoi_goc {g!r}: {{duong_dan, sha256}} of the grid before the mask')
+    try:
+        if cu.sha256(g['duong_dan']) != g['sha256']:
+            raise EdoError(f'{g["duong_dan"]}: not the grid the masked grid was made from (sha256)')
+        with open(g['duong_dan'], encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError) as exc:
+        raise EdoError(f'luoi_goc {g["duong_dan"]}: {exc}')
+
+
 def chung_cu(luois, edos, ban_cham_cuoi, luoi_sha256=None):
     """chung_cu_c8 of a run (data contract F17, GATE design v6_C8 section 7): one bo_so per scoring (two when scored
     again with the two calibrations), each {e_do_lo_vuot_D_moi_nut, e_do_xac_dinh_moi_nut,
@@ -405,7 +442,7 @@ def chung_cu(luois, edos, ban_cham_cuoi, luoi_sha256=None):
         okd = e.get('trang_thai') == 'dat'
         bo.append(dict(e_do_lo_vuot_D_moi_nut=bool(okd and e.get('vuot_moi_nut')),
                        e_do_xac_dinh_moi_nut=bool(okd and e.get('can_xac_dinh_moi_nut')),
-                       g4_can_huu_han_mien_hop_moi_nut=g4_finite_every_node(L)))
+                       g4_can_huu_han_mien_hop_moi_nut=g4_finite_every_node(L, luoi_goc_of(L))))
     return dict(phan_loai_du=bool(phan), ban_cham_cuoi=bool(ban_cham_cuoi), bo_so=bo)
 
 

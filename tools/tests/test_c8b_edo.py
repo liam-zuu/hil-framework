@@ -216,7 +216,8 @@ def test_mask_none_and_mask_open_everywhere_change_nothing():
     nd = [_node(0.12), _node(0.12)]
     r0 = E.analyse_run(GIO, nd, _log(), TASK)
     r1 = E.analyse_run(GIO, nd, _log(), TASK, mat_na=_mn(range(1000)))
-    assert all(n.pop('n_che') == 0 for n in r1['theo_nut']) and r1 == r0 and r0['vuot_moi_nut']
+    assert all(n.pop('n_che') == 0 and n.pop('n_undef_mo') == 0 and n.pop('ti_le_khung_mo') == 1.0
+               for n in r1['theo_nut']) and r1 == r0 and r0['vuot_moi_nut']
 
 
 def test_masked_frame_is_undefined_and_makes_no_conclusion():
@@ -225,14 +226,38 @@ def test_masked_frame_is_undefined_and_makes_no_conclusion():
     r0 = E.analyse_run(GIO, nd, _log(), TASK)
     assert r0['vuot_moi_nut'] and r0['can_xac_dinh_moi_nut'] and r0['theo_nut'][0]['khung_vuot'] == ['7']
     n = r0['theo_nut'][0]['n_khung']
-    # frame 7 masked: not over D any more (the masked frame was the only evidence), and the node is not bounded
+    # frame 7 masked: not over D any more (the masked frame was the only evidence); (b) of CODE 26/11: the masked
+    # frame is out of the domain, every open frame is bounded, so the run is bounded (n_undef_mo 0)
     r = E.analyse_run(GIO, nd, _log(), TASK, mat_na=_mn(set(range(n)) - {7}))
-    assert r['trang_thai'] == 'dat' and not r['vuot_moi_nut'] and not r['can_xac_dinh_moi_nut']
-    assert [(x['n_che'], x['n_undef'], x['khung_vuot']) for x in r['theo_nut']] == [(1, 1, [])] * 2
+    assert r['trang_thai'] == 'dat' and not r['vuot_moi_nut'] and r['can_xac_dinh_moi_nut']
+    assert [(x['n_che'], x['n_undef'], x['n_undef_mo'], x['khung_vuot']) for x in r['theo_nut']] == [(1, 1, 0, [])] * 2
+    assert r['theo_nut'][0]['ti_le_khung_mo'] == pytest.approx((n - 1) / n, abs=1e-6)
     assert r['theo_nut'][0]['lo_max_m'] < 0.01
-    # another frame masked: the finite lower bound of frame 7 stays (design 7c), the node still not bounded
+    # another frame masked: the finite lower bound of frame 7 stays (design 7c), bounded on the open frames
     r = E.analyse_run(GIO, nd, _log(), TASK, mat_na=_mn(set(range(n)) - {3}))
-    assert r['vuot_moi_nut'] and not r['can_xac_dinh_moi_nut'] and r['theo_nut'][1]['khung_vuot'] == ['7']
+    assert r['vuot_moi_nut'] and r['can_xac_dinh_moi_nut'] and r['theo_nut'][1]['khung_vuot'] == ['7']
+
+
+def test_mask_open_frame_undefined_still_unbounds_the_run():
+    """(b): an OPEN frame left undefined (here: outside the log) counts in n_undef_mo and the run is not bounded; a
+    masked frame that is also undefined counts in n_che only."""
+    nd = [_node(0.12), _node(0.12)]
+    n = len(nd[0][1])
+    sc, rows = _node(0.12)
+    rows[2]['t_cam_s'] = '1e6'                                     # far outside the log: zs None
+    rows[4]['t_cam_s'] = '1e6'
+    nd = [(sc, rows)] * 2
+    r = E.analyse_run(GIO, nd, _log(), TASK, mat_na=_mn(set(range(n)) - {4}))
+    assert not r['can_xac_dinh_moi_nut']
+    assert [(x['n_che'], x['n_undef'], x['n_undef_mo']) for x in r['theo_nut']] == [(1, 2, 1)] * 2
+    r = E.analyse_run(GIO, nd, _log(), TASK, mat_na=_mn(set(range(n)) - {2, 4}))
+    assert r['can_xac_dinh_moi_nut'] and [x['n_undef_mo'] for x in r['theo_nut']] == [0, 0]
+    sc, rows = _node(0.12)                                         # the other branch: a value not finite
+    rows[6]['x'] = 'nan'
+    r = E.analyse_run(GIO, [(sc, rows)] * 2, _log(), TASK, mat_na=_mn(range(n)))
+    assert not r['can_xac_dinh_moi_nut'] and [x['n_undef_mo'] for x in r['theo_nut']] == [1, 1]
+    r = E.analyse_run(GIO, [(sc, rows)] * 2, _log(), TASK, mat_na=_mn(set(range(n)) - {6}))
+    assert r['can_xac_dinh_moi_nut'] and [x['n_undef_mo'] for x in r['theo_nut']] == [0, 0]
 
 
 def test_mask_cell_rule_needs_an_open_frame_over_d():
@@ -241,7 +266,7 @@ def test_mask_cell_rule_needs_an_open_frame_over_d():
     n = len(nd[0][1])
     assert E.analyse_run(GIO, nd, _log(), TASK, mat_na=_mn(set(range(n)) - {7}))['vuot_moi_nut']
     assert not E.analyse_run(GIO, nd, _log(), TASK, mat_na=_mn(set(range(n)) - {7, 9}))['vuot_moi_nut']
-    # every frame masked: nothing concluded from the frames
+    # every frame masked: nothing concluded from the frames; a node with no open frame is not bounded (conservative)
     r = E.analyse_run(GIO, nd, _log(), TASK, mat_na=_mn(()))
     assert not r['vuot_moi_nut'] and not r['can_xac_dinh_moi_nut'] and r['theo_nut'][0]['lo_max_m'] is None
 
@@ -326,8 +351,9 @@ def test_cli_luot_reads_the_mask_through_the_masked_grid(tmp_path, capsys):
     rc, g = TM.run(d, gp, mp)
     assert rc == 0 and g['mat_na_d2']['nut'][0]['n_che'] == 1
     rc, r = _edo(tmp_path, d, gp, lp, mp)
-    assert rc == 0 and r['trang_thai'] == 'dat' and not r['vuot_moi_nut'] and not r['can_xac_dinh_moi_nut']
-    assert [(x['n_khung'], x['n_che'], x['n_undef'], x['khung_vuot']) for x in r['theo_nut']] == [(6, 1, 1, [])] * 2
+    assert rc == 0 and r['trang_thai'] == 'dat' and not r['vuot_moi_nut'] and r['can_xac_dinh_moi_nut']   # (b)
+    want = [(6, 1, 1, 0, [])] * 2
+    assert [(x['n_khung'], x['n_che'], x['n_undef'], x['n_undef_mo'], x['khung_vuot']) for x in r['theo_nut']] == want
     assert r['mat_na_d2'] == dict(sha256=c8_u_imu.sha256(mp), sha_noi_dung=g['mat_na_d2']['sha_noi_dung'], luot='r1',
                                   lan_cham=g['mat_na_d2']['lan_cham'], n_khung_mo=5, nut_khong_cham=[],
                                   ca_luot_chua_ket_luan=False)
@@ -348,8 +374,9 @@ def test_cli_luot_reads_the_mask_through_the_masked_grid(tmp_path, capsys):
         return E.main(['chung-cu', '--luoi', lu, '--edo', ed, '--ban-cham-cuoi', 'true', '--out', str(tmp_path / name)])
     assert cc(p2, e2, 'cc.json') == 0 and cc(p0, e0, 'cc0.json') == 0
     c = json.load(open(tmp_path / 'cc.json', encoding='utf-8'))
-    assert c['chung_cu_c8']['bo_so'] == [dict(e_do_lo_vuot_D_moi_nut=False, e_do_xac_dinh_moi_nut=False,
-                                              g4_can_huu_han_mien_hop_moi_nut=False)]
+    # (b): e_do bounded on the open frames; G4 of the masked grid by the gate rule (its luoi_goc has no undefined frame)
+    assert c['chung_cu_c8']['bo_so'] == [dict(e_do_lo_vuot_D_moi_nut=False, e_do_xac_dinh_moi_nut=True,
+                                              g4_can_huu_han_mien_hop_moi_nut=True)]
     assert [x['sha256'] for x in c['nguon']] == [c8_u_imu.sha256(p2), c8_u_imu.sha256(e2)]
     c0 = json.load(open(tmp_path / 'cc0.json', encoding='utf-8'))
     assert c0['chung_cu_c8']['bo_so'] == [dict(e_do_lo_vuot_D_moi_nut=True, e_do_xac_dinh_moi_nut=True,
@@ -365,7 +392,7 @@ def test_cli_luot_open_frame_over_d_stays_under_the_mask(tmp_path):
     mp = TM.mask_file(tmp_path, [100, 101, 103, 104, 105])
     assert TM.run(d, gp, mp)[0] == 0
     rc, r = _edo(tmp_path, d, gp, lp, mp)
-    assert rc == 0 and r['vuot_moi_nut'] and not r['can_xac_dinh_moi_nut']
+    assert rc == 0 and r['vuot_moi_nut'] and r['can_xac_dinh_moi_nut']                               # (b)
     assert r['theo_nut'][0]['khung_vuot'] == ['104'] and r['theo_nut'][0]['n_che'] == 1
 
 
@@ -457,6 +484,33 @@ def test_chung_cu_mask_pairs():
         E.chung_cu([l0], [em], True, luoi_sha256=['e' * 64])
     # two scorings: the first with the mask, the second (H1, no mask of its own) without
     assert len(E.chung_cu([lm, _luoi()], [em, e1], True)['bo_so']) == 2
+
+
+def test_chung_cu_g4_of_a_masked_grid_by_the_gate_rule(tmp_path):
+    """(b) of CODE 26/11 (gate_c8 _g4_finite, GATE 67958d8): the masked grid's n_undef (it counts the masked frames)
+    is not asked; its luoi_goc (read, sha256 checked) must have every node ok, a finite G4 bound, no undefined frame."""
+    e1 = dict(trang_thai='dat', vuot_moi_nut=False, can_xac_dinh_moi_nut=True)
+    blk = dict(sha256='a' * 64, sha_noi_dung='b' * 64, luot='r1', lan_cham='c' * 16)
+    em = dict(e1, mat_na_d2=dict(blk, n_khung_mo=5, nut_khong_cham=[]), luoi_d2_sha256='d' * 64)
+
+    def goc(**kw):
+        p = tmp_path / f'luoi_{len(list(tmp_path.iterdir()))}.json'
+        p.write_text(json.dumps(_luoi(**kw)), encoding='utf-8')
+        return dict(duong_dan=str(p), sha256=c8_u_imu.sha256(str(p)))
+
+    def g4(lm):
+        return E.chung_cu([lm], [em], True)['bo_so'][0]['g4_can_huu_han_mien_hop_moi_nut']
+    base = dict(_luoi(nu=3), mat_na_d2=dict(blk, nut=[]))
+    assert g4(dict(base, luoi_goc=goc())) is True                    # masked frames undefined only: G4 holds
+    assert g4(dict(base, luoi_goc=goc(nu=1))) is False               # an undefined frame before the mask
+    assert g4(dict(base, luoi_goc=goc(hi=None))) is False
+    assert g4(dict(base, luoi_goc=goc(ok=False))) is False
+    assert g4(dict(base, nodes_ok=[True, False], luoi_goc=goc())) is False
+    assert g4(dict(base, nums=dict(g4=dict(hi=None, n_undef=0)), luoi_goc=goc())) is False
+    assert g4(base) is False                                         # no luoi_goc: the rule before (b)
+    bad = goc()
+    with pytest.raises(E.EdoError):
+        E.chung_cu([dict(base, luoi_goc=dict(bad, sha256='0' * 64))], [em], True)
 
 
 def test_cli_luot_whole_run_not_concluded_in_the_masked_grid(tmp_path):
