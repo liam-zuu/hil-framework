@@ -1565,11 +1565,10 @@ def test_round3_evidence_recomputed_from_the_edo_files(tmp_path, edit, field):
 def test_round3_evidence_g4_and_classification_from_the_grid(tmp_path):
     d, goc = build_c8(tmp_path / 'a')
     x = d['o_c8'][0]['chuoi'][0]
-    _d2_all(goc, d, che={x['run_id']: {2}})        # D2-1a: G4 of a scored run is that of its masked grid: a masked
-    x['ket_qua'] = 'chua_ket_luan'                 # frame is an undefined frame of G4 (and G1 is not concluded, L156)
-    assert _doc(goc, x['file_cham_d2'])['nums']['g4']['n_undef'] == 1
-    with pytest.raises(GC.GateFileError, match='recomputed from the scorings'):
-        GC.check_nguon(d, goc)
+    _d2_all(goc, d, che={x['run_id']: {2}})        # D2-1a: the numbers of a scored run are those of its masked grid
+    x['ket_qua'] = 'chua_ket_luan'                 # (G1 is not concluded, L156); (b) of CODE 26/11: the masked frame
+    assert _doc(goc, x['file_cham_d2'])['nums']['g4']['n_undef'] == 1     # is no undefined frame of the G4 evidence
+    GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'b')
     x = d['o_c8'][0]['chuoi'][0]
     old = x['file_cham']['sha256']
@@ -3599,9 +3598,8 @@ def test_d2_1a_the_gate_takes_the_masked_grid_of_a_scored_run(tmp_path):
     with pytest.raises(GC.GateFileError, match="outcome is 'chua_ket_luan'"):     # not the khong_dat of luoi.json
         GC.check_nguon(d, goc)
     x['ket_qua'] = 'chua_ket_luan'
-    with pytest.raises(GC.GateFileError, match='recomputed from the scorings'):   # G4 has an undefined frame now
-        GC.check_nguon(d, goc)
-    # the evidence follows the masked grid: G4 not finite at every frame, the run is no g4 evidence
+    GC.check_nguon(d, goc)                     # (b) of CODE 26/11: the masked frame is no undefined frame of the evidence
+    # the evidence file must say what the gate recomputes: a g4 false there is refused
     _rewrite(goc, x['file_chung_cu'], lambda y: y['chung_cu_c8']['bo_so'][0].update(
         g4_can_huu_han_mien_hop_moi_nut=False))
     _set_ev(d, c['muc'], c['controller'], g4_can_huu_han_mien_hop_moi_nut=False)
@@ -4150,6 +4148,7 @@ def test_l172_lost_runs_after_the_run_of_the_cell(tmp_path):
     with pytest.raises(GC.GateFileError, match='a rerun replaces a lost run only'):
         _ghep(goc)
     c[GC.SAU_HONG_KEY] = dict(LIAM_L172)
+    _ho_so_khung_mo(goc, d)                                            # the run the cell counts with changed
     GC.check(d)
     GC.check_nguon(d, goc)
     assert c['trang_thai'] == 'co_luot' and GC.eligible_run(c) is c['chuoi'][0] and c['chuoi'][1]['ket_qua'] == 'hong'
@@ -4191,6 +4190,7 @@ def test_l172_lost_runs_after_the_run_of_the_cell(tmp_path):
     d, goc = build_c8(tmp_path / 'c')
     c = _l172(goc, d)
     c[GC.SAU_HONG_KEY] = dict(LIAM_L172)
+    _ho_so_khung_mo(goc, d)
     _rewrite_khoa(goc, d, lambda k: k.update(
         muc_du_dai_theo_buoi={d['tien_de_c8'][0]['buoi']: [lv for lv in LEVELS if lv != c['muc']]}))
     with pytest.raises(GC.GateFileError, match=f'cell {c["o"]}: its eligible run was made in session'):
@@ -4259,6 +4259,7 @@ def test_b5_extra_runs_of_a_cell(tmp_path):
     with pytest.raises(GC.GateFileError, match='a rerun replaces a lost run only'):
         GC.check(d)
     c[GC.THEM_P6_KEY] = dict(LIAM_B5, luot=[extra])
+    _ho_so_khung_mo(goc, d)                                            # the run the cell counts with changed
     GC.check(d)
     GC.check_nguon(d, goc)
     assert GC.eligible_run(c) is c['chuoi'][0] and GC.chain_counted(c) == [c['chuoi'][0]]
