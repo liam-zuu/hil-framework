@@ -153,7 +153,9 @@ COARSE, FINE = 0.25, 0.01        # steps (PWM side)
 # on 16702ff) changes only logger.c / logger.h (the #gain line gets boot) and a comment in us_state.h; src/main.c and
 # src/encoder/ are those of 16702ff (AGV git diff 16702ff 5bde4c5; a test checks when the AGV repo is there). Liam
 # 15/11 CODE_RS4 local_3b1a170b "Thêm 5bde4c5, Codex riêng (Recommended)".
-FW_COUNTS_AT_TICK = ('16702ff0e688', '5bde4c55bf3a')
+# AGV diff 5bde4c5..1882010 changes only src/controller/gain_set.c (gain limits, L142).
+# Its src/main.c and src/encoder/ still match 16702ff.
+FW_COUNTS_AT_TICK = ('16702ff0e688', '5bde4c55bf3a', '18820107799e')
 FW_COUNTS_BASE = '16702ff0e688'         # the firmware L98 was checked on; the others keep its count read path
 LOG_CNT_INVALID = -2 ** 31       # AGV main.c LOG_CNT_INVALID (INT32_MIN): line dropped
 J_READ_US = 50.0                 # AGV main.c LOG_CNT_WIN_US (a test checks)
