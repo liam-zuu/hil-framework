@@ -31,7 +31,6 @@ ACK_NAME = 'gain_ack.txt'
 SHA = '16702ff0e688'
 BOOT = '4753dc47'
 MAC = 'aa:bb'
-PID_NAMES = ('kp_xy', 'ki_xy', 'kp_wz', 'ki_wz', 'pos_kp', 'pos_ki', 'k_psi')   # gain_line_check.NAMES['PID']
 
 
 class Log:
@@ -79,11 +78,11 @@ def stamp(lines, t0: str, step_us: int = 1000) -> list:
             for k, x in enumerate(lines)]
 
 
-def gain_line(gain: dict, first_seq: int, drop: int = 0) -> str:
+def gain_line(gain: dict, first_seq: int, drop: int = 0, boot: str = '') -> str:
     """'#gain' line of a gain file dict(ctrl, id, gains) as the firmware writes it (values compared as float32)."""
-    vals = ','.join(f'{k}={gain["gains"][k]!r}' for k in PID_NAMES)
+    vals = ','.join(f'{k}={v!r}' for k, v in gain['gains'].items())
     return (f'#gain,id={gain["id"]},applied_n=1,ctrl={gain["ctrl"]},{vals},first_seq={first_seq},'
-            f'line_drop={drop}')
+            f'line_drop={drop}' + (f',boot={boot}' if boot else ''))
 
 
 def stretch_starts(rows) -> list:
@@ -122,6 +121,26 @@ def write_gain_file(path: str, gain: dict) -> str:
     return path
 
 
+def sample_gain(controller='PID'):
+    if controller == 'PID':
+        return dict(ctrl='PID', id=1,
+                    gains=dict(kp_xy=1.0, ki_xy=0.5, kp_wz=1.0, ki_wz=0.2, pos_kp=6.0, pos_ki=3.0, k_psi=1.0))
+    return dict(ctrl='ADRC', id=1,
+                gains=dict(omega_c_xy=2.0, omega_o_xy=6.0, omega_c_wz=2.0, omega_o_wz=6.0,
+                           pos_kp=6.0, pos_ki=3.0, k_psi=1.0))
+
+
+def write_trial_gain(d, controller='PID', boot=BOOT):
+    """FAKE trial gain and its short ESP32 log, for tests of rq3_log end."""
+    os.makedirs(d, exist_ok=True)
+    gain = sample_gain(controller)
+    log = Log()
+    log.off(10)
+    log.on(5)
+    write_esp32(d, log, gain, boot, '2026-11-20T10:00:00', ())
+    return write_gain_file(os.path.join(d, 'gain_trial.json'), gain)
+
+
 def write_queries(d: str, boot: str = BOOT, gid: int = 1, t0: float = 100.0) -> tuple:
     """The two query outputs of a run in folder d (before: t0..t0+1, after: t0+100..t0+101); their paths."""
     os.makedirs(d, exist_ok=True)
@@ -143,27 +162,37 @@ def write_final_run(d: str, platform: str, gain: dict, e_perp: float = 0.05, t_e
     keys of score.json (C9D-1: 'outcome' and 'gate_v3', so score.json is the scorer file given to rq3_log end).
     Returns the paths of the query outputs."""
     os.makedirs(d, exist_ok=True)
-    score = dict(FAKE=True, e_perp_max=e_perp, e_s_absmax=0.01, e_trk_max=0.02, t_end=t_end,
-                 e_theta_lane_max_deg=5.0, e_theta_cmd_max_deg=4.0, **(score_extra or {}))
-    if platform == 'HIL':
-        score.update(track_err_frames=0, pi_period_ppm=-12.0, edge_map=dict(esp_pi_ppm=24.6))
-    else:
-        score.update(n_back_frames=0)
-    with open(os.path.join(d, 'score.json'), 'w', encoding='utf-8', newline='\n') as f:
-        json.dump(score, f)
     if log is None:
         log = Log()
         log.off(30)
         log.on(int(round(t_end * 100)) + 3)
         log.off(20, after_on=True)
+    score = dict(FAKE=True, e_perp_max=e_perp, e_s_absmax=0.01, e_trk_max=0.02, e_bao_max=0.08,
+                 e_theta_lane_max_deg=5.0, e_theta_cmd_max_deg=4.0)
+    if platform == 'HIL':
+        score.update(t_end=t_end, track_err_frames=0, pi_period_ppm=-12.0, edge_map=dict(esp_pi_ppm=24.6))
+    else:
+        t0_log = next((int(r['timestamp_us']) for r in log.rows if r['run_active'] == '1'), None)
+        score.update(t_end_union=t_end, t0_log_us=t0_log, n_back_frames=0)
+    score.update(score_extra or {})
+    with open(os.path.join(d, 'score.json'), 'w', encoding='utf-8', newline='\n') as f:
+        json.dump(score, f)
+    write_esp32(d, log, gain, boot, t0, run_end_extra)
+    with open(os.path.join(d, ACK_NAME), 'w', encoding='utf-8', newline='\n') as f:
+        f.write(ack_text(boot, gain['id']))
+    return write_queries(d, boot, gain['id'])
+
+
+def write_esp32(d, log, gain, boot, t0, run_end_extra):
     with open(os.path.join(d, 'esp32.csv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=COLS)
         w.writeheader()
         w.writerows(log.rows)
     base = dt.datetime.fromisoformat(t0)
     ev = stamp([gain_line(gain, 0)], (base - dt.timedelta(seconds=10)).isoformat())     # the gain setting
+    env = 'pid' if gain['ctrl'] == 'PID' else 'ladrc'
     for k, s in enumerate(stretch_starts(log.rows)):
-        ev += stamp([f'#fw,sha={SHA},dirty=0,env=pid'] * 3 + [gain_line(gain, s)] * 3
+        ev += stamp([f'#fw,sha=5bde4c55bf3a,dirty=0,env={env}'] * 3 + [gain_line(gain, s, boot=boot)] * 3
                     + [f'#us,ev=start,boot={boot},on=0,swb=1500,first_seq={s},line_drop=0'] * 3,
                     (base + dt.timedelta(seconds=5 * k)).isoformat())
     ends = list(log.run_ends) + list(run_end_extra)
@@ -171,6 +200,3 @@ def write_final_run(d: str, platform: str, gain: dict, e_perp: float = 0.05, t_e
                 (base + dt.timedelta(seconds=60)).isoformat())
     with open(os.path.join(d, 'esp32.csv.events.txt'), 'w', encoding='utf-8', newline='\n') as f:
         f.write(''.join(f'{x}\n' for x in ev))
-    with open(os.path.join(d, ACK_NAME), 'w', encoding='utf-8', newline='\n') as f:
-        f.write(ack_text(boot, gain['id']))
-    return write_queries(d, boot, gain['id'])

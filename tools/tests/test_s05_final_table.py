@@ -202,6 +202,7 @@ def write_gains(ds, frozen=(('A-PID', 'A-PID/G07'),)):
     for camp, gs in frozen:
         f = write_gain_file(os.path.join(ds, f'gain_{gs.replace("/", "_")}.json'))
         rows.append(dict.fromkeys(rl.FREEZE_COLS, '') | dict(campaign=camp, gain_set_id=gs,
+                                                              frozen_at='2026-11-19T08:00:00',
                                                               gain_file=os.path.basename(f),
                                                               gain_sha256=rl.sha256_file(f)))
     with open(os.path.join(ds, rl.FREEZE), 'w', newline='', encoding='utf-8') as fh:
@@ -288,8 +289,15 @@ def write_run(base, uid, platform, stage, ctrl, task, gain_set_id, outcome, e_pe
     d = os.path.join(base, uid)
     os.makedirs(d)
     k = task.startswith('O1-K')
-    score = dict(e_perp_max=e_perp, e_s_absmax=0.01, e_trk_max=0.02, t_end=10.0,
+    L = Log()
+    L.off(30)
+    L.on(1001 + 3, zigzag) if tv_ok else (L.on(400, zigzag), L.off(5, after_on=True), L.on(601 + 3, zigzag))
+    score = dict(e_perp_max=e_perp, e_s_absmax=0.01, e_trk_max=0.02,
                  track_err_frames=flag if platform == 'HIL' else 0, n_back_frames=flag if platform == 'HW' else 0)
+    if platform == 'HW':
+        score.update(t_end_union=10.0, t0_log_us=int(next(r['timestamp_us'] for r in L.rows if r['run_active'] == '1')))
+    else:
+        score['t_end'] = 10.0
     score.update(e_theta_start_max_deg=3.0) if k else score.update(e_theta_lane_max_deg=5.0, e_theta_cmd_max_deg=4.0)
     gate = None
     if outcome in T.VALID:      # C9D-1: score.json is the scorer file of the run (outcome, gate_v3), sha in the log
@@ -299,21 +307,27 @@ def write_run(base, uid, platform, stage, ctrl, task, gain_set_id, outcome, e_pe
         score.update(outcome=outcome, gate_v3=gate)
     with open(os.path.join(d, 'score.json'), 'w', encoding='utf-8') as f:
         json.dump(score, f)
-    L = Log()
-    L.off(30)
-    L.on(1001 + 3, zigzag) if tv_ok else (L.on(400, zigzag), L.off(5, after_on=True), L.on(601 + 3, zigzag))
     write_log(d, L.rows, boots=boots)
     # R134C4-2: the log row as rq3_log writes it (the table runs its row checks): campaign, the gate columns of a
     # judged run (FAKE gate agreeing with the outcome; a car run: camera gate), both boots of a judged car /
     # final_hil run
     row = dict.fromkeys(rl.TUNING_COLS, '')
     row.update(run_uid=uid, platform=platform, stage=stage, controller=ctrl, trajectory=task, gain_set_id=gain_set_id,
+               wall_start='2026-11-20T08:00:00', speed_mps=str(rl.FIG8.get(task, 0.5)),
                run_outcome=outcome, results_dir=d, fail_cause='mat_khung' if outcome == 'hong_he_do' else '',
                campaign='RQ2' if stage == 'final_hil' else gain_set_id.split('/')[0])
     if outcome in T.VALID:
         row.update(rl.gate_columns(gate, rl.sha256_file(os.path.join(d, 'score.json'))))
         row.update(boot_before='4753dc47', boot_after='4753dc47')
+        bind_queries(row)
     return row
+
+
+def bind_queries(row):
+    for when, cf, cs in (('before', *rl.QUERY_FILE_COLS[:2]), ('after', *rl.QUERY_FILE_COLS[2:])):
+        p = os.path.join(row['results_dir'], f'gain_query_{when}.txt')
+        if os.path.isfile(p):
+            row.update({cf: p, cs: rl.sha256_file(p)})
 
 
 def test_table_cells_medians_and_reasons(tmp_path, no_moc):
@@ -571,9 +585,9 @@ def test_only_a_late_start_copy_left():
     (firmware 16702ff) the run is refused (limit, DEFERRED); with boot on '#gain' it is the run."""
     L = _clean()
     s0 = _first(L)
-    gains = start_events(s0)[3:6]
+    fw, gains = start_events(s0)[:3], start_events(s0)[3:6]
     late_us = stamp([US.format(boot='4753dc47', seq=s0)], '2026-11-14T10:00:00.700')
-    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), ack=_ack(), events=gains + late_us)
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), ack=_ack(), events=fw + gains + late_us)
     assert r['tv_duty'] is None and 'within 0.5 s' in r['reason']
     with_boot = [x + ',boot=4753dc47' for x in gains]
     r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), ack=_ack(), events=with_boot + late_us)
@@ -821,6 +835,7 @@ def test_c5_1_run_evidence_is_checked_apart_from_tv_duty(tmp_path, case, match):
             f.write(answer('0badf00d', t=(200.0, 201.0)))
     else:
         r.update(boot_before='0badf00d', boot_after='0badf00d')
+    bind_queries(r)
     with pytest.raises(ValueError, match=match):
         LR(_table_ds(tmp_path, [r]))
 
@@ -875,6 +890,8 @@ def test_c6_1_a_run_of_another_file_than_its_set_is_refused(tmp_path):
     ds = _table_ds(tmp_path, [r])
     assert len(LR(ds)[0]) == 1                                        # the fixture run itself passes
     _set_id(r, 8)
+    bind_queries(r)
+    ds = _table_ds(tmp_path, [r])
     with pytest.raises(ValueError, match=r'run w1: id dang chay 8 .* khac id 7 cua file gain'):
         LR(ds)
 
@@ -905,7 +922,7 @@ def test_c6_1_no_file_for_the_set(tmp_path, capsys):
     a = write_run(tmp_path, 'n1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
     i = write_run(tmp_path, 'n2', 'HIL', 'final_hil', 'PID', 'O1-F05', 'RQ2-INIT-PID/G00', 'dat', 0.02)
     ds = _table_ds(tmp_path, [a, i], frozen=())
-    with pytest.raises(ValueError, match=r'run n1: khong co file gain .*S05_freeze.csv; run n2: .*--init-gain PID'):
+    with pytest.raises(ValueError, match=r'n1: .*needs a row in S05_freeze.csv; run n2: .*--init-gain PID'):
         LR(ds, init_gain={})
     assert T.main(['table', '--dataset', ds, '--out', str(tmp_path / 'o')]) == 2
     assert 'cho --init-gain PID' in capsys.readouterr().out
@@ -971,6 +988,8 @@ def test_c6_2_table_without_ids(tmp_path):
             txt = f.read()
         with open(p, 'w', encoding='utf-8') as f:
             f.write(re.sub(r',id=7(?=[,\n])', '', txt))
+    bind_queries(r)
+    ds = _table_ds(tmp_path, [r])
     with pytest.raises(ValueError, match='run k1: .*khong so duoc bo gain'):
         LR(ds)
 
@@ -1020,6 +1039,8 @@ def test_c7_1_question_after_shows_the_file_id(tmp_path):
     ds = _table_ds(tmp_path, [r])
     with open(os.path.join(r['results_dir'], 'gain_query_after.txt'), 'w', encoding='utf-8') as f:
         f.write(answer('4753dc47', t=(200.0, 201.0), gid=8))
+    bind_queries(r)
+    ds = _table_ds(tmp_path, [r])
     with pytest.raises(ValueError, match=r"run q1: id dang chay '8' cua lan hoi sau khac id 7"):
         LR(ds)
 
@@ -1054,6 +1075,7 @@ def test_c7_3_relative_frozen_name_takes_the_candidate_with_the_sha(tmp_path, mo
         w = csv.DictWriter(fh, fieldnames=rl.FREEZE_COLS)
         w.writeheader()
         w.writerow(dict.fromkeys(rl.FREEZE_COLS, '') | dict(campaign='A-PID', gain_set_id='A-PID/G07',
+                                                             frozen_at='2026-11-19T08:00:00',
                                                              gain_file='gain_rel.json', gain_sha256=rl.sha256_file(good)))
     monkeypatch.chdir(work)
     runs, _ = LR(ds)

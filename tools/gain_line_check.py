@@ -94,6 +94,7 @@ OPT_FIELDS = ('boot',)           # Liam 14/11 "Them boot vao #gain" (firmware af
 SEGMENT_STATUS_BAD = ('conflict', 'ambiguous')
 HEX = set('0123456789abcdefABCDEF')
 GAIN_US_WINDOW_S = 0.5           # [DE XUAT] '#gain' to '#us,ev=start' of one run (same tick, ms apart)
+LEGACY_GAIN_FW = ('16702ff0e688', '54b7269ce21d')
 
 
 class InputError(ValueError):
@@ -268,7 +269,7 @@ def run_start(events, seq0: int, window_s: float = GAIN_US_WINDOW_S) -> dict:
     if events is None:
         out['why'].append('no events file (#gain, #us lines)')
         return out
-    starts, gains = [], []
+    starts, gains, firmware = [], [], set()
     for line in events:
         t, text = split_event(line)
         if text.startswith('#gain,'):
@@ -279,6 +280,9 @@ def run_start(events, seq0: int, window_s: float = GAIN_US_WINDOW_S) -> dict:
             f = _fields(text)
             if f.get('ev') == 'start' and _int(f.get('first_seq')) == seq0:
                 starts.append((t, f))
+        elif text.startswith('#fw,'):
+            f = _fields(text)
+            firmware.add((f.get('sha', '').lower(), f.get('env', ''), f.get('dirty')))
     if not starts:
         out['why'].append(f'no #us,ev=start line with first_seq = {seq0}: the boot of the run is not shown')
         return out
@@ -302,6 +306,12 @@ def run_start(events, seq0: int, window_s: float = GAIN_US_WINDOW_S) -> dict:
             out['why'].append(f'no #gain line with first_seq = {seq0} and boot {boot} (the boot of the run)')
             return out
     else:
+        if not firmware or any(not env or dirty != '0' or not set(sha) <= HEX
+                               or not any(sha == old[:7] or sha.startswith(old) for old in LEGACY_GAIN_FW)
+                               for sha, env, dirty in firmware):
+            out['why'].append(f'no #gain line with boot {boot} for first_seq = {seq0}; '
+                              'the 0.5 s rule needs #fw of a known legacy build')
+            return out
         gs = [g for t, g in gains if t is not None and abs(t - t_us) <= window_s]
         out.update(n_gain_lines=len(gs), n_gain_outside=len(gains) - len(gs), gain_rule='time_window')
         if not gs:
@@ -363,6 +373,8 @@ def query_problem(before, after, run_boot=None, check_run_boot=True):
     tb, ta = times[1], times[2]
     if tb > ta:
         return f'hoi truoc xong luc {tb:.3f} sau khi hoi sau bat dau {ta:.3f}: khong phai truoc va sau luot'
+    if before.get('tx') and before['tx'] == after.get('tx'):
+        return 'hai file hoi co cung tx: khong phai hai lan hoi'
     bb, ba = before['boot'].lower(), after['boot'].lower()
     if bb != ba:
         return f'boot truoc {before["boot"]} khac boot sau {after["boot"]}: ESP32 khoi dong lai giua luot'

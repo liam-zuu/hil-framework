@@ -37,13 +37,15 @@ Commands (the operator types them while working; every time stamp is the PC cloc
                                          of one gain at one level, then that level is chua_ket_luan
                                          B8-1 (S05 v3.20 C9 (a)-(c), 14/11): a judged car run needs the
                                          camera scorer output (two frame domains, G1 fields: see GATE_COLS);
-                                         a judged car / final_hil run needs both boot answers (API and summary)
+                                         a judged car / final_hil run needs both boot answers (API and summary);
+                                         a judged floor or HIL tune run needs --gain-file for its ESP32 #gain proof
   cancel / status                        drop the open run / show it. cancel only before the "run"
                                          step (S05 §3.3: every started run counts, EA-6); time of the
                                          steps already logged goes to m7_dev_effort_log.csv
   machine --campaign C --controller PID --script-run-id ID --results-dir D --n-sim-evals N
-         --t-machine-s S --wall-start T --wall-end T [--stage script]   summary row of a fwsim
-                                         script run (stage script by default, S05 v3.7 A-R2-4)
+         --t-machine-s S --wall-start T --wall-end T [--n-sim-diagnostic N]   allocated fwsim script row
+  machine-phases --script-kind S03|S3 --script-run-id ID --results-dir D
+         --phase ACCOUNT START END N_PID N_LADRC DIAG_PID DIAG_LADRC   repeat for each elapsed phase, including bo
   hoc-start --campaign C --ghi-chu X / hoc-end [--ghi-chu X]   a hoc segment, time stamps written
                                          by the script (S05 §3.1 R-2, EA-7)
   effort --date D --start HH:MM --end HH:MM (--campaign C | --khoan K) [--nhan hoc] --ghi-chu X
@@ -56,9 +58,9 @@ Commands (the operator types them while working; every time stamp is the PC cloc
                                          F = the locked C8 gate file (gate_c8_v1 JSON, tools/gate_c8.py:
                                          gate levels, so_do conditions per level); its sha256 is
                                          reported; every gate row is checked against it (O1 v11.33)
-  so-h   --run-uid UID --score-final F   S05 v3.37 4.3: outcome of a car run after the clip H comparison at the end
+  so-h   --run-uid UID --score-final F [--drift D]   outcome after the clip H comparison at the end
                                          of the session (F = c7_calib_drift.py gop output); appended to
-                                         m7_so_clip_h.csv; summary, begin, s05_final_table use the outcome after it
+                                         m7_so_clip_h.csv; D = original v2 comparison from c7_calib_drift.py so
   demo   --out DIR                       C9 dry run: made-up campaign in DIR (every judged run with its folder:
                                          s05_fake_runs.py), then summary
   u-moc  --run-uid UID [--lan H0|H1] --file U --gate-file C   C8b v3 §5 (CODE_GATE 18/11, design
@@ -103,6 +105,8 @@ SO_H = 'm7_so_clip_h.csv'
 SO_H_COLS = ['run_uid', 'outcome_tam', 'outcome_sau', 'flags', 'vuot', 'D_H_mm', 'score_final_file',
              'score_final_sha256', 'ghi_luc']
 SO_H_FLAGS = ('calib_drift', 'calib_drift_split', 'thieu_H1')
+DRIFT_FIELDS = ('D_H_huong_deg', 'eps_H_huong_deg', 'trang_thai_vi_tri', 'trang_thai_huong', 'vuot_do_thieu')
+SO_H_COLS += ['drift_file', 'drift_sha256', *DRIFT_FIELDS]
 FAIL_SO_H = 'so_clip_h'                  # fail cause of a run that became hong_he_do at the comparison
 SO_H_LOST = '_so_h_lost'                 # C9D2-4: in-memory mark set by apply_so_h only (never a log column)
 RETRO_FLAG = 'sau_dung_hoi_to'           # S05 v3.38 4.3 (B8S2-2): run after a stop the comparison showed
@@ -124,6 +128,7 @@ TUNING_NEW = (['run_uid', 'campaign', 'script_run_id', 'gain_set_id', 'speed_mps
               + ['t_operator_wait_s', 't_machine_s', 'wall_start', 'wall_end', 'n_sim_evals']
               + ['boot_before', 'boot_after']           # R134 (b): S05 4.7 (iv), R3V-9
               + list(QUERY_FILE_COLS)                   # R134 (1), summary reads the two answers again
+              + ['script_kind', 'n_sim_diagnostic', 'trial_gain_file', 'trial_gain_sha256']
               + ['c8b_gio_sha256'])                     # O1 v11.37 D1, S05 v3.43 D3: kiem_gio_c8b (CODE_GATE)
 # tune stop gate v3 (dossier 00_OVERVIEW/2026-11-12_De_xuat_cong_dung_tune_bam_huong_van_toc_v3.md section 6,
 # CG2-12; Liam 12/11 CODE local_87282b70 "làm ngay đi"): per run the measured maximum q, its bound U and
@@ -258,16 +263,17 @@ GAIN_OWNERS = TUNED + ('RQ2-INIT-PID', 'RQ2-INIT-LADRC')   # the six gain sets o
 KHOAN = ('T_H', 'C_chung', 'RQ2')
 STAGES = ('screen', 'confirm', 'final', 'explore', 'hil_check', 'final_hil', 'script')   # script: v3.7 §3.3
 FIG8 = {'O1-F02': 0.2, 'O1-F05': 0.5, 'O1-F08': 0.8}     # same as rpi5/o1_tasks.py FIG8 (a test checks)
+FINAL_SPEEDS = {**FIG8, 'O1-K1': 0.5, 'O1-K2': 0.5}
 MANUAL = '[nhap_tay]'                    # flag of a hoc row typed by hand (S05 §3.1 R-2, EA-7)
 CLIP_H_NOTE = 'clip_h'                   # S05 v3.44 §3.2 H6: ghi_chu of an effort row of clip H filming
 
 
-def is_clip_h(ghi_chu: str) -> bool:
-    """S05 v3.44 H6: an effort row of clip H filming (ghi_chu starts with 'clip_h', after the [nhap_tay] flag)."""
+def floor_effort(ghi_chu: str) -> str:
+    """Campaign work marked clip_h or 12b, including on manually entered rows."""
     g = ghi_chu or ''
     if g.startswith(MANUAL):
         g = g[len(MANUAL):].lstrip()
-    return g.startswith(CLIP_H_NOTE)
+    return next((label for label in (CLIP_H_NOTE, '12b') if g.startswith(label)), '')
 OUTCOMES = ('dat', 'khong_dat', 'chua_ket_luan', 'hong_he_do')
 PLATFORMS = ('SIM', 'HIL', 'HW')
 STEPS = ('flash', 'setup', 'run', 'log', 'analysis')
@@ -299,10 +305,57 @@ def _parse_t(s: str) -> dt.datetime:
 
 
 def _f(x) -> float:
+    if x is None or x == '':
+        return 0.0
     try:
         return float(x)
     except (TypeError, ValueError):
-        return 0.0
+        raise LogError(f'{x!r}: expected a number')
+
+
+def _nonnegative(value, field, count=False) -> None:
+    if value in (None, ''):
+        return
+    try:
+        n = int(str(value)) if count else float(value)
+    except (ValueError, TypeError, OverflowError):
+        n = -1
+    if isinstance(value, bool) or n < 0 or (not count and not math.isfinite(n)):
+        kind = 'integer' if count else 'finite number'
+        raise LogError(f'{field}: expected a {kind} >= 0, got {value!r}')
+
+
+def check_account_row(row, kind, legacy=False) -> None:
+    campaign = row.get('campaign' if kind == TUNING else 'chien_dich') or ''
+    account = row.get('khoan') or ''
+    if campaign and campaign not in CAMPAIGNS or account and account not in KHOAN:
+        raise LogError(f'{kind}: invalid campaign / khoan ({campaign!r}, {account!r})')
+    if kind == EFFORT and (campaign and account or not legacy and not (campaign or account)):
+        raise LogError('exactly one of --campaign, --khoan (S05 §6.2)')
+    ctrl = row.get('controller') or ''
+    if ctrl not in ('', 'PID', 'LADRC'):
+        raise LogError(f'{kind}: controller {ctrl!r}, expected PID, LADRC or empty')
+    if kind == TUNING:
+        owner = campaign.split('-')[-1]
+        if owner in ('PID', 'LADRC') and ctrl != owner:
+            raise LogError(f'{kind}: controller {ctrl!r} does not match {campaign}')
+        for field in ('iter_no', 'n_sim_evals', 'n_sim_diagnostic', 'completed', 'candidate_no'):
+            _nonnegative(row.get(field), field, count=True)
+        for field in (*[f't_{k}_s' for k in STEPS], 't_operator_wait_s', 't_machine_s'):
+            _nonnegative(row.get(field), field)
+    elif kind == EFFORT:
+        _nonnegative(row.get('gio'), 'gio')
+        nhan, note = row.get('nhan') or '', row.get('ghi_chu') or ''
+        if nhan not in ('', 'hoc') or (nhan == 'hoc' and not note):
+            raise LogError('nhan must be empty or hoc with a ghi_chu')
+        work = floor_effort(note)
+        if nhan == 'hoc' and work:
+            raise LogError(f'a {work} row cannot be hoc (S05 §3.2)')
+        if work == '12b' and not campaign:
+            raise LogError('12b effort needs the campaign of the floor session (S05 §3.2)')
+    else:
+        _nonnegative(row.get('gio_sua'), 'gio_sua')
+        _nonnegative(row.get('iter_no'), 'iter_no', count=True)
 
 
 def _fmt(x: float, nd=1) -> str:
@@ -373,6 +426,8 @@ def migrate(ds: str) -> Dict[str, str]:
            for name, cols in ((TUNING, TUNING_COLS), (EFFORT, EFFORT_COLS), (HWFAIL, HWFAIL_COLS))}
     if os.path.exists(os.path.join(ds, FREEZE)):              # v3.6 file without stop_cause (v3.7)
         out[FREEZE] = migrate_file(os.path.join(ds, FREEZE), FREEZE_COLS)
+    if os.path.exists(os.path.join(ds, SO_H)):
+        out[SO_H] = migrate_file(os.path.join(ds, SO_H), SO_H_COLS)
     for name, cols in ((U_MOC, U_MOC_COLS), (TIEN_DE, TIEN_DE_COLS)):   # C8b v3 §5, design section 4 (RC1-5)
         out[name] = migrate_file(os.path.join(ds, name), cols)
     return out
@@ -388,11 +443,13 @@ def check_task(task: str, speed) -> None:
         bad = False                                     # not a number: the figure-8 check below refuses it
     if bad:                                             # Codex S315-R2-1: nan passes abs(nan - x) > tol
         raise LogError(f'speed {speed!r}: not a finite number')
-    if task.startswith('O1-F'):
-        if task not in FIG8:
-            raise LogError(f'task {task!r}: figure-8 names are {sorted(FIG8)} (the name carries the level)')
-        if abs(_f(speed) - FIG8[task]) > 1e-9:
-            raise LogError(f'task {task} is level {FIG8[task]} m/s, speed {speed!r} given')
+    if task.strip().lower() == '12b':
+        raise LogError('task 12b is campaign effort: use effort with ghi_chu starting with 12b')
+    if task.startswith('O1-F') and task not in FIG8:
+        raise LogError(f'task {task!r}: figure-8 names are {sorted(FIG8)} (the name carries the level)')
+    level = FINAL_SPEEDS.get(task)
+    if level is not None and abs(_f(speed) - level) > 1e-9:
+        raise LogError(f'task {task} is level {level} m/s, speed {speed!r} given')
 
 
 def gain_owner(gain_set: str) -> str:
@@ -475,7 +532,8 @@ def begin(ds: str, session: str, campaign: str, platform: str, controller: str, 
     t = now()
     row = {'session_id': session, 'date': t.date().isoformat(), 'platform': platform, 'controller': controller,
            'trajectory': task, 'iter_no': str(it), 'run_uid': f'{session}:{it}', 'campaign': campaign,
-           'gain_set_id': gain_set, 'speed_mps': speed, 'stage': stage, 'wall_start': _iso(t)}
+           'gain_set_id': gain_set, 'speed_mps': condition_key({'trajectory': task, 'speed_mps': speed})[1],
+           'stage': stage, 'wall_start': _iso(t)}
     row.update(_parse_gains(gains))
     for k, v in extra.items():
         if v not in (None, ''):
@@ -484,6 +542,7 @@ def begin(ds: str, session: str, campaign: str, platform: str, controller: str, 
             if k in row or k.startswith('g_') or k in OWN_FIELDS:   # Codex S315-R3-1: the identity fields
                 raise LogError(f'field {k}: set by begin or end, not by an extra field')   # are checked, not given
             row[k] = str(v)
+    check_account_row(row, TUNING)
     tun = apply_so_h(live_rows(read_rows(os.path.join(ds, TUNING))), ds)   # S315-R2-2; v3.37 outcome after so-h
     if _map_counted(row):
         if not gain_set:
@@ -500,6 +559,8 @@ def begin(ds: str, session: str, campaign: str, platform: str, controller: str, 
     if stage in ('final', 'final_hil') and final_key(row) in _final_stops(tun):
         raise LogError(f'{task}@{speed} of {gain_set or campaign}: stopped after {FINAL_LOST_N} lost runs in a row '
                        '(S05 4.6), no further run')
+    if stage == 'final' and campaign in TUNED:
+        check_final_freeze(row, freeze_rows(ds))
     run = {'row': row, 'segments': [], 'current': None, 'paused_from': None}
     _save_open(ds, run)
     return run
@@ -1235,7 +1296,7 @@ def query_files_needed(row: dict, outcome: str) -> bool:
     return outcome in VALID and boot_needed(row.get('platform'), row.get('stage'))
 
 
-def check_query_rows(tun: List[dict], ds: str) -> None:
+def check_query_rows(tun: List[dict], ds: str) -> dict:
     """R134 (1) (R134C4-1 summary part, deferred at round 4): the summary reads the two gain_send --query outputs of a
     row again. A judged car / final_hil campaign row (query_files_needed) must name both files with their sha256;
     every named file must be there with that sha256 (a file changed after 'end' is refused); the two answers must be
@@ -1243,6 +1304,7 @@ def check_query_rows(tun: List[dict], ds: str) -> None:
     relative name is looked for in the dataset folder, then in the working folder. Rows outside the campaigns that
     name no file (historic rows) are not checked."""
     import gain_line_check as glc
+    checked = {}
     for r in tun:
         uid = r.get('run_uid')
         need = (r.get('campaign') in CAMPAIGNS and r.get('run_outcome') in VALID
@@ -1275,8 +1337,10 @@ def check_query_rows(tun: List[dict], ds: str) -> None:
             raise LogError(f'{uid}: the two saved answers: {why} (R134 (1), R134C4-1)')
         cols = ((r.get('boot_before') or '').lower(), (r.get('boot_after') or '').lower())
         if cols != (qs[0]['boot'].lower(), qs[1]['boot'].lower()):
-            raise LogError(f"{uid}: boot columns {cols} differ from the saved answers ({qs[0]['boot']}, "
+            raise LogError(f"{uid}: boot cua dong log / boot columns {cols} differ from the saved answers ({qs[0]['boot']}, "
                            f"{qs[1]['boot']}; R134 (1))")
+        checked[uid] = tuple(qs)
+    return checked
 
 
 # ── S05 v3.37 §4.3 (B8S-3): the outcome after the clip H comparison ────────────────────────────────────────────────
@@ -1351,14 +1415,48 @@ def _finite_number(x, what: str) -> float:
     return float(x)
 
 
-def check_score_final(r: dict, path: str, ds: str) -> tuple:
+def check_drift_thresholds(cd, uid):
+    """Recompute J v6 §5; keep the old position-only rule for existing combined files."""
+    vuot, thieu = cd['vuot'], cd['thieu_H1']
+    has_v2 = any(k in cd for k in DRIFT_FIELDS)
+    if thieu:
+        if cd.get('D_H_mm') is not None or not vuot:
+            raise LogError(f'run {uid}: thieu_H1 comes with vuot true and no D_H_mm (C9D-5)')
+    if not has_v2:
+        if not thieu:
+            dh = _finite_number(cd.get('D_H_mm'), f'run {uid}: D_H_mm')
+            eps = _finite_number(cd.get('eps_H_mm'), f'run {uid}: eps_H_mm')
+            if vuot != (dh > eps):
+                raise LogError(f'run {uid}: vuot {vuot} but D_H_mm {dh} vs eps_H_mm {eps} (C9D-5)')
+        return
+    position, heading = cd.get('trang_thai_vi_tri'), cd.get('trang_thai_huong')
+    if thieu and (position, heading) != ('thieu', 'thieu'):
+        raise LogError(f'run {uid}: thieu_H1 requires both quantities to be missing')
+    missing = 'thieu' in (position, heading)
+    if cd.get('vuot_do_thieu') is not missing:
+        raise LogError(f'run {uid}: vuot_do_thieu must indicate a missing quantity')
+    if 'D_H_vi_tri_mm' in cd and cd['D_H_vi_tri_mm'] != cd.get('D_H_mm'):
+        raise LogError(f'run {uid}: D_H_vi_tri_mm differs from D_H_mm')
+    over = thieu or missing
+    for state, quantity, limit in ((position, 'D_H_mm', 'eps_H_mm'), (heading, 'D_H_huong_deg', 'eps_H_huong_deg')):
+        if state == 'so':
+            d = _finite_number(cd.get(quantity), f'run {uid}: {quantity}')
+            eps = _finite_number(cd.get(limit), f'run {uid}: {limit}')
+            over = (d > eps) or over
+        elif state != 'thieu' or cd.get(quantity) is not None:
+            raise LogError(f'run {uid}: invalid state/value for {quantity} ({state!r}, {cd.get(quantity)!r})')
+    if vuot != over:
+        raise LogError(f'run {uid}: vuot {vuot} differs from {over} by position, heading and missing data (J v6 §5)')
+
+
+def check_score_final(r: dict, path: str, ds: str, drift=None, new=False) -> tuple:
     """The output of c7_calib_drift.py gop for logged car run r, checked (command so-h and apply_so_h); returns
     (outcome after the comparison, flags, the calib_drift block). Checks:
       * the run is a car run of a campaign; outcome_h0 = its logged (provisional) outcome;
       * C9D-1: the file is under the run's results_dir and is the H0 scorer file of the run (h0_file) with only
         'outcome' and 'calib_drift' changed: a file of another run with the same outcome and gate is refused;
-      * C9D-5: vuot is computed again, D_H_mm > eps_H_mm (clip H at the end missing: no D_H_mm, vuot true); above
-        eps_H, outcome_h1 = the outcome of the kept H1 score (h1_score) and its gate, recomputed, gives it;
+      * J v6 §5: vuot is computed from position, heading and missing quantities; above a threshold or when a
+        quantity is missing with H1 present, recompute the outcome of the kept H1 score (h1_score) and its gate;
       * the outcome and flags of the file = so_h_outcome; the gate of the file (the H0 scoring) = the logged gate."""
     uid = r.get('run_uid')
     if r.get('platform') != 'HW' or r.get('campaign') not in CAMPAIGNS:
@@ -1371,6 +1469,20 @@ def check_score_final(r: dict, path: str, ds: str) -> tuple:
         vuot, thieu = cd['vuot'], cd['thieu_H1']
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise LogError(f'score_final {path!r}: not an output of c7_calib_drift.py gop ({exc})')
+    if drift is not None:
+        if not isinstance(drift, dict) or drift.get('kind') != 'c7_calib_drift' or drift.get('version') != 'c7_calib_drift_v2':
+            raise LogError(f'run {uid}: --drift must be an output of c7_calib_drift so (v2)')
+        for k in ('s0_session_sha256', 's1_session_sha256', 'D_H_mm', 'eps_H_mm', 'thieu_H1', 'vuot'):
+            if k not in cd or k not in drift or cd[k] != drift[k]:
+                raise LogError(f'run {uid}: score_final and --drift disagree in {k}')
+        for k in DRIFT_FIELDS:
+            if k in cd and cd[k] != drift.get(k):
+                raise LogError(f'run {uid}: score_final and --drift disagree in {k}')
+        if any(k not in drift for k in DRIFT_FIELDS):
+            raise LogError(f'run {uid}: --drift is missing v2 position/heading fields')
+        cd.update({k: drift[k] for k in (*DRIFT_FIELDS, 'D_H_vi_tri_mm') if k in drift})
+    elif new and cd.get('s0_session_sha256') and not any(k in cd for k in DRIFT_FIELDS):
+        raise LogError(f'run {uid}: give --drift with the original v2 comparison (gop omits the heading evidence)')
     if not isinstance(vuot, bool) or not isinstance(thieu, bool) or not set(flags) <= set(SO_H_FLAGS):
         raise LogError(f'score_final {path!r}: vuot, thieu_H1 must be true/false, flags in {SO_H_FLAGS}')
     if o0 != r.get('run_outcome'):
@@ -1388,18 +1500,11 @@ def check_score_final(r: dict, path: str, ds: str) -> tuple:
             {k: v for k, v in h0.items() if k != 'outcome'}:
         raise LogError(f'run {uid}: score_final {path!r} is not the H0 scorer file of the run ({h0p}) with only '
                        f'outcome and calib_drift added (C9D-1)')
-    if thieu:                                                                      # C9D-5
-        if cd.get('D_H_mm') is not None or not vuot:
-            raise LogError(f'run {uid}: thieu_H1 comes with vuot true and no D_H_mm (C9D-5)')
-    else:
-        dh = _finite_number(cd.get('D_H_mm'), f'run {uid}: D_H_mm')
-        eps = _finite_number(cd.get('eps_H_mm'), f'run {uid}: eps_H_mm')
-        if vuot != (dh > eps):
-            raise LogError(f'run {uid}: vuot {vuot} but D_H_mm {dh} vs eps_H_mm {eps} (C9D-5)')
+    check_drift_thresholds(cd, uid)
     if vuot and not thieu:
         h1 = cd.get('h1_score')
         if not isinstance(h1, dict) or h1.get('outcome') != o1:
-            raise LogError(f'run {uid}: above eps_H, outcome_h1 {o1!r} must be the outcome of the kept H1 score '
+            raise LogError(f'run {uid}: vuot requires an H1 score, and outcome_h1 {o1!r} must match that score '
                            f'(h1_score; C9D-5)')
         g1 = h1.get('gate_v3')                         # C9D2-1: a lost H1 may carry no gate, or null
         h1_kn = 'trang_thai_luot' in h1 and check_luoi_dict(h1, f'run {uid}: h1_score') == KHONG_NUT    # GC6-13
@@ -1451,7 +1556,13 @@ def check_score_final(r: dict, path: str, ds: str) -> tuple:
     return final, flags, cd
 
 
-def so_h(ds: str, run_uid: str, score_final: str) -> dict:
+def drift_columns(cd):
+    return {k: _num(cd.get(k)) if k.startswith(('D_', 'eps_')) else
+            ('true' if cd[k] else 'false') if k == 'vuot_do_thieu' and k in cd else cd.get(k) or ''
+            for k in DRIFT_FIELDS}
+
+
+def so_h(ds: str, run_uid: str, score_final: str, drift_file='') -> dict:
     """Command so-h: one row of SO_H for car run `run_uid` from the output of c7_calib_drift.py gop (score_final.json:
     'outcome' and the 'calib_drift' block), checked by check_score_final; any run below eps_H too (outcome kept,
     C9D-2: the row shows the comparison was made). The run must be in the log and not given before."""
@@ -1463,12 +1574,16 @@ def so_h(ds: str, run_uid: str, score_final: str) -> dict:
         raise LogError(f'run {run_uid}: the clip H comparison is for car runs of a campaign (O1 §4)')
     if any(x.get('run_uid') == run_uid for x in read_rows(os.path.join(ds, SO_H))):
         raise LogError(f'run {run_uid}: already in {SO_H} (one row per run, append only)')
-    final, flags, cd = check_score_final(r, score_final, ds)
+    drift, drift_sha = read_json_sha(drift_file, '--drift') if drift_file else (None, '')
+    if drift_file and not isinstance(drift, dict):
+        raise LogError('--drift: expected a JSON object')
+    final, flags, cd = check_score_final(r, score_final, ds, drift, new=True)
     o0, vuot = cd['outcome_h0'], cd['vuot']
     row = dict(run_uid=run_uid, outcome_tam=o0, outcome_sau=final, flags=','.join(flags),
                vuot='true' if vuot else 'false', D_H_mm=_num(cd.get('D_H_mm')),
                score_final_file=os.path.abspath(score_final), score_final_sha256=sha256_file(score_final),
-               ghi_luc=_iso(now()))
+               ghi_luc=_iso(now()), drift_file=os.path.abspath(drift_file) if drift_file else '',
+               drift_sha256=drift_sha, **drift_columns(cd))
     append_row(os.path.join(ds, SO_H), SO_H_COLS, row)
     return row
 
@@ -1513,9 +1628,17 @@ def apply_so_h(tun: List[dict], ds: str) -> List[dict]:
         if not os.path.isfile(p) or sha256_file(p) != s.get('score_final_sha256'):
             raise LogError(f"{SO_H}: run {r.get('run_uid')}: {p!r} missing or changed since so-h")
         try:                                           # C9D-1, C9D-5: the same checks as at so-h
-            final, want, cd = check_score_final(r, p, ds)
+            drift_path, drift_sha = s.get('drift_file'), s.get('drift_sha256')
+            drift = None
+            if drift_path or drift_sha:
+                drift, sha = read_json_sha(drift_path or '', 'drift_file')
+                if sha != drift_sha or not isinstance(drift, dict):
+                    raise LogError(f'{drift_path!r}: drift_file changed since so-h')
+            final, want, cd = check_score_final(r, p, ds, drift)
         except LogError as exc:
             raise LogError(f'{SO_H}: {exc}')
+        if any((s.get(k) or '') != v for k, v in drift_columns(cd).items()):
+            raise LogError(f"{SO_H}: run {r.get('run_uid')}: drift fields differ from the comparison file")
         if s.get('vuot') != ('true' if cd['vuot'] else 'false'):      # RC1-1: vuot decides the H1 scoring (apply_moc)
             raise LogError(f"{SO_H}: run {r.get('run_uid')}: vuot {s.get('vuot')!r} is not that of the score_final file")
         if (final, sorted(want)) != (s.get('outcome_sau'), sorted(flags)):
@@ -1584,7 +1707,13 @@ def confirm_block_problem(tun_after: List[dict], ds: str, campaign: str, gain_se
     to summary, not to freeze; S05 v3.40 4.3 Q1, Liam 17/11 at THESIS "Nhờ C13 thêm kiểm (Recommended)"): at least
     CONFIRM_PER_LEVEL valid runs at every level (trajectory) of the gate. tun_after: the live rows after apply_so_h
     (a row without so-h keeps its logged outcome)."""
-    conf = [r for r in tun_after if r.get('campaign') == campaign and r.get('platform') == 'HW'
+    try:
+        t_frz = _parse_t(frozen_at)
+        history = [r for r in tun_after if r.get('campaign') == campaign and r.get('stage') in TUNE_STAGES
+                   and _parse_t(r.get('wall_end') or r['wall_start']) <= t_frz]
+    except (ValueError, TypeError, KeyError) as exc:
+        return f'time stamps not readable ({exc})'
+    conf = [r for r in history if r.get('platform') == 'HW'
             and r.get('stage') == 'confirm' and r.get('gain_set_id') == gain_set]
     if not conf:
         return f'no confirm car run of {gain_set} in the log'
@@ -1598,7 +1727,7 @@ def confirm_block_problem(tun_after: List[dict], ds: str, campaign: str, gain_se
     # levels of the block)
     levels = None if levels is None else tuple(levels)          # GT3-2: an iterator is read once, used twice
     lv = set(levels) if levels is not None else {r.get('trajectory') for r in block}
-    stop = sorted(f'{k[2]}@{k[3]}' for k, n in c8b_refusals(tun_after).items()
+    stop = sorted(f'{k[2]}@{k[3]}' for k, n in c8b_refusals(history).items()
                   if k[0] == campaign and k[1] == gain_set and k[2] in lv and n > C8B_RERUNS_MAX)
     if stop:
         return (f"{gain_set}: level(s) {', '.join(stop)} stopped after {C8B_RERUNS_MAX} reruns for the C8b time check "
@@ -1621,7 +1750,6 @@ def confirm_block_problem(tun_after: List[dict], ds: str, campaign: str, gain_se
                     '(S05 4.3, 2 x |G|)')
     try:
         last = max(_parse_t(so[r['run_uid']]['ghi_luc']) for r in block if r.get('run_uid') in so)
-        t_frz = _parse_t(frozen_at)
     except (ValueError, TypeError, KeyError) as exc:
         return f'block {bid}: time stamps not readable ({exc})'
     if t_frz < last:
@@ -1865,9 +1993,12 @@ def map_key(r: dict) -> tuple:
     The stage is not in it (Codex S315-3: a run of the same gain at the same level in another HIL stage counts
     against the same reruns); the gain values are checked for agreement in map_refusals (S315-2). A figure-8
     task gives its level FIG8[task], not the speed as typed (S315-R2-1: check_task allows 1e-9 around it)."""
+    return (r.get('campaign', ''), r.get('gain_set_id', ''), *condition_key(r))
+
+
+def condition_key(r: dict) -> tuple:
     task = r.get('trajectory', '')
-    speed = repr(float(FIG8[task])) if task in FIG8 else _num_text(r.get('speed_mps'))
-    return (r.get('campaign', ''), r.get('gain_set_id', ''), task, speed)
+    return task, repr(FINAL_SPEEDS[task]) if task in FINAL_SPEEDS else _num_text(r.get('speed_mps'))
 
 
 def live_rows(tun: List[dict]) -> List[dict]:
@@ -1931,7 +2062,7 @@ def check_map_rows(tun: List[dict]) -> None:
 def final_key(r: dict) -> tuple:
     """A condition of the final session (S05 4.6), as in _final_stops."""
     return (r.get('stage', ''), r.get('campaign', ''), r.get('gain_set_id', ''), r.get('platform', ''),
-            r.get('trajectory', ''), r.get('speed_mps', ''))
+            *condition_key(r))
 
 
 def final_lost_streak(tun: List[dict], key: tuple) -> int:
@@ -2619,11 +2750,38 @@ def boot_problem(before, after) -> Optional[str]:
     return None
 
 
+def check_trial_gain(row, ds):
+    if not (row.get('campaign') in TUNED and row.get('stage') in (*TUNE_STAGES, 'hil_check')
+            and row.get('platform') in ('HW', 'HIL') and row.get('run_outcome') in VALID):
+        return
+    from s05_final_table import _want, run_gain_problem
+
+    uid = row.get('run_uid')
+    p, sha = row.get('trial_gain_file'), row.get('trial_gain_sha256')
+    if not p or not sha:
+        raise LogError(f'{uid}: judged tune run needs --gain-file (trial_gain_file / trial_gain_sha256; S05 6.3 L90)')
+    candidates = [p] if os.path.isabs(p) else [os.path.join(ds, p), p]
+    try:
+        gain = next((f for f in candidates if os.path.isfile(f) and sha256_file(f) == sha), None)
+        if gain is None:
+            raise LogError(f'{uid}: trial gain file {p!r} missing or SHA-256 differs')
+        want = _want(gain, row.get('controller'))
+    except (OSError, ValueError) as exc:
+        raise LogError(f'{uid}: {exc}') from exc
+    rd = _results_dir(row, ds)
+    if not rd:
+        raise LogError(f'{uid}: results_dir missing, cannot verify #gain against the trial gain file')
+    why = run_gain_problem(os.path.join(rd, 'esp32.csv'), want, expected_boot=row.get('boot_before'),
+                           exact_first_seq=True)
+    if why:
+        raise LogError(f'{uid}: {why} (S05 6.3 L90): hong_he_do if gain evidence is missing or differs')
+
+
 def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Optional[float] = None,
         fail_cause: str = '', results_dir: str = '', notes: str = '', gate: Optional[dict] = None,
         gate_sha256: str = '', boot_before: Optional[str] = None, boot_after: Optional[str] = None,
         query_problem: Optional[str] = None, queries: Optional[tuple] = None, gate_file=None,
-        c8b_gio: Optional[str] = None, gate_khong_nut: bool = False, gate_path: str = '') -> dict:
+        c8b_gio: Optional[str] = None, gate_khong_nut: bool = False, gate_path: str = '', gain_file: str = '') -> dict:
     """gate_khong_nut (F11): the scorer file (gate_sha256) is a c8b_luoi file of a run where no node could be scored
     (read_luoi_khong_nut): only chua_ket_luan on the floor, logged with fail cause KHONG_NUT. GC6-12: end reads that
     file itself (gate_path, its sha256 = gate_sha256) and needs the time file c8b_gio (under results_dir, c8b_gio_v1 of
@@ -2733,7 +2891,7 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     row.update({k: _fmt(v, 0) for k, v in segment_totals(run['segments']).items()})
     row.update(run_outcome=outcome, wall_end=_iso(t), fail_cause=fail_cause, results_dir=results_dir)
     if completed is not None:
-        row['completed'] = str(int(completed))
+        row['completed'] = str(completed)
     if e_perp_max is not None:
         row['e_perp_max_m'] = f'{e_perp_max:.4f}'
     if gate is not None:
@@ -2752,6 +2910,14 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
         row['notes'] = (row.get('notes', '') + ' ' + notes).strip()
     if c8b_sha:
         row['c8b_gio_sha256'] = c8b_sha
+    if gain_file:
+        try:
+            row.update(trial_gain_file=os.path.abspath(gain_file), trial_gain_sha256=sha256_file(gain_file))
+        except OSError as exc:
+            raise LogError(f'--gain-file {gain_file!r}: {exc}') from exc
+    check_account_row(row, TUNING)
+    if stage == 'final' and row.get('campaign') in TUNED:
+        check_final_freeze(row, freeze_rows(ds))
     # Codex S315-5: the log as it will be, this row included, checked before the row is written
     after = live_rows(read_rows(os.path.join(ds, TUNING))) + [row]
     check_map_rows([row])
@@ -2768,6 +2934,7 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
             map_refusals(after)
         except LogError as exc:
             raise LogError(f'the run is not logged (the log changed since begin?): {exc}')
+    check_trial_gain(row, ds)
     append_row(os.path.join(ds, TUNING), TUNING_COLS, row)
     os.remove(_open_path(ds))
     return row
@@ -2826,6 +2993,7 @@ def cancel(ds: str) -> dict:
                'gio': f'{active / 3600:.4f}', 'chien_dich': row['campaign'],
                'ghi_chu': f"rq3_log cancel truoc buoc run: {row['run_uid']} ({row['trajectory']} {row['speed_mps']}); "
                           f"gio = tong cac buoc da ghi"}
+        check_account_row(eff, EFFORT)
         append_row(os.path.join(ds, EFFORT), EFFORT_COLS, eff)
         run['effort_row'] = eff
     os.remove(_open_path(ds))
@@ -2833,44 +3001,108 @@ def cancel(ds: str) -> dict:
 
 
 # ── rows not tied to one live run ─────────────────────────────────────────
-def machine(ds: str, campaign: str, controller: str, script_run_id: str, results_dir: str, n_sim_evals: int,
-            t_machine_s: float, wall_start: str, wall_end: str, platform: str = 'SIM', stage: str = 'script',
-            session: str = 'MACHINE', notes: str = '', **active) -> dict:
-    """Summary row of a script run (S5-23 v2): one per (controller, account); n_sim_evals and
-    t_machine_s are this row's part, the rows of one script run add up to the run. Stage `script`
-    by default (S05 v3.7 §3.3, A-R2-4: an `explore` row would be left out of T and N, §4.8)."""
+def check_machine_rows(rows):
+    seen = set()
+    kinds = {}
+    for r in rows:
+        sid = r.get('script_run_id')
+        if not sid:
+            continue
+        c, ctrl, kind = r.get('campaign'), r.get('controller'), r.get('script_kind') or ''
+        accounts = {'': CAMPAIGNS, 'S03': ('B-chung', 'RQ2'), 'S3': ('RQ2',)}
+        if (not ctrl or c not in accounts.get(kind, ()) or
+                (kind and (r.get('platform'), r.get('stage')) != ('SIM', 'script'))):
+            raise LogError(f'{sid}: invalid controller/account for script {kind!r} ({ctrl!r}, {c!r})')
+        if _f(r.get('n_sim_diagnostic')) > _f(r.get('n_sim_evals')):
+            raise LogError(f'{sid}: diagnostic count exceeds actual count')
+        key = sid, ctrl, c
+        if key in seen:
+            raise LogError(f'{sid}: duplicate script row for {ctrl}, {c}')
+        if kinds.setdefault(sid, kind) != kind:
+            raise LogError(f'{sid}: inconsistent script_kind')
+        seen.add(key)
+
+
+def _machine_row(it, campaign, controller, script_run_id, results_dir, n_sim_evals, t_machine_s, wall_start,
+                 wall_end, platform, stage, session, notes, script_kind, n_sim_diagnostic, active):
     if campaign not in CAMPAIGNS:
         raise LogError(f'--campaign {campaign!r}: one of {CAMPAIGNS}')
-    if stage not in STAGES:
-        raise LogError(f'--stage one of {STAGES}')
-    it = next_iter_no(ds, session)
+    if stage not in STAGES or platform not in PLATFORMS:
+        raise LogError(f'--stage one of {STAGES}, --platform one of {PLATFORMS}')
+    if not script_run_id:
+        raise LogError('--script-run-id is required')
     row = {'session_id': session, 'iter_no': str(it), 'run_uid': f'{session}:{it}', 'date': wall_start[:10],
            'platform': platform, 'controller': controller, 'campaign': campaign, 'stage': stage,
-           'script_run_id': script_run_id, 'results_dir': results_dir, 'n_sim_evals': str(int(n_sim_evals)),
-           't_machine_s': _fmt(t_machine_s, 0), 'wall_start': wall_start, 'wall_end': wall_end, 'notes': notes}
+           'script_run_id': script_run_id, 'results_dir': results_dir, 'n_sim_evals': str(n_sim_evals),
+           'script_kind': script_kind, 'n_sim_diagnostic': str(n_sim_diagnostic),
+           't_machine_s': str(t_machine_s), 'wall_start': wall_start, 'wall_end': wall_end, 'notes': notes}
     for k in STEPS:
-        v = active.get(f't_{k}_s')
-        if v is not None:
-            row[f't_{k}_s'] = _fmt(float(v), 0)
-    append_row(os.path.join(ds, TUNING), TUNING_COLS, row)
+        field = f't_{k}_s'
+        if active.get(field) is not None:
+            row[field] = str(active[field])
+    check_account_row(row, TUNING)
     return row
+
+
+def machine(ds: str, campaign: str, controller: str, script_run_id: str, results_dir: str, n_sim_evals: int,
+            t_machine_s: float, wall_start: str, wall_end: str, platform: str = 'SIM', stage: str = 'script',
+            session: str = 'MACHINE', notes: str = '', script_kind: str = '', n_sim_diagnostic: int = 0,
+            **active) -> dict:
+    """Record one already allocated row of a script run."""
+    row = _machine_row(next_iter_no(ds, session), campaign, controller, script_run_id, results_dir, n_sim_evals,
+                       t_machine_s, wall_start, wall_end, platform, stage, session, notes, script_kind,
+                       n_sim_diagnostic, active)
+    path = os.path.join(ds, TUNING)
+    check_machine_rows(live_rows(read_rows(path)) + [row])
+    append_row(path, TUNING_COLS, row)
+    return row
+
+
+def machine_phases(ds, script_kind, script_run_id, results_dir, phases, notes=''):
+    """Allocate each elapsed phase by actual counts, then write one row per controller and account."""
+    totals = {}
+    for account, start, end_, pid, ladrc, pid_diag, ladrc_diag in phases:
+        try:
+            t0, t1 = _parse_t(start), _parse_t(end_)
+            elapsed = (t1 - t0).total_seconds()
+        except (ValueError, TypeError) as exc:
+            raise LogError(f'{script_run_id}: invalid phase interval {start!r} to {end_!r}') from exc
+        _nonnegative(elapsed, 'phase elapsed seconds')
+        for v in (pid, ladrc, pid_diag, ladrc_diag):
+            _nonnegative(v, 'phase count', count=True)
+        try:
+            pid, ladrc, pid_diag, ladrc_diag = map(int, (pid, ladrc, pid_diag, ladrc_diag))
+        except (ValueError, TypeError) as exc:
+            raise LogError('phase counts are required') from exc
+        for ctrl, n, diag in (('PID', pid, pid_diag), ('LADRC', ladrc, ladrc_diag)):
+            if diag > n:
+                raise LogError('phase diagnostic count exceeds actual count')
+            total = totals.setdefault((account, ctrl), [0, 0, 0.0, t0, t1])
+            total[0] += n
+            total[1] += diag
+            total[2] += elapsed * (n / (pid + ladrc) if pid + ladrc else 0.5)
+            total[3], total[4] = min(total[3], t0), max(total[4], t1)
+    path = os.path.join(ds, TUNING)
+    existing = read_rows(path)
+    session = 'MACHINE'
+    it = next_iter_no(ds, session)
+    rows = [_machine_row(it + i, c, ctrl, script_run_id, results_dir, n, seconds, t0.isoformat(), t1.isoformat(),
+                         'SIM', 'script', session, notes, script_kind, diag, {})
+            for i, ((c, ctrl), (n, diag, seconds, t0, t1)) in enumerate(totals.items())]
+    if not rows:
+        raise LogError('at least one phase is required')
+    if any(r.get('script_run_id') == script_run_id for r in existing):
+        raise LogError(f'{script_run_id}: duplicate script import')
+    check_machine_rows(rows)
+    if os.path.exists(path) and _header(path) != TUNING_COLS:
+        raise LogError(f'{TUNING}: header differs from S05 §6; run "rq3_log.py migrate" first')
+    _write_all(path, TUNING_COLS, existing + rows)
+    return rows
 
 
 def effort(ds: str, date: str, start: str, end_: str, campaign: str = '', khoan: str = '', nhan: str = '',
            ghi_chu: str = '', **extra) -> dict:
     """One row of m7_dev_effort_log.csv from the times Liam reports (never made up)."""
-    if bool(campaign) == bool(khoan):
-        raise LogError('exactly one of --campaign, --khoan (S05 §6.2)')
-    if campaign and campaign not in CAMPAIGNS or khoan and khoan not in KHOAN:
-        raise LogError(f'--campaign one of {CAMPAIGNS}, --khoan one of {KHOAN}')
-    if nhan not in ('', 'hoc'):
-        raise LogError('--nhan hoc or nothing')
-    if nhan == 'hoc' and not ghi_chu:
-        raise LogError('a hoc row names what was read (S05 §3.1)')
-    if nhan == 'hoc' and is_clip_h(ghi_chu):                    # RS1-1: clip H filming is work in the caps
-        raise LogError(f'ghi_chu {CLIP_H_NOTE}: clip H filming is campaign work, not hoc (S05 v3.44 §3.2 H6)')
-    if nhan == 'hoc' and not ghi_chu.startswith(MANUAL):
-        ghi_chu = f'{MANUAL} {ghi_chu}'                 # EA-7: times typed, not stamped by the script
     t0 = dt.datetime.fromisoformat(f'{date}T{start}')
     t1 = dt.datetime.fromisoformat(f'{date}T{end_}')
     if t1 <= t0:
@@ -2880,6 +3112,9 @@ def effort(ds: str, date: str, start: str, end_: str, campaign: str = '', khoan:
     row = {'ngay': date, 'bat_dau': start, 'ket_thuc': end_, 'gio': f'{(t1 - t0).total_seconds() / 3600:.4f}',
            'chien_dich': campaign, 'khoan': khoan, 'nhan': nhan, 'ghi_chu': ghi_chu}
     row.update({k: v for k, v in extra.items() if v not in (None, '')})
+    check_account_row(row, EFFORT)
+    if nhan == 'hoc' and not row['ghi_chu'].startswith(MANUAL):
+        row['ghi_chu'] = f"{MANUAL} {row['ghi_chu']}"     # EA-7: times typed, not stamped by the script
     append_row(os.path.join(ds, EFFORT), EFFORT_COLS, row)
     return row
 
@@ -2900,10 +3135,7 @@ def hoc_start(ds: str, campaign: str, ghi_chu: str) -> dict:
     """EA-7 (S05 §3.1 R-2): open a hoc segment; the script stamps its start (PC clock)."""
     if campaign not in TUNED:
         raise LogError(f'--campaign one of {TUNED} (hoc of a campaign, S05 §3.1)')
-    if not ghi_chu:
-        raise LogError('a hoc row names what was read (S05 §3.1)')
-    if is_clip_h(ghi_chu):                                       # RS1-1
-        raise LogError(f'ghi_chu {CLIP_H_NOTE}: clip H filming is campaign work, not hoc (S05 v3.44 §3.2 H6)')
+    check_account_row(dict(chien_dich=campaign, nhan='hoc', ghi_chu=ghi_chu), EFFORT)
     if _load_hoc(ds):
         raise LogError('a hoc segment is open: "hoc-end" first (one segment at a time)')
     if _load_open(ds):
@@ -2924,6 +3156,7 @@ def hoc_end(ds: str, ghi_chu: str = '') -> dict:
     row = {'ngay': t0.date().isoformat(), 'bat_dau': t0.strftime('%H:%M:%S'), 'ket_thuc': t1.strftime('%H:%M:%S'),
            'gio': f'{(t1 - t0).total_seconds() / 3600:.4f}', 'chien_dich': seg['campaign'], 'nhan': 'hoc',
            'ghi_chu': (seg['ghi_chu'] + (' ' + ghi_chu if ghi_chu else '')).strip()}
+    check_account_row(row, EFFORT)
     append_row(os.path.join(ds, EFFORT), EFFORT_COLS, row)
     os.remove(_hoc_path(ds))
     return row
@@ -2936,9 +3169,11 @@ def hwfail(ds: str, date: str, session: str, campaign: str, platform: str, what:
                        'time is in no run (S05 v3.7 §3.3, EA-1)')
     if campaign not in CAMPAIGNS or cause not in CAUSES:
         raise LogError(f'--campaign one of {CAMPAIGNS}, --cause one of {CAUSES}')
+    _nonnegative(fix_h, 'gio_sua')
     row = {'ngay': date, 'session_id': session, 'chien_dich': campaign, 'nen_tang': platform, 'thu_hong': what,
            'nguyen_nhan': cause, 'gio_sua': f'{fix_h:.2f}', 'iter_no': iter_no, 'ghi_chu': notes}
     row.update({k: v for k, v in extra.items() if v not in (None, '')})
+    check_account_row(row, HWFAIL)
     append_row(os.path.join(ds, HWFAIL), HWFAIL_COLS, row)
     return row
 
@@ -2979,9 +3214,18 @@ def freeze(ds: str, campaign: str, stop_reason: str, gain_set: str, gain_file: s
         # L81 (Liam 11/11): .gitattributes keeps 05_DATA/**/*gain_*.json byte-exact (-text), so the
         # sha256 still matches after a checkout; another name would get its line ends converted
         raise LogError(f'--gain-file {base!r}: name must contain "gain_" and end in .json (.gitattributes L81)')
-    if any(r['campaign'] == campaign for r in read_rows(os.path.join(ds, FREEZE))):
+    if campaign in freeze_rows(ds):
         raise LogError(f'{campaign} already frozen')
+    from s05_final_table import _want
+    try:
+        _want(gain_file, campaign.split('-')[-1])
+    except ValueError as exc:
+        raise LogError(str(exc)) from exc
     at = at or _iso(now())
+    try:
+        _parse_t(at)
+    except (ValueError, TypeError) as exc:
+        raise LogError(f'--at {at!r}: invalid frozen_at') from exc
     if stop_reason == 'khoi_xac_nhan_dat':                                         # C9D-4
         why = confirm_block_problem(apply_after(live_rows(read_rows(os.path.join(ds, TUNING))), ds), ds, campaign,
                                     gain_set, at)
@@ -2994,6 +3238,32 @@ def freeze(ds: str, campaign: str, stop_reason: str, gain_set: str, gain_file: s
     return row
 
 
+def freeze_rows(ds):
+    rows = {}
+    for r in read_rows(os.path.join(ds, FREEZE)):
+        c = r['campaign']
+        if c in rows:
+            raise LogError(f'{FREEZE}: {c} is frozen twice')
+        rows[c] = r
+    return rows
+
+
+def check_final_freeze(row, freezes):
+    c, uid = row.get('campaign'), row.get('run_uid')
+    f = freezes.get(c)
+    if not f:
+        raise LogError(f'{uid}: final run of {c} needs a row in {FREEZE}')
+    gs = f.get('gain_set_id')
+    if not gs or row.get('gain_set_id') != gs:
+        raise LogError(f"{uid}: final run of {c} with gain set {row.get('gain_set_id')}, frozen is {gs}")
+    try:
+        after = _parse_t(row['wall_start']) > _parse_t(f['frozen_at'])
+    except (KeyError, ValueError, TypeError) as exc:
+        raise LogError(f'{uid}: invalid wall_start or frozen_at ({exc})') from exc
+    if not after:
+        raise LogError(f"{uid}: final run must start after frozen_at {f['frozen_at']}")
+
+
 # ── summary (S05 §6.3) ─────────────────────────────────────────────────────
 SUMMARY_ROWS = ('A-PID', 'A-LADRC', 'B-PID', 'B-LADRC', 'B-chung', 'RQ2-INIT-PID', 'RQ2-INIT-LADRC', 'RQ2',
                 'C_chung', 'T_H')
@@ -3001,10 +3271,11 @@ SUMMARY_HEAD = ['campaign', 'T_operator_h', 'T_operator_no_hoc_h', 'T_machine_h'
                 'N_HW', 'N_hong', 'T_sua_h', 'stop_reason', 'stop_cause', 'stop_reason_check', 'cap_hit',
                 'T_tune_no_hoc_h', 'N_HW_tune', 'gate_result', 'gate_sha256', 'T_wall_end_src', 'B_chung_share',
                 'B_chung_after_freeze_h', 'hoc_nhap_tay_n', 'explore_T_operator_h', 'explore_N_SIM',
-                'explore_N_HIL', 'explore_N_HW', 'so_h_chua_n', 'moc_cho_n', 'moc_ha_n', 'T_clip_h_h']
+                'explore_N_HIL', 'explore_N_HW', 'so_h_chua_n', 'moc_cho_n', 'moc_ha_n', 'T_clip_h_h',
+                'T_12b_h', 'T_operator_no_12b_h', 'N_SIM_diagnostic']
 VALID = ('dat', 'khong_dat', 'chua_ket_luan')
 _COUNT = {'dat': 'pass', 'khong_dat': 'fail', 'chua_ket_luan': 'inconclusive', 'hong_he_do': 'invalid'}
-_SAME_CONDITION = ('campaign', 'platform', 'stage', 'trajectory', 'speed_mps', 'gain_set_id')
+_SAME_CONDITION = ('stage', 'campaign', 'gain_set_id', 'platform', 'trajectory', 'speed_mps')
 
 
 def read_gate_file(path: str, allow_fake: bool = False):
@@ -3082,7 +3353,7 @@ def _check_replacements(tun: List[dict]) -> None:
         old = by_uid.get(ref)
         if not old or old.get('run_outcome') != 'hong_he_do':
             raise LogError(f"{r.get('run_uid')}: replaces_run_uid {ref} is not a hong_he_do run (§4.7)")
-        diff = [k for k in _SAME_CONDITION if old.get(k, '') != r.get(k, '')]
+        diff = [k for k, a, b in zip(_SAME_CONDITION, final_key(old), final_key(r)) if a != b]
         if diff:
             raise LogError(f"{r.get('run_uid')}: replaces {ref} with another {', '.join(diff)} (a replacement "
                            f"runs the same condition, §4.3, §4.6)")
@@ -3100,8 +3371,7 @@ def _final_stops(tun: List[dict]) -> set:
     groups = defaultdict(list)
     for r in tun:
         if r.get('stage') in ('final', 'final_hil'):
-            groups[(r['stage'], r.get('campaign', ''), r.get('gain_set_id', ''), r.get('platform', ''),
-                    r.get('trajectory', ''), r.get('speed_mps', ''))].append(r)
+            groups[final_key(r)].append(r)
     stopped = set()
     for key, runs in groups.items():
         # S315-R2-3: the order of the log rows (as map_refusals, S315-4, and final_lost_streak), not wall_start
@@ -3115,6 +3385,19 @@ def _final_stops(tun: List[dict]) -> set:
             lost = lost + 1 if r.get('run_outcome') == 'hong_he_do' else 0
             if lost >= FINAL_LOST_N:
                 stopped.add(key)
+    return stopped
+
+
+def check_finals(tun):
+    _check_replacements(tun)
+    stopped = _final_stops(tun)
+    valid = defaultdict(int)
+    for r in tun:
+        if r.get('stage') in ('final', 'final_hil') and not r.get(RETRO_FLAG) and r.get('run_outcome') in VALID:
+            key = final_key(r)
+            valid[key] += 1
+            if valid[key] > FINAL_N:
+                raise LogError(f'{key[2] or key[1]} {key[0]}_{key[4]}@{key[5]}: more than {FINAL_N} valid runs (§4.7)')
     return stopped
 
 
@@ -3144,9 +3427,8 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
       * so_h_chua_n (C9D-2): judged car runs of the campaign without their clip H comparison (so-h);
       * moc_cho_n, moc_ha_n (C8b v3 §5, apply_moc): car runs waiting for a file / lowered by a check; they stay in
         N_HW, N_HW_tune and the time like any chua_ket_luan run (S05 v3.44 §4.3 H4-H5);
-      * T_clip_h_h (S05 v3.44 §3.2 H6): hours of the effort rows whose ghi_chu starts with 'clip_h' (clip H filming
-        of the floor sessions); they are in T_operator and T_tune like any effort row, given apart so that §6.4
-        reports T without clip H too;
+      * T_clip_h_h and T_12b_h (§3.2): tagged floor effort in T_operator and in the hour cap.
+        T_operator_no_12b_h excludes the recorded 12b hours.
       * final (§4.7 [v3.6]): final_<task>@<speed>_* by run_outcome (hong_he_do out of n_valid);
         final_hil rows are account RQ2 (§4.6) and their final_hil_<task>@<speed>_* columns go on the row
         of the campaign whose frozen gain_set_id they carry, or of RQ2-INIT-* by the prefix of the id;
@@ -3185,7 +3467,7 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
         so_h_open[r.get('campaign', '')] += 1
     eff = read_rows(os.path.join(ds, EFFORT))
     hw = read_rows(os.path.join(ds, HWFAIL))
-    frz = {r['campaign']: r for r in read_rows(os.path.join(ds, FREEZE))}
+    frz = freeze_rows(ds)
     by_gain = {}
     for r in frz.values():
         gs = r.get('gain_set_id', '')
@@ -3201,6 +3483,7 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
     unassigned = 0
 
     for r in tun:
+        check_account_row(r, TUNING, legacy=True)
         if r.get('stage') == 'final_hil' and r.get('campaign') != 'RQ2':
             raise LogError(f"{r.get('run_uid')}: a final_hil run is account RQ2 (§4.6)")
         if r.get('platform') in ('HIL', 'HW'):
@@ -3208,10 +3491,13 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
                 check_task(r.get('trajectory', ''), r.get('speed_mps', ''))
             except LogError as exc:
                 raise LogError(f"{r.get('run_uid')}: {exc}")
-    _check_replacements(tun)
+    check_machine_rows(tun)
+    stopped = check_finals(tun)
     check_gate_rows(raw, gate_file)                 # GV3-1, GV3-R2-1: gate rows recomputed (logged outcome)
     check_query_rows(raw, ds)                       # R134 (1): the two saved answers read again
-    stopped = _final_stops(tun)
+    for r in tun:
+        if r.get('stage') == 'final' and r.get('campaign') in TUNED:
+            check_final_freeze(r, frz)
     check_map_rows(tun)                             # S05 v3.15 4.5 step 2 (Codex S315-1)
     check_c8b_rows(tun)                             # O1 v11.37 D1, S05 v3.43 D3
     check_khong_nut_rows(tun, ds)                   # GC6-12, GC7-4
@@ -3222,6 +3508,8 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
             if n > C8B_RERUNS_MAX:
                 c8b_rep[k[0]]['stopped'].append(f'{k[1]} {k[2]}@{k[3]}')
     map_n = map_refusals(tun)                       # refused mappings, levels stopped
+    for r in raw:
+        check_trial_gain(r, ds)
     map_rep = defaultdict(lambda: {'n': 0, 'stopped': []})
     for k, n in map_n.items():
         if not n:
@@ -3262,6 +3550,7 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
         act, mach = _active_s(r), _f(r.get('t_machine_s'))
         plat = r.get('platform')
         n_sim = (_f(r.get('n_sim_evals')) if r.get('n_sim_evals', '') != '' else 1.0) if plat == 'SIM' else 0.0
+        diag = _f(r.get('n_sim_diagnostic'))
         targets = b_split(c, r.get('controller'))
         if stage == 'explore':                          # S05 v3.7 §4.8: reported apart only
             for tgt, share in targets:
@@ -3274,6 +3563,7 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
             add('B-chung', 'T_noh_s', act)
             add('B-chung', 'T_mach_s', mach)
             add('B-chung', 'N_SIM', n_sim)
+            add('B-chung', 'N_SIM_diagnostic', diag)
             for t in (t0, t1):
                 if t:
                     times['B-chung'].append(t)
@@ -3289,6 +3579,7 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
                     add(tgt, 'Bc_after_s', act, share)
             if plat == 'SIM':
                 add(tgt, 'N_SIM', n_sim, share if c != 'B-chung' else 1.0)
+                add(tgt, 'N_SIM_diagnostic', diag, share)
             elif plat == 'HIL':
                 add(tgt, 'N_HIL', 1.0)
             elif plat == 'HW':
@@ -3301,13 +3592,11 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
         if stage in ('final', 'final_hil') and r.get(RETRO_FLAG):     # S05 v3.38 4.3: time, N_HW above only
             finals[c][f'{RETRO_FLAG}_n'] += 1
         elif stage in ('final', 'final_hil'):
-            task, o, sp = r.get('trajectory', ''), r.get('run_outcome', ''), r.get('speed_mps', '')
+            task, sp = condition_key(r)
+            o = r.get('run_outcome', '')
             gs = r.get('gain_set_id', '')
             if stage == 'final':
                 home, cond = c, f"final_{task}@{sp}"
-                frozen_gs = (frz.get(c) or {}).get('gain_set_id', '')
-                if gs and frozen_gs and gs != frozen_gs:
-                    raise LogError(f"{r.get('run_uid')}: final run of {c} with gain set {gs}, frozen is {frozen_gs}")
                 final_tasks[c][task].append(o)
             else:
                 owner = gain_owner(gs) if gs else ''
@@ -3322,35 +3611,30 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
             f = finals[home]
             if o in VALID:
                 f[f'{cond}_n_valid'] += 1
-                if f[f'{cond}_n_valid'] > FINAL_N:
-                    raise LogError(f'{home} {cond}: more than {FINAL_N} valid runs (§4.7)')
             f[f'{cond}_' + _COUNT.get(o, 'invalid')] += 1
-            key = (stage, c, gs, r.get('platform', ''), task, sp)
-            if key in stopped:
+            if final_key(r) in stopped:
                 f[f'{cond}_stopped_n3'] = 1
 
     for r in eff:
+        check_account_row(r, EFFORT, legacy=True)
         c, k = r.get('chien_dich', ''), r.get('khoan', '')
         if not c and not k:
             continue                       # rows before S05 §6.2 (no account): not in any line
         h = _f(r.get('gio')) * 3600
         hoc = r.get('nhan') == 'hoc'
         t, t_end = _effort_span(r)
-        clip_h = is_clip_h(r.get('ghi_chu', ''))                 # S05 v3.44 H6: in T and the caps, also apart
-        if clip_h and hoc:                                        # RS1-1: a row typed into the CSV by hand
-            raise LogError(f"{EFFORT}: row {r.get('ngay')} {r.get('bat_dau')}: a clip_h row cannot be hoc "
-                           '(S05 v3.44 §3.2 H6: clip H filming counts in the hour cap)')
+        floor_work = floor_effort(r.get('ghi_chu', ''))
         if c == 'B-chung':
             add('B-chung', 'T_op_s', h)
             if not hoc:
                 add('B-chung', 'T_noh_s', h)
-            if clip_h:
-                add('B-chung', 'clip_h_s', h)
+            if floor_work:
+                add('B-chung', f'{floor_work}_s', h)
         targets = b_split(c) if c else [(k, 1.0)]
         for tgt, share in targets:
             add(tgt, 'T_op_s', h, share)
-            if clip_h:
-                add(tgt, 'clip_h_s', h, share)
+            if floor_work:
+                add(tgt, f'{floor_work}_s', h, share)
             if hoc:
                 if r.get('ghi_chu', '').startswith(MANUAL):
                     add(tgt, 'hoc_manual', 1.0)
@@ -3365,6 +3649,7 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
                 times[tgt].append(t)
 
     for r in hw:
+        check_account_row(r, HWFAIL, legacy=True)
         c = r.get('chien_dich', '')
         if not c:
             continue
@@ -3433,7 +3718,7 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
                'stop_reason_check': check, 'cap_hit': '+'.join(cap),
                'T_tune_no_hoc_h': _fmt(a.get('T_tune_s', 0) / 3600, 3),
                'N_HW_tune': str(int(a.get('N_HW_tune', 0))), 'gate_result': gres,
-               'gate_sha256': gate_sha256 if gres else '', 'T_wall_end_src': src,
+               'gate_sha256': gate_sha256 if c in TUNED or gres else '', 'T_wall_end_src': src,
                'B_chung_share': 'unsplit total' if c == 'B-chung' else '',
                'B_chung_after_freeze_h': _fmt(a.get('Bc_after_s', 0) / 3600, 3) if c in ('B-PID', 'B-LADRC') else '',
                'hoc_nhap_tay_n': str(int(a.get('hoc_manual', 0))),
@@ -3441,7 +3726,10 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
                'explore_N_SIM': str(int(round(a.get('X_N_SIM', 0)))), 'explore_N_HIL': str(int(a.get('X_N_HIL', 0))),
                'explore_N_HW': str(int(a.get('X_N_HW', 0))), 'so_h_chua_n': str(so_h_open.get(c, 0)),
                'moc_cho_n': str(moc_cho.get(c, 0)), 'moc_ha_n': str(moc_ha.get(c, 0)),
-               'T_clip_h_h': _fmt(a.get('clip_h_s', 0) / 3600, 3)}
+               'T_clip_h_h': _fmt(a.get('clip_h_s', 0) / 3600, 3),
+               'T_12b_h': _fmt(a.get('12b_s', 0) / 3600, 3),
+               'T_operator_no_12b_h': _fmt((a.get('T_op_s', 0) - a.get('12b_s', 0)) / 3600, 3),
+               'N_SIM_diagnostic': str(int(a.get('N_SIM_diagnostic', 0)))}
         row.update({k: str(v) for k, v in sorted(finals.get(c, {}).items())})
         if c in map_rep:                            # extra columns, only for a campaign with refused mappings
             row['hil_map_refused_n'] = str(map_rep[c]['n'])
@@ -3662,7 +3950,8 @@ def demo(out_dir: str, seed: int = 1, levels=('O1-F05',)) -> List[dict]:
                 extra['frames_sha256'] = sha256_file(fake_frames(d, name))
             qp = fr.write_final_run(d, platform, gain, score_extra=extra)
             sp = os.path.join(d, 'score.json')
-            kw = dict(results_dir=d, gate=read_gate_json(sp), gate_sha256=sha256_file(sp), gate_file=gf)
+            kw = dict(results_dir=d, gate=read_gate_json(sp), gate_sha256=sha256_file(sp), gate_file=gf,
+                      gain_file=gfile)
             if ask:
                 kw['queries'] = tuple(glc.read_query(p) for p in qp)
             return kw
@@ -3670,6 +3959,7 @@ def demo(out_dir: str, seed: int = 1, levels=('O1-F05',)) -> List[dict]:
         def tick(s):
             clock[0] += dt.timedelta(seconds=s)
 
+        gfile = fr.write_gain_file(os.path.join(out_dir, 'FAKE_gain_G00.json'), gain)
         clock[0] -= dt.timedelta(minutes=30)
         hoc_start(out_dir, 'A-PID', 'FAKE: doc huong dan tune')     # stamps by the script (EA-7)
         tick(1800)
@@ -3702,13 +3992,25 @@ def demo(out_dir: str, seed: int = 1, levels=('O1-F05',)) -> List[dict]:
         tien_de(out_dir, 'FAKE-A1', fake_tien_de(
             os.path.join(out_dir, 'FAKE_moc', 'tien_de_FAKE-A1.json'), 'FAKE-A1', a1[0]['date'],
             [(f'a1_{k + 1}', os.path.join(run_dir(f'a1_{k + 1}'), 'frames.csv')) for k in range(len(a1))], moc_common))
-        gfile = fr.write_gain_file(os.path.join(out_dir, 'FAKE_gain_G00.json'), gain)   # gain_send file format
         freeze(out_dir, 'A-PID', 'khong_du_luot_xac_nhan', 'A-PID/G00', gfile, at=_iso(clock[0]),
                notes='FAKE')
-        machine(out_dir, 'B-chung', 'PID', 'FAKE-S03', 'results/S03/FAKE', 2739, 5400, _iso(clock[0]),
-                _iso(clock[0] + dt.timedelta(seconds=5400)), t_setup_s=600)
-        machine(out_dir, 'B-chung', 'LADRC', 'FAKE-S03', 'results/S03/FAKE', 2739, 5400, _iso(clock[0]),
-                _iso(clock[0] + dt.timedelta(seconds=5400)))
+
+        def phase(account, start, end_, pid, ladrc, pid_diag=0, ladrc_diag=0):
+            return (account, (clock[0] + dt.timedelta(seconds=start)).isoformat(),
+                    (clock[0] + dt.timedelta(seconds=end_)).isoformat(), pid, ladrc, pid_diag, ladrc_diag)
+
+        machine_phases(out_dir, 'S03', 'FAKE-S03', 'results/S03/FAKE', [
+            phase('B-chung', 0, 900, 100, 200),             # overlapping sweep: a single 15-minute interval
+            phase('B-chung', 900, 901, 0, 0),               # aborted before the first run (bo)
+            phase('B-chung', 901, 1501, 50, 100, 1, 2),   # replacement S0
+            phase('B-chung', 1501, 3901, 90, 120, 3, 1),  # screening
+            phase('B-chung', 3901, 9301, 2313, 2313),     # 257 design points per controller
+            phase('RQ2', 9301, 9901, 126, 126),           # axis
+            phase('RQ2', 9901, 10801, 300, 300),         # test set
+        ], 'FAKE: quet, S0 bo va thay, sang loc, thiet ke, truc, tap kiem')
+        machine_phases(out_dir, 'S3', 'FAKE-S3', 'results/S04/FAKE/doi_chung_s3', [
+            phase('RQ2', 10801, 12601, 1000, 1000, 1, 2),
+        ], 'FAKE: doi chung S3')
         effort(out_dir, '2026-11-20', '13:00', '14:00', campaign='B-chung', ghi_chu='FAKE: doc S03 chung')
         effort(out_dir, '2026-11-20', '14:00', '14:30', khoan='C_chung', ghi_chu='FAKE: script video')
         tick(7200)
@@ -3787,6 +4089,7 @@ def main(argv=None) -> int:
                    'the level (O1 v11.33); needed when the scorer used it')
     e.add_argument('--query-before', default='', help='gain_send.py --query output just before the run (R134 (b))')
     e.add_argument('--query-after', default='', help='gain_send.py --query output just after the run (R134 (b))')
+    e.add_argument('--gain-file', default='', help='trial gain file of this tune run (S05 §6.3 L90)')
     for name in ('fail-cause', 'results-dir', 'notes'):
         e.add_argument('--' + name, default='')
     m = sub.add_parser('machine')
@@ -3794,11 +4097,20 @@ def main(argv=None) -> int:
         m.add_argument('--' + name, required=True)
     m.add_argument('--n-sim-evals', type=int, required=True)
     m.add_argument('--t-machine-s', type=float, required=True)
+    m.add_argument('--n-sim-diagnostic', type=int, default=0)
+    m.add_argument('--script-kind', choices=('S03', 'S3'), default='')
     m.add_argument('--platform', default='SIM', choices=PLATFORMS)
     m.add_argument('--stage', default='script', choices=STAGES)
     m.add_argument('--notes', default='')
     for k in STEPS:
         m.add_argument(f'--t-{k}-s', type=float)
+    mp = sub.add_parser('machine-phases', help='allocate elapsed S03 or S3 phases and record their totals')
+    mp.add_argument('--script-kind', required=True, choices=('S03', 'S3'))
+    mp.add_argument('--script-run-id', required=True)
+    mp.add_argument('--results-dir', required=True)
+    mp.add_argument('--phase', nargs=7, action='append', required=True,
+                    metavar=('ACCOUNT', 'START', 'END', 'N_PID', 'N_LADRC', 'DIAG_PID', 'DIAG_LADRC'))
+    mp.add_argument('--notes', default='')
     hs = sub.add_parser('hoc-start')
     hs.add_argument('--campaign', required=True, choices=TUNED)
     hs.add_argument('--ghi-chu', required=True)
@@ -3832,6 +4144,7 @@ def main(argv=None) -> int:
     sh = sub.add_parser('so-h', help='outcome of a car run after the clip H comparison (S05 v3.37 4.3)')
     sh.add_argument('--run-uid', required=True)
     sh.add_argument('--score-final', required=True, help='output of c7_calib_drift.py gop for that run')
+    sh.add_argument('--drift', default='', help='original c7_calib_drift.py so v2 JSON (heading and missing evidence)')
     um = sub.add_parser('u-moc', help='U file of one scoring of a car run (C8b v3 §5, design section 4)')
     um.add_argument('--run-uid', required=True)
     um.add_argument('--lan', default='H0', choices=LANS)
@@ -3899,16 +4212,20 @@ def main(argv=None) -> int:
                       gate_sha256=gj_sha,
                       gate_path=a.gate_json if kn else '',
                       gate_file=read_gate_file(a.gate_file, a.gate_file_fake) if a.gate_file else None, c8b_gio=a.c8b_gio or None,
-                      **boots)
+                      gain_file=a.gain_file, **boots)
             print('row', row['run_uid'], {k: row[f't_{k}_s'] for k in STEPS}, 'wait', row['t_operator_wait_s'])
             note = refusal_note(ds, row)
             if note:
                 print(note)
         elif a.cmd == 'machine':
             row = machine(ds, a.campaign, a.controller, a.script_run_id, a.results_dir, a.n_sim_evals, a.t_machine_s,
-                          a.wall_start, a.wall_end, a.platform, a.stage, notes=a.notes,
+                          a.wall_start, a.wall_end, a.platform, a.stage, notes=a.notes, script_kind=a.script_kind,
+                          n_sim_diagnostic=a.n_sim_diagnostic,
                           **{f't_{k}_s': getattr(a, f't_{k}_s') for k in STEPS})
             print('row', row['run_uid'])
+        elif a.cmd == 'machine-phases':
+            for row in machine_phases(ds, a.script_kind, a.script_run_id, a.results_dir, a.phase, a.notes):
+                print('row', row['run_uid'])
         elif a.cmd == 'hoc-start':
             print('hoc open', hoc_start(ds, a.campaign, a.ghi_chu)['start'])
         elif a.cmd == 'hoc-end':
@@ -3935,7 +4252,7 @@ def main(argv=None) -> int:
                 print(f'{NO_GATE_EVIDENCE}: {n_old} dat row(s) outside the campaigns without gate columns '
                       '(historic; not in gate_result nor in a stop rule)')
         elif a.cmd == 'so-h':
-            r = so_h(ds, a.run_uid, a.score_final)
+            r = so_h(ds, a.run_uid, a.score_final, a.drift)
             print('so-h', r['run_uid'], r['outcome_tam'], '->', r['outcome_sau'], r['flags'] or '(khong co)')
         elif a.cmd == 'u-moc':
             r = u_moc(ds, a.run_uid, a.lan, a.file, a.gate_file)

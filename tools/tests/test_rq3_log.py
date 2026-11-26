@@ -48,17 +48,24 @@ def tick(clock, s):
 
 
 def gain_file(d, name='gain_G0.json'):
+    import s05_fake_runs as fr
     p = os.path.join(d, name)
     if not os.path.exists(p):
-        with open(p, 'w', encoding='utf-8') as f:
-            f.write('{"kp_xy": 1.0}\n')
+        fr.write_gain_file(p, fr.sample_gain())
     return p
+
+
+def freeze_for_final(d, clock, campaign='A-PID', gain_set='A-PID/G0'):
+    rl.freeze(d, campaign, 'het_ung_vien', gain_set, gain_file(d))
+    tick(clock, 1)
 
 
 def car_run(d, clock, campaign, stage, outcome, task='O1-F05', speed='0.5', s=60, **kw):
     platform = kw.pop('platform', 'HW')
     if platform == 'HW' and stage != 'final' and campaign in rl.GAIN_OWNERS:   # GT1-7: a floor campaign run names
         kw.setdefault('gain_set', f'{campaign}/G1')                            # its gain set
+    if stage == 'final' and 'gain_set' not in kw:
+        kw['gain_set'] = rl.freeze_rows(d)[campaign]['gain_set_id']
     rl.begin(d, kw.pop('session', 'S'), campaign, platform, 'PID', task, speed, stage, **kw)
     rl.step(d, 'run')
     tick(clock, s)
@@ -71,6 +78,19 @@ def car_run(d, clock, campaign, stage, outcome, task='O1-F05', speed='0.5', s=60
 def rows(path):
     with open(path, newline='', encoding='utf-8') as f:
         return list(csv.DictReader(f))
+
+
+def end_with_trial(ds, outcome, **kwargs):
+    """Supply the L90 evidence for tests exercising other end rules."""
+    import s05_fake_runs as fr
+    row = rl._require_open(ds)['row']
+    results_dir = kwargs.get('results_dir')
+    if (outcome in rl.VALID and results_dir and row['platform'] in ('HW', 'HIL')
+            and row['stage'] in (*rl.TUNE_STAGES, 'hil_check')):
+        before = (kwargs.get('queries') or (None,))[0] or {}
+        boot = before.get('boot') or kwargs.get('boot_before') or fr.BOOT
+        kwargs['gain_file'] = fr.write_trial_gain(os.path.join(ds, results_dir), row['controller'], boot)
+    return rl.end(ds, outcome, **kwargs)
 
 
 def end_(d, outcome, gate=None, **kw):
@@ -88,6 +108,12 @@ def end_(d, outcome, gate=None, **kw):
         gate = rl.floor_gate(rl.fake_gate(e_trk=0.5 if outcome == 'khong_dat' else 0.03,
                                           completed='true' if outcome != 'chua_ket_luan' else 'inconclusive'))
         kw.setdefault('results_dir', 'r')
+    if outcome in rl.VALID and row.get('stage') in (*rl.TUNE_STAGES, 'hil_check'):
+        import s05_fake_runs as fr
+        results = os.path.join(d, 'trial_' + row['controller'])
+        kw['results_dir'] = results
+        before = (kw.get('queries') or (None,))[0]
+        kw['gain_file'] = fr.write_trial_gain(results, row['controller'], (before or {}).get('boot', fr.BOOT))
     return rl.end(d, outcome, gate=gate, **kw)
 
 
@@ -168,16 +194,15 @@ def test_refusals(ds):
         f.write(b'{}\n')
     with pytest.raises(rl.LogError, match='gain_'):
         rl.freeze(d, 'A-PID', 'cham_tran_xe', 'A-PID/G1', bad)
-    g = os.path.join(d, 'gain_G1.json')
-    with open(g, 'wb') as f:
-        f.write(b'{"kp_xy": 1.25}\n')
+    g = gain_file(d, 'gain_G1.json')
     with pytest.raises(rl.LogError, match='stop-reason'):
         rl.freeze(d, 'A-PID', 'cham_tran', 'A-PID/G1', g)
     with pytest.raises(rl.LogError, match='no such file'):
         rl.freeze(d, 'A-PID', 'cham_tran_xe', 'A-PID/G1', g + 'x')
     row = rl.freeze(d, 'A-PID', 'cham_tran_xe', 'A-PID/G1', g)
     import hashlib
-    assert row['gain_sha256'] == hashlib.sha256(b'{"kp_xy": 1.25}\n').hexdigest()
+    with open(g, 'rb') as f:
+        assert row['gain_sha256'] == hashlib.sha256(f.read()).hexdigest()
     assert list(rows(os.path.join(d, rl.FREEZE))[0]) == rl.FREEZE_COLS and 'gate_result' not in rl.FREEZE_COLS
     with pytest.raises(rl.LogError, match='already'):
         rl.freeze(d, 'A-PID', 'cham_tran_gio', 'A-PID/G1', g)
@@ -196,9 +221,11 @@ def test_summary_accounts_split_caps_and_finals(ds, no_moc):
     for sp in ('0.2', '0.5'):
         rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F0' + sp[-1], sp, 'screen', gain_set='A-PID/G1'); rl.step(d, 'setup'); tick(clock, 600)
         end_(d, 'khong_dat')
-    rl.begin(d, 'F1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final'); rl.step(d, 'run'); tick(clock, 100)
+    rl.freeze(d, 'A-PID', 'cham_tran_xe', 'A-PID/G0', gain_file(d), at='2026-11-20T12:00:00')
+    clock[0] = dt.datetime(2026, 11, 20, 12, 0, 1)
+    rl.begin(d, 'F1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final', gain_set='A-PID/G0'); rl.step(d, 'run'); tick(clock, 100)
     end_(d, 'dat', results_dir='r', gate=rl.fake_gate())               # R134 (d) SC3-2: dat with its gate
-    rl.begin(d, 'F1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final'); rl.step(d, 'run'); tick(clock, 100)
+    rl.begin(d, 'F1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final', gain_set='A-PID/G0'); rl.step(d, 'run'); tick(clock, 100)
     end_(d, 'hong_he_do', fail_cause='mat_khung')
     rl.effort(d, '2026-11-20', '06:00', '07:00', campaign='A-PID', nhan='hoc', ghi_chu='doc')
     rl.effort(d, '2026-11-20', '07:00', '08:00', campaign='A-PID', ghi_chu='lap xe')
@@ -208,7 +235,6 @@ def test_summary_accounts_split_caps_and_finals(ds, no_moc):
     rl.machine(d, 'B-chung', 'LADRC', 'S03X', 'r', 2739, 3600, '2026-11-20T09:00:00', '2026-11-20T10:00:00')
     rl.effort(d, '2026-11-20', '10:00', '12:00', campaign='B-chung', ghi_chu='doc S03')
     rl.hwfail(d, '2026-11-20', 'A1', 'A-PID', 'HW', 'tuot banh', 'phan_cung_ngau_nhien', 0.5, iter_no='2')
-    rl.freeze(d, 'A-PID', 'cham_tran_xe', 'A-PID/G0', gain_file(d), at='2026-11-20T12:00:00')
     s = {r['campaign']: r for r in rl.summary(d)}
     a = s['A-PID']
     # S05 v3.7 §3.3 (EA-1): the 0.5 h repair is in T_operator and in the hour cap
@@ -268,6 +294,7 @@ def test_finals_gate_replacement_and_final_hil_join(ds, no_moc):
     d, clock = ds
     rl.migrate(d)
     rl.freeze(d, 'A-PID', 'het_ung_vien', 'A-PID/G7', gain_file(d))   # C9D-4: no confirm block here
+    tick(clock, 1)
     lost = car_run(d, clock, 'A-PID', 'final', 'hong_he_do', session='F')['run_uid']
     car_run(d, clock, 'A-PID', 'final', 'dat', session='F', replaces_run_uid=lost)
     for _ in range(4):
@@ -290,6 +317,7 @@ def test_finals_gate_replacement_and_final_hil_join(ds, no_moc):
 def test_bad_replacement_and_final_hil_account_are_errors(ds):
     d, clock = ds
     rl.migrate(d)
+    freeze_for_final(d, clock)
     ok = car_run(d, clock, 'A-PID', 'final', 'dat', session='F')['run_uid']
     car_run(d, clock, 'A-PID', 'final', 'dat', session='F', replaces_run_uid=ok)
     with pytest.raises(rl.LogError, match='not a hong_he_do'):
@@ -319,7 +347,7 @@ def test_c9_dry_run_recomputes_summary(tmp_path):
     assert a['A-PID']['stop_reason_check'] == 'khong_kiem_duoc' and a['A-PID']['gate_result'] == 'chua_ket_luan'
     assert a['A-PID']['final_O1-F05@0.5_n_valid'] == '2' and a['A-PID']['final_hil_O1-F05@0.5_pass'] == '2'
     assert a['RQ2']['N_HIL'] == '2' and a['A-PID']['N_HIL'] == '0'
-    assert a['B-PID']['N_SIM'] == '2739' and a['B-PID']['N_HIL'] == '2' and a['B-PID']['N_hong'] == '1'
+    assert a['B-PID']['N_SIM'] == '2553' and a['B-PID']['N_HIL'] == '2' and a['B-PID']['N_hong'] == '1'
     assert a['B-PID']['hil_map_refused_n'] == '1' and a['B-PID']['hil_map_stopped'] == ''   # S05 v3.15 4.5 step 2
     assert a['A-PID']['hoc_nhap_tay_n'] == '0' and len(a['A-PID']['gate_sha256']) == 64
     assert float(a['A-PID']['T_operator_h']) - float(a['A-PID']['T_operator_no_hoc_h']) == pytest.approx(0.5)
@@ -389,8 +417,11 @@ def test_ea5_gain_set_prefix_and_final_hil_join(ds):
 def test_ea5_final_car_run_with_another_gain_set(ds):
     d, clock = ds
     rl.migrate(d)
-    rl.freeze(d, 'A-PID', 'cham_tran_xe', 'A-PID/G0', gain_file(d))
-    car_run(d, clock, 'A-PID', 'final', 'dat', session='F', gain_set='A-PID/G3')
+    freeze_for_final(d, clock)
+    with pytest.raises(rl.LogError, match='frozen is'):
+        car_run(d, clock, 'A-PID', 'final', 'dat', session='F', gain_set='A-PID/G3')
+    r = car_run(d, clock, 'A-PID', 'final', 'dat', session='F')
+    rl._write_all(os.path.join(d, rl.TUNING), rl.TUNING_COLS, [dict(r, gain_set_id='A-PID/G3')])
     with pytest.raises(rl.LogError, match='frozen is'):
         rl.summary(d)
 
@@ -477,6 +508,7 @@ def test_ea7_hoc_stamped_by_the_script_manual_flagged(ds):
 def test_ea8_replacement_same_condition_once(ds):
     d, clock = ds
     rl.migrate(d)
+    freeze_for_final(d, clock)
     lost = car_run(d, clock, 'A-PID', 'final', 'hong_he_do', session='F')['run_uid']
     car_run(d, clock, 'A-PID', 'final', 'dat', task='O1-F08', speed='0.8', session='F', replaces_run_uid=lost)
     with pytest.raises(rl.LogError, match='another trajectory, speed_mps'):
@@ -484,6 +516,7 @@ def test_ea8_replacement_same_condition_once(ds):
     d2 = os.path.join(d, 'b')
     os.makedirs(d2)
     rl.migrate(d2)
+    freeze_for_final(d2, clock)
     lost = car_run(d2, clock, 'A-PID', 'final', 'hong_he_do', session='F')['run_uid']
     car_run(d2, clock, 'A-PID', 'final', 'dat', session='F', replaces_run_uid=lost)
     car_run(d2, clock, 'A-PID', 'final', 'dat', session='F', replaces_run_uid=lost)
@@ -494,6 +527,7 @@ def test_ea8_replacement_same_condition_once(ds):
 def test_ea8_three_lost_in_a_row_stop_the_condition(ds):
     d, clock = ds
     rl.migrate(d)
+    freeze_for_final(d, clock)
     car_run(d, clock, 'A-PID', 'final', 'dat', session='F')
     for _ in range(3):
         car_run(d, clock, 'A-PID', 'final', 'hong_he_do', session='F')

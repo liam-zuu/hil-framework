@@ -13,6 +13,7 @@ import pytest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..'))
 import gate_c8 as GC          # noqa: E402
+from test_rq3_log import end_with_trial, gain_file
 import rq3_log as rl          # noqa: E402
 import hil_o1_score as H      # noqa: E402
 import o1_gate                # noqa: E402
@@ -62,14 +63,14 @@ def test_end_hil_b_with_g5_so_do(ds):
     _hil_b(d)
     g = _gate(gf)
     assert g['g5']['state'] == 'khong_dat' and g['outcome_decide'] == 'khong_dat' and g['g5']['nhanh'] == 'so_do'
-    row = rl.end(d, 'khong_dat', completed=1, results_dir=str(tmp), gate=g, gate_sha256='x', gate_file=gf)
+    row = end_with_trial(d, 'khong_dat', completed=1, results_dir=str(tmp), gate=g, gate_sha256='x', gate_file=gf)
     assert row['gate_version'] == 'gate_v3.4' and row['gate_so_do'] == 'g5'
     assert row['gate_file_sha256'] == gf.sha256 and row['gate_decide'] == 'g1,g2,g3,g4,g5'
     # 7.4 deg: hi above 7.5 (three branches chua_ket_luan), q below it: dat by q
     _hil_b(d)
     g = _gate(gf, th=7.4)
     assert g['g5']['state_ba_nhanh'] == 'chua_ket_luan' and g['g5']['state'] == 'dat' and g['outcome_decide'] == 'dat'
-    rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_sha256='y', gate_file=gf)
+    end_with_trial(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_sha256='y', gate_file=gf)
     rl.summary(d, gate_file=gf)                                               # the rows pass the summary checks
 
 
@@ -77,14 +78,14 @@ def test_end_refuses_dat_with_a_so_do_condition_above_the_threshold(ds):
     d, gf, tmp = ds
     _hil_b(d)
     with pytest.raises(rl.LogError, match='gate outcome khong_dat'):
-        rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=_gate(gf), gate_file=gf)
+        end_with_trial(d, 'dat', completed=1, results_dir=str(tmp), gate=_gate(gf), gate_file=gf)
 
 
 def test_end_masked_gate_needs_the_gate_file(ds):
     d, gf, tmp = ds
     _hil_b(d)
     with pytest.raises(rl.LogError, match='not given here'):
-        rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=_gate(gf))
+        end_with_trial(d, 'dat', completed=1, results_dir=str(tmp), gate=_gate(gf))
 
 
 def test_end_refuses_another_gate_file(ds):
@@ -93,7 +94,7 @@ def test_end_refuses_another_gate_file(ds):
     GC.write_gate(p2, GC.fake_gate(LEVELS, u_psi_deg=1.0, u_t_s=0.014))
     _hil_b(d)
     with pytest.raises(rl.LogError, match='scored with the gate file'):
-        rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=_gate(gf), gate_file=rl.read_gate_file(p2, allow_fake=True))
+        end_with_trial(d, 'dat', completed=1, results_dir=str(tmp), gate=_gate(gf), gate_file=rl.read_gate_file(p2, allow_fake=True))
 
 
 def test_end_refuses_a_self_declared_exemption(ds):
@@ -105,7 +106,7 @@ def test_end_refuses_a_self_declared_exemption(ds):
     g = rl._plain(GC.apply_so_do(rl._plain(o1_gate.gate(frames, 'true', v_cmd_max=0.729, wz_cmd_max=1.634,
                                                         u_t=0.0015)), ['g5'], 'O1-F05', gf.sha256))
     with pytest.raises(rl.LogError, match='gate file gives'):
-        rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_file=gf)
+        end_with_trial(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_file=gf)
 
 
 def test_end_refuses_an_exemption_without_any_gate_file(ds):
@@ -114,7 +115,7 @@ def test_end_refuses_an_exemption_without_any_gate_file(ds):
     g = _gate(gf)
     g['gate_file_sha256'] = None
     with pytest.raises(rl.LogError, match='source of so_do'):
-        rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=g)
+        end_with_trial(d, 'dat', completed=1, results_dir=str(tmp), gate=g)
 
 
 def test_end_final_hil_cannot_carry_the_mask(ds):
@@ -123,7 +124,7 @@ def test_end_final_hil_cannot_carry_the_mask(ds):
     rl.step(d, 'run')
     g = _gate(gf)                                                             # masked as for a B candidate check
     with pytest.raises(rl.LogError, match='gate file gives'):
-        rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_file=gf,
+        end_with_trial(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_file=gf,
                queries=rl.fake_queries())
 
 
@@ -133,7 +134,7 @@ def test_end_unmapped_hil_b_still_a_lost_run(ds):
     g = _gate(gf, mapped=False)
     assert g['decide'] == ['g1', 'g2'] and g['complete'] is False
     with pytest.raises(rl.LogError, match='lost run'):
-        rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_file=gf)
+        end_with_trial(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_file=gf)
     row = rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.MAP_REFUSED, results_dir=str(tmp), gate=g,
                  gate_file=gf)
     assert row['gate_decide'] == 'g1,g2'
@@ -143,7 +144,7 @@ def test_summary_refuses_a_floor_campaign_run_scored_without_the_gate_file(ds):
     d, gf, tmp = ds
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
-    rl.end(d, 'khong_dat', completed=1, e_perp_max=0.2, results_dir=str(tmp),
+    end_with_trial(d, 'khong_dat', completed=1, e_perp_max=0.2, results_dir=str(tmp),
            gate=rl.floor_gate(rl.fake_gate(e_trk=0.5)), queries=rl.fake_queries())       # v3.2, no gate file
     rl.summary(d)                                                             # without the gate file: as before
     with pytest.raises(rl.LogError, match='scored without the C8 gate file'):
@@ -153,7 +154,7 @@ def test_summary_refuses_a_floor_campaign_run_scored_without_the_gate_file(ds):
 def test_summary_refuses_a_row_whose_so_do_was_edited(ds):
     d, gf, tmp = ds
     _hil_b(d)
-    rl.end(d, 'khong_dat', completed=1, results_dir=str(tmp), gate=_gate(gf), gate_file=gf)
+    end_with_trial(d, 'khong_dat', completed=1, results_dir=str(tmp), gate=_gate(gf), gate_file=gf)
     p = os.path.join(d, rl.TUNING)
     rows = rl.read_rows(p)
     rows[-1]['gate_so_do'] = 'g3,g5'
@@ -168,7 +169,7 @@ def test_floor_run_masked_at_f08(ds):
     rl.step(d, 'run')
     g = rl.floor_gate(_gate(gf, platform='HW', stage='screen', campaign='A-PID', th=7.4))
     assert g['outcome_decide'] == 'dat' and g['g5']['state'] == 'dat' and g['g5']['state_ba_nhanh'] == 'chua_ket_luan'
-    row = rl.end(d, 'dat', completed=1, e_perp_max=0.02, results_dir=str(tmp), gate=g, gate_file=gf,
+    row = end_with_trial(d, 'dat', completed=1, e_perp_max=0.02, results_dir=str(tmp), gate=g, gate_file=gf,
                  queries=rl.fake_queries())
     assert row['gate_so_do'] == 'g5'
     rl.summary(d, gate_file=gf)
@@ -278,8 +279,8 @@ def test_grid_run_g1_from_the_nodes_end_and_summary(ds):
     g = _grid_gate(gf, ['dat', 'dat', 'khong_dat'])                         # centre node dat, one node not
     assert g['g1']['state'] == 'chua_ket_luan' and g['outcome_decide'] == 'chua_ket_luan'
     with pytest.raises(rl.LogError, match='gate outcome chua_ket_luan'):
-        rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_file=gf, queries=rl.fake_queries())
-    row = rl.end(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), gate=g, gate_file=gf,
+        end_with_trial(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_file=gf, queries=rl.fake_queries())
+    row = end_with_trial(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), gate=g, gate_file=gf,
                  queries=rl.fake_queries())
     assert (row['luoi_g1_nut'], row['luoi_g1_state'], row['luoi_n_nut']) == ('ddk', 'chua_ket_luan', '3')
     rl.summary(d, gate_file=gf)                                               # the row read back and recomputed
@@ -292,7 +293,7 @@ def test_grid_g1_state_must_be_the_grid_one(ds):
     g['g1'].update(state='dat', q='true')
     g.update(o1_gate.evaluate_outcomes(g, g['decide'], g.get('required')))
     with pytest.raises(rl.LogError, match='grid gives'):
-        rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_file=gf, queries=rl.fake_queries())
+        end_with_trial(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_file=gf, queries=rl.fake_queries())
 
 
 def test_grid_centre_fields_must_match_their_node(ds):
@@ -300,7 +301,7 @@ def test_grid_centre_fields_must_match_their_node(ds):
     _floor_run(d)
     g = _grid_gate(gf, ['dat', 'khong_dat', 'dat'])                         # centre khong_dat, its fields say dat
     with pytest.raises(rl.LogError, match='grid node nut_tam'):
-        rl.end(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), gate=g, gate_file=gf,
+        end_with_trial(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), gate=g, gate_file=gf,
                queries=rl.fake_queries())
 
 
@@ -310,7 +311,7 @@ def test_grid_every_node_lost_is_a_lost_run(ds):
     base = _undef(_t1_base(gf, t_done=(None, None)))                         # GT1-1: the centre lost by its t1
     g = _grid_gate(gf, ['chua_ket_luan'] * 3, hong=[True] * 3, base=base)
     with pytest.raises(rl.LogError, match='every grid node lost'):
-        rl.end(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), gate=g, gate_file=gf, queries=rl.fake_queries())
+        end_with_trial(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), gate=g, gate_file=gf, queries=rl.fake_queries())
     row = rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', results_dir=str(tmp), gate=g,
                  gate_file=gf, queries=rl.fake_queries())
     assert row['luoi_hong_nut'] == '111'
@@ -329,10 +330,10 @@ def test_grid_exception_before_t1_only_when_every_node_has_it(ds):
     part = _grid_gate(gf, ['chua_ket_luan'] * 3, cat=[True, True, False], nut_tam=0, base=_cat_base(gf))
     assert part['outcome_decide'] == 'khong_dat'                              # G3 certainly above D
     with pytest.raises(rl.LogError, match='every node has it'):
-        rl.end(d, 'khong_dat', completed=1, fail_cause=rl.VIOL_BEFORE, results_dir=str(tmp), gate=part,
+        end_with_trial(d, 'khong_dat', completed=1, fail_cause=rl.VIOL_BEFORE, results_dir=str(tmp), gate=part,
                gate_file=gf, queries=rl.fake_queries())
     full = _grid_gate(gf, ['chua_ket_luan'] * 3, cat=[True] * 3, base=_cat_base(gf))
-    row = rl.end(d, 'khong_dat', completed=1, fail_cause=rl.VIOL_BEFORE, results_dir=str(tmp), gate=full,
+    row = end_with_trial(d, 'khong_dat', completed=1, fail_cause=rl.VIOL_BEFORE, results_dir=str(tmp), gate=full,
                  gate_file=gf, queries=rl.fake_queries())
     assert row['luoi_cat_nut'] == '111'
     rl.summary(d, gate_file=gf)
@@ -497,8 +498,8 @@ def test_f11_no_scored_node_closes_the_run_chua_ket_luan(ds):
               gate_khong_nut=True, c8b_gio=g, gate_path=p)
     for o, fc in (('hong_he_do', 'mat_khung_FAKE'), ('khong_dat', ''), ('dat', '')):
         with pytest.raises(rl.LogError, match='no node could be scored'):
-            rl.end(d, o, fail_cause=fc, **kw)
-    row = rl.end(d, 'chua_ket_luan', **kw)
+            end_with_trial(d, o, fail_cause=fc, **kw)
+    row = end_with_trial(d, 'chua_ket_luan', **kw)
     assert row['fail_cause'] == rl.KHONG_NUT and row['gate_json_sha256'] == rl.sha256_file(p)
     rl.summary(d)
     for bad in (dict(n=1), dict(gate={'version': 'gate_v3.3'}), dict(st='x')):
@@ -541,6 +542,7 @@ def test_c8b_fourth_failure_stops_the_level_in_total_not_in_a_row(ds):
 
 def test_c8b_final_follows_the_lost_in_a_row_rule(ds):
     d, gf, tmp = ds
+    rl.freeze(d, 'A-PID', 'het_ung_vien', 'A-PID/G00', gain_file(d), at='2026-11-19T08:00:00')
     for i in range(5):                                                        # final: no limit of 3 reruns here
         rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final', gain_set='A-PID/G00')
         rl.step(d, 'run')
@@ -548,7 +550,7 @@ def test_c8b_final_follows_the_lost_in_a_row_rule(ds):
             rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, f'f{i}'),
                    results_dir=str(tmp), queries=rl.fake_queries())
         else:
-            rl.end(d, 'dat', completed=1, e_perp_max=0.02, results_dir=str(tmp),
+            end_with_trial(d, 'dat', completed=1, e_perp_max=0.02, results_dir=str(tmp),
                    gate=rl.floor_gate(rl.fake_gate(gate_file=gf)), gate_file=gf, queries=rl.fake_queries())
     assert rl.c8b_refusals(rl.read_rows(os.path.join(d, rl.TUNING))) == {}
 
@@ -602,7 +604,7 @@ def test_cc1_2_gate_null_only_for_a_lost_run(ds):
     with pytest.raises(rl.LogError, match='no gate_v3 block'):
         rl.read_gate_json(sp)                                                 # judged outcomes: as before
     with pytest.raises(rl.LogError, match='only for a run lost'):
-        rl.end(d, 'chua_ket_luan', completed=1, results_dir=folder, gate=None, gate_sha256=rl.sha256_file(sp),
+        end_with_trial(d, 'chua_ket_luan', completed=1, results_dir=folder, gate=None, gate_sha256=rl.sha256_file(sp),
                queries=rl.fake_queries())
     with pytest.raises(rl.LogError, match='results-dir'):
         rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', gate=None, gate_sha256=rl.sha256_file(sp))
@@ -697,7 +699,7 @@ def _judged(d, tmp, name, gate, outcome, gf, task='O1-F05'):
         json.dump(dict(FAKE=True, outcome=outcome, gate_v3=gate), f)
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', task, str(rl.FIG8[task]), 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
-    row = rl.end(d, outcome, completed=1, results_dir=folder, gate=rl.read_gate_json(sp),
+    row = end_with_trial(d, outcome, completed=1, results_dir=folder, gate=rl.read_gate_json(sp),
                  gate_sha256=rl.sha256_file(sp), gate_file=gf, queries=rl.fake_queries())
     return row, folder
 
@@ -1014,10 +1016,10 @@ def test_gc6_12_the_time_file_of_a_run_without_a_scored_node(ds):
     kw = dict(completed=1, results_dir=str(tmp), queries=rl.fake_queries(), gate_sha256=rl.sha256_file(p),
               gate_khong_nut=True, gate_path=p)
     with pytest.raises(rl.LogError, match='GC6-12'):
-        rl.end(d, 'chua_ket_luan', **kw)                                 # no time file
+        end_with_trial(d, 'chua_ket_luan', **kw)                                 # no time file
     with pytest.raises(rl.LogError, match='GC6-12'):
-        rl.end(d, 'chua_ket_luan', c8b_gio=_gio(tmp, 'other_gio', ok=True), **kw)
-    row = rl.end(d, 'chua_ket_luan', c8b_gio=g, **kw)
+        end_with_trial(d, 'chua_ket_luan', c8b_gio=_gio(tmp, 'other_gio', ok=True), **kw)
+    row = end_with_trial(d, 'chua_ket_luan', c8b_gio=g, **kw)
     assert row['c8b_gio_sha256'] == rl.sha256_file(g)
     rl.summary(d)
     path = os.path.join(d, rl.TUNING)
@@ -1053,7 +1055,7 @@ def test_gc6_13_end_so_h_summary_for_a_run_without_a_scored_node(ds):
     p = _luoi(folder, 'score', gio=g)                                   # the H0 scorer file of the run
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
-    row = rl.end(d, 'chua_ket_luan', completed=1, results_dir=folder, queries=rl.fake_queries(),
+    row = end_with_trial(d, 'chua_ket_luan', completed=1, results_dir=folder, queries=rl.fake_queries(),
                  gate_sha256=rl.sha256_file(p), gate_khong_nut=True, c8b_gio=g, gate_path=p)
     r = rl.so_h(d, row['run_uid'], rl.fake_score_final(folder, 0.8))      # below eps_H: outcome kept
     assert r['outcome_sau'] == 'chua_ket_luan'
@@ -1063,7 +1065,7 @@ def test_gc6_13_end_so_h_summary_for_a_run_without_a_scored_node(ds):
     p2 = _luoi(folder2, 'score', gio=g2)
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
-    row2 = rl.end(d, 'chua_ket_luan', completed=1, results_dir=folder2, queries=rl.fake_queries(),
+    row2 = end_with_trial(d, 'chua_ket_luan', completed=1, results_dir=folder2, queries=rl.fake_queries(),
                   gate_sha256=rl.sha256_file(p2), gate_khong_nut=True, c8b_gio=g2, gate_path=p2)
     # GC7-3: an H1 scoring without a node whose time file is another run's (not under the run folder) is refused
     h1_other = dict(json.load(open(p, encoding='utf-8')))
@@ -1149,7 +1151,7 @@ def test_gc6_16_an_old_log_read_after_migrate(ds):
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F08', '0.8', 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
     g = rl.floor_gate(_gate(gf, platform='HW', stage='screen', campaign='A-PID', th=7.4))   # G5 so_do dat by q
-    rl.end(d, 'dat', completed=1, e_perp_max=0.02, results_dir=str(tmp), gate=g, gate_file=gf,
+    end_with_trial(d, 'dat', completed=1, e_perp_max=0.02, results_dir=str(tmp), gate=g, gate_file=gf,
            queries=rl.fake_queries())
     path = os.path.join(d, rl.TUNING)
     rows = rl.read_rows(path)
@@ -1179,7 +1181,7 @@ def test_gc6_12_end_reads_the_luoi_file_itself(ds):
               gate_khong_nut=True, c8b_gio=g)
     for path in (other, ''):                                            # a judged grid file / no file: the flag alone
         with pytest.raises(rl.LogError, match='GC6-12'):
-            rl.end(d, 'chua_ket_luan', gate_path=path, **kw)
+            end_with_trial(d, 'chua_ket_luan', gate_path=path, **kw)
 
 
 def test_gc8_1_end_needs_the_h0_file_under_results_dir(ds, tmp_path_factory):
@@ -1192,7 +1194,7 @@ def test_gc8_1_end_needs_the_h0_file_under_results_dir(ds, tmp_path_factory):
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
     with pytest.raises(rl.LogError, match='GC8-1'):
-        rl.end(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), queries=rl.fake_queries(),
+        end_with_trial(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), queries=rl.fake_queries(),
                gate_sha256=rl.sha256_file(p), gate_khong_nut=True, c8b_gio=g, gate_path=p)
 
 
@@ -1204,7 +1206,7 @@ def test_gc8_2_one_time_file_one_run_checked_on_the_sources(ds):
     p = _luoi(tmp, 'kn82', gio=g)
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
-    rl.end(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), queries=rl.fake_queries(),
+    end_with_trial(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), queries=rl.fake_queries(),
            gate_sha256=rl.sha256_file(p), gate_khong_nut=True, c8b_gio=g, gate_path=p)
     path = os.path.join(d, rl.TUNING)
     rows = rl.read_rows(path)
@@ -1224,7 +1226,7 @@ def test_gc9_10_end_applies_the_summary_rule(ds):
               gate_khong_nut=True, c8b_gio=g, gate_path=p)
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
-    rl.end(d, 'chua_ket_luan', **kw)
+    end_with_trial(d, 'chua_ket_luan', **kw)
     path = os.path.join(d, rl.TUNING)
     rows = rl.read_rows(path)
     rows[-1]['c8b_gio_sha256'] = ''
@@ -1232,7 +1234,7 @@ def test_gc9_10_end_applies_the_summary_rule(ds):
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
     with pytest.raises(rl.LogError, match='GC8-2'):
-        rl.end(d, 'chua_ket_luan', **kw)
+        end_with_trial(d, 'chua_ket_luan', **kw)
 
 
 def test_gc9_10_end_applies_the_summary_rule_the_other_way(ds):
@@ -1243,7 +1245,7 @@ def test_gc9_10_end_applies_the_summary_rule_the_other_way(ds):
     p = _luoi(tmp, 'kn911', gio=g)
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
-    rl.end(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), queries=rl.fake_queries(),
+    end_with_trial(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), queries=rl.fake_queries(),
            gate_sha256=rl.sha256_file(p), gate_khong_nut=True, c8b_gio=g, gate_path=p)
     path = os.path.join(d, rl.TUNING)
     rows = rl.read_rows(path)
@@ -1265,7 +1267,7 @@ def test_gc7_3_h1_of_its_own_task_and_time_file(ds):
     p = _luoi(folder, 'score', gio=g)
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
-    row = rl.end(d, 'chua_ket_luan', completed=1, results_dir=folder, queries=rl.fake_queries(),
+    row = end_with_trial(d, 'chua_ket_luan', completed=1, results_dir=folder, queries=rl.fake_queries(),
                  gate_sha256=rl.sha256_file(p), gate_khong_nut=True, c8b_gio=g, gate_path=p)
     h1_same = dict(json.load(open(p, encoding='utf-8')))                  # the H0 time file
     with pytest.raises(rl.LogError, match='GC7-3'):

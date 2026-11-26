@@ -102,8 +102,8 @@ every valid run without a number. The quantity list is fixed here (do not change
       line; A: stdout of gain_send.py setting the set, with its '# ack' line)
   python tools/s05_final_table.py table [--dataset 05_DATA/M7_dataset] --out <dir>
       [--score-name score.json] [--esp32-name esp32.csv]
-      [--query-before-name gain_query_before.txt] [--query-after-name gain_query_after.txt]
       [--gain-ack-name gain_ack.txt] [--init-gain PID=F] [--init-gain LADRC=F]
+  table reads both query replies from the paths and SHA-256 values in the tuning log.
   table writes <out>/S05_final_table.csv (one row per cell and quantity), S05_final_table.md (the
   three gain sets side by side), S05_final_runs.csv (the value of every valid run: appendix) and
   S05_final_gain_files.csv (gain file and sha256 of every set; R134C6-1).
@@ -131,7 +131,11 @@ CONDITIONS = ('O1-F02', 'O1-F05', 'O1-F08', 'O1-K1', 'O1-K2')
 PLATFORMS = (('HW', 'xe', 'final'), ('HIL', 'HIL', 'final_hil'))
 GAIN_SETS = ('khoi_dau', 'A', 'B')
 CONTROLLERS = ('PID', 'LADRC')
-QUANTITIES = ('e_perp_max', 'e_theta_lane_max_deg', 'e_theta_cmd_max_deg', 'e_s_absmax', 'e_trk_max', 'tv_duty')
+QUANTITIES = ('e_perp_max', 'e_theta_lane_max_deg', 'e_theta_cmd_max_deg', 'e_s_absmax', 'e_trk_max',
+              'e_bao_max', 'e_bao_phys_max', 'tv_duty')
+GATE_RUN_FIELDS = [f'g{i}_{k}' for i in range(1, 6) for k in ('q', 'lo', 'hi', 'state')]
+GATE_COUNTS = [f'n_g{i}_dat' for i in range(1, 6)]
+APPENDIX_QUANTITIES = ('ds_absmax', 'e_perp_rms', 'e_do_max', 'stop_dist_end', 'stop_heading_err_deg')
 VALID = ('dat', 'khong_dat', 'chua_ket_luan')
 # t_end error (S05 4.7 (i), Liam 14/11 CODE_RS4 Q4)
 # ESP_PPM_NOISE: noise of the per-run esp_pi_ppm estimate, an estimate of Claude (not a bound). Source (recomputed
@@ -300,6 +304,16 @@ def tv_duty_esp32(rows, t_end_s, edge_max_ms=EDGE_MAX_MS, t0_us=None, queries=No
     if d_tick != d_seq:
         out['reason'] = f'tick tang {d_tick}, log_seq tang {d_seq}: motor tat o mot tick trong cua so'
         return out
+    duty_steps = []
+    for w in WHEELS:
+        try:
+            counts = [int(str(rows[i].get(w))) for i in win]
+        except (ValueError, TypeError):
+            counts = []
+        if not counts or counts[0] < 0 or any(y < x for x, y in zip(counts, counts[1:])):
+            out['reason'] = f'{w}: bo dem trong cua so phai la so nguyen khong am va khong giam'
+            return out
+        duty_steps.append(counts[-1] - counts[0])
     if check_gain_line or check_boot:
         # the run's start (R134C-1, -2): '#us,ev=start' with first_seq = first motor-on data line gives
         # the boot of the run; the '#gain' lines next to it give the set (gain_line_check.run_start)
@@ -330,7 +344,7 @@ def tv_duty_esp32(rows, t_end_s, edge_max_ms=EDGE_MAX_MS, t0_us=None, queries=No
         if bad:
             out['reason'] = bad
             return out
-    num = sum(_int(rows[b][w]) - _int(rows[a][w]) for w in WHEELS) / PWM_MAX
+    num = sum(duty_steps) / PWM_MAX
     dt = (ts[b] - ts[a]) / 1e6
     out.update(tv_duty=num / dt, sum_abs_dduty=num, t_a_s=(ts[a] - t0_us) / 1e6, t_b_s=(ts[b] - t0_us) / 1e6)
     return out
@@ -357,10 +371,13 @@ def _a_number(v):
 
 def run_values(score, task, tv):
     fig8 = task.startswith('O1-F')
+    e_bao = score.get('e_bao_max')
     v = dict(e_perp_max=score.get('e_perp_max'),
              e_theta_lane_max_deg=score.get('e_theta_lane_max_deg') if fig8 else None,
              e_theta_cmd_max_deg=score.get('e_theta_cmd_max_deg') if fig8 else score.get('e_theta_start_max_deg'),
-             e_s_absmax=score.get('e_s_absmax'), e_trk_max=score.get('e_trk_max'), tv_duty=tv.get('tv_duty'))
+             e_s_absmax=score.get('e_s_absmax'), e_trk_max=score.get('e_trk_max'),
+             e_bao_max=e_bao, e_bao_phys_max=max(0, e_bao) if _a_number(e_bao) else e_bao,
+             tv_duty=tv.get('tv_duty'))
     miss = {}
     for q in QUANTITIES:
         if q == 'e_theta_lane_max_deg' and not fig8:
@@ -386,7 +403,7 @@ def gain_files(dataset, init_gain=None):
     want = gain_line_check.load_gain_file of the file; its ctrl must be the controller of the set."""
     import rq3_log as rl
     out = {}
-    for r in rl.read_rows(os.path.join(dataset, rl.FREEZE)):
+    for r in rl.freeze_rows(dataset).values():
         gs, p = r.get('gain_set_id', ''), r.get('gain_file', '')
         if not gs:
             continue
@@ -447,8 +464,50 @@ def gain_file_of(gain_set_id, files):
     return files.get(g) if g.startswith('RQ2-INIT-') else files.get(gain_set_id or '')
 
 
-def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_before.txt',
-              query_after_name='gain_query_after.txt', gain_ack_name='gain_ack.txt', init_gain=None, gate_file=None,
+def read_run_score(row, dataset, score_name):
+    """Read the score bound to the row. A C8b grid binds its representative camera score by SHA."""
+    import rq3_log as rl
+    d = rl._results_dir(row, dataset)
+    uid = row.get('run_uid')
+    if not d:
+        raise ValueError(f'{uid}: results_dir missing')
+    p = os.path.join(d, score_name)
+    if not rl._inside(p, d):
+        raise ValueError(f'{uid}: score file must be under results_dir')
+    score, sha = rl.read_json_sha(p, f'{uid}: score')
+    if sha != row.get('gate_json_sha256'):
+        raise ValueError(f'{uid}: {p} SHA-256 differs from gate_json_sha256')
+    if not isinstance(score, dict):
+        raise ValueError(f'{uid}: score file must contain a JSON object')
+    if row.get('platform') == 'HW' and 'trang_thai_luot' in score:
+        if score['trang_thai_luot'] == rl.KHONG_NUT:
+            return {}
+        node = (score.get('gate_v3', {}).get('luoi') or {}).get('nut_tam')
+        ref = next((s for s in score.get('nguon_nut', []) if s.get('nut') == node), None)
+        if ref is None or not ref.get('duong_dan'):
+            raise ValueError(f'{uid}: luoi score lacks the bound camera score for nut_tam')
+        np = ref['duong_dan']
+        if not os.path.isabs(np) or not os.path.isfile(np):
+            np = os.path.join(os.path.dirname(p), os.path.basename(np))
+        if not rl._inside(np, d):
+            raise ValueError(f'{uid}: camera score of nut_tam must be under results_dir')
+        score, sha = rl.read_json_sha(np, f'{uid}: nut_tam score')
+        if sha != ref.get('sha256') or not isinstance(score, dict):
+            raise ValueError(f'{uid}: {np} SHA-256 differs from nguon_nut or invalid score')
+    return score
+
+
+def score_window(score, platform):
+    end_key = 't_end_union' if platform == 'HW' else 't_end'
+    end = score.get(end_key)
+    t0 = score.get('t0_log_us') if platform == 'HW' else None
+    for key, v in [(end_key, end)] + ([('t0_log_us', t0)] if platform == 'HW' else []):
+        if not _a_number(v) or v < 0:
+            return None, None, f'diem cham thieu {key} hop le'
+    return t0, end, ''
+
+
+def load_runs(dataset, score_name, esp32_name, gain_ack_name='gain_ack.txt', init_gain=None, gate_file=None,
               gate_file_fake=False):
     path = os.path.join(dataset, 'm7_tuning_log.csv')
     with open(path, newline='', encoding='utf-8') as f:
@@ -468,12 +527,17 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
         # recomputed from it, the gate file SHA of every run (rq3_log.check_gate_rows)
         rl.check_gate_rows(rows, rl.read_gate_file(gate_file, gate_file_fake) if gate_file else None)   # GC6-14
         rl.check_map_rows(rows)
+        queries = rl.check_query_rows(rows, dataset)
         miss = rl.so_h_missing(rows, dataset, stages=('final',))
         if miss:          # C9D-2 (Liam 17/11 at CODE_C13 "Sửa cả 7 + vòng 2 (Recommended)"): no table before so-h
             raise rl.LogError('luot xe kiem cuoi da phan chua so clip H (lenh rq3_log so-h, ca luot duoi nguong): '
                               + ', '.join(r.get('run_uid', '') for r in miss) + ' (C9D-2)')
         rows = rl.apply_after(rows, dataset)    # S05 v3.37 4.3 clip H comparison, then C8b v3 §5 (rq3_log.apply_moc)
-        rl._final_stops(rows)      # C9D2-3: a run after a known N = 3 stop (4.6) stops the table as the summary
+        stopped = rl.check_finals(rows)
+        frozen = rl.freeze_rows(dataset)
+        for r in rows:
+            if r.get('stage') in ('final', 'final_hil'):
+                rl.check_task(r.get('trajectory', ''), r.get('speed_mps', ''))
     except rl.LogError as e:
         raise ValueError(f'm7_tuning_log.csv: {e}')
     files = gain_files(dataset, init_gain)                                              # R134C6-1
@@ -486,19 +550,32 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
             continue
         if plat is None:
             continue
-        ctrl, task = r.get('controller', ''), r.get('trajectory', '')
+        ctrl = r.get('controller', '')
+        task, speed = rl.condition_key(r)
         gs = gain_set_of(r.get('gain_set_id'), ctrl)
         if ctrl not in CONTROLLERS or task not in CONDITIONS or gs is None:
             problems.append(f"run {r.get('run_uid')}: controller {ctrl!r}, trajectory {task!r}, gain_set_id "
                             f"{r.get('gain_set_id')!r} khong vao bang")
             continue
         gf = gain_file_of(r.get('gain_set_id'), files)
+        if r.get('stage') == 'final' and r.get('campaign') in rl.TUNED:
+            try:
+                rl.check_final_freeze(r, frozen)
+            except rl.LogError as exc:
+                bad.append(str(exc))
+                continue
+        d = rl._results_dir(r, dataset)
+        qs = queries.get(r.get('run_uid'))
         if r.get('run_outcome') in VALID:           # R134C5-1, -3, R134C6-1: the run's evidence, whatever tv_duty
-            why = run_evidence_problem(r, query_before_name, query_after_name, gain_ack_name, esp32_name, gf)
+            why = run_evidence_problem(r, qs, gain_ack_name, esp32_name, gf, d)
             if why:
                 bad.append(f"run {r.get('run_uid')}: {why}")
+                continue
         run = dict(run_uid=r.get('run_uid'), platform=plat[1], controller=ctrl, condition=task, gain_set=gs,
                    outcome=r.get('run_outcome'), results_dir=r.get('results_dir', ''),
+                   speed_mps=speed, fail_cause=r.get('fail_cause', ''),
+                   stop_reason='N=3 hong_he_do lien tiep' if rl.final_key(r) in stopped else '',
+                   **{k: r.get(k, '') for k in GATE_RUN_FIELDS},
                    cat_t1=r.get('g1_cat_t1') == 'true',      # R134C4-6: O1 3.5 R2V-4, counted per cell
                    gain_set_id=r.get('gain_set_id', ''), gain_file=(gf or {}).get('file', ''),
                    gain_sha256=(gf or {}).get('sha256', ''), gain_source=(gf or {}).get('source', ''),
@@ -506,25 +583,20 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
                    moc_flags=r.get('moc_flags', ''), U_moc_xy_m=r.get('U_moc_xy_m', ''),
                    U_moc_psi_deg=r.get('U_moc_psi_deg', ''))           # C8b v3 §5 (CODE_GATE design 6)
         if run['outcome'] in VALID:
-            d = run['results_dir']
-            score, tv = {}, dict(reason='')
-            sp = os.path.join(d, score_name)
-            if os.path.isfile(sp):
-                with open(sp, encoding='utf-8') as f:
-                    score = json.load(f)
-            else:
-                tv['reason'] = f'thieu {score_name}'
+            try:
+                score = read_run_score(r, dataset, score_name)
+            except rl.LogError as exc:
+                raise ValueError(str(exc)) from exc
+            t0, t_end, reason = score_window(score, plat[0])
+            tv = dict(reason=reason)
             ep = os.path.join(d, esp32_name)
-            if score.get('t_end') is not None and os.path.isfile(ep):
+            if not reason:
                 rows_ep, n_drop = read_esp32_log_info(ep)
-                tv = tv_duty_esp32(rows_ep, float(score['t_end']),
-                                   queries=(read_query(os.path.join(d, query_before_name)),
-                                            read_query(os.path.join(d, query_after_name))),
+                tv = tv_duty_esp32(rows_ep, t_end, t0_us=t0, queries=qs,
                                    events=read_events(ep), ack=glc.read_ack(os.path.join(d, gain_ack_name)))
                 tv['rows_dropped'] = n_drop
-            elif not tv['reason']:
-                tv['reason'] = f'thieu {esp32_name}' if not os.path.isfile(ep) else 'diem cham khong co t_end'
             run['values'], run['missing'] = run_values(score, task, tv)
+            run['values'].update({k: score[k] for k in APPENDIX_QUANTITIES if _a_number(score.get(k))})
             run['flag'] = (int(score.get('track_err_frames') or 0) > 0 if plat[1] == 'HIL'
                            else int(score.get('n_back_frames') or 0) > 0)
             run['tv_check'] = tv
@@ -564,7 +636,7 @@ def seq_wrap_evidence(data_seqs, end_seqs):
     return None
 
 
-def run_gain_problem(esp32_path, want):
+def run_gain_problem(esp32_path, want, expected_boot=None, exact_first_seq=False):
     """R134C6-1, R134C7-1 (Codex rounds 6, 7; Liam 15/11 CODE_R134 hop chon "Kiem gain moi doan (Recommended)"):
     None, or why the run does not show the set of the gain file `want` in EVERY motor-on stretch of its ESP32 log:
     each stretch (a data line with motor_on = 1 after one with 0) must have its own '#gain' line, next to its
@@ -621,11 +693,15 @@ def run_gain_problem(esp32_path, want):
             where = f'moc bat dau first_seq={seq} ({len(seqs)} moc trong events)'
             if st['gain'] is None:
                 return f'dong #gain cua {where}: {"; ".join(st["why"])} (S05 6.3)'
+            if expected_boot and st['boot'] != expected_boot.lower():
+                return f'boot cua luot {st["boot"]} (#us,ev=start) khac boot cua hai lan hoi {expected_boot}'
             why = glc.gain_mismatch(st['gain'], want)
             if why:
                 return f'dong #gain cua {where} khac file gain: {"; ".join(why)}'
         seq_of = [_int(x.get('log_seq')) for x in rows]
         tick_of = [_int(x.get('tick')) for x in rows]
+        if exact_first_seq and seq_of[on.index(True)] not in seqs:
+            return '#gain first_seq khong khop log_seq cua dong du lieu dau luot'
         for i in range(1, len(rows)):                                                    # (2)
             if not on[i]:
                 continue
@@ -648,12 +724,10 @@ def run_gain_problem(esp32_path, want):
     return None
 
 
-def run_evidence_problem(row, query_before_name='gain_query_before.txt', query_after_name='gain_query_after.txt',
-                         gain_ack_name='gain_ack.txt', esp32_name='esp32.csv', gain_file=None):
+def run_evidence_problem(row, queries, gain_ack_name, esp32_name, gain_file, results_dir):
     """R134C5-1, R134C5-3 (Codex round 5; Liam 14/11 CODE_R134 hop chon "Bat buoc ack moi luot (Recommended)"):
     None, or why a judged final run (car or HIL) lacks the evidence S05 4.7 (iv) asks for, checked at the level of
-    the run, apart from tv_duty: two answers in <results_dir> that are two questions one after the other
-    (gain_line_check.query_problem), their boots equal to the two boot columns of the row, and the '#gain_ack' of
+    the run, apart from tv_duty: the two answers checked by rq3_log.check_query_rows, and the '#gain_ack' of
     the gain setting (every final run, the initial gain too, sets its gain from a file with --gain-file): present,
     readable, of the boot, MAC and running id of the question before the run.
     R134C6-1 (Codex round 6): and the set of the row's cell (gain_file: entry of gain_files(), None = no file for
@@ -661,14 +735,10 @@ def run_evidence_problem(row, query_before_name='gain_query_before.txt', query_a
     is the running id of the question before (so of the ack too).
     R134C7-1, -2 (Codex round 7): the '#gain' line of every motor-on stretch; the running id of the question after
     equals the file id too; a frozen set whose file could not be proved (entry with 'error') refuses its runs."""
-    d = row.get('results_dir', '')
-    qb, qa = read_query(os.path.join(d, query_before_name)), read_query(os.path.join(d, query_after_name))
-    why = glc.query_problem(qb, qa, check_run_boot=False)
-    if why:
-        return why
-    cols = ((row.get('boot_before') or '').lower(), (row.get('boot_after') or '').lower())
-    if cols != (qb['boot'].lower(), qa['boot'].lower()):
-        return f'boot cua dong log {cols} khac hai file hoi ({qb["boot"]}, {qa["boot"]})'
+    if results_dir is None:
+        return 'thieu results_dir cua luot'
+    d = results_dir
+    qb, qa = queries
     ap = os.path.join(d, gain_ack_name)
     ack = glc.read_ack(ap)
     if ack is None:
@@ -690,10 +760,12 @@ def run_evidence_problem(row, query_before_name='gain_query_before.txt', query_a
     if not glc._dec(qa.get('id')) or int(qa['id']) != want['id']:                    # R134C7-1
         return (f'id dang chay {qa.get("id")!r} cua lan hoi sau khac id {want["id"]} cua file gain '
                 f'{gain_file["file"]}: bo gain doi trong luot')
-    return run_gain_problem(os.path.join(d, esp32_name), want)
+    return run_gain_problem(os.path.join(d, esp32_name), want, expected_boot=qb['boot'])
 
 
 def build_table(runs):
+    from rq3_log import FINAL_N
+
     cells = defaultdict(list)
     for r in runs:
         cells[(r['controller'], r['condition'], r['platform'], r['gain_set'])].append(r)
@@ -704,7 +776,13 @@ def build_table(runs):
                 for gs in GAIN_SETS:
                     rs = cells.get((ctrl, cond, plat, gs), [])
                     val = [r for r in rs if r['outcome'] in VALID]
-                    base = dict(controller=ctrl, condition=cond, platform=plat, gain_set=gs, n_valid=len(val),
+                    if len(val) > FINAL_N:
+                        raise ValueError(f'{ctrl} {cond} {plat} {gs}: more than {FINAL_N} valid runs (§4.7)')
+                    base = dict(controller=ctrl, condition=cond, platform=plat, gain_set=gs, n_planned=FINAL_N,
+                                n_valid=len(val), stop_reason=next((r['stop_reason'] for r in rs
+                                                                  if r.get('stop_reason')), ''),
+                                **{f'n_g{i}_dat': sum(r.get(f'g{i}_state') == 'dat' for r in val)
+                                   for i in range(1, 6)},
                                 n_dat=sum(r['outcome'] == 'dat' for r in val),
                                 n_khong_dat=sum(r['outcome'] == 'khong_dat' for r in val),
                                 n_chua_ket_luan=sum(r['outcome'] == 'chua_ket_luan' for r in val),
@@ -714,6 +792,8 @@ def build_table(runs):
                     for q in QUANTITIES:
                         xs = [r['values'][q] for r in val if _a_number(r['values'].get(q))]   # B81-16
                         why = '; '.join(f"{r['run_uid']}: {r['missing'][q]}" for r in val if q in r['missing'])
+                        if not val:
+                            why = 'khong co luot hop le'
                         out.append(dict(base, quantity=q, n_m=len(xs),
                                         median=statistics.median(xs) if xs else None,
                                         max=max(xs) if xs else None, missing=why))
@@ -727,19 +807,22 @@ def markdown(table):
     for ctrl in CONTROLLERS:
         for cond in CONDITIONS:
             for plat in ('xe', 'HIL'):
-                head = ' | '.join(
-                    f"n {by[(ctrl, cond, plat, g, QUANTITIES[0])]['n_valid']}: "
-                    f"{by[(ctrl, cond, plat, g, QUANTITIES[0])]['n_dat']}/"
-                    f"{by[(ctrl, cond, plat, g, QUANTITIES[0])]['n_khong_dat']}/"
-                    f"{by[(ctrl, cond, plat, g, QUANTITIES[0])]['n_chua_ket_luan']}, co {by[(ctrl, cond, plat, g, QUANTITIES[0])]['n_flag']}, "
-                    f"cat_t1 {by[(ctrl, cond, plat, g, QUANTITIES[0])]['n_cat_t1']}"
-                    for g in GAIN_SETS)
+                head = []
+                for g in GAIN_SETS:
+                    t = by[(ctrl, cond, plat, g, QUANTITIES[0])]
+                    counts = '/'.join(str(t[k]) for k in GATE_COUNTS)
+                    cell = (f"n {t['n_valid']}/{t['n_planned']}: {t['n_dat']}/{t['n_khong_dat']}/{t['n_chua_ket_luan']}, "
+                            f"hong {t['n_hong_he_do']}, co {t['n_flag']}, cat_t1 {t['n_cat_t1']}, G1–G5 {counts}")
+                    head.append(f"{cell}; {t['stop_reason']}" if t['stop_reason'] else cell)
+                head = ' | '.join(head)
                 L.append(f'| {ctrl} | {cond} | {plat} | n_valid: dat/khong/chua, co | {head} |')
                 for q in QUANTITIES:
                     cells = []
                     for g in GAIN_SETS:
                         t = by[(ctrl, cond, plat, g, q)]
-                        cells.append('–' if t['n_m'] == 0 else f"{t['median']:.4g} / {t['max']:.4g} (n_m {t['n_m']})")
+                        cell = '–' if t['n_m'] == 0 else f"{t['median']:.4g} / {t['max']:.4g} (n_m {t['n_m']})"
+                        why = t['missing'].replace('|', r'\|').replace('\n', ' ')
+                        cells.append(f'{cell} ({why})' if why else cell)
                     L.append(f'| | | | {q} (trung vi / lon nhat) | ' + ' | '.join(cells) + ' |')
     return '\n'.join(L) + '\n'
 
@@ -747,15 +830,17 @@ def markdown(table):
 def write_table(runs, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     table = build_table(runs)
-    cols = ['controller', 'condition', 'platform', 'gain_set', 'n_valid', 'n_dat', 'n_khong_dat', 'n_chua_ket_luan',
-            'n_hong_he_do', 'n_flag', 'n_cat_t1', 'quantity', 'n_m', 'median', 'max', 'missing']
+    cols = ['controller', 'condition', 'platform', 'gain_set', 'n_planned', 'n_valid', 'n_dat', 'n_khong_dat',
+            'n_chua_ket_luan', 'n_hong_he_do', 'n_flag', 'n_cat_t1', 'stop_reason', *GATE_COUNTS,
+            'quantity', 'n_m', 'median', 'max', 'missing']
     with open(os.path.join(out_dir, 'S05_final_table.csv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         w.writerows({k: ('' if t[k] is None else t[k]) for k in cols} for t in table)
     with open(os.path.join(out_dir, 'S05_final_table.md'), 'w', encoding='utf-8') as f:
         f.write(markdown(table))
-    rcols = ['run_uid', 'platform', 'controller', 'condition', 'gain_set', 'outcome', 'flag'] + list(QUANTITIES) + \
+    rcols = ['run_uid', 'platform', 'controller', 'condition', 'speed_mps', 'gain_set', 'outcome', 'flag',
+             'fail_cause', 'stop_reason', *GATE_RUN_FIELDS, *QUANTITIES, *APPENDIX_QUANTITIES, 'missing'] + \
             ['tv_reason', 'tv_d_tick', 'tv_d_seq', 'tv_end_gap_ms', 'tv_rows_dropped', 't_end_err_ms', 't_end_err_src',
              'results_dir', 'gain_set_id', 'gain_file', 'gain_sha256', 'so_h_flags', 'moc_flags', 'U_moc_xy_m',
              'U_moc_psi_deg']
@@ -767,7 +852,10 @@ def write_table(runs, out_dir):
             tv = r.get('tv_check', {})
             w.writerow(dict(run_uid=r['run_uid'], platform=r['platform'], controller=r['controller'],
                             condition=r['condition'], gain_set=r['gain_set'], outcome=r['outcome'],
-                            flag=r.get('flag', ''), **{q: ('' if v.get(q) is None else v[q]) for q in QUANTITIES},
+                            **{k: r.get(k, '') for k in ('speed_mps', 'fail_cause', 'stop_reason', *GATE_RUN_FIELDS)},
+                            flag=r.get('flag', ''),
+                            **{q: v.get(q) for q in (*QUANTITIES, *APPENDIX_QUANTITIES)},
+                            missing='; '.join(f'{q}: {why}' for q, why in r.get('missing', {}).items()),
                             tv_reason=tv.get('reason', ''), tv_d_tick=tv.get('d_tick', ''), tv_d_seq=tv.get('d_seq', ''),
                             tv_end_gap_ms=tv.get('end_gap_ms', ''), tv_rows_dropped=tv.get('rows_dropped', ''),
                             t_end_err_ms='' if r.get('t_end_err_ms') is None else r['t_end_err_ms'],
@@ -803,8 +891,6 @@ def main(argv=None):
     a2.add_argument('--out', required=True)
     a2.add_argument('--score-name', default='score.json')
     a2.add_argument('--esp32-name', default='esp32.csv')
-    a2.add_argument('--query-before-name', default='gain_query_before.txt')
-    a2.add_argument('--query-after-name', default='gain_query_after.txt')
     a2.add_argument('--gain-ack-name', default='gain_ack.txt')
     a2.add_argument('--init-gain', action='append', default=[], metavar='CTRL=FILE',
                     help='gain file of the initial gain RQ2-INIT-<CTRL> (PID, LADRC; R134C6-1)')
@@ -827,8 +913,7 @@ def main(argv=None):
                 if not sep or not f or c in init:
                     raise ValueError(f'--init-gain {x!r}: write CTRL=FILE, once per controller')
                 init[c] = f
-            runs, problems = load_runs(a.dataset, a.score_name, a.esp32_name, a.query_before_name,
-                                       a.query_after_name, a.gain_ack_name, init, a.gate_file or None,
+            runs, problems = load_runs(a.dataset, a.score_name, a.esp32_name, a.gain_ack_name, init, a.gate_file or None,
                                        a.gate_file_fake)
             for p in problems:
                 print('CANH BAO:', p)

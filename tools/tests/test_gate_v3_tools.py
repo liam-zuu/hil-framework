@@ -20,6 +20,8 @@ import hil_o1_score as H                                     # noqa: E402
 import o1_gate as G                                          # noqa: E402
 import o1_lanes as L                                         # noqa: E402
 import protocol as P                                         # noqa: E402
+from test_rq3_log import end_with_trial, freeze_for_final, gain_file
+import s05_fake_runs as fr
 import rq3_log as rl                                         # noqa: E402
 from test_hil_o1_score import write_frame_log, k_log         # noqa: E402
 
@@ -117,8 +119,8 @@ def _end(d, outcome, gate=None, **kw):
         gate = rl.floor_gate(gate)
     if outcome in rl.VALID and rl.boot_needed(row.get('platform'), row.get('stage')):     # car, final_hil
         if 'boot_before' not in kw and 'queries' not in kw:      # R134C4-1: two answers, not two strings
-            kw['queries'] = rl.fake_queries('ab')
-    return rl.end(d, outcome, gate=gate, **kw)
+            kw['queries'] = rl.fake_queries(fr.BOOT)
+    return end_with_trial(d, outcome, gate=gate, **kw)
 
 
 def test_gate_columns_written(ds):
@@ -589,8 +591,9 @@ def test_cli_end_with_gate_json(ds, tmp_path):
         json.dump(dict(gate_v3=rl.floor_gate(_gate(e_trk=0.12))), fh)  # a car run: camera scorer output
     _open(d, clock)
     qb, qa = _query_files(tmp_path)                                        # a judged car run: R134 (b)
+    trial = fr.write_trial_gain(os.path.join(d, 'r'))
     assert rl.main(['--dataset', d, 'end', '--outcome', 'khong_dat', '--gate-json', f, '--results-dir', 'r',
-                    '--query-before', qb, '--query-after', qa]) == 0
+                    '--query-before', qb, '--query-after', qa, '--gain-file', trial]) == 0
     r = _rows(d)[-1]
     assert r['g3_state'] == 'khong_dat' and r['gate_json_sha256'] == rl.sha256_file(f)
     assert r['boot_before'] == r['boot_after'] == '4753dc47'
@@ -642,6 +645,8 @@ def test_s315_r3_1_begin_extra_cannot_set_identity(ds):
 
 
 def _final_car(d, clock, outcome, minutes, replaces=''):
+    if not rl.freeze_rows(d):
+        rl.freeze(d, 'A-PID', 'het_ung_vien', 'A-PID/G0', gain_file(d), at='2026-11-19T08:00:00')
     clock[0] = dt.datetime(2026, 11, 20, 8, 0, 0) + dt.timedelta(minutes=minutes)
     rl.begin(d, 'F', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final', gain_set='A-PID/G0', replaces_run_uid=replaces)
     rl.step(d, 'run')
@@ -762,6 +767,8 @@ def test_cli_end_requires_the_query_files(ds, tmp_path, capsys, platform, stage,
     assert rl.query_files_needed(dict(platform=platform, stage=stage), outcome) is needed
     d, clock = ds
     campaign, gs = {('HW', 'screen'): ('A-PID', 'A-PID/G1'), ('HW', 'final'): ('A-PID', 'A-PID/G0'), ('HIL', 'final_hil'): ('RQ2', 'RQ2-INIT-PID/G0'), ('HIL', 'hil_check'): ('B-PID', 'B-PID/GA1'), ('SIM', 'screen'): ('B-PID', '')}[(platform, stage)]
+    if stage == 'final':
+        freeze_for_final(d, clock, campaign, gs)
     rl.begin(d, 'S', campaign, platform, 'PID', 'O1-F05', '0.5', stage, gain_set=gs)
     rl.step(d, 'run')
     clock[0] += dt.timedelta(seconds=60)
@@ -770,6 +777,8 @@ def test_cli_end_requires_the_query_files(ds, tmp_path, capsys, platform, stage,
         g = _gate(u_t=0.0015 if platform == 'HIL' else 0.0, e_trk=0.12 if outcome == 'khong_dat' else 0.03)
         json.dump(dict(gate_v3=rl.floor_gate(g) if platform == 'HW' else g), fh)          # B81-1, B81-3
     extra = ['--fail-cause', 'mat_khung'] if outcome == 'hong_he_do' else ['--gate-json', f, '--results-dir', 'r']
+    if outcome in rl.VALID and platform in ('HW', 'HIL') and stage in ('screen', 'hil_check'):
+        extra += ['--gain-file', fr.write_trial_gain(os.path.join(d, 'r'))]
     qb, qa = _query_files(tmp_path)
     for q in ([], ['--query-before', qb]):
         rc = rl.main(['--dataset', d, 'end', '--outcome', outcome] + extra + q)

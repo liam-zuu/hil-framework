@@ -147,10 +147,11 @@ def test_end_records_the_query_files(tmp_path):
     rl.migrate(ds)
     qdir = str(tmp_path / 'q')
     qs = rl.fake_queries('ab', folder=qdir)
+    trial = fr.write_trial_gain(qdir, boot='ab')
     rl.begin(ds, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
     rl.step(ds, 'run')
     row = rl.end(ds, 'khong_dat', completed=1, e_perp_max=0.2, results_dir=qdir,
-                 gate=rl.floor_gate(rl.fake_gate(e_trk=0.5)), queries=qs)
+                 gate=rl.floor_gate(rl.fake_gate(e_trk=0.5)), queries=qs, gain_file=trial)
     assert row['query_before_file'] == os.path.abspath(os.path.join(qdir, 'gain_query_before.txt'))
     assert row['query_after_sha256'] == rl.sha256_file(os.path.join(qdir, 'gain_query_after.txt'))
 
@@ -339,14 +340,16 @@ def test_b8s2_1_end_refuses_a_score_final_file(demo_ds, tmp_path):
 
 def _judged_run(ds, d, campaign, ctrl, stage, outcome, gain_set, block_id='', platform='HW'):
     """A judged run with its folder and scorer file score.json (outcome, gate_v3) given to end with its sha256."""
+    gain = fr.sample_gain(ctrl)
     qs = tuple(T.glc.read_query(p) for p in fr.write_final_run(
-        d, platform, GAIN, score_extra=dict(outcome=outcome, gate_v3=GATES[outcome](_gf(ds)))))
+        d, platform, gain, score_extra=dict(outcome=outcome, gate_v3=GATES[outcome](_gf(ds)))))
+    trial = fr.write_gain_file(os.path.join(d, 'gain_trial.json'), gain)
     sp = os.path.join(d, 'score.json')
     rl.begin(ds, 'FAKE-' + stage, campaign, platform, ctrl, 'O1-F05', '0.5', stage, gain_set=gain_set,
              block_id=block_id)
     rl.step(ds, 'run')
     return rl.end(ds, outcome, completed=1, e_perp_max=0.1, results_dir=d, gate=rl.read_gate_json(sp),
-                  gate_sha256=rl.sha256_file(sp), queries=qs, gate_file=_gf(ds))
+                  gate_sha256=rl.sha256_file(sp), queries=qs, gate_file=_gf(ds), gain_file=trial)
 
 
 def _fourth_final_run(ds, tmp_path):
@@ -448,7 +451,7 @@ def _confirm_block(ds, tmp_path, block, outcomes):
 
 def _freeze_ok(ds, tmp_path, at=''):
     return rl.freeze(ds, 'A-LADRC', 'khoi_xac_nhan_dat', 'A-LADRC/G01',
-                     fr.write_gain_file(str(tmp_path / 'FAKE_gain_L.json'), GAIN), at=at)
+                     fr.write_gain_file(str(tmp_path / 'FAKE_gain_L.json'), fr.sample_gain('LADRC')), at=at)
 
 
 def test_c9d4_freeze_needs_the_so_h_of_the_last_block(demo_ds, tmp_path, no_moc):
@@ -457,9 +460,13 @@ def test_c9d4_freeze_needs_the_so_h_of_the_last_block(demo_ds, tmp_path, no_moc)
         _freeze_ok(demo_ds, tmp_path)
     for u in uids:
         rl.so_h(demo_ds, u, _score_final(demo_ds, u, 0.5))
+    finished = max(_row(demo_ds, u)['wall_end'] for u in uids)
+    compared = rl._iso(rl._parse_t(finished) + rl.dt.timedelta(seconds=1))
+    p = os.path.join(demo_ds, rl.SO_H)
+    _write_rows(p, [dict(r, ghi_luc=compared) if r['run_uid'] in uids else r for r in _rows(p)])
     with pytest.raises(rl.LogError, match='earlier than the last so-h'):
-        _freeze_ok(demo_ds, tmp_path, at='2026-01-01T00:00:00')
-    _freeze_ok(demo_ds, tmp_path)
+        _freeze_ok(demo_ds, tmp_path, at=finished)
+    _freeze_ok(demo_ds, tmp_path, at=compared)
     assert {r['campaign']: r for r in _summary(demo_ds)}['A-LADRC']['stop_reason_check'] == 'ok'
 
 
@@ -617,7 +624,7 @@ def test_q1c1_a_run_lost_at_so_h_is_not_one_of_the_two(demo_ds, tmp_path, no_moc
 
 def test_c9d4_summary_mismatch_for_a_freeze_row_the_log_does_not_back(demo_ds, tmp_path):
     _confirm_block(demo_ds, tmp_path, 'K1', ('dat',))
-    gf = fr.write_gain_file(str(tmp_path / 'FAKE_gain_L.json'), GAIN)
+    gf = fr.write_gain_file(str(tmp_path / 'FAKE_gain_L.json'), fr.sample_gain('LADRC'))
     rl.append_row(os.path.join(demo_ds, rl.FREEZE), rl.FREEZE_COLS, dict(
         campaign='A-LADRC', frozen_at='2030-01-01T00:00:00', stop_reason='khoi_xac_nhan_dat', stop_cause='',
         gain_set_id='A-LADRC/G01', gain_file=gf, gain_sha256=rl.sha256_file(gf), notes='FAKE: by hand'))

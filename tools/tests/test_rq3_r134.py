@@ -11,7 +11,9 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from test_rq3_log import end_with_trial, freeze_for_final
 import rq3_log as rl  # noqa: E402
+import s05_fake_runs as fr
 
 # B81-1, B81-3: the camera scorer output of a judged car run (FAKE: two equal frame domains), G3 failed
 CAR_KD = dict(gate=rl.floor_gate(rl.fake_gate(e_trk=0.5)), results_dir='r')
@@ -45,7 +47,7 @@ def test_boot_columns_recorded(ds):
     d, clock = ds
     _open(d, clock)
     qb, qa = rl.fake_queries('4753dc47')
-    rl.end(d, 'khong_dat', queries=(qb, dict(qa, boot='4753DC47')), **CAR_KD)
+    end_with_trial(d, 'khong_dat', queries=(qb, dict(qa, boot='4753DC47')), **CAR_KD)
     r = _rows(d)[-1]
     assert (r['boot_before'], r['boot_after']) == ('4753dc47', '4753DC47')
     assert {'boot_before', 'boot_after'} <= set(rl.TUNING_COLS)
@@ -59,7 +61,7 @@ def test_missing_or_different_boot_is_a_run_failed_by_operation(ds, before, afte
     _open(d, clock)
     for o in ('khong_dat', 'chua_ket_luan'):
         with pytest.raises(rl.LogError, match=rl.BOOT_FAIL):
-            rl.end(d, o, boot_before=before, boot_after=after)
+            end_with_trial(d, o, boot_before=before, boot_after=after)
     with pytest.raises(rl.LogError, match=rl.BOOT_FAIL):
         rl.end(d, 'hong_he_do', fail_cause='mat_khung', boot_before=before, boot_after=after)
     rl.end(d, 'hong_he_do', fail_cause=rl.BOOT_FAIL, boot_before=before, boot_after=after)
@@ -79,7 +81,7 @@ def test_boot_fail_cause_needs_the_evidence(ds):
 def test_summary_refuses_a_judged_row_with_two_boots(ds):
     d, clock = ds
     _open(d, clock)
-    rl.end(d, 'khong_dat', queries=rl.fake_queries('ab'), **CAR_KD)
+    end_with_trial(d, 'khong_dat', queries=rl.fake_queries('ab'), **CAR_KD)
     rows = _rows(d)
     rows[-1]['boot_after'] = 'cd'                                      # edited by hand
     rl._write_all(os.path.join(d, rl.TUNING), rl.TUNING_COLS, rows)
@@ -148,8 +150,9 @@ def test_cli_end_accepts_two_proper_answers(ds, tmp_path):
     qb, qa = _answer_file(tmp_path / 'qb.txt'), _answer_file(tmp_path / 'qa.txt', t=(3.0, 4.0))
     gj = tmp_path / 'score.json'
     gj.write_text(json.dumps(dict(gate_v3=CAR_KD['gate'])), encoding='utf-8')            # B81-1: camera gate
+    trial = fr.write_trial_gain(os.path.join(d, 'r'))
     assert rl.main(['--dataset', d, 'end', '--outcome', 'khong_dat', '--query-before', qb, '--query-after', qa,
-                    '--gate-json', str(gj), '--results-dir', 'r']) == 0
+                    '--gate-json', str(gj), '--results-dir', 'r', '--gain-file', trial]) == 0
     assert (_rows(d)[-1]['boot_before'], _rows(d)[-1]['boot_after']) == ('4753dc47', '4753dc47')
 
 
@@ -182,16 +185,16 @@ def test_b81_1_judged_car_run_needs_the_camera_gate(ds, outcome):
     d, clock = ds
     _open(d, clock)
     with pytest.raises(rl.LogError, match='camera scorer'):
-        rl.end(d, outcome, **BOOTS)
+        end_with_trial(d, outcome, **BOOTS)
     one = rl.fake_gate()                                              # o1_gate output: one domain, no G1 fields
     with pytest.raises(rl.LogError, match='t_done'):
-        rl.end(d, outcome, gate=one, results_dir='r', **BOOTS)
+        end_with_trial(d, outcome, gate=one, results_dir='r', **BOOTS)
     no_common = _hw_gate()
     no_common['g3'].pop('chung')
     with pytest.raises(rl.LogError, match='common frame domain'):
-        rl.end(d, outcome, gate=no_common, results_dir='r', **BOOTS)
+        end_with_trial(d, outcome, gate=no_common, results_dir='r', **BOOTS)
     g = {'dat': _hw_gate(), 'khong_dat': _hw_gate(e_trk=0.5), 'chua_ket_luan': _hw_gate(t_done=(10.0, None))}[outcome]
-    rl.end(d, outcome, gate=g, results_dir='r', **BOOTS)
+    end_with_trial(d, outcome, gate=g, results_dir='r', **BOOTS)
     r = _rows(d)[-1]
     assert r['g1_ways'] == '2' and r['g3_q_chung'] == r['g3_q'] and r['run_outcome'] == outcome
     rl.summary(d)
@@ -200,7 +203,7 @@ def test_b81_1_judged_car_run_needs_the_camera_gate(ds, outcome):
 def test_b81_1_summary_refuses_a_judged_car_row_without_gate_columns(ds):
     d, clock = ds
     _open(d, clock)
-    rl.end(d, 'khong_dat', **BOOTS, **CAR_KD)
+    end_with_trial(d, 'khong_dat', **BOOTS, **CAR_KD)
     rows = _rows(d)
     bare = dict(rows[0], **{c: '' for c in rl.GATE_COLS})
     path = os.path.join(d, rl.TUNING)
@@ -222,14 +225,16 @@ def test_b81_2_end_and_summary_need_both_boots(ds, platform, stage, needed):
     campaign, gs = {('HW', 'screen'): ('A-PID', 'A-PID/G1'), ('HW', 'final'): ('A-PID', 'A-PID/G0'),
                     ('HIL', 'final_hil'): ('RQ2', 'RQ2-INIT-PID/G0'), ('HIL', 'hil_check'): ('B-PID', 'B-PID/GA1')}[
         (platform, stage)]
+    if stage == 'final':
+        freeze_for_final(d, clock, campaign, gs)
     rl.begin(d, 'S', campaign, platform, 'PID', 'O1-F05', '0.5', stage, gain_set=gs)
     rl.step(d, 'run')
     clock[0] += dt.timedelta(seconds=60)
     gate = _hw_gate(e_trk=0.5) if platform == 'HW' else rl.fake_gate(e_trk=0.5)
     if needed:
         with pytest.raises(rl.LogError, match=rl.BOOT_FAIL):        # the Python API too, not only the CLI
-            rl.end(d, 'khong_dat', gate=gate, results_dir='r')
-        rl.end(d, 'khong_dat', gate=gate, results_dir='r', **BOOTS)
+            end_with_trial(d, 'khong_dat', gate=gate, results_dir='r')
+        end_with_trial(d, 'khong_dat', gate=gate, results_dir='r', **BOOTS)
         rows = _rows(d)
         path = os.path.join(d, rl.TUNING)
         for cut in (dict(boot_before=''), dict(boot_after=''), dict(boot_before='', boot_after='')):
@@ -237,7 +242,7 @@ def test_b81_2_end_and_summary_need_both_boots(ds, platform, stage, needed):
             with pytest.raises(rl.LogError, match='missing or unreadable'):
                 rl.summary(d)
     else:
-        rl.end(d, 'khong_dat', gate=gate, results_dir='r')
+        end_with_trial(d, 'khong_dat', gate=gate, results_dir='r')
         rl.summary(d)
 
 
@@ -271,8 +276,8 @@ def test_b81_3_two_domains_violation_only_in_the_union_is_inconclusive(ds):
     d, clock = ds
     _open(d, clock)
     with pytest.raises(rl.LogError, match='disagrees'):
-        rl.end(d, 'khong_dat', gate=g, results_dir='r', **BOOTS)
-    rl.end(d, 'chua_ket_luan', gate=g, results_dir='r', **BOOTS)
+        end_with_trial(d, 'khong_dat', gate=g, results_dir='r', **BOOTS)
+    end_with_trial(d, 'chua_ket_luan', gate=g, results_dir='r', **BOOTS)
     r = _rows(d)[-1]
     assert (r['g2_lo'], r['g2_lo_chung'], r['g1_t_done_1'], r['g1_t_done_2']) == ('0.12', '0.02', '10.0', '12.0')
     rl.summary(d)
@@ -363,13 +368,13 @@ def test_b81_3_cat_t1_and_the_violation_before_t1(ds):
     assert g['g1']['state'] == 'chua_ket_luan' and g['outcome_decide'] == 'khong_dat'
     _open(d, clock)
     with pytest.raises(rl.LogError, match='R2V-4'):                  # cat_t1 without the fail cause
-        rl.end(d, 'khong_dat', gate=g, results_dir='r', **BOOTS)
+        end_with_trial(d, 'khong_dat', gate=g, results_dir='r', **BOOTS)
     plain = rl.floor_gate(rl.fake_gate(e_trk=0.5))
     with pytest.raises(rl.LogError, match='R2V-4'):                  # the fail cause without cat_t1
-        rl.end(d, 'khong_dat', gate=plain, results_dir='r', fail_cause=rl.VIOL_BEFORE, **BOOTS)
+        end_with_trial(d, 'khong_dat', gate=plain, results_dir='r', fail_cause=rl.VIOL_BEFORE, **BOOTS)
     with pytest.raises(rl.LogError, match='R2V-4'):                  # the fail cause without a gate
         rl.end(d, 'hong_he_do', fail_cause=rl.VIOL_BEFORE)
-    rl.end(d, 'khong_dat', gate=g, results_dir='r', fail_cause=rl.VIOL_BEFORE, **BOOTS)
+    end_with_trial(d, 'khong_dat', gate=g, results_dir='r', fail_cause=rl.VIOL_BEFORE, **BOOTS)
     r = _rows(d)[-1]
     assert (r['g1_cat_t1'], r['g1_t1'], r['g1_state']) == ('true', '6.0', 'chua_ket_luan')
     rl.summary(d)
@@ -396,22 +401,22 @@ def test_c4_1_end_needs_two_answers_not_two_strings(ds):
     d, clock = ds
     _open(d, clock)
     with pytest.raises(rl.LogError, match='R134C4-1'):
-        rl.end(d, 'khong_dat', boot_before='ab', boot_after='ab', **CAR_KD)
+        end_with_trial(d, 'khong_dat', boot_before='ab', boot_after='ab', **CAR_KD)
     qb, qa = rl.fake_queries('ab')
     for qs, why in (((qb, qb), 'cung mot file'), ((qa, qb), 'khong phai truoc va sau'),
                     ((qb, dict(qa, mac='cc')), 'hai board'), ((qb, None), 'sau')):
         with pytest.raises(rl.LogError, match=why):
-            rl.end(d, 'khong_dat', queries=qs, **CAR_KD)
+            end_with_trial(d, 'khong_dat', queries=qs, **CAR_KD)
     row = rl.end(d, 'hong_he_do', fail_cause=rl.BOOT_FAIL, queries=(qb, qb))      # the failed run is logged
     assert row['fail_cause'] == rl.BOOT_FAIL
     rl.begin(d, 'S', 'RQ2', 'HIL', 'PID', 'O1-F05', '0.5', 'final_hil', gain_set='RQ2-INIT-PID/G0')
     rl.step(d, 'run')
     with pytest.raises(rl.LogError, match='R134C4-1'):
-        rl.end(d, 'khong_dat', gate=rl.fake_gate(e_trk=0.5), results_dir='r', boot_before='ab', boot_after='ab')
-    rl.end(d, 'khong_dat', gate=rl.fake_gate(e_trk=0.5), results_dir='r', queries=(qb, qa))
+        end_with_trial(d, 'khong_dat', gate=rl.fake_gate(e_trk=0.5), results_dir='r', boot_before='ab', boot_after='ab')
+    end_with_trial(d, 'khong_dat', gate=rl.fake_gate(e_trk=0.5), results_dir='r', queries=(qb, qa))
     rl.begin(d, 'S', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5', 'hil_check', gain_set='B-PID/GA1')
     rl.step(d, 'run')
-    rl.end(d, 'khong_dat', gate=rl.fake_gate(e_trk=0.5), results_dir='r', boot_before='ab', boot_after='ab')
+    end_with_trial(d, 'khong_dat', gate=rl.fake_gate(e_trk=0.5), results_dir='r', boot_before='ab', boot_after='ab')
     rl.summary(d)                                                     # hil_check: the boots are not required
 
 
@@ -431,11 +436,11 @@ def test_c4_3_floor_run_with_t1_is_lost(ds, t_done, outcome):
     assert g['outcome_decide'] == outcome
     _open(d, clock)
     with pytest.raises(rl.LogError, match='lost to the measurement'):
-        rl.end(d, outcome, gate=g, results_dir='r', **BOOTS)
+        end_with_trial(d, outcome, gate=g, results_dir='r', **BOOTS)
     rl.end(d, 'hong_he_do', fail_cause='loi_theo_doi', gate=g, results_dir='r')
     rl.summary(d)
     _open(d, clock)
-    rl.end(d, outcome, gate=_hw_gate(t_done=t_done), results_dir='r', **BOOTS)   # the same run without t1
+    end_with_trial(d, outcome, gate=_hw_gate(t_done=t_done), results_dir='r', **BOOTS)   # the same run without t1
     rows = _rows(d)
     rows[-1]['g1_t1'] = '5.0'                                         # t1 written in by hand
     rl._write_all(os.path.join(d, rl.TUNING), rl.TUNING_COLS, rows)
@@ -458,7 +463,7 @@ def test_c4_4_completion_at_the_deadline_is_not_before_it(ds):
         rl.validate_gate(one, 'SIM')
     d, clock = ds
     _open(d, clock)
-    rl.end(d, 'dat', gate=g, results_dir='r', **BOOTS)
+    end_with_trial(d, 'dat', gate=g, results_dir='r', **BOOTS)
     rows = _rows(d)
     rows[-1]['g1_t_done_2'] = rows[-1]['g1_t_deadline']               # the CSV path too
     rl._write_all(os.path.join(d, rl.TUNING), rl.TUNING_COLS, rows)
