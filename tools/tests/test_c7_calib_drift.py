@@ -496,6 +496,35 @@ V2_MISS_H1 = dict(DRIFT_MISS, version=cd.DRIFT_VERSION, D_H_vi_tri_mm=None, D_H_
                   trang_thai_vi_tri='thieu', trang_thai_huong='thieu', vuot_do_thieu=True)
 
 
+@pytest.mark.parametrize('drift', [DRIFT_OK, V2_OK])
+@pytest.mark.parametrize('task,bad', [('O1-F05', dict(tasks=['O1-F08'])),
+                                      ('O1-K1', dict(k_start=[99., 0., 0.])),
+                                      ('O1-K2', dict(k_start=[99., 0., 0.]))])
+def test_x3v3_5_round4_so_h_checks_drift_scope(tmp_path, drift, task, bad):
+    import rq3_log as rl
+    ds = str(tmp_path)
+    drift = dict(drift, tasks=[task])
+    h0 = dict(sc('dat'), task=task, k_start=list(KS_K), gate_v3=rl.floor_gate(rl.fake_gate()))
+    combined = cd.combine(drift, h0, tr('s0'), 'f0')
+    if 'version' not in drift:
+        combined['calib_drift'].pop('version')  # original v1 gop
+    h, raw, final = (tmp_path / n for n in ('h0.json', 'drift.json', 'score_final.json'))
+    h.write_text(json.dumps(h0), encoding='utf-8')
+    final.write_text(json.dumps(combined), encoding='utf-8')
+    row = dict(run_uid='S:1', platform='HW', campaign='A-PID', trajectory=task, run_outcome='dat',
+               results_dir=ds, **rl.gate_columns(h0['gate_v3'], rl.sha256_file(str(h))))
+    rl.append_row(str(tmp_path / rl.TUNING), rl.TUNING_COLS, row)
+    raw.write_text(json.dumps(dict(drift, **bad)), encoding='utf-8')
+    with pytest.raises(rl.LogError, match='(task|k_start)'):
+        rl.so_h(ds, 'S:1', str(final), str(raw))
+    raw.write_text(json.dumps(drift), encoding='utf-8')
+    saved = rl.so_h(ds, 'S:1', str(final), str(raw))
+    raw.write_text(json.dumps(dict(drift, **bad)), encoding='utf-8')
+    rl._write_all(str(tmp_path / rl.SO_H), rl.SO_H_COLS, [dict(saved, drift_sha256=rl.sha256_file(str(raw)))])
+    with pytest.raises(rl.LogError, match='(task|k_start)'):
+        rl.apply_so_h([row], ds)
+
+
 @pytest.mark.parametrize('drift', [dict(V2_MISS_XY, eps_H_huong_deg=None),
                                    dict(V2_MISS_PSI, eps_H_huong_deg=None), DRIFT_OK])
 def test_x3_18_x3v2_5_x3v2_6_round3_gop_to_so_h(tmp_path, drift):

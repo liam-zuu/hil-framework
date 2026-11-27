@@ -307,7 +307,7 @@ def test_x3_18_so_h_requires_h1_for_heading_or_missing_quantity(tmp_path, headin
     cd.update(D_H_mm=.5, s0_session_sha256='0' * 64, s1_session_sha256='1' * 64)
     path.write_text(json.dumps(d), encoding='utf-8')
     drift = {k: cd[k] for k in ('s0_session_sha256', 's1_session_sha256', 'D_H_mm', 'eps_H_mm', 'thieu_H1', 'vuot')}
-    drift.update(kind='c7_calib_drift', version='c7_calib_drift_v2', tasks=['O1-F05'], tag_offset=[0, 0, 0],
+    drift.update(kind='c7_calib_drift', version='c7_calib_drift_v2', tasks=['O1-F08'], tag_offset=[0, 0, 0],
                  k_start=None, D_H_vi_tri_mm=.5, D_H_huong_deg=heading, eps_H_huong_deg=1.,
                  trang_thai_vi_tri='so', trang_thai_huong='thieu' if missing else 'so', vuot_do_thieu=missing)
     run = next(r for r in rl.read_rows(str(Path(ds) / rl.TUNING)) if r['run_uid'] == uid)
@@ -472,8 +472,11 @@ def test_x3_14_round3_replay_each_freeze(tmp_path, bad, match):
     rl._write_all(p, rl.FREEZE_COLS, [dict(rl.read_rows(p)[0], **bad)])
     with pytest.raises(rl.LogError, match=match):
         rl.summary(ds)
-    with pytest.raises(ValueError, match=match):
-        LR(ds)
+    if 'frozen_at' in bad:
+        with pytest.raises(ValueError, match=match):
+            LR(ds)
+    else:
+        assert LR(ds)[0] == []
 
 
 def test_x3_14_round3_begin_final_hil_requires_its_freeze(tmp_path):
@@ -634,3 +637,182 @@ def test_x3v2_9_round3_freeze_and_final_same_second(tmp_path, monkeypatch):
     frozen = rl.freeze(ds, 'A-PID', 'het_ung_vien', 'A-PID/G1', str(p))
     run = rl.begin(ds, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '.5', 'final', gain_set='A-PID/G1')
     assert (frozen['frozen_at'], run['row']['wall_start']) == (t.isoformat(), t.replace(microsecond=123457).isoformat())
+
+
+@pytest.mark.parametrize('run_id,folder', [('R1', 'results/S03/R1'), ('R1', 'results/S3/R1'), ('S03X', 'r')])
+def test_x3_1_round4_machine_without_kind(tmp_path, run_id, folder):
+    args = ['--dataset', str(tmp_path), 'machine', '--campaign', 'RQ2', '--controller', 'PID',
+            '--script-run-id', run_id, '--results-dir', folder, '--n-sim-evals', '300',
+            '--t-machine-s', '600', '--wall-start', P1[1], '--wall-end', P1[2]]
+    assert rl.main(args) != 0
+    assert not (tmp_path / rl.TUNING).exists()
+
+
+@pytest.mark.parametrize('previous', [False, True])
+def test_x3_1_round4_phase_cannot_be_charged_twice(tmp_path, previous):
+    ds = str(tmp_path)
+    phases = [('RQ2', *P1[1:])]
+    if previous:
+        rl.machine_phases(ds, 'S03', 'R1', 'results/S03/R1', [P1, P2])
+    else:
+        phases.insert(0, P1)
+    rows = rl.read_rows(str(tmp_path / rl.TUNING))
+    with pytest.raises(rl.LogError, match='duplicate phase'):
+        rl.machine_phases(ds, 'S03', 'R2', 'results/S03/R2', phases)
+    assert rl.read_rows(str(tmp_path / rl.TUNING)) == rows
+
+
+def _begin_final(ds, row):
+    rl.begin(ds, 'S', row['campaign'], row['platform'], row['controller'], row['trajectory'],
+             row['speed_mps'], row['stage'], gain_set=row['gain_set_id'])
+
+
+def _final_evidence(row):
+    import gain_line_check as glc
+    d = Path(row['results_dir'])
+    return dict(results_dir=str(d), gate=rl.read_gate_json(str(d / 'score.json')),
+                gate_sha256=row['gate_json_sha256'],
+                queries=tuple(glc.read_query(row[k]) for k in rl.QUERY_FILE_COLS[::2]))
+
+
+@pytest.mark.parametrize('plat,stage,file', [('HW', 'final', 'esp32.csv.events.txt'),
+                                            ('HIL', 'final_hil', 'gain_ack.txt')])
+def test_x3_8_round4_boot_agrees_on_write_and_replay(tmp_path, plat, stage, file):
+    row = write_run(tmp_path, 'r', plat, stage, 'PID', 'O1-F05', 'A-PID/G07', 'dat', .03)
+    ds = _table_ds(tmp_path, [row])
+    p = Path(row['results_dir']) / file
+    p.write_text(p.read_text().replace('boot=4753dc47', 'boot=abcd'), encoding='utf-8')
+    _begin_final(ds, row)
+    before = (Path(ds) / rl.TUNING).read_bytes()
+    with pytest.raises(rl.LogError, match='boot'):
+        rl.end(ds, 'dat', **_final_evidence(row))
+    assert (Path(ds) / rl.TUNING).read_bytes() == before and rl._load_open(ds)
+    with pytest.raises(rl.LogError, match='boot'):
+        rl.summary(ds)
+    with pytest.raises(ValueError, match='boot'):
+        LR(ds)
+
+
+@pytest.mark.parametrize('ref', ['absolute', 'relative'])
+def test_x3v3_1_round4_log_must_belong_to_run(tmp_path, ref):
+    row = write_run(tmp_path, 'first', 'HIL', 'hil_check', 'PID', 'O1-F05', 'B-PID/G1', 'dat', .03)
+    d = tmp_path / 'second'
+    d.mkdir()
+    from test_s05_final_table import write_gain_file
+    gf = write_gain_file(tmp_path / 'gain.json')
+    log = str(tmp_path / 'first/esp32.csv') if ref == 'absolute' else '../first/esp32.csv'
+    ds = str(tmp_path)
+    _begin_final(ds, row)
+    kw = dict(gate=rl.fake_gate(), results_dir=str(d), gain_file=gf)
+    with pytest.raises(rl.LogError, match='results_dir'):
+        rl.end(ds, 'dat', esp32_log=log, **kw)
+    (d / 'pi').mkdir()
+    for suffix in ('', '.events.txt'):
+        (d / ('pi/capture.csv' + suffix)).write_bytes((tmp_path / ('first/esp32.csv' + suffix)).read_bytes())
+    inside = str(d / 'pi/capture.csv') if ref == 'absolute' else 'pi/capture.csv'
+    saved = rl.end(ds, 'dat', esp32_log=inside, **kw)
+    assert rl.summary(ds)
+    rl._write_all(str(tmp_path / rl.TUNING), rl.TUNING_COLS, [dict(saved, esp32_log=log)])
+    with pytest.raises(rl.LogError, match='results_dir'):
+        rl.summary(ds)
+
+
+@pytest.mark.parametrize('plat,stage', [('HW', 'final'), ('HIL', 'final_hil')])
+def test_x3_14_round4_reject_wrong_account_at_each_entry(tmp_path, plat, stage):
+    row = write_run(tmp_path, 'r', plat, stage, 'PID', 'O1-F05', 'A-PID/G07', 'dat', .03)
+    wrong = dict(row, campaign='RQ2' if plat == 'HW' else 'B-PID', wall_start='2026-11-18T09:00:00')
+    ds = _table_ds(tmp_path, [wrong])
+    for read, error in ((rl.summary, rl.LogError), (LR, ValueError)):
+        with pytest.raises(error, match='(belong|account RQ2)'):
+            read(ds)
+    with pytest.raises(rl.LogError, match='(belong|account RQ2)'):
+        _begin_final(ds, wrong)
+    _begin_final(ds, row)
+    opened = rl._load_open(ds)
+    opened['row']['campaign'] = wrong['campaign']
+    rl._save_open(ds, opened)
+    with pytest.raises(rl.LogError, match='(belong|account RQ2)'):
+        rl.end(ds, 'dat', **_final_evidence(row))
+
+
+@pytest.mark.parametrize('plat,stage', [('HW', 'final'), ('HIL', 'final_hil')])
+@pytest.mark.parametrize('prior,n,reason', [('dat', 5, 'more than 5'), ('hong_he_do', 3, 'stopped after 3')])
+def test_x3v2_3_round4_end_checks_projected_log(tmp_path, plat, stage, prior, n, reason):
+    ds = str(tmp_path)
+    row = write_run(tmp_path, 'r', plat, stage, 'PID', 'O1-F05', 'RQ2-INIT-PID/G3', 'dat', .03)
+    history = [write_run(tmp_path, f'past{i}', plat, stage, 'PID', 'O1-F05', f'RQ2-INIT-PID/G{i % 2 + 1}',
+                         prior, .03) for i in range(n)]
+    if prior == 'hong_he_do':
+        _begin_final(ds, row)  # A stop revealed while the run is open must still block end.
+    p = tmp_path / rl.TUNING
+    rl._write_all(str(p), rl.TUNING_COLS, history)
+    if prior == 'dat':
+        _begin_final(ds, row)  # Five valid runs already in the cell when the operator starts /G3.
+    before = p.read_bytes()
+    with pytest.raises(rl.LogError, match=reason):
+        rl.end(ds, 'dat', **_final_evidence(row))
+    assert p.read_bytes() == before and rl._load_open(ds)
+
+
+def test_x3v3_2_round4_unused_freeze_file_only_blocks_summary(tmp_path):
+    row = write_run(tmp_path, 'a', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', .03)
+    ds = _table_ds(tmp_path, [row], frozen=(('A-PID', 'A-PID/G07'), ('B-PID', 'B-PID/G1')))
+    (Path(ds) / 'gain_B-PID_G1.json').unlink()
+    assert [r['run_uid'] for r in LR(ds)[0]] == ['a']
+    with pytest.raises(rl.LogError, match='B-PID/G1.*not found'):
+        rl.summary(ds)
+
+
+def test_x3v3_3_round4_only_lock_a_checked_or_requested_log(tmp_path):
+    row = write_run(tmp_path, 'r', 'HW', 'final', 'PID', 'O1-F05', 'RQ2-INIT-PID/G1', 'dat', .03)
+    ds = str(tmp_path)
+    _begin_final(ds, row)
+    lost = rl.end(ds, 'hong_he_do', fail_cause='mat_khung', results_dir=row['results_dir'])
+    assert not lost.get('esp32_log')
+    # Old end recorded the default even for a lost run without a delivered capture.
+    old = dict(lost, results_dir='lost_capture', esp32_log='esp32.csv')
+    rl._write_all(str(tmp_path / rl.TUNING), rl.TUNING_COLS, [old])
+    assert rl.summary(ds)
+    d = Path(row['results_dir'])
+    _begin_final(ds, row)
+    (d / 'esp32.csv').rename(d / 'capture.csv')
+    # The floor logger hasn't delivered a complete pair. Keep the run open for the retry.
+    with pytest.raises(rl.LogError, match='esp32.csv'):
+        rl.end(ds, 'dat', **_final_evidence(row))
+    assert rl._load_open(ds)
+    (d / 'esp32.csv.events.txt').rename(d / 'capture.csv.events.txt')
+    saved = rl.end(ds, 'dat', **_final_evidence(row))
+    assert saved.get('esp32_log') in (None, '', 'capture.csv')
+    ds = _table_ds(tmp_path, [dict(row, esp32_log='')])
+    runs, _ = table.load_runs(ds, 'score.json', 'capture.csv', init_gain={'PID': str(Path(ds) / 'gain_init_PID.json')})
+    assert runs[0]['values']['tv_duty'] is not None
+
+
+def test_x3v3_4_round4_lost_hil_score_found_by_sha(tmp_path):
+    row = write_run(tmp_path, 'lost', 'HIL', 'final_hil', 'PID', 'O1-F05', 'A-PID/G07', 'hong_he_do', .03)
+    d = Path(row['results_dir'])
+    score = d / 'mapping_refused.json'
+    score.write_text(json.dumps(dict(outcome='hong_he_do', gate_v3=None)), encoding='utf-8')
+    row['gate_json_sha256'] = rl.sha256_file(str(score))
+    ds = _table_ds(tmp_path, [row])
+    for exists in (True, False):
+        if not exists:
+            (d / 'score.json').unlink()
+        run, = LR(ds)[0]
+        assert (run['run_uid'], run['outcome']) == ('lost', 'hong_he_do')
+    score.unlink()
+    with pytest.raises(ValueError, match='(SHA|sha256)'):
+        LR(ds)
+
+
+def test_x3v3_6_round4_manual_minutes_and_exact_freeze(tmp_path):
+    ds = str(tmp_path)
+    p = tmp_path / 'gain_PID.json'
+    p.write_text(json.dumps(GAIN7_FILE), encoding='utf-8')
+    rl.freeze(ds, 'A-PID', 'het_ung_vien', 'A-PID/G1', str(p), at='2026-11-20T09:00:00.123456')
+    rl.effort(ds, '2026-11-20', '09:00', '09:01', campaign='A-PID')
+    a = next(r for r in rl.summary(ds) if r['campaign'] == 'A-PID')
+    assert a['T_tune_no_hoc_h'] == '0.000' and float(a['T_operator_h']) > 0
+    rl.effort(ds, '2026-11-20', '08:59', '09:01', campaign='A-PID')
+    with pytest.raises(rl.LogError, match='across the freeze'):
+        rl.summary(ds)

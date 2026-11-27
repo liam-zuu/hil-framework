@@ -53,7 +53,7 @@ tv_duty (S03 Y3, S05 4.7 (1)), from the cumulative firmware counters dpwm_fl..dp
     file of S05_freeze.csv (sha256 checked), the initial gain the file of --init-gain <ctrl>=F; no file for the
     set stops the table too. R134C7-1, -2, -3 (round 7; Liam 15/11 "Kiem gain moi doan (Recommended)"): the '#gain'
     line of every motor-on stretch of the log, the running id of the question after = the file id; a frozen file
-    that cannot be proved stops the table (X3-14); a relative frozen name takes the first
+    that cannot be proved rejects the judged runs of that set (R134C7-2); a relative frozen name takes the first
     candidate (dataset folder, then working folder) whose sha256 matches. The files and their sha256 go to S05_final_gain_files.csv and S05_final_runs.csv.
     The data lines are read by gain_line_check.read_esp32_log (R134C-3, S05 6.3): lines marked
     'duplicate' in <log>.segments.csv dropped (counted, tv_rows_dropped), 'conflict' / 'ambiguous'
@@ -430,11 +430,11 @@ def gain_files(dataset, init_gain=None, frozen=None):
     import rq3_log as rl
     if frozen is None:
         try:
-            frozen = rl.freeze_rows(dataset)
+            frozen = rl.freeze_rows(dataset, defer_gain_errors=True)
         except rl.LogError as exc:
             raise ValueError(str(exc)) from exc
     out = {r['gain_set_id']: dict(file=r['gain_file'], sha256=r['gain_sha256'], source=rl.FREEZE, want=r['want'])
-           for r in frozen.values()}
+           for r in frozen.values() if 'gain_error' not in r}
     for ctrl, f in (init_gain or {}).items():
         if ctrl not in CONTROLLERS:
             raise ValueError(f'--init-gain {ctrl}=...: controller one of {CONTROLLERS}')
@@ -461,6 +461,9 @@ def read_run_score(row, dataset, score_name):
     p = os.path.join(d, score_name)
     if not rl._inside(p, d):
         raise ValueError(f'{uid}: score file must be under results_dir')
+    if (row.get('platform') == 'HIL' and row.get('run_outcome') == 'hong_he_do'
+            and not rl._same_file(p, row.get('gate_json_sha256'))):
+        p = rl.h0_file(row, dataset)
     score, sha = rl.read_json_sha(p, f'{uid}: score')
     if sha != row.get('gate_json_sha256'):
         raise ValueError(f'{uid}: {p} SHA-256 differs from gate_json_sha256')
@@ -522,7 +525,7 @@ def load_runs(dataset, score_name, esp32_name, gain_ack_name='gain_ack.txt', ini
                               + ', '.join(r.get('run_uid', '') for r in miss) + ' (C9D-2)')
         rows = rl.apply_after(rows, dataset)    # S05 v3.37 4.3 clip H comparison, then C8b v3 §5 (rq3_log.apply_moc)
         stopped = rl.check_finals(rows)
-        frozen = rl.freeze_rows(dataset)
+        frozen = rl.freeze_rows(dataset, defer_gain_errors=True)
         for r in rows:
             if r.get('stage') in ('final', 'final_hil'):
                 rl.check_task(r.get('trajectory', ''), r.get('speed_mps', ''))
@@ -532,11 +535,16 @@ def load_runs(dataset, score_name, esp32_name, gain_ack_name='gain_ack.txt', ini
     runs, bad = [], []
     for r in rows:
         plat = next((p for p in PLATFORMS if r.get('platform') == p[0] and r.get('stage') == p[2]), None)
-        if plat is not None and r.get(rl.RETRO_FLAG):         # S05 v3.38 4.3 (B8S2-2): not in the final table
+        if plat is None:
+            continue
+        try:
+            rl.check_final_freeze(r, frozen)
+        except rl.LogError as exc:
+            bad.append(str(exc))
+            continue
+        if r.get(rl.RETRO_FLAG):                             # S05 v3.38 4.3 (B8S2-2): not in the final table
             problems.append(f"run {r.get('run_uid')}: thu sau diem dung N = 3 lo ra khi so clip H "
                             f'({rl.RETRO_FLAG}), khong vao bang (S05 v3.38 4.3)')
-            continue
-        if plat is None:
             continue
         ctrl = r.get('controller', '')
         _, _, gain_key, _, task, speed = rl.final_key(r)
@@ -546,15 +554,17 @@ def load_runs(dataset, score_name, esp32_name, gain_ack_name='gain_ack.txt', ini
                             f"{r.get('gain_set_id')!r} khong vao bang")
             continue
         gf = files.get(gain_key)
+        d = rl._results_dir(r, dataset, existing=False)
         try:
-            rl.check_final_freeze(r, frozen)
+            ep = rl.esp32_path(r, d, esp32_name)
         except rl.LogError as exc:
-            bad.append(str(exc))
-            continue
-        d = rl._results_dir(r, dataset)
-        ep = rl.esp32_path(r, d, esp32_name)
+            raise ValueError(f"{r.get('run_uid')}: {exc}") from exc
         qs = queries.get(r.get('run_uid'))
         if r.get('run_outcome') in VALID:           # R134C5-1, -3, R134C6-1: the run's evidence, whatever tv_duty
+            freeze_error = frozen.get(gain_key.split('/')[0], {}).get('gain_error')
+            if freeze_error:
+                bad.append(f"run {r.get('run_uid')}: {freeze_error}")
+                continue
             why = run_evidence_problem(r, qs, gain_ack_name, esp32_name, gf, d)
             if why:
                 bad.append(f"run {r.get('run_uid')}: {why}")
@@ -733,7 +743,7 @@ def run_gain_problem(esp32_path, want, expected_boot=None, exact_first_seq=False
     return None
 
 
-def run_evidence_problem(row, queries, gain_ack_name, esp32_name, gain_file, results_dir):
+def run_evidence_problem(row, queries, gain_ack_name, esp32_name, gain_file, results_dir, *, boot_only=False):
     """R134C5-1, R134C5-3 (Codex round 5; Liam 14/11 CODE_R134 hop chon "Bat buoc ack moi luot (Recommended)"):
     None, or why a judged final run (car or HIL) lacks the evidence S05 4.7 (iv) asks for, checked at the level of
     the run, apart from tv_duty: the two answers checked by rq3_log.check_query_rows, and the '#gain_ack' of
@@ -743,8 +753,8 @@ def run_evidence_problem(row, queries, gain_ack_name, esp32_name, gain_file, res
     the gain_set_id): the run's '#gain' line equals that file bit for bit (run_gain_problem), and the id of the file
     is the running id of the question before (so of the ack too).
     R134C7-1, -2 (Codex round 7): the '#gain' line of every motor-on stretch; the running id of the question after
-    equals the file id too. All freeze rows have already been verified."""
-    if results_dir is None:
+    equals the file id too. end and summary request only the boot evidence here."""
+    if not results_dir or not os.path.isdir(results_dir):
         return 'thieu results_dir cua luot'
     d = results_dir
     qb, qa = queries
@@ -756,6 +766,13 @@ def run_evidence_problem(row, queries, gain_ack_name, esp32_name, gain_file, res
     why = glc.ack_problem(ack, qb, {'id': qb.get('id')})
     if why:
         return why
+    import rq3_log as rl
+    try:
+        esp32_log = rl.esp32_path(row, d, esp32_name)
+    except rl.LogError as exc:
+        return str(exc)
+    if boot_only:
+        return run_gain_problem(esp32_log, None, expected_boot=qb['boot'])
     if gain_file is None:
         g = (row.get('gain_set_id') or '').split('/')[0]
         return (f'khong co file gain cua {row.get("gain_set_id")!r}: '
@@ -767,8 +784,7 @@ def run_evidence_problem(row, queries, gain_ack_name, esp32_name, gain_file, res
     if not glc._dec(qa.get('id')) or int(qa['id']) != want['id']:                    # R134C7-1
         return (f'id dang chay {qa.get("id")!r} cua lan hoi sau khac id {want["id"]} cua file gain '
                 f'{gain_file["file"]}: bo gain doi trong luot')
-    from rq3_log import esp32_path
-    return run_gain_problem(esp32_path(row, d, esp32_name), want, expected_boot=qb['boot'])
+    return run_gain_problem(esp32_log, want, expected_boot=qb['boot'])
 
 
 def build_table(runs):

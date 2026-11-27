@@ -1057,8 +1057,9 @@ def test_x3_14_c7_2_validate_the_freeze_even_without_a_judged_run(tmp_path):
     runs, _ = LR(ds)
     assert sorted(x['run_uid'] for x in runs) == ['a1', 'b0']
     os.remove(os.path.join(ds, 'gain_B-LADRC_G02.json'))
-    with pytest.raises(ValueError, match='B-LADRC/G02.*not found'):
-        LR(ds)
+    with pytest.raises(rl.LogError, match='B-LADRC/G02.*not found'):
+        rl.summary(ds)
+    assert sorted(x['run_uid'] for x in LR(ds)[0]) == ['a1', 'b0']
     b = write_run(tmp_path, 'b1', 'HW', 'final', 'LADRC', 'O1-F05', 'B-LADRC/G02', 'dat', 0.02)
     ds = _table_ds(tmp_path, [a, h, b], frozen=(('A-PID', 'A-PID/G07'), ('B-LADRC', 'B-LADRC/G02')))
     os.remove(os.path.join(ds, 'gain_B-LADRC_G02.json'))
@@ -1187,8 +1188,9 @@ def test_c8_2_a_read_error_stays_with_its_candidate(tmp_path, monkeypatch):
         return open(path, *args, **kwargs)
 
     monkeypatch.setattr(rq3_log, 'open', open_candidate, raising=False)
-    with pytest.raises(ValueError, match='B-LADRC/G02.*khong doc duoc'):
-        LR(ds)
+    with pytest.raises(rl.LogError, match='B-LADRC/G02.*khong doc duoc'):
+        rl.summary(ds)
+    assert [r['run_uid'] for r in LR(ds)[0]] == ['p1']
     # good copy in the dataset, unreadable copy of the same name in the work folder: never read
     work = tmp_path / 'work'
     os.makedirs(work)

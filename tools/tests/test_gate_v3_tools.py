@@ -782,9 +782,9 @@ def test_cli_end_requires_the_query_files(ds, tmp_path, capsys, platform, stage,
     extra = ['--fail-cause', 'mat_khung'] if outcome == 'hong_he_do' else ['--gate-json', f, '--results-dir', 'r']
     if outcome in rl.VALID and platform in ('HW', 'HIL') and stage in ('screen', 'hil_check'):
         extra += ['--gain-file', fr.write_trial_gain(os.path.join(d, 'r'))]
-    if stage == 'final_hil':
+    if stage in ('final', 'final_hil'):
         fr.write_trial_gain(os.path.join(d, 'r'))
-    qb, qa = _query_files(tmp_path)
+    qb, qa = fr.write_queries(str(tmp_path), gid=fr.sample_gain()['id'])
     for q in ([], ['--query-before', qb]):
         rc = rl.main(['--dataset', d, 'end', '--outcome', outcome] + extra + q)
         err = capsys.readouterr().err

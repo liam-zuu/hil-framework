@@ -467,14 +467,8 @@ def check_score(sc, tr, frames_sha, session_sha, drift, name):
             _finite(v, f'{name} score thresholds.{k}', 0.0)
     _sha(sc['esp32_sha256'], f'{name} score esp32_sha256')
     _sha(sc['frames_sha256'], f'{name} score frames_sha256')
-    ks = _triple(sc['k_start'], f'{name} score k_start')
-    # CD2-5: the run is one the drift was computed for, on the same nominal start pose
-    if sc['task'] not in drift['tasks']:
-        raise ValueError(f'{name} score is task {sc["task"]!r}, drift.json covers {drift["tasks"]}')
-    if sc['task'] in FINAL_SET:
-        dk = _triple(drift['k_start'], 'drift.json k_start')
-        if max(abs(a - b) for a, b in zip(ks, dk)) > 1e-9:
-            raise ValueError(f'{name} score k_start {ks} is not the k_start of drift.json {dk}')
+    _triple(sc['k_start'], f'{name} score k_start')
+    evidence.check_score_scope(sc, drift, name)
     # CD1-4, CD2-3: score -> frames.csv -> track.json -> session
     if tr['session_sha256'] != session_sha:
         raise ValueError(f'{name} track.json used session {tr["session_sha256"]!r}, drift.json has {session_sha!r}')

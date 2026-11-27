@@ -138,6 +138,8 @@ def write_trial_gain(d, controller='PID', boot=BOOT, gain=None):
     log.off(10)
     log.on(5)
     write_esp32(d, log, gain, boot, '2026-11-20T10:00:00', ())
+    with open(os.path.join(d, ACK_NAME), 'w', encoding='utf-8') as f:
+        f.write(ack_text(boot, gain['id']))
     return write_gain_file(os.path.join(d, 'gain_trial.json'), gain)
 
 

@@ -50,6 +50,17 @@ def check_file(d, allowed_tasks):
     return check(d)
 
 
+def check_score_scope(score, drift, name):
+    task = score.get('task')
+    if task not in drift['tasks']:
+        raise ValueError(f'{name} score is task {task!r}, drift.json covers {drift["tasks"]}')
+    if task in ('O1-K1', 'O1-K2'):
+        ks = pose_triple(score.get('k_start'), f'{name} score k_start')
+        dk = pose_triple(drift['k_start'], 'drift.json k_start')
+        if max(abs(a - b) for a, b in zip(ks, dk)) > 1e-9:
+            raise ValueError(f'{name} score k_start {ks} is not the k_start of drift.json {dk}')
+
+
 def check(d):
     """Validate the recorded decision and return its schema version. Older gop blocks lack a version."""
     has_heading = any(k in d for k in V2_FIELDS)

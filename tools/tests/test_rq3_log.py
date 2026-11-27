@@ -87,7 +87,7 @@ def end_with_trial(ds, outcome, **kwargs):
     row = rl._require_open(ds)['row']
     results_dir = kwargs.get('results_dir')
     if (outcome in rl.VALID and results_dir and row['platform'] in ('HW', 'HIL')
-            and row['stage'] in (*rl.TUNE_STAGES, 'hil_check', 'final_hil')):
+            and row['stage'] in (*rl.TUNE_STAGES, 'hil_check', 'final_hil', 'final')):
         before = (kwargs.get('queries') or (None,))[0] or {}
         boot = before.get('boot') or kwargs.get('boot_before') or fr.BOOT
         gains = fr.sample_gain(row['controller'])
@@ -113,7 +113,7 @@ def end_(d, outcome, gate=None, **kw):
         gate = rl.floor_gate(rl.fake_gate(e_trk=0.5 if outcome == 'khong_dat' else 0.03,
                                           completed='true' if outcome != 'chua_ket_luan' else 'inconclusive'))
         kw.setdefault('results_dir', 'r')
-    if outcome in rl.VALID and row.get('stage') in (*rl.TUNE_STAGES, 'hil_check', 'final_hil'):
+    if outcome in rl.VALID and row.get('stage') in (*rl.TUNE_STAGES, 'hil_check', 'final_hil', 'final'):
         kw['results_dir'] = os.path.join(d, 'trial_' + row['controller'], row['run_uid'].replace(':', '_'))
     return end_with_trial(d, outcome, gate=gate, **kw)
 
@@ -230,10 +230,10 @@ def test_summary_accounts_split_caps_and_finals(ds, no_moc):
     end_(d, 'hong_he_do', fail_cause='mat_khung')
     rl.effort(d, '2026-11-20', '06:00', '07:00', campaign='A-PID', nhan='hoc', ghi_chu='doc')
     rl.effort(d, '2026-11-20', '07:00', '08:00', campaign='A-PID', ghi_chu='lap xe')
-    # B-chung: S03 rows per controller (machine 3600 s each, 100 s setup on the PID row), 2 h common
-    rl.machine(d, 'B-chung', 'PID', 'S03X', 'r', 2739, 3600, '2026-11-20T09:00:00', '2026-11-20T10:00:00',
+    # B-chung: allocated script rows per controller (3600 s each, 100 s setup on PID), 2 h common
+    rl.machine(d, 'B-chung', 'PID', 'shared', 'r', 2739, 3600, '2026-11-20T09:00:00', '2026-11-20T10:00:00',
                t_setup_s=100)
-    rl.machine(d, 'B-chung', 'LADRC', 'S03X', 'r', 2739, 3600, '2026-11-20T09:00:00', '2026-11-20T10:00:00')
+    rl.machine(d, 'B-chung', 'LADRC', 'shared', 'r', 2739, 3600, '2026-11-20T09:00:00', '2026-11-20T10:00:00')
     rl.effort(d, '2026-11-20', '10:00', '12:00', campaign='B-chung', ghi_chu='doc S03')
     rl.hwfail(d, '2026-11-20', 'A1', 'A-PID', 'HW', 'tuot banh', 'phan_cung_ngau_nhien', 0.5, iter_no='2')
     s = {r['campaign']: r for r in rl.summary(d)}
@@ -310,7 +310,11 @@ def test_finals_gate_replacement_and_final_hil_join(ds, no_moc):
     assert a['N_HIL'] == '0' and q['N_HIL'] == '4'                        # HIL final = account RQ2
     assert s['RQ2-INIT-PID']['final_hil_O1-F05@0.5_fail'] == '1'          # joined by the id prefix (EA-5)
     assert {r['campaign']: r for r in rl.summary(d)}['A-PID']['gate_result'] == ''   # no gate given
-    car_run(d, clock, 'A-PID', 'final', 'dat', session='F')               # a 6th valid run
+    with pytest.raises(rl.LogError, match='more than 5'):
+        car_run(d, clock, 'A-PID', 'final', 'dat', session='F')           # a 6th valid run
+    path = os.path.join(d, rl.TUNING)
+    sixth = next(r for r in rows(path) if r['stage'] == 'final' and r['run_outcome'] == 'dat')
+    rl.append_row(path, rl.TUNING_COLS, dict(sixth, run_uid='F:99', replaces_run_uid=''))
     with pytest.raises(rl.LogError, match='more than 5'):
         rl.summary(d)
 
@@ -326,7 +330,10 @@ def test_bad_replacement_and_final_hil_account_are_errors(ds):
     d2 = os.path.join(d, 'b')
     os.makedirs(d2)
     rl.migrate(d2)
-    car_run(d2, clock, 'A-PID', 'final_hil', 'dat', platform='HIL', gain_set='RQ2-INIT-PID/G0')
+    with pytest.raises(rl.LogError, match='account RQ2'):
+        car_run(d2, clock, 'A-PID', 'final_hil', 'dat', platform='HIL', gain_set='RQ2-INIT-PID/G0')
+    r = car_run(d2, clock, 'RQ2', 'final_hil', 'dat', platform='HIL', gain_set='RQ2-INIT-PID/G0')
+    rl._write_all(os.path.join(d2, rl.TUNING), rl.TUNING_COLS, [dict(r, campaign='A-PID')])
     with pytest.raises(rl.LogError, match='account RQ2'):
         rl.summary(d2)
 
@@ -436,7 +443,7 @@ def test_ea5_final_car_run_with_another_gain_set(ds):
 def test_ea17_and_a_r2_4_explore_out_script_rows_in(ds):
     d, clock = ds
     rl.migrate(d)
-    row = rl.machine(d, 'B-chung', 'PID', 'S03X', 'r', 2739, 3600, '2026-11-20T09:00:00', '2026-11-20T10:00:00',
+    row = rl.machine(d, 'B-chung', 'PID', 'shared', 'r', 2739, 3600, '2026-11-20T09:00:00', '2026-11-20T10:00:00',
                      t_setup_s=100)
     assert row['stage'] == 'script'
     rl.machine(d, 'B-PID', 'PID', 'X', 'r', 50, 600, '2026-11-20T10:00:00', '2026-11-20T10:10:00', stage='explore')

@@ -20,7 +20,8 @@ Commands (the operator types them while working; every time stamp is the PC cloc
   pause / resume                         other work in between: not counted (S05 §3.1)
   end    --outcome dat|khong_dat|chua_ket_luan|hong_he_do [--e-perp-max M] [--completed 0|1]
          [--fail-cause X] [--results-dir D] [--esp32-log CSV] [--gate-json F] [--gate-file C]
-                                         close the run and append its row; CSV defaults to D/esp32.csv
+                                         close the run and append its row. CSV defaults to D/esp32.csv.
+                                         For final car runs a single named CSV/events pair in D is also accepted.
                                          C = the C8 gate file (O1 v11.33): the conditions that must
                                          decide are recomputed from it (level = task, platform, stage,
                                          campaign); needed when F was scored with it (gate_v3.3)
@@ -1382,19 +1383,25 @@ def so_h_outcome(o0: str, o1: Optional[str], vuot: bool, thieu: bool) -> tuple:
         raise LogError(str(exc)) from exc
 
 
-def _results_dir(r: dict, ds: str) -> Optional[str]:
+def _results_dir(r: dict, ds: str, *, existing=True) -> Optional[str]:
     """The results_dir of a logged row as a folder that exists (a relative name: in the dataset folder, then in the
-    working folder, as check_query_rows), or None."""
+    working folder, as check_query_rows), or None. For path containment alone, existing=False also resolves
+    a recorded folder of a lost run whose capture is absent."""
     p = r.get('results_dir', '')
     if not p:
         return None
     cand = [p] if os.path.isabs(p) else [os.path.join(ds, p), p]
-    return next((c for c in cand if os.path.isdir(c)), None)
+    return next((c for c in cand if os.path.isdir(c)), None if existing else cand[0])
 
 
 def esp32_path(row, results_dir, default='esp32.csv'):
     # An explicit run path is relative to its results_dir, including bench names under pi/.
-    return os.path.join(results_dir or '', row.get('esp32_log') or default)
+    name = row.get('esp32_log') or default
+    path = os.path.join(results_dir or '', name)
+    if results_dir or row.get('esp32_log'):
+        if not results_dir or not all(_inside(p, results_dir) for p in (path, path + '.events.txt')):
+            raise LogError(f'{name!r}: ESP32 CSV and events must resolve under the results_dir of the run')
+    return path
 
 
 def _inside(path: str, folder: str) -> bool:
@@ -1492,6 +1499,11 @@ def check_score_final(r: dict, path: str, ds: str, drift=None, new=False) -> tup
             {k: v for k, v in h0.items() if k != 'outcome'}:
         raise LogError(f'run {uid}: score_final {path!r} is not the H0 scorer file of the run ({h0p}) with only '
                        f'outcome and calib_drift added (C9D-1)')
+    if drift is not None:
+        try:
+            drift_evidence.check_score_scope(h0, drift, 'H0')
+        except ValueError as exc:
+            raise LogError(f'run {uid}: {exc}') from exc
     if vuot and not thieu:
         h1 = cd.get('h1_score')
         if not isinstance(h1, dict) or h1.get('outcome') != o1:
@@ -2765,12 +2777,20 @@ def boot_problem(before, after) -> Optional[str]:
     return None
 
 
-def final_hil_boot_problem(row, ds, boot):
-    from s05_final_table import run_gain_problem
+def final_boot_problem(row, ds, queries):
+    from s05_final_table import run_evidence_problem
     rd = _results_dir(row, ds)
-    if not rd:
-        return 'missing results_dir: cannot verify ESP32 boot'
-    return run_gain_problem(esp32_path(row, rd), want=None, expected_boot=boot)
+    name = 'esp32.csv'
+    if rd and row.get('platform') == 'HW' and not row.get('esp32_log') and not os.path.exists(os.path.join(rd, name)):
+        # Floor logging is separate. A single named CSV/events pair identifies the capture.
+        names = [f for f in os.listdir(rd) if f.lower().endswith('.csv') and
+                 os.path.isfile(os.path.join(rd, f + '.events.txt'))]
+        if len(names) > 1:
+            return 'multiple ESP32 captures: give --esp32-log', None
+        if names:
+            name = names[0]
+    why = run_evidence_problem(row, queries, 'gain_ack.txt', name, None, rd, boot_only=True)
+    return why, row.get('esp32_log') or name
 
 
 def check_trial_gain(row, ds, fill=False):
@@ -2808,6 +2828,8 @@ def check_trial_gain(row, ds, fill=False):
                            exact_first_seq=True)
     if why:
         raise LogError(f'{uid}: {why} (S05 6.3 L90): hong_he_do if gain evidence is missing or differs')
+    if fill:
+        row['esp32_log'] = row.get('esp32_log') or 'esp32.csv'
 
 
 def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Optional[float] = None,
@@ -2824,7 +2846,7 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     questions before and after the run (gain_line_check.query_problem); handled as missing / different boot.
     queries (R134C4-1): the two answers as read by gain_line_check.read_query (before, after; None = missing);
     end checks the two replies and takes boot_before / boot_after from them. A judged final_hil
-    also checks the boot at the starts in the run's ESP32 CSV and events.
+    or final car run also checks the ACK and the starts in the run's ESP32 CSV and events.
     A judged car / final_hil run needs them: two boot strings alone do not show two questions.
     gate_file (O1 v11.33): the C8 gate file (gate_c8.GateC8, CLI --gate-file); the run's so_do set is taken from it
     (row_so_do), and a gate scored with a gate file needs it (gate_file_problem)."""
@@ -2846,8 +2868,12 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     if not bbad and queries is None and outcome in VALID and boot_needed(plat, stage):
         bbad = ('the two query answers (gain_send --query outputs read by gain_line_check.read_query) not given: '
                 'two boot strings do not show two questions (R134C4-1)')
-    if not bbad and plat == 'HIL' and stage == 'final_hil' and (outcome in VALID or fail_cause == BOOT_FAIL):
-        bbad = final_hil_boot_problem(dict(results_dir=results_dir, esp32_log=esp32_log), ds, boot_before)
+    evidence_row = dict(run['row'], results_dir=results_dir, esp32_log=esp32_log)
+    if esp32_log:
+        esp32_path(evidence_row, _results_dir(evidence_row, ds, existing=False))
+    final_boot = (plat, stage) in (('HW', 'final'), ('HIL', 'final_hil'))
+    if not bbad and final_boot and fail_cause == BOOT_FAIL and queries:
+        bbad, _ = final_boot_problem(evidence_row, ds, queries)
     if bbad and not (outcome == 'hong_he_do' and fail_cause == BOOT_FAIL):   # R134 (b)
         raise LogError(f'{bbad}: a run failed by operation, outcome hong_he_do with fail cause {BOOT_FAIL} '
                        '(S05 4.7 (iv), R3V-9)')
@@ -2927,8 +2953,8 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     row = dict(run['row'])
     row.update({k: _fmt(v, 0) for k, v in segment_totals(run['segments']).items()})
     row.update(run_outcome=outcome, wall_end=_iso(t), fail_cause=fail_cause, results_dir=results_dir)
-    if plat in ('HIL', 'HW') and (esp32_log or results_dir):
-        row['esp32_log'] = esp32_log or 'esp32.csv'
+    if esp32_log:
+        row['esp32_log'] = esp32_log
     if completed is not None:
         row['completed'] = str(completed)
     if e_perp_max is not None:
@@ -2945,8 +2971,12 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
             p = (q or {}).get('_path')
             if p and os.path.isfile(p):
                 row.update({cf: os.path.abspath(p), cs: sha256_file(p)})
-    if stage == 'final_hil' and outcome in VALID:
-        check_query_rows([row], ds)  # Replay the files that will be recorded, including API callers.
+    if final_boot and outcome in VALID:
+        pair = check_query_rows([row], ds)[row['run_uid']]
+        why, name = final_boot_problem(row, ds, pair)
+        if why:
+            raise LogError(f'{why}: a run failed by operation, outcome hong_he_do with fail cause {BOOT_FAIL}')
+        row['esp32_log'] = name
     if notes:
         row['notes'] = (row.get('notes', '') + ' ' + notes).strip()
     if c8b_sha:
@@ -2962,6 +2992,9 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     # Codex S315-5: the log as it will be, this row included, checked before the row is written
     check_trial_gain(row, ds, fill=True)
     after = live_rows(read_rows(os.path.join(ds, TUNING))) + [row]
+    if stage in ('final', 'final_hil'):
+        # Earlier clip-H comparisons already known at end can free a slot or reveal a stop.
+        check_final_limits(apply_so_h(after[:-1], ds) + [row])
     check_map_rows([row])
     check_c8b_rows(after)                              # GT1-8: the time file of no other run
     if any(r.get('fail_cause') == KHONG_NUT for r in after):
@@ -3090,8 +3123,9 @@ def machine(ds: str, campaign: str, controller: str, script_run_id: str, results
             session: str = 'MACHINE', notes: str = '', script_kind: str = '', n_sim_diagnostic: int = 0,
             **active) -> dict:
     """Record one already allocated row of a script run."""
-    if script_kind in ('S03', 'S3'):
-        raise LogError(f'{script_kind}: use machine-phases to allocate each controller/account from cited phases')
+    if (script_kind in ('S03', 'S3') or re.search(r'(?<![a-z0-9])s0?3(?!\d)', script_run_id or '', re.I)
+            or re.search(r'(?<![a-z0-9])s0?3(?![a-z0-9])', str(results_dir), re.I)):
+        raise LogError('S03/S3: use machine-phases to allocate each controller/account from cited phases')
     row = _machine_row(next_iter_no(ds, session), campaign, controller, script_run_id, results_dir, n_sim_evals,
                        t_machine_s, wall_start, wall_end, platform, stage, session, notes, script_kind,
                        n_sim_diagnostic, active)
@@ -3117,6 +3151,23 @@ def _phase_source(text, what, script_run_id):
     return s
 
 
+def _logged_phase_sources(rows):
+    """Read individual citations, since a machine row may aggregate several phase intervals."""
+    sources = set()
+    for r in rows:
+        if r.get('script_kind') not in ('S03', 'S3'):
+            continue
+        marker = f"{MANUAL} nguon pha {r.get('campaign')}: "
+        _, found, citations = (r.get('notes') or '').rpartition(marker)
+        if found:
+            for citation in citations.split(' | '):
+                m = re.fullmatch(r'(.+?)\.\.(.+?) PID \d+/\d+ LADRC \d+/\d+ \(gio: (.+); so: (.+)\)', citation)
+                if not m:
+                    raise LogError(f"{r.get('run_uid')}: cannot read logged phase source {citation!r}")
+                sources.add((_parse_t(m[1]), _parse_t(m[2]), m[3], m[4]))
+    return sources
+
+
 def machine_phases(ds, script_kind, script_run_id, results_dir, phases, notes=''):
     """Allocate each elapsed phase by actual counts, then write one row per controller and account.
 
@@ -3128,6 +3179,11 @@ def machine_phases(ds, script_kind, script_run_id, results_dir, phases, notes=''
     totals = {}
     cited = {}
     intervals = set()
+    path = os.path.join(ds, TUNING)
+    existing = read_rows(path)
+    if any(r.get('script_run_id') == script_run_id for r in existing):
+        raise LogError(f'{script_run_id}: duplicate script import')
+    sources = _logged_phase_sources(existing)
     for ph in phases:
         if len(ph) != 9:
             raise LogError(f'{script_run_id}: a phase needs 9 fields (ACCOUNT START END N_PID N_LADRC DIAG_PID '
@@ -3141,9 +3197,11 @@ def machine_phases(ds, script_kind, script_run_id, results_dir, phases, notes=''
         except (ValueError, TypeError) as exc:
             raise LogError(f'{script_run_id}: invalid phase interval {start!r} to {end_!r}') from exc
         interval = (account, t0, t1)
-        if interval in intervals:
+        source = (t0, t1, src_t, src_n)
+        if interval in intervals or source in sources:
             raise LogError(f'{script_run_id}: duplicate phase {account} {start}..{end_}')
         intervals.add(interval)
+        sources.add(source)
         _nonnegative(elapsed, 'phase elapsed seconds')
         for v in (pid, ladrc, pid_diag, ladrc_diag):
             _nonnegative(v, 'phase count', count=True)
@@ -3161,8 +3219,6 @@ def machine_phases(ds, script_kind, script_run_id, results_dir, phases, notes=''
             total[3], total[4] = min(total[3], t0), max(total[4], t1)
         cited.setdefault(account, []).append(
             f'{start}..{end_} PID {pid}/{pid_diag} LADRC {ladrc}/{ladrc_diag} (gio: {src_t}; so: {src_n})')
-    path = os.path.join(ds, TUNING)
-    existing = read_rows(path)
     session = 'MACHINE'
     it = next_iter_no(ds, session)
 
@@ -3174,8 +3230,6 @@ def machine_phases(ds, script_kind, script_run_id, results_dir, phases, notes=''
             for i, ((c, ctrl), (n, diag, seconds, t0, t1)) in enumerate(totals.items())]
     if not rows:
         raise LogError('at least one phase is required')
-    if any(r.get('script_run_id') == script_run_id for r in existing):
-        raise LogError(f'{script_run_id}: duplicate script import')
     check_machine_rows(rows)
     if os.path.exists(path) and _header(path) != TUNING_COLS:
         raise LogError(f'{TUNING}: header differs from S05 §6; run "rq3_log.py migrate" first')
@@ -3320,7 +3374,7 @@ def freeze(ds: str, campaign: str, stop_reason: str, gain_set: str, gain_file: s
     return row
 
 
-def freeze_rows(ds, campaign=None):
+def freeze_rows(ds, campaign=None, *, defer_gain_errors=False):
     rows = {}
     for r in read_rows(os.path.join(ds, FREEZE)):
         c = r.get('campaign')
@@ -3338,7 +3392,11 @@ def freeze_rows(ds, campaign=None):
         try:
             path, want, _ = read_gain(r.get('gain_file') or '', c.split('-')[-1], ds, r.get('gain_sha256') or '')
         except ValueError as exc:
-            raise LogError(f'{FREEZE}: {gs}: {exc}') from exc
+            why = f'{FREEZE}: {gs}: {exc}'
+            if not defer_gain_errors:
+                raise LogError(why) from exc
+            rows[c] = dict(r, gain_error=why)
+            continue
         rows[c] = dict(r, gain_file=path, want=want)
     return rows
 
@@ -3371,10 +3429,17 @@ def read_gain(path, controller, ds=None, expected_sha=None):
 
 def check_final_freeze(row, freezes=None, *, ds=None):
     c, uid = row.get('campaign'), row.get('run_uid')
+    gs = row.get('gain_set_id')
     if row.get('stage') == 'final_hil':
-        c = gain_owner(row.get('gain_set_id'))
-        if row.get('controller') != c.split('-')[-1]:
-            raise LogError(f"{uid}: controller {row.get('controller')!r} does not match the gain set of {c}")
+        if c != 'RQ2':
+            raise LogError(f'{uid}: a final_hil run is account RQ2 (§4.6)')
+        c = gain_owner(gs)
+    elif gs:
+        check_gain_set(c, 'final', gs)
+    elif c in CAMPAIGNS and c not in GAIN_OWNERS:
+        raise LogError(f'{uid}: a final car run must belong to the campaign of its gain set (got {c})')
+    if c in GAIN_OWNERS and row.get('controller') != c.split('-')[-1]:
+        raise LogError(f"{uid}: controller {row.get('controller')!r} does not match the gain set of {c}")
     if c not in TUNED:
         return
     if freezes is None:
@@ -3517,8 +3582,7 @@ def _final_stops(tun: List[dict]) -> set:
     return stopped
 
 
-def check_finals(tun):
-    _check_replacements(tun)
+def check_final_limits(tun):
     stopped = _final_stops(tun)
     valid = defaultdict(int)
     for r in tun:
@@ -3530,6 +3594,11 @@ def check_finals(tun):
             if valid[key] > FINAL_N:
                 raise LogError(f'{key[2] or key[1]} {key[0]}_{key[4]}@{key[5]}: more than {FINAL_N} valid runs (§4.7)')
     return stopped
+
+
+def check_finals(tun):
+    _check_replacements(tun)
+    return check_final_limits(tun)
 
 
 def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = '', gate_file=None) -> List[dict]:
@@ -3583,7 +3652,7 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
     gate = None if gate is None else list(gate)     # used per campaign (gate_result, Q1)
     raw = live_rows(read_rows(os.path.join(ds, TUNING)))
     check_gate_rows(raw, gate_file)                 # The provisional outcomes and query boots as originally logged.
-    check_query_rows(raw, ds)
+    queries = check_query_rows(raw, ds)
     check_map_rows(raw)                             # HIL scoring evidence is checked before counting candidates.
     for r in raw:
         check_trial_gain(r, ds)                     # Bind sparse historical g_* before copies, counts or post-scoring.
@@ -3622,8 +3691,10 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
     check_machine_rows(tun)
     stopped = check_finals(tun)
     for r in raw:
-        if r.get('platform') == 'HIL' and r.get('stage') == 'final_hil' and r.get('run_outcome') in VALID:
-            why = final_hil_boot_problem(r, ds, r.get('boot_before'))
+        if r.get('esp32_log'):
+            esp32_path(r, _results_dir(r, ds, existing=False))
+        if r.get('stage') in ('final', 'final_hil') and r.get('run_uid') in queries:
+            why, _ = final_boot_problem(r, ds, queries[r['run_uid']])
             if why:
                 raise LogError(f"{r.get('run_uid')}: {why}")
     for r in tun:
@@ -3764,8 +3835,14 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
                     add(tgt, 'hoc_manual', 1.0)
             else:
                 add(tgt, 'T_noh_s', h, share)
-                spans_freeze(tgt, t, t_end, f"effort row {r.get('ngay')} {r.get('bat_dau')}")
-                if not frozen_before(tgt, t):
+                start = t
+                if tgt in frz and t and len(r['bat_dau']) == 5:
+                    # A manual HH:MM start in the freeze minute counts as post-freeze.
+                    cut = _parse_t(frz[tgt]['frozen_at'])
+                    if cut.replace(second=0, microsecond=0) == t:
+                        start = cut
+                spans_freeze(tgt, start, t_end, f"effort row {r.get('ngay')} {r.get('bat_dau')}")
+                if not frozen_before(tgt, start):
                     add(tgt, 'T_tune_s', h, share)
                 elif c == 'B-chung':
                     add(tgt, 'Bc_after_s', h, share)
@@ -4074,6 +4151,7 @@ def demo(out_dir: str, seed: int = 1, levels=('O1-F05',)) -> List[dict]:
             d = run_dir(name)
             extra = dict(outcome=outcome, gate_v3=g)
             if platform == 'HW':                       # C8b v3 §5: the frames of the car scoring (design 3.0)
+                extra['task'] = _require_open(out_dir)['row']['trajectory']
                 extra['frames_sha256'] = sha256_file(fake_frames(d, name))
             qp = fr.write_final_run(d, platform, gain, score_extra=extra)
             sp = os.path.join(d, 'score.json')
