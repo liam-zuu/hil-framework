@@ -44,6 +44,7 @@ import datetime as _dt
 import ipaddress
 import json
 import os
+from pathlib import Path
 import re
 import secrets
 import signal
@@ -60,6 +61,7 @@ from panel_link import RunSnapshot
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(HERE, '..', 'tools'))   # after rpi5/: a tools/ module never shadows one of rpi5/
 import gain_send
+import panel_result
 
 def _o1_panel() -> Tuple[str, ...]:
     import o1_tasks                               # the figure-8 levels, never FINAL_SET (K1, K2)
@@ -98,6 +100,8 @@ STOP_TERM_S = 5.0   # [ĐỀ XUẤT]
 STOP_KILL_S = 3.0   # [ĐỀ XUẤT]
 REAP_S = 3.0        # after the owner exits: the group's last processes get this long, then SIGKILL
 SHUTDOWN_S = 12.0   # daemon stop (Ctrl+C, systemd; TimeoutStopSec 15): wait this long for the run
+LOGGER_READY_S = 3.0
+_RE_FW = re.compile(r'^(?:\S+\s+)?#fw,sha=([^,\s]+),dirty=([01]),env=([^,\s]+)(?:,.*)?$')
 
 _PHASES = ('PREPARE', 'ARM', 'RUN', 'STOPPING', 'END')
 _PHASE_ST = {'PREPARE': pp.ST_PREPARE, 'ARM': pp.ST_ARM, 'RUN': pp.ST_RUN,
@@ -374,7 +378,13 @@ class HilDaemon:
         self._reader: Optional[threading.Thread] = None
         self._meta: dict = {}
         self._probing = False               # a probe run_hil.py is running: START is BUSY
-        self._checking = False              # reserved for the post-run check
+        self._checking = False
+        self.check_code, self.check_text = pp.CHK_NONE, ''
+        self.tracks = {}
+        self._note_at = None
+        self._logger_thread = None
+        self._run_done = threading.Event()
+        self._shutdown = threading.Event()
         self._querying = False              # idle worker has reserved the DUT for a gain_get
         self._t_dut_query: Optional[float] = None
         self._wedged = False                # a run's / probe's process survived SIGKILL: START, probe refused
@@ -406,8 +416,10 @@ class HilDaemon:
             if reason:
                 if index == self.reset_index:
                     self.note = 'DUT reset skipped: ' + reason
+                    self._note_at = self.clock()
                 return pp.RES_BUSY
             if index == self.reset_index:
+                self._note_at = self.clock()
                 return self._reset_dut()
             try:
                 run_no = pp.next_run_no(self.run_no)
@@ -424,6 +436,9 @@ class HilDaemon:
             self.profile, self.run_no = index, run_no
             self.outcome, self.error_code, self.error_text = pp.OUT_NONE, 0, ''
             self.result, self.result_run = (), 0
+            self.tracks, self.check_code, self.check_text = {}, pp.CHK_NONE, ''
+            self._logger_thread = None
+            self._run_done.clear()
             self.quality = pp.Q_DUT_UNCONF              # DUT READY is never checked in a panel run
             self.loop_us = self.overruns = None
             self._t_stop, self._stop_pending, self._seen_phase = None, False, False
@@ -433,30 +448,151 @@ class HilDaemon:
             try:
                 self._open_run_dir(name)
                 args = [*args, '--finite-run', *self.extra_args]
+                args.extend(['--pose-log', os.path.join(self.run_dir, 'pose.csv'),
+                             '--frame-log', os.path.join(self.run_dir, 'frames.npz')])
                 if '--faults' in args:
-                    args.extend(['--frame-log', os.path.join(self.run_dir, 'frames.npz'),
-                                 '--step-log', os.path.join(self.run_dir, 'steps.csv')])
+                    args.extend(['--step-log', os.path.join(self.run_dir, 'steps.csv')])
                 argv = self.child_cmd(args)
                 self._meta['argv'] = argv
+                self._meta['logger'] = dict(ready=False, reason='starting' if self.dut_ip else 'no --dut-ip')
                 self._write_meta()
                 if '--faults' in args:
                     with open(args[args.index('--faults') + 1], encoding='utf-8') as f:
                         self._fault_rows = sorted(fault_schedule.parse(f.read()), key=lambda r: r.end_ms)
-                self.proc = subprocess.Popen(argv, cwd=HERE, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                             stderr=subprocess.STDOUT, text=True, bufsize=1,
-                                             encoding='utf-8', errors='replace', **_spawn_kw())
             except (OSError, ValueError) as exc:
-                self._fail(E_SPAWN, f'start: {exc}', f'start failed: {exc}')
-                if self.run_dir is not None:
-                    self._close_meta(rc=None)
-                return pp.RES_FAILED
-            self._meta['pid'] = self.proc.pid
+                return self._spawn_failed(exc)
             self._enter(pp.ST_PREPARE)
-            acc = {'summary': None, 'miso': None, 'last': None}   # this run's results, shared by both
-            threading.Thread(target=self._watch_owner, args=(self.proc, acc), name='run-owner', daemon=True).start()
-            self._reader = threading.Thread(target=self._read, args=(self.proc, acc), daemon=True)
-            self._reader.start()
+            if not self.dut_ip:
+                return self._spawn_run(argv)
+            self._logger_thread = threading.Thread(target=self._logged_run, args=(argv,), name='udp-logger',
+                                                   daemon=True)
+            self._logger_thread.start()
             return pp.RES_OK
+
+    def _spawn_failed(self, exc):
+        self._fail(E_SPAWN, f'start: {exc}', f'start failed: {exc}')
+        if self.run_dir is not None:
+            self.result_run = self.run_no
+            self.result = (f'start failed #{self.run_no}', panel_result.error_line(None, None), panel_result.timing_line())
+            self._start_check(None)
+        return pp.RES_FAILED
+
+    def _spawn_run(self, argv):
+        try:
+            self.proc = subprocess.Popen(argv, cwd=HERE, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                         encoding='utf-8', errors='replace', **_spawn_kw())
+        except (OSError, ValueError) as exc:
+            return self._spawn_failed(exc)
+        self._meta['pid'] = self.proc.pid
+        acc = {'summary': None, 'miso': None, 'last': None}
+        threading.Thread(target=self._watch_owner, args=(self.proc, acc), name='run-owner', daemon=True).start()
+        self._reader = threading.Thread(target=self._read, args=(self.proc, acc), daemon=True)
+        self._reader.start()
+        return pp.RES_OK
+
+    def _logger_cmd(self, folder):
+        cmd = panel_result.tool_cmd('agv_logger.py', '--strict', '--src-ip', self.dut_ip, '--out',
+                                    folder / 'esp32.csv', '--ready-file', folder / 'logger_ready.json')
+        if hasattr(os, 'sched_getaffinity'):
+            cores = os.sched_getaffinity(0) - {0}
+            if cores:
+                cmd = ['taskset', '-c', ','.join(map(str, sorted(cores))), *cmd]
+        return cmd
+
+    def _stop_logger(self, proc, info):
+        for level, delay in enumerate((self.stop_term_s, self.stop_kill_s, REAP_S)):
+            if proc.poll() is not None:
+                break
+            try:
+                info.setdefault('stop_signals', []).append(level)
+                self.stop_fn(proc, level)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=delay)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        info['group_gone'] = _reap_group(proc.pid if _spawn_kw() else None) and proc.poll() is not None
+        info['exit_code'] = proc.poll()
+        if not info['group_gone']:
+            with self._lock:
+                self._wedged = True
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass  # a killed or already exited logger may have closed the pipe
+
+    def _follow_fw(self, path):
+        # agv_logger flushes timestamp + space + payload after each datagram.
+        with path.open(encoding='utf-8', errors='replace') as f:
+            partial = ''
+            while True:
+                finished = self._run_done.is_set()
+                lines = (partial + f.read()).split('\n')
+                partial = lines.pop()
+                for line in lines:
+                    match = _RE_FW.fullmatch(line.rstrip())
+                    if match:
+                        self.on_fw_line(*match.groups())
+                if finished:
+                    return
+                self._run_done.wait(0.1)
+
+    def _logged_run(self, argv):
+        folder = Path(self.run_dir)
+        ready = folder / 'logger_ready.json'
+        info = dict(ready=False)
+        logger = None
+        try:
+            try:
+                cmd = info['argv'] = self._logger_cmd(folder)
+                with (folder / 'logger.log').open('wb') as log:
+                    logger = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
+                                              text=True, **_spawn_kw())
+                deadline = time.monotonic() + LOGGER_READY_S
+                while logger.poll() is None and not self._stop_pending and time.monotonic() < deadline:
+                    if ready.is_file():
+                        info['ready'] = True
+                        break
+                    time.sleep(0.05)
+            except (OSError, ValueError) as exc:
+                info['reason'] = str(exc)
+            if not info['ready'] and logger is not None:
+                info.setdefault('reason', 'logger not ready')
+                self._stop_logger(logger, info)
+                logger = None
+            with self._lock:
+                self._meta['logger'] = info.copy()
+                self._write_meta()
+                if self._stop_pending or self._closing:
+                    self._finish(0, {'outcome': 'user_stop'}, None, None)
+                    return
+                if self._wedged or self.busy_check(None):
+                    self._spawn_failed('logger group left' if self._wedged else 'PC run active')
+                    return
+                if self._spawn_run(argv) != pp.RES_OK:
+                    return
+            if info['ready']:
+                try:
+                    self._follow_fw(folder / 'esp32.csv.events.txt')
+                except OSError as exc:
+                    info['events_error'] = str(exc)
+                    self._run_done.wait()
+        except Exception as exc:
+            # A launch error (for example the second /proc check failing) has no
+            # run-owner thread to take PREPARE to its end.
+            with self._lock:
+                if self.proc is None and self.state in pp.ST_ACTIVE:
+                    self._spawn_failed(exc)
+                else:
+                    info['error'] = str(exc)
+        finally:
+            if logger is not None:
+                self._stop_logger(logger, info)
+            with self._lock:
+                self._meta['logger'] = info
 
     def stop(self) -> int:
         with self._lock:
@@ -467,8 +603,11 @@ class HilDaemon:
             return self._stop_run()
 
     def _stop_run(self) -> int:
-        if self.state not in pp.ST_ACTIVE or self.proc is None:
+        if self.state not in pp.ST_ACTIVE:
             return pp.RES_NOT_IDLE
+        if self.proc is None:                      # logger readiness, before the plant starts
+            self._stop_pending = True
+            return pp.RES_OK
         self.outcome = pp.OUT_ERROR if self._fw_error else pp.OUT_USER_STOP
         if self._t_stop is not None:
             return pp.RES_OK                       # STOP again: the existing timer escalates
@@ -481,6 +620,9 @@ class HilDaemon:
 
     def snapshot(self) -> RunSnapshot:
         with self._lock:
+            note = self.note
+            if self._note_at is not None and self.clock() - self._note_at >= 3:
+                note = ''
             return RunSnapshot(
                 run_state=self.state, phase_s=self.clock() - self.t_phase, profile=self.profile,
                 outcome=self.outcome, quality=self.quality, lost=0, data_age_ms=None,
@@ -488,7 +630,8 @@ class HilDaemon:
                 ctrl=self.dut_env or self.ctrl, ctrl_src=(pp.CTRL_SRC_FW if self.dut_env else
                                                           pp.CTRL_SRC_PROFILE if self.ctrl else pp.CTRL_SRC_NONE),
                 loop_us=self.loop_us, overruns=self.overruns, result=self.result,
-                run_no=self.run_no, result_run=self.result_run, reset_index=self.reset_index, note=self.note,
+                run_no=self.run_no, result_run=self.result_run, reset_index=self.reset_index, note=note,
+                check_run=self.result_run, check_code=self.check_code, check_text=self.check_text, tracks=self.tracks,
                 sha_state=self.sha_state, dut_sha=self.dut_sha, dut_env=self.dut_env, fault_text=self._fault_text())
 
     def _fault_text(self) -> str:
@@ -719,14 +862,16 @@ class HilDaemon:
         is closed. True only if nothing of the daemon's is left running (not after E_GROUP)."""
         with self._lock:
             self._closing = True
-            active = self.proc is not None
+            self._shutdown.set()
+            active = self.state in pp.ST_ACTIVE
         if active:
             self.stop()
         killed = None
         t_end = time.monotonic() + wait_s
         while time.monotonic() < t_end:
             with self._lock:
-                if self.proc is None and not self._probing and not self._querying:
+                if (self.state not in pp.ST_ACTIVE and self.proc is None and not self._checking
+                        and not self._probing and not self._querying):
                     return not self._wedged
                 probe = self._probe_proc            # read again each time (PPI-R3-1)
             if probe is not None and probe is not killed:
@@ -861,11 +1006,11 @@ class HilDaemon:
                 self.quality |= pp.Q_SPI_STALE
                 self.h7_ok = False
         outcome = (summary or {}).get('outcome') or ''
-        lines = [f'{self._fw_error or outcome or "no summary"} #{self.run_no}'[:pp.RESULT_LEN]]
-        if last is not None:
-            p99 = '-' if last[0] is None else f'{last[0]:.0f}'
-            lines.append(f'p99 {p99} max {last[1]:.0f}us'[:pp.RESULT_LEN])
-            lines.append(f'ovr {last[2]} miso {"-" if miso is None else miso[1] + miso[2]}'[:pp.RESULT_LEN])
+        suffix = f' #{self.run_no}'
+        title = self._fw_error or outcome or 'no summary'
+        lines = [title[:pp.RESULT_LEN - len(suffix)] + suffix]
+        lines.append(panel_result.error_line(None, None))
+        lines.append(panel_result.timing_line(*last[:2]) if last else panel_result.timing_line())
         self.result, self.result_run = tuple(lines), self.run_no
         if not group_gone:
             # a process of the run would not die even by SIGKILL: it may hold the SPI
@@ -885,8 +1030,50 @@ class HilDaemon:
         else:
             self.outcome = pp.OUT_USER_STOP if outcome == 'user_stop' else pp.OUT_COMPLETED
             self._enter(pp.ST_END)
-        self._close_meta(rc)
         self.proc = None
+        self._start_check(rc)
+
+    def _start_check(self, rc):
+        # Reserve the run folder and DUT until the logger is reaped and the verdict published.
+        self._checking, self.check_code, self.check_text = True, pp.CHK_RUNNING, 'checking'
+        self._run_done.set()
+        self._close_meta(rc)
+        threading.Thread(target=self._post_run, name='panel-result', daemon=True).start()
+
+    def _post_run(self):
+        folder = Path(self.run_dir)
+        errors, other = [], []
+        try:
+            if self._logger_thread:
+                self._logger_thread.join()
+            if sys.platform.startswith('linux'):
+                os.nice(10)  # Linux niceness is per thread; the UART thread keeps its priority.
+            logger_ready = self._meta.get('logger', {}).get('ready', False)
+            dut = None
+            if logger_ready:
+                try:
+                    dut = panel_result.read_dut(folder / 'esp32.csv')
+                except (OSError, ValueError) as exc:
+                    errors.append(str(exc))
+            try:
+                tracks, maximum, last = panel_result.trajectory(folder / 'pose.csv', dut)
+                with self._lock:
+                    self.tracks = tracks
+                    self.result = (self.result[0], panel_result.error_line(maximum, last), self.result[2])
+                    self._meta['trajectory'] = dict(e_max_mm=maximum, e_end_mm=last)
+            except (OSError, ValueError) as exc:
+                errors.append(str(exc))
+            check, other = panel_result.run_check(folder, '--faults' in self._meta.get('argv', ()),
+                                                 logger_ready, dut, self._shutdown)
+        except Exception as exc:
+            check = panel_result.inconclusive(f'{type(exc).__name__}: {exc}')
+        with self._lock:
+            self.check_code, self.check_text = check['code'], check['text']
+            self._meta.update(check=check, check_other=other, result=list(self.result))
+            if errors:
+                self._meta['result_errors'] = errors
+            self._write_meta()
+            self._checking = False
 
 
 def main(argv=None) -> int:
@@ -904,7 +1091,7 @@ def main(argv=None) -> int:
                     help='BCM GPIO wired to the panel EN (pulled low once at start); -1 = no wire')
     ap.add_argument('--dut-reset-gpio', type=int, default=DUT_RESET_GPIO,
                     help='BCM GPIO wired to DUT EN for RESET DUT (-1 = no wire)')
-    ap.add_argument('--dut-ip', type=ipaddress.IPv4Address, help='DUT IPv4 address for read-only firmware queries')
+    ap.add_argument('--dut-ip', type=ipaddress.IPv4Address, help='DUT IPv4 for firmware queries and strict UDP logging')
     ap.add_argument('--expect-dut', type=_expected_sha, help='expected DUT firmware SHA (12 hex digits)')
     ap.add_argument('--lock-dir', default=os.path.expanduser('~/.hil_panel_locks'),
                     help='lock folder: one daemon per account and folder (never change it in use)')

@@ -402,3 +402,89 @@ def test_stalled_extra_uses_current_window_when_uart_accepts_first_byte():
     w.stalled = False
     w.step(3)
     assert w.panel.extra == pp.Extra(sid=w.panel.sid)
+
+
+def test_tracks_on_the_wire_keep_status_period_and_resend_the_complete_result():
+    run = Recorder()
+    now = [0.0]
+    wire = WireFifo(lambda: now[0])
+    link = PanelLink(5, run, wire, clock=lambda: now[0])
+    reference = Recorder()
+    plain_wire = WireFifo(lambda: now[0])
+    plain_link = PanelLink(5, reference, plain_wire, clock=lambda: now[0])
+    link.feed(pp.encode_cmd(0, 0, pp.CMD_HELLO, 3))
+    plain_link.feed(pp.encode_cmd(0, 0, pp.CMD_HELLO, 3))
+    chunks = tuple(tuple((i, -i) for i in range(start, min(start + 22, 200)))
+                   for start in range(0, 200, 22))
+    run.snap = RunSnapshot(run_no=7, result_run=7, result=('completed #7',), run_state=pp.ST_END)
+    reference.snap = RunSnapshot(**vars(run.snap))
+    for ms in range(0, 13000, 5):
+        now[0] = ms / 1000
+        if ms == 500:  # the worker publishes points after the initial RESULT
+            run.snap.tracks = {s: chunks for s in (pp.TR_REF, pp.TR_PLANT, pp.TR_DUT)}
+        link.poll()
+        plain_link.poll()
+
+    def received(fifo):
+        parser = pp.StreamParser(clock=lambda: now[0])
+        for byte, sent in zip(fifo.data, fifo.t_out):
+            for frame in parser.feed(bytes([byte])):
+                yield sent, frame
+        assert parser.bad_frames == parser.skipped_bytes == 0
+
+    statuses, tracks, count = [], [], 0
+    for sent, frame in received(wire):
+        if isinstance(frame, pp.Status):
+            assert count <= 2
+            statuses.append(sent)
+            count = 0
+        elif isinstance(frame, pp.Track):
+            tracks.append((sent, frame))
+            count += 1
+    assert count <= 2
+    # INFO / EXTRA also use the wire. TRACK must add zero delay to every periodic STATUS.
+    assert statuses == pytest.approx([sent for sent, f in received(plain_wire) if isinstance(f, pp.Status)])
+    assert max(b - a for a, b in zip(statuses, statuses[1:])) < .115
+    expected = [pp.Track(link.sess.sid, 7, series, i, 10, points)
+                for series in run.snap.tracks for i, points in enumerate(chunks)]
+    assert [frame for _, frame in tracks] == expected * 2
+    assert 0.5 < tracks[0][0] < 0.65
+    assert tracks[30][0] - tracks[0][0] == pytest.approx(10, abs=0.11)
+
+
+def test_partial_track_finishes_before_new_session_status_then_old_chunks_stop():
+    run = Recorder()
+    t, wire = [0.0], bytearray()
+    paused = False
+
+    def write(data):
+        nonlocal paused
+        if paused:
+            return 0
+        if data[0] == pp.START_TRACK:
+            paused = True
+            data = data[:7]
+        wire.extend(data)
+        return len(data)
+
+    link = PanelLink(3, run, write, clock=lambda: t[0])
+    link.feed(pp.encode_cmd(0, 0, pp.CMD_HELLO, 1))
+    sid = link.sess.sid
+    chunks = (((10, 20),), ((30, 40),))
+    run.snap = RunSnapshot(run_no=5, result_run=5, result=('completed #5',), run_state=pp.ST_END,
+                           tracks={pp.TR_PLANT: chunks})
+    for ms in range(0, 250, 5):
+        t[0] = ms / 1000
+        link.poll()
+    assert paused
+    run.snap = RunSnapshot(run_no=6, run_state=pp.ST_RUN)
+    link.feed(pp.encode_cmd(0, 0, pp.CMD_HELLO, 2))
+    paused = False
+    for ms in range(250, 12000, 5):
+        t[0] = ms / 1000
+        link.poll()
+    frames = pp.StreamParser().feed(bytes(wire))
+    assert [f for f in frames if isinstance(f, pp.Track)] == [pp.Track(sid, 5, pp.TR_PLANT, 0, 2, chunks[0])]
+    last_old = max(i for i, f in enumerate(frames) if f.sid == sid)
+    assert isinstance(frames[last_old], pp.Track)
+    assert isinstance(frames[last_old + 1], pp.Status) and frames[last_old + 1].sid == link.sess.sid

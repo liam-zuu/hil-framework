@@ -49,6 +49,7 @@ Notes
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, nullcontext
 import logging
 import multiprocessing as mp
 import os
@@ -335,6 +336,53 @@ class _PhaseReporter:
             log.info('#phase,%s,t_ns=%d', ph, time.monotonic_ns())
 
 
+@contextmanager
+def _pose_log(path, shared_state, control):
+    """Sample the world pose from the run owner for the panel drawing."""
+    import threading
+
+    # hil_node writes shared_state under get_lock() every 1 ms in the SCHED_FIFO loop.
+    # Preempting a normal-priority lock holder would invert priorities. A torn read
+    # across pose fields is acceptable for this drawing, which is never thesis data.
+    raw = shared_state.get_obj()
+    done = threading.Event()
+
+    def sample():
+        try:
+            os.sched_setaffinity(0, {1, 3})
+        except (AttributeError, OSError):
+            pass
+        try:
+            with open(path, 'w', encoding='ascii', newline='') as f:
+                f.write('t_ns,phase,x,y,th\n')
+                deadline = time.monotonic()
+                last_phase = None
+                while True:
+                    closing = done.is_set()
+                    phase = control.phase() if control is not None else ''
+                    if not closing or phase != last_phase:
+                        t_ns = time.monotonic_ns()
+                        x, y, th = raw[:3]
+                        f.write(f'{t_ns},{phase},{x},{y},{th}\n')
+                        last_phase = phase
+                    if closing:
+                        break
+                    deadline += 0.05
+                    if deadline <= time.monotonic():
+                        deadline = time.monotonic() + 0.05
+                    done.wait(deadline - time.monotonic())
+        except OSError as exc:
+            log.error('Pose log %s: %s', path, exc)
+
+    thread = threading.Thread(target=sample, name='panel-pose')
+    thread.start()
+    try:
+        yield
+    finally:
+        done.set()
+        thread.join()
+
+
 def _finite_run_config(args, spec):
     """--finite-run: (LifecycleConfig, ceiling in steps), or SystemExit on a bad combination."""
     from run_lifecycle import LifecycleConfig
@@ -517,6 +565,7 @@ def _parse_args() -> argparse.Namespace:
                    help='L82 fault injection batch 1: schedule file of fault_schedule.py (enc_loss, imu_loss, '
                         'imu_delay, gyro_scale), windows in ms from the first RUN step (--finite-run) or '
                         'step 0 (--steps); needs --frame-log, which then also keeps the true frames')
+    p.add_argument('--pose-log', metavar='CSV', help='sample world pose in the run owner at 20 Hz (panel drawing)')
     p.add_argument('--finite-run',    action='store_true',
                    help='Run phases of run_lifecycle.py: ARM (plant held, setpoint 0), RUN (the trajectory), '
                         'STOPPING (setpoint 0 for 1 s), END. Needs a finite trajectory; Ctrl+C = STOP, '
@@ -805,7 +854,8 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _stop)
 
     # Primary: wait for plant loop, printing its stats from here
-    _report_plant_stats(p1, monitor, hil_cfg.stats_interval, step_csv, owner)
+    with _pose_log(args.pose_log, shared_state, control) if args.pose_log else nullcontext():
+        _report_plant_stats(p1, monitor, hil_cfg.stats_interval, step_csv, owner)
     p1.join()
     if owner is not None:
         phase_rep()                       # the last phase (END, or where an error left it)

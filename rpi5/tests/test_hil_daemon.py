@@ -6,6 +6,7 @@ panel client over PanelLink. No hardware, no SPI."""
 import json
 import logging
 import os
+from pathlib import Path
 import sys
 import time
 
@@ -38,7 +39,8 @@ def wait_for(d, states, timeout=10.0):
     t_end = time.monotonic() + timeout
     while time.monotonic() < t_end:
         s = d.snapshot()
-        if s.run_state in states and (s.run_state in pp.ST_ACTIVE or d.proc is None):
+        if s.run_state in states and (s.run_state in pp.ST_ACTIVE or
+                                      (d.proc is None and s.check_code != pp.CHK_RUNNING)):
             return s
         time.sleep(0.01)
     raise AssertionError(f'state {d.snapshot().run_state} never in {states}')
@@ -75,7 +77,9 @@ def test_whole_run_completed_result_and_run_folder(tmp_path, monkeypatch):
     assert s.result[0].startswith('completed #1') and s.loop_us == 43 and s.overruns == 1
     assert all(len(x) <= pp.RESULT_LEN for x in s.result)
     assert s.ctrl == 'LADRC' and s.ctrl_src == pp.CTRL_SRC_PROFILE and s.quality & pp.Q_DUT_UNCONF
-    assert json.loads(out.read_text()) == ['--o1', 'O1-F05', '--finite-run']
+    folder = Path(d.run_dir)
+    assert json.loads(out.read_text()) == ['--o1', 'O1-F05', '--finite-run', '--pose-log', str(folder / 'pose.csv'),
+                                          '--frame-log', str(folder / 'frames.npz')]
     m = run_meta(d)
     assert m['mode'] == 'panel' and m['data_valid'] is False and m['exit_code'] == 0
     assert m['outcome'] == 'completed' and m['run_no'] == 1 and m['test'] == 'T-2'

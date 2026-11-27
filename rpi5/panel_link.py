@@ -38,6 +38,7 @@ Run it on the Pi (only when stage E provides a RunControl; --demo uses the FAKE 
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import os
 import random
 import time
@@ -49,6 +50,7 @@ import panel_proto as pp
 STATUS_PERIOD_S = 0.1       # workflow 9.6: STATUS ~10 Hz
 INFO_PERIOD_S = 1.0         # v6: INFO ~1 Hz and on change
 INFO_MIN_GAP_S = 0.2        # a changing INFO (loop_us moves all the time) at most 5 per second
+TRACK_PERIOD_S = 10.0
 WIRE_BUDGET_MAX = 128       # bytes handed to the UART ahead of the wire at most (Codex Q9)
 WIRE_RATE_FACTOR = 0.95     # hand bytes over at 95 % of the line rate (baud / 10 bytes per second)
 
@@ -79,6 +81,10 @@ class RunSnapshot:
     fault_text: str = ''                 # populated while a scheduled window is open
     reset_index: int = pp.PROFILE_NONE
     note: str = ''                       # RESET DUT feedback, independent of the run result
+    check_code: int = pp.CHK_NONE
+    check_run: int = 0
+    check_text: str = ''
+    tracks: dict = field(default_factory=dict)  # series -> immutable chunks of (x_mm, y_mm)
 
 
 class RunControl(Protocol):
@@ -113,9 +119,13 @@ def info_of(snap: RunSnapshot, sid: int) -> pp.Info:
 
 
 def extra_of(snap: RunSnapshot, sid: int) -> pp.Extra:
-    return pp.Extra(sid=sid, flags=pp.X_FAULT_ACTIVE if snap.fault_text else 0, fault_text=snap.fault_text,
+    flags = pp.X_FAULT_ACTIVE if snap.fault_text else 0
+    show_check = snap.check_run and (not snap.note or snap.check_code == pp.CHK_RUNNING)
+    return pp.Extra(sid=sid, flags=flags | (pp.X_CHECK_VALID if show_check else 0), fault_text=snap.fault_text,
                     sha_state=snap.sha_state, dut_sha=snap.dut_sha, dut_env=snap.dut_env,
-                    reset_index=snap.reset_index, check_text=snap.note)
+                    reset_index=snap.reset_index, check_run=snap.check_run if show_check else 0,
+                    check_code=snap.check_code if show_check else pp.CHK_NONE,
+                    check_text=snap.check_text if show_check else snap.note)
 
 
 def _due(now, sent_at, frame, previous) -> bool:
@@ -157,7 +167,11 @@ class PanelLink:
         self.last_info: Optional[bytes] = None
         self.last_extra: Optional[bytes] = None
         self._write = write
-        self._pending_extra = self._extra_tail = b''
+        self._pending_extra = self._tail = b''
+        self._info_run = self._track_run = 0
+        self._tracks = deque()
+        self._t_tracks = None
+        self._track_allowance = 0
         self.log = []                       # (t, cmd, seq, result of on_cmd) for the operator
 
     def _exec(self, c: pp.Cmd) -> int:
@@ -184,7 +198,9 @@ class PanelLink:
             if r == 'hello':
                 self.tx.clear_session()
                 self.last_info = self.last_extra = None
-                self._pending_extra = b''            # an EXTRA already partly on the wire must finish
+                self._pending_extra = b''            # any frame already on the wire must finish
+                self._info_run = 0
+                self._track_run = None  # discard unsent chunks even if the new session has no result
             self.tx.put(pp.encode_status(status_of(self.run.snapshot(), self.sess)))
             if r in ('hello', 'profiles'):
                 self._send_profiles()
@@ -196,15 +212,44 @@ class PanelLink:
             self.t_status = now
             snap = self.run.snapshot()
             self.tx.put(pp.encode_status(status_of(snap, self.sess)))
+            self._track_allowance = 2  # usable only once TxQueue has drained this STATUS
         if self.sess.sid:
             snap = snap or self.run.snapshot()
-            info = pp.encode_info(info_of(snap, self.sess.sid))
+            result_info = info_of(snap, self.sess.sid)
+            info = pp.encode_info(result_info)
             if _due(now, self.t_info, info, self.last_info):
                 self.t_info, self.last_info = now, info
                 self.tx.put(info)
+                self._info_run = result_info.result_run
             extra = pp.encode_extra(extra_of(snap, self.sess.sid))
             self._pending_extra = extra if _due(now, self.t_extra, extra, self.last_extra) else b''
+            run_no = result_info.result_run if result_info.result_run == self._info_run and snap.tracks else 0
+            self._schedule_tracks(now, run_no, snap.tracks)
         self._pump(now)
+
+    def _schedule_tracks(self, now, run_no, tracks):
+        if run_no != self._track_run:
+            self._track_run, self._t_tracks = run_no, None
+            self._tracks.clear()
+        if run_no and not self._tracks and (self._t_tracks is None or now - self._t_tracks >= TRACK_PERIOD_S):
+            self._t_tracks = now
+            for series, chunks in tracks.items():
+                self._tracks.extend(pp.Track(self.sess.sid, run_no, series, i, len(chunks), points)
+                                    for i, points in enumerate(chunks))
+
+    def _write_frame(self, frame):
+        """Keep the unwritten tail of a started frame across polls, including HELLO and STOP."""
+        rest = frame
+        while rest and self._budget >= 1:
+            n = self._write(rest[:int(self._budget)])
+            if not n:
+                break
+            rest = rest[n:]
+            self._budget -= n
+        if rest == frame:
+            return False
+        self._tail = rest
+        return True
 
     def _pump(self, now: float) -> None:
         '''Hand bytes to the UART at the line rate, never more than WIRE_BUDGET_MAX ahead: a
@@ -215,19 +260,25 @@ class PanelLink:
         self._t_budget = now
         # TxQueue's FIFO holds profiles. Keep one replaceable EXTRA outside it so a stalled
         # UART cannot accumulate stale countdowns or evict a profile. Finish each frame on the wire.
-        if not self._extra_tail and self._budget >= 1:
-            self._budget -= self.tx.pump(max_bytes=int(self._budget))
-            if self.tx.pending():
+        if self._tail:
+            self._write_frame(self._tail)
+            if self._tail:
                 return
-        frame = self._extra_tail or self._pending_extra
-        if frame and self._budget >= 1:
-            n = self._write(frame[:int(self._budget)])
-            if n:
-                if not self._extra_tail:
-                    self.t_extra, self.last_extra = now, frame
-                    self._pending_extra = b''
-                self._extra_tail = frame[n:]
-                self._budget -= n
+        self._budget -= self.tx.pump(max_bytes=int(self._budget))
+        if self.tx.pending():
+            return
+        if self._pending_extra:
+            if self._write_frame(self._pending_extra):
+                self.t_extra, self.last_extra = now, self._pending_extra
+                self._pending_extra = b''
+        elif self._tracks and self._track_allowance and self._budget >= pp.LEN_TRACK:
+            # The unspent byte budget bounds how much space is free in the UART.
+            # Include bytes already handed over when reserving time for the next STATUS.
+            wire_room = (self.t_status + STATUS_PERIOD_S - now) * self.rate
+            backlog = WIRE_BUDGET_MAX - self._budget
+            if wire_room >= pp.LEN_TRACK + backlog and self._write_frame(pp.encode_track(self._tracks[0])):
+                self._track_allowance -= 1
+                self._tracks.popleft()
 
 
 # ── FAKE run for the bench and --demo (nothing here is a measurement) ─────

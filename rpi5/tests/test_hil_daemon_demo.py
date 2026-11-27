@@ -22,8 +22,11 @@ IP = '192.0.2.42'
 
 
 def daemon(tmp_path, **kwargs):
-    return hd.HilDaemon(str(tmp_path / 'runs'), child_cmd=lambda args: [sys.executable, '-u', STUB, *args],
-                        stop_fn=stdin_stop, busy_check=lambda pid: False, **kwargs)
+    d = hd.HilDaemon(str(tmp_path / 'runs'), child_cmd=lambda args: [sys.executable, '-u', STUB, *args],
+                     stop_fn=stdin_stop, busy_check=lambda pid: False, **kwargs)
+    # Firmware-query tests exercise the daemon without binding the host UDP port.
+    d._logger_cmd = lambda folder: [sys.executable, '-c', 'pass']
+    return d
 
 
 @pytest.mark.parametrize('name,fault,target,end_ms,params', [
@@ -85,7 +88,8 @@ def test_fault_argv_and_meta_name_the_same_run_files(tmp_path, monkeypatch):
     wait_for(d, (pp.ST_END,))
     argv = json.loads(out.read_text())
     expected = dict(hd.panel_tests())['DEMO-ENC']
-    assert argv == [*expected, '--finite-run', '--frame-log', str(Path(d.run_dir) / 'frames.npz'),
+    assert argv == [*expected, '--finite-run', '--pose-log', str(Path(d.run_dir) / 'pose.csv'),
+                    '--frame-log', str(Path(d.run_dir) / 'frames.npz'),
                     '--step-log', str(Path(d.run_dir) / 'steps.csv')]
     assert initial['argv'] == run_meta(d)['argv'] == [sys.executable, '-u', STUB, *argv]
     assert not initial['data_valid'] and initial['mode'] == 'panel'
@@ -314,4 +318,99 @@ def test_motor_on_firmware_fault_stops_run_and_records_error(tmp_path, monkeypat
             assert d.start(d.reset_index) == pp.RES_OK and d.snapshot().sha_state == pp.SHA_UNKNOWN
             assert d.start(0) == pp.RES_OK and d.snapshot().sha_state == pp.SHA_OK
     finally:
+        assert d.shutdown()
+
+
+def test_logger_ready_before_run_then_dirty_event_stops_fake_owner(tmp_path, monkeypatch, udp):
+    d = daemon(tmp_path, dut_ip=IP, expect_dut=SHA)
+    monkeypatch.setenv('FAKE_RUN_S', '30')
+    seen = []
+    on_fw_line = d.on_fw_line
+
+    def record(*identity):
+        seen.append(identity)
+        on_fw_line(*identity)
+
+    d.on_fw_line = record
+    # Keep the production argv and session/stop handling. Substitute only the logger script.
+    popen = hd.subprocess.Popen
+
+    def spawn(cmd, **kw):
+        if STUB in cmd:
+            assert (Path(d.run_dir) / 'logger_ready.json').is_file()
+        elif any(Path(s).name == 'agv_logger.py' for s in cmd):
+            argv = list(cmd)
+            idx = argv.index(str(hd.panel_result.TOOLS / 'agv_logger.py'))
+            argv[idx] = str(Path(__file__).with_name('fake_panel_logger.py'))
+            return popen(argv, **kw)
+        return popen(cmd, **kw)
+
+    del d._logger_cmd  # use the actual class method for this run
+    monkeypatch.setattr(hd.subprocess, 'Popen', spawn)
+    assert d.start(0) == pp.RES_OK
+    try:
+        wait_for(d, (pp.ST_RUN,))
+        folder = Path(d.run_dir)
+        (folder / 'motor_on').touch()
+        snap = wait_for(d, (pp.ST_ERROR,))
+        assert snap.sha_state == pp.SHA_DIRTY and snap.error_text == 'DUT FW dirty'
+        assert seen == [(SHA, '0', 'pid'), (SHA, '1', 'ladrc')]
+        meta = run_meta(d)
+        logger = meta['logger']
+        assert logger['argv'][-7:] == ['--strict', '--src-ip', IP, '--out', str(folder / 'esp32.csv'),
+                                       '--ready-file', str(folder / 'logger_ready.json')]
+        assert 'first' not in logger['argv']
+        assert logger['ready'] and logger['group_gone'] and logger['exit_code'] == 0
+        assert meta['stop_signals'] == logger['stop_signals'] == [0]
+        assert meta['run_summary']['outcome'] == 'user_stop'
+        assert snap.tracks[pp.TR_DUT] == (((0, 0), (60, 0)),)
+        assert meta['check']['pos_reset_mid'] == 0
+        assert d.start(0) == pp.RES_BAD_PROFILE
+    finally:
+        assert d.shutdown()
+
+
+def test_unready_logger_is_reaped_and_run_proceeds(tmp_path, monkeypatch, udp):
+    d = daemon(tmp_path, dut_ip=IP)
+    d._logger_cmd = lambda folder: [sys.executable, '-c', 'import sys; sys.stdin.readline()']
+    monkeypatch.setattr(hd, 'LOGGER_READY_S', .15)
+    assert d.start(0) == pp.RES_OK
+    wait_for(d, (pp.ST_END,))
+    logger = run_meta(d)['logger']
+    assert not logger['ready'] and logger['reason'] == 'logger not ready'
+    assert logger['group_gone'] and logger['stop_signals'] == [0]
+
+
+def test_without_ip_no_logger_and_both_starts_refused_until_check_finishes(tmp_path, monkeypatch):
+    now = [1.0]
+    d = daemon(tmp_path, clock=lambda: now[0])
+    d._logger_cmd = lambda folder: pytest.fail('unexpected UDP logger')
+    entered, release = threading.Event(), threading.Event()
+    run_check = hd.panel_result.run_check
+
+    def check(*args):
+        entered.set()
+        assert release.wait(5)
+        return run_check(*args)
+
+    monkeypatch.setattr(hd.panel_result, 'run_check', check)
+    assert d.start(0) == pp.RES_OK
+    try:
+        assert entered.wait(5)
+        assert d.start(0) == d.start(d.reset_index) == pp.RES_BUSY
+        x = extra_of(d.snapshot(), 1)
+        assert x.flags & pp.X_CHECK_VALID and (x.check_code, x.check_run) == (pp.CHK_RUNNING, 1)
+        release.set()
+        s = wait_for(d, (pp.ST_END,))
+        m = run_meta(d)
+        assert m['logger'] == dict(ready=False, reason='no --dut-ip')
+        assert not (Path(d.run_dir) / 'esp32.csv').exists()
+        assert not s.tracks and m['check']['pos_reset_mid'] is None
+        assert m['check']['code'] == s.check_code == pp.CHK_INCONCLUSIVE
+        now[0] += 3  # the transient RESET DUT feedback relinquishes the shared text field
+        x = extra_of(d.snapshot(), 1)
+        assert x.flags & pp.X_CHECK_VALID and (x.check_run, x.check_code, x.check_text) == (
+            1, m['check']['code'], m['check']['text'])
+    finally:
+        release.set()
         assert d.shutdown()
