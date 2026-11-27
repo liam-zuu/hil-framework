@@ -579,7 +579,7 @@ def test_k3_direct_call_verifies_the_rows_file(tmp_path):
     assert fast.compare_verdict(dict(fast.node_verdict(lost), nut=3), lost, None)['dat']
 
 
-def test_so_refuses_full_chain_files_other_than_its_track(tmp_path):
+def test_so_refuses_full_chain_files_other_than_its_track(tmp_path, capsys):
     """CN-6 round 2 (Codex 27/11): --day and --dets must be the files the full chain's track.json records."""
     rows, ds = so_inputs(tmp_path)
     args = write_so(tmp_path / 'a', rows, rows, ds, ds)
@@ -590,9 +590,12 @@ def test_so_refuses_full_chain_files_other_than_its_track(tmp_path):
     cm.write_frames(day, moved)
     assert fast.main(args + ['--out', str(tmp_path / 'b.json')]) == 2
     args = write_so(tmp_path / 'c', rows, rows, ds, ds)
+    # CNV3-2 (Codex 27/11): same detections (K2 alone would pass), another file: refused by its sha256 only
     other = tmp_path / 'c/other.npz'
-    cm.save_dets(other, [(i, t, {}) for i, t, _ in ds], 'V', (2, 2))
+    cm.save_dets(other, ds, 'V', (3, 3))
+    capsys.readouterr()
     assert fast.main(args[:-1] + [str(other), '--out', str(tmp_path / 'd.json')]) == 2
+    assert 'dets_sha256' in capsys.readouterr().err
 
 
 def test_cham_broken_track_json_still_writes_the_verdict(tmp_path, monkeypatch):
@@ -608,11 +611,27 @@ def test_cham_broken_track_json_still_writes_the_verdict(tmp_path, monkeypatch):
     assert result['buoc'] == {} and result['loi']
 
 
+@pytest.mark.parametrize('missing', ['track.json', 'frames.csv', 'dets_nhanh.npz'])
+def test_cham_missing_track_files_still_write_the_verdict(tmp_path, monkeypatch, missing):
+    """CNV3-1 (Codex 27/11): a missing track file stops cham before step 1 with its error in ket_luan_nhanh.json."""
+    cfg = config(tmp_path)
+    conf, frames, out = [tmp_path / n for n in ('config.json', 'frames.csv', 'scored')]
+    fast.write_json(conf, cfg)
+    track_fixture(frames, frames.with_name('dets_nhanh.npz'), tmp_path)
+    frames.with_name(missing).unlink()
+    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: pytest.fail('no step may run'))
+    assert fast.main(['cham', '--cau-hinh', str(conf), '--frames', str(frames), '--out', str(out)]) == 2
+    result = fast.read_json(out / 'ket_luan_nhanh.json')
+    assert result['buoc'] == {} and missing in result['loi']
+
+
 def test_help_text_shows_the_parser_defaults():
     """CN-12 (Codex 27/11): the defaults written in the module docstring (shown by --help) are the parser's."""
-    a = fast.build_parser().parse_args(['track', '--video', 'v', '--session', 's', '--hang-so', 'h', '--out', 'o'])
+    ap = fast.build_parser()
+    a = ap.parse_args(['track', '--video', 'v', '--session', 's', '--hang-so', 'h', '--out', 'o'])
+    shown = ap.format_help()                      # CNV3-3 (Codex 27/11): what --help prints, not only the docstring
     for flag, value in (('--n-thua', a.n_thua), ('--nua-vung', a.nua_vung), ('--eps-cam-mm', a.eps_cam_mm)):
-        assert f'[{flag} {value}]' in fast.__doc__
+        assert f'[{flag} {value}]' in shown
 
 
 @pytest.mark.parametrize('times,t', [([0, 0.016, 0.032], 2.0), ([0, 0.016, 0.032], -0.01), ([0, 1, 1, 1.03], 1),

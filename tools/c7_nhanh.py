@@ -451,9 +451,12 @@ def cham(a):
         p = Path(cfg['esp32'] + '.' + suffix)
         if p.is_file():
             inputs[suffix] = p
-    result = dict(nhan='duong_nhanh_v1', sha256={k: cm.sha256(p) for k, p in inputs.items()}, buoc={})
+    result = dict(nhan='duong_nhanh_v1', sha256={}, buoc={})
 
     def track_matches():
+        # CNV3-1 (Codex 27/11): hashing runs inside the try too, so a missing frames, dets or track.json still leaves
+        # ket_luan_nhanh.json with its error
+        result['sha256'].update({k: cm.sha256(p) for k, p in inputs.items()})
         # CN-4 (Codex 27/11): the clip, session, frames and detections of the config must be those of the track
         # (track.json of either chain records all four); a wrong clip in the config would otherwise score silently.
         # Inside the try below (CNV2-1): a broken track.json still leaves ket_luan_nhanh.json with its error.
