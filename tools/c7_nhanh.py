@@ -1,7 +1,7 @@
 """Fast C8 camera scoring (design 2026-11-26, sections 2 and 4).
 
 python tools/c7_nhanh.py track --video V --session S --hang-so HS --out DIR
-    [--tag-offset DX,DY,DPSI_DEG] [--n-thua 30] [--nua-vung 150] [--eps-cam-mm 0.25]
+    [--tag-offset DX,DY,DPSI_DEG] [--n-thua 30] [--nua-vung 250] [--eps-cam-mm 0.25]
     [--jobs J] [--max-frames N]
 python tools/c7_nhanh.py cham --cau-hinh C.json --frames DIR/frames.csv --out DIR2 [--luoi] [--nut K]
     [--dets D.npz (default dets_nhanh.npz beside the frames; the full chain's dets.npz for its frames)]
@@ -432,6 +432,8 @@ def node_verdict(node):
             if not isinstance(block, dict) or not all(k in block for k in keys):
                 raise ValueError(f'gate_v3.{g} requires {keys}')
             verdict[g] = {k: block[k] for k in keys}
+            if g == 'g1' and 'q' in block:          # CN-11 (Codex 27/11): G1 q is part of the design 2.2 output
+                verdict[g]['q'] = block['q']
     return verdict
 
 
@@ -449,6 +451,14 @@ def cham(a):
         if p.is_file():
             inputs[suffix] = p
     result = dict(nhan='duong_nhanh_v1', sha256={k: cm.sha256(p) for k, p in inputs.items()}, buoc={})
+    # CN-4 (Codex 27/11): the clip, session, frames and detections of the config must be those of the track
+    # (track.json of either chain records all four); a wrong clip in the config would otherwise score silently.
+    info = read_json(inputs['track'])
+    for key, field in (('clip', 'video_sha256'), ('session', 'session_sha256'), ('frames', 'frames_sha256'),
+                       ('dets', 'dets_sha256')):
+        if info.get(field) != result['sha256'][key]:
+            write_json(out / 'ket_luan_nhanh.json', dict(result, loi=f'{key}: sha256 differs from track.json {field}'))
+            raise ValueError(f'{key}: sha256 differs from track.json {field} ({inputs["track"]})')
     for sub in ('cua_so', 'f12', 'mot_nut'):
         (out / sub).mkdir()
     gio, cua = out / 'gio_so_bo.json', out / 'cua_so/cua_so_v1.jsonl'
@@ -473,8 +483,17 @@ def cham(a):
             rc = subprocess.run(cmd, cwd=HERE.parent, stdin=subprocess.DEVNULL, stdout=stdout,
                                 stderr=subprocess.STDOUT).returncode
         result['buoc'][name] = dict(ma=rc, thoi_gian_s=perf_counter() - start)
-        if rc and not (name == '3_f8_hieu_chuan' and rc == 1):
+        if rc and not (name == '3_f8_hieu_chuan' and rc == 1 and f8_missing_anchors()):
             raise ValueError(f'{name}: exit {rc} (see {out / (name + ".txt")})')
+
+    def f8_missing_anchors():
+        # CN-3 (Codex 27/11): hieu_chuan exits 1 for every state other than dat; only the empty F8 (missing anchors,
+        # as the full chain of run03-run07) goes on.
+        try:
+            h = read_json(hc)
+        except (OSError, ValueError):
+            return False
+        return h.get('trang_thai') == 'chua_ket_luan' and h.get('ly_do') == ['thieu_neo']
 
     try:
         step('1_gio_so_bo', 'c8b_gio', '--frames', frames, *log, *task, '--out', gio)
@@ -532,7 +551,12 @@ def frame_step(times, t):
     """Larger of the two frame intervals beside the frame of `times` (increasing) nearest t."""
     if len(times) < 2:
         raise ValueError('K3: at least two frame times needed for the G1 threshold')
-    j = min(max(bisect_left(times, t), 0), len(times) - 1)
+    # CN-8 (Codex 27/11): finite, strictly increasing, and covering t (t_done is one of these times)
+    if not all(map(math.isfinite, times)) or any(b <= a for a, b in pairwise(times)):
+        raise ValueError('K3: frame times must be finite and strictly increasing')
+    if not math.isfinite(t) or not times[0] <= t <= times[-1]:
+        raise ValueError(f'K3: t_done {t} outside the frame times [{times[0]}, {times[-1]}]')
+    j =min(max(bisect_left(times, t), 0), len(times) - 1)
     if j and abs(times[j - 1] - t) <= abs(times[j] - t):
         j -= 1
     steps = [times[j] - times[j - 1]] if j else []
@@ -554,8 +578,15 @@ def compare_frames(fast, reference, fast_dets, ref_dets):
         raise ValueError('detections do not cover the frame indices')
     xy, psi, corners = [], [], []
     fast_only = ref_only = run = longest = 0
-    for a, b, (_, _, da), (_, _, db) in zip(fast, reference, fast_dets, ref_dets):
+    for a, b, (_, ta, da), (_, tb, db) in zip(fast, reference, fast_dets, ref_dets):
+        # CN-6 (Codex 27/11): both chains decode the same clip with the same reader, so the frame times agree.
+        # frames.csv writes t_s to 1e-6 s (write_frames); the detection files keep the decoded value.
+        if a['t_s'] != b['t_s'] or ta != tb or abs(a['t_s'] - ta) > 1e-6:
+            raise ValueError(f"frame {a['idx']}: frame times differ between the two chains or their detections")
         if a['valid'] and b['valid']:
+            # CN-5: a valid row has the car tag in the detections of its own chain (else the files do not belong together)
+            if cm.CAR_ID not in da or cm.CAR_ID not in db:
+                raise ValueError(f"frame {a['idx']}: valid on both sides but the car tag is missing from a detection file")
             xy.append(1000 * math.hypot(a['x'] - b['x'], a['y'] - b['y']))
             psi.append(abs(math.degrees(cm.cp_wrap(a['psi'] - b['psi']))))
         different = a['valid'] != b['valid']
@@ -595,7 +626,14 @@ def compare_verdict(fast, node, frame_times):
     real frame there (frame_step). The clip times t_s of frames.csv are another time base: not usable here."""
     ref = node_verdict(node)
     gate = node['gate_v3']
-    checks = {'outcome': same(fast['outcome'], ref['outcome'])}
+    # CN-7 (Codex 27/11): K3a and K3b compare the same node number. A lost node (c7_score.lost_output, gate_v3 null)
+    # records no gio_c8b, so its number cannot be checked there (run07 C8-L-F08-1_lai4, C8-L-F08-2_lai1); say so.
+    k_ref = (node.get('gio_c8b') or {}).get('nut')
+    lost_unnumbered = gate is None and 'gio_c8b' not in node
+    if type(fast.get('nut')) is not int or not (lost_unnumbered or type(k_ref) is int and fast['nut'] == k_ref):
+        raise ValueError(f"K3: node numbers differ or are missing (fast {fast.get('nut')!r}, reference {k_ref!r})")
+    checks = {'nut': dict(gia_tri=fast['nut'], nguong='nut_mat_he_do_khong_ghi_so' if lost_unnumbered else k_ref, dat=True),
+              'outcome': same(fast['outcome'], ref['outcome'])}
     for g in GATES:
         a, b = fast[g], ref[g]
         checks[g + '_state'] = same(a['state'], b['state'])
@@ -608,6 +646,8 @@ def compare_verdict(fast, node, frame_times):
                     raise ValueError('K3: expected the two G1 completion times')
                 return v
             for k, (x, y) in enumerate(zip(times(a), times(b)), 1):
+                if y is not None and frame_times is None:   # CN-10: rows.csv only when the reference has a t_done
+                    raise ValueError('K3: the frame times of the reference node (rows.csv) are needed for G1')
                 checks[f'g1_t_done_{k}_s'] = delta(x, y, None if y is None else frame_step(frame_times, y))
         else:
             uncertainty = None if gate is None else gate['u_psi_deg' if g == 'g5' else 'u_p']
@@ -623,22 +663,31 @@ def so(a):
     if bool(a.cham_nhanh) != bool(a.cham_day):
         raise ValueError('--cham-nhanh and --cham-day go together')
     folder = Path(a.nhanh)
+    info = read_json(folder / 'track.json')
+    for name, field in (('frames.csv', 'frames_sha256'), ('dets_nhanh.npz', 'dets_sha256')):   # CN-6 (Codex 27/11)
+        if info.get(field) != cm.sha256(folder / name):
+            raise ValueError(f'{folder / name}: sha256 differs from track.json {field}')
     fast = cm.read_frames(folder / 'frames.csv')
     ref = cm.read_frames(a.day)
     fd, vf, _ = cm.load_dets(folder / 'dets_nhanh.npz')
     rd, vr, _ = cm.load_dets(a.dets)
     if vf != vr:
         raise ValueError('detections belong to different videos')
-    if read_json(folder / 'track.json').get('thu') is True:
+    if info.get('thu') is True:
         ref, rd = ref[:len(fast)], rd[:len(fast)]
     k2 = compare_frames(fast, ref, fd, rd)
     k3 = None
     if a.cham_day:
-        if not a.rows_day:
-            raise ValueError('--rows-day (rows.csv of the --cham-day node, its frame times) is needed for K3')
-        with open(a.rows_day, newline='', encoding='utf-8') as f:
-            times = [float(r['t']) for r in csv.DictReader(f)]
-        k3 = compare_verdict(read_json(a.cham_nhanh), read_json(a.cham_day), times)
+        node = read_json(a.cham_day)
+        times = None
+        if a.rows_day:
+            # CN-7 (Codex 27/11): the rows.csv must be the one the node wrote
+            recorded = (node.get('khung_tuong_doi_v1') or {}).get('rows_sha256')
+            if recorded is not None and recorded != cm.sha256(a.rows_day):
+                raise ValueError(f'{a.rows_day}: sha256 differs from the node khung_tuong_doi_v1.rows_sha256')
+            with open(a.rows_day, newline='', encoding='utf-8') as f:
+                times = [float(r['t']) for r in csv.DictReader(f)]
+        k3 = compare_verdict(read_json(a.cham_nhanh), node, times)
     write_json(a.out, dict(K2=k2, K3=k3, dat=k2['dat'] and (k3 is None or k3['dat'])))
 
 

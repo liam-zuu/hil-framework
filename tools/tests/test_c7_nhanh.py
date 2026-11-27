@@ -217,13 +217,34 @@ def test_track_cli_job_order_and_downstream(tmp_path, sess, capsys):
 
 
 # Trimmed from run02 / C8-L-F08-1 / mot_nut / nut_010.json. The run and gate outcomes differ.
-NODE = dict(outcome='hong_he_do', gate_v3=dict(
+NODE = dict(outcome='hong_he_do', gio_c8b=dict(nut=2), gate_v3=dict(
     outcome='khong_dat', u_p=0.04243766250217123, u_psi_deg=3.197749408164356,
     g1=dict(q='true', state='dat', t_done=[11.483937780725682, 11.483937780725682]),
     g2=dict(q=0.08444631540799737, lo=0.03826116042465006, hi=0.15748391005456897, state='chua_ket_luan'),
     g3=dict(q=0.09100499546974757, lo=0.009786671789513451, hi=0.18732951241534113, state='chua_ket_luan'),
     g4=dict(q=0.12536783565092294, lo=0.0725039610320882, hi=0.32187370812253857, state='chua_ket_luan'),
     g5=dict(q=23.792549302558406, lo=16.34268283893251, hi=31.2424157661843, state='khong_dat')))
+
+
+def verdict_of(node):
+    """The ket_luan_nhanh.json fields compare_verdict reads (node number: CN-7)."""
+    return dict(fast.node_verdict(node), nut=node['gio_c8b']['nut'])
+
+
+def f8_result(cmd, reasons):
+    """hieu_chuan writes its out directory and hieu_chuan_neo.json, then exits 1 when the state is not dat."""
+    out = Path(cmd[cmd.index('--out') + 1])
+    out.mkdir(parents=True)
+    fast.write_json(out / 'hieu_chuan_neo.json', dict(trang_thai='chua_ket_luan', ly_do=reasons))
+
+
+def track_fixture(frames, dets, cfg_dir, **change):
+    """frames.csv, its dets and a track.json recording the clip, session, frames and dets sha256 (CN-4)."""
+    for p in (frames, dets):
+        p.write_text('fixture ' + p.name)
+    info = dict(video_sha256=cm.sha256(cfg_dir / 'clip'), session_sha256=cm.sha256(cfg_dir / 'session'),
+                frames_sha256=cm.sha256(frames), dets_sha256=cm.sha256(dets))
+    fast.write_json(frames.with_name('track.json'), dict(info, **change))
 
 
 def config(tmp_path):
@@ -252,8 +273,7 @@ def test_cham_steps_and_verdict(tmp_path, monkeypatch, grid, failed):
     cfg = config(tmp_path)
     conf, frames, out = [tmp_path / n for n in ('config.json', 'frames.csv', 'scored')]
     fast.write_json(conf, cfg)
-    for p in (frames, frames.with_name('track.json'), frames.with_name('dets_nhanh.npz')):
-        p.write_text('fixture')
+    track_fixture(frames, frames.with_name('dets_nhanh.npz'), tmp_path)
     calls = []
 
     def run(cmd, cwd, stdin, stdout, stderr):
@@ -269,6 +289,7 @@ def test_cham_steps_and_verdict(tmp_path, monkeypatch, grid, failed):
         if step == 3:
             j = cmd.index('--mau')
             assert cmd[j + 1:j + 4] == [str(tmp_path / 'clip_h'), str(tmp_path / 'session'), '500']   # clip H, not the run clip
+            f8_result(cmd, ['thieu_neo'])
         if step == 6:
             assert cmd[cmd.index('--nut') + 1] == '2'
             fast.write_json(cmd[cmd.index('--out') + 1], NODE)
@@ -291,7 +312,7 @@ def test_cham_steps_and_verdict(tmp_path, monkeypatch, grid, failed):
     else:
         assert result['outcome'] == 'hong_he_do'
         assert result['sha256']['mot_nut'] == cm.sha256(out / 'mot_nut/nut.json')
-        assert result['g1'] == dict(t_done=NODE['gate_v3']['g1']['t_done'], state='dat')
+        assert result['g1'] == dict(t_done=NODE['gate_v3']['g1']['t_done'], state='dat', q='true')   # CN-11
         for g in fast.GATES[1:]:
             assert result[g] == NODE['gate_v3'][g]
 
@@ -302,12 +323,13 @@ def test_cham_node_and_dets_options(tmp_path, monkeypatch, nut, ok):
     cfg = config(tmp_path)
     conf, frames, out, other = [tmp_path / n for n in ('config.json', 'frames.csv', 'scored', 'dets.npz')]
     fast.write_json(conf, cfg)
-    for p in (frames, frames.with_name('track.json'), other):
-        p.write_text('fixture')
+    track_fixture(frames, other, tmp_path)
     calls = []
 
     def run(cmd, cwd, stdin, stdout, stderr):
         calls.append(cmd)
+        if len(calls) == 3:
+            f8_result(cmd, ['thieu_neo'])
         if len(calls) == 1:
             fast.write_json(cmd[-1], dict(nodes_s=[-1, 0, 1, 2]))
         if len(calls) == 2:
@@ -334,7 +356,7 @@ T60 = [i / 60 for i in range(2000)]
 
 
 def test_k3_each_quantity_and_nulls():
-    verdict = fast.node_verdict(NODE)
+    verdict = verdict_of(NODE)
     assert fast.compare_verdict(verdict, NODE, T60)['dat']
     verdict['outcome'] = 'dat'
     verdict['g1']['t_done'] = [NODE['gate_v3']['g1']['t_done'][0], None]
@@ -351,8 +373,17 @@ def test_k3_each_quantity_and_nulls():
             entry = result[f'{g}_{k}_{unit}']
             assert not entry['dat'] and entry['nguong'] == 0.05 * uncertainty
             assert entry['gia_tri'] == abs(10 - NODE['gate_v3'][g][k])
-    lost = dict(outcome='hong_he_do', gate_v3=None)
-    assert fast.compare_verdict(fast.node_verdict(lost), lost, T60)['dat']
+    lost = dict(outcome='hong_he_do', gate_v3=None)          # c7_score.lost_output: no gio_c8b, no node number
+    lost_verdict = dict(fast.node_verdict(lost), nut=2)
+    assert fast.compare_verdict(lost_verdict, lost, T60)['nut']['nguong'] == 'nut_mat_he_do_khong_ghi_so'
+    assert fast.compare_verdict(lost_verdict, lost, T60)['dat']
+    with pytest.raises(ValueError, match='node numbers'):
+        fast.compare_verdict(lost_verdict, dict(lost, gio_c8b=dict(nut=5)), T60)   # a lost node that has one: same
+    lost = dict(lost, gio_c8b=dict(nut=2))
+    assert fast.compare_verdict(verdict_of(lost), lost, T60)['dat']
+    assert fast.compare_verdict(verdict_of(lost), lost, None)['dat']          # CN-10: no rows.csv needed
+    with pytest.raises(ValueError):
+        fast.compare_verdict(verdict_of(NODE), NODE, None)                      # a reference t_done needs them
     assert not fast.compare_verdict(verdict, lost, T60)['dat']
 
 
@@ -376,9 +407,10 @@ def test_so_trial_domain_corner_on_invalid_frame_and_k3(tmp_path):
     cm.write_frames(tmp_path / 'day.csv', base)
     cm.save_dets(tmp_path / 'dets.npz', ref_ds, 'V', (2, 2))
     cm.save_dets(tmp_path / 'dets_nhanh.npz', fast_ds, 'V', (2, 2))
-    fast.write_json(tmp_path / 'track.json', dict(thu=True))
+    shas = dict(frames_sha256=cm.sha256(tmp_path / 'frames.csv'), dets_sha256=cm.sha256(tmp_path / 'dets_nhanh.npz'))
+    fast.write_json(tmp_path / 'track.json', dict(shas, thu=True))
     fast.write_json(tmp_path / 'node.json', NODE)
-    fast.write_json(tmp_path / 'cham.json', fast.node_verdict(NODE))
+    fast.write_json(tmp_path / 'cham.json', verdict_of(NODE))
     (tmp_path / 'rows.csv').write_text('t,x\n' + ''.join(f'{i / 60},0\n' for i in range(1200)))
     args = ['so', '--nhanh', str(tmp_path), '--day', str(tmp_path / 'day.csv'), '--dets', str(tmp_path / 'dets.npz'),
             '--cham-day', str(tmp_path / 'node.json'), '--cham-nhanh', str(tmp_path / 'cham.json'),
@@ -394,7 +426,7 @@ def test_so_trial_domain_corner_on_invalid_frame_and_k3(tmp_path):
     assert k2['goc_max_px'] == dict(gia_tri=0.15, nguong=0.1, dat=False)
     assert k2['hop_le_mot_ben_pct'] == dict(gia_tri=70., nguong=1., dat=False)
     assert k2['lien_tiep'] == dict(gia_tri=7, nguong=6, dat=False)
-    (tmp_path / 'track.json').write_text(json.dumps(dict(thu=False)))
+    (tmp_path / 'track.json').write_text(json.dumps(dict(shas, thu=False)))
     assert fast.main(args + ['--out', str(tmp_path / 'bad.json')]) == 2
 
 
@@ -406,7 +438,7 @@ def test_k3_g1_threshold_is_one_real_frame_of_a_variable_rate_clip():
     assert fast.frame_step(times, t_ref + 0.018334) == pytest.approx(0.018334)
     node = copy.deepcopy(NODE)
     node['gate_v3']['g1']['t_done'] = [t_ref, t_ref]
-    verdict = fast.node_verdict(node)
+    verdict = verdict_of(node)
     verdict['g1']['t_done'] = [t_ref + 0.0183289, t_ref + 0.0183289]   # one frame later: within one real frame
     assert fast.compare_verdict(verdict, node, times)['dat']
     assert not fast.compare_verdict(verdict, node, [i / 60 for i in range(3000)])['dat']   # 1/60 s spacing: not
@@ -414,3 +446,116 @@ def test_k3_g1_threshold_is_one_real_frame_of_a_variable_rate_clip():
     assert not fast.compare_verdict(verdict, node, times)['dat']
     with pytest.raises(ValueError):
         fast.frame_step([t_ref], t_ref)
+
+
+def cham_until_f8(tmp_path, monkeypatch, reasons, write=True):
+    cfg = config(tmp_path)
+    conf, frames, out = [tmp_path / n for n in ('config.json', 'frames.csv', 'scored')]
+    fast.write_json(conf, cfg)
+    track_fixture(frames, frames.with_name('dets_nhanh.npz'), tmp_path)
+    calls = []
+
+    def run(cmd, cwd, stdin, stdout, stderr):
+        calls.append(cmd)
+        if len(calls) == 1:
+            fast.write_json(cmd[-1], dict(nodes_s=[0, 1]))
+        if len(calls) == 3 and write:
+            f8_result(cmd, reasons)
+        return subprocess.CompletedProcess(cmd, 1 if len(calls) == 3 else 0)
+
+    monkeypatch.setattr(subprocess, 'run', run)
+    rc = fast.main(['cham', '--cau-hinh', str(conf), '--frames', str(frames), '--out', str(out)])
+    return rc, calls, fast.read_json(out / 'ket_luan_nhanh.json')
+
+
+@pytest.mark.parametrize('reasons,write', [(['r_vuot'], True), (['thieu_neo', 'r_vuot'], True), (['thieu_neo'], False)])
+def test_cham_f8_exit_1_goes_on_only_for_missing_anchors(tmp_path, monkeypatch, reasons, write):
+    """CN-3 (Codex 27/11): hieu_chuan exits 1 for every state other than dat; only thieu_neo goes on."""
+    rc, calls, result = cham_until_f8(tmp_path, monkeypatch, reasons, write)
+    assert rc == 2 and len(calls) == 3 and '3_f8_hieu_chuan' in result['loi']
+
+
+@pytest.mark.parametrize('field', ['video_sha256', 'session_sha256', 'frames_sha256', 'dets_sha256'])
+def test_cham_refuses_inputs_of_another_track(tmp_path, monkeypatch, field):
+    """CN-4 (Codex 27/11): clip, session, frames and dets of the config must be those of track.json."""
+    cfg = config(tmp_path)
+    conf, frames, out = [tmp_path / n for n in ('config.json', 'frames.csv', 'scored')]
+    fast.write_json(conf, cfg)
+    track_fixture(frames, frames.with_name('dets_nhanh.npz'), tmp_path, **{field: '0' * 64})
+    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: pytest.fail('no step may run'))
+    assert fast.main(['cham', '--cau-hinh', str(conf), '--frames', str(frames), '--out', str(out)]) == 2
+    assert field in fast.read_json(out / 'ket_luan_nhanh.json')['loi']
+
+
+def so_inputs(tmp_path, n=4):
+    rows = [dict(idx=i, t_s=i / 60, n_marks=12, why=[], car_seen=True, valid=True, x=1., y=0., psi=0.) for i in range(n)]
+    ds = [(r['idx'], r['t_s'], {0: np.zeros((4, 2))}) for r in rows]
+    return rows, ds
+
+
+def write_so(tmp_path, quick, base, fast_ds, ref_ds):
+    tmp_path.mkdir()                                       # every writer here refuses to overwrite
+    cm.write_frames(tmp_path / 'frames.csv', quick)
+    cm.write_frames(tmp_path / 'day.csv', base)
+    cm.save_dets(tmp_path / 'dets.npz', ref_ds, 'V', (2, 2))
+    cm.save_dets(tmp_path / 'dets_nhanh.npz', fast_ds, 'V', (2, 2))
+    fast.write_json(tmp_path / 'track.json', dict(frames_sha256=cm.sha256(tmp_path / 'frames.csv'),
+                                                  dets_sha256=cm.sha256(tmp_path / 'dets_nhanh.npz')))
+    return ['so', '--nhanh', str(tmp_path), '--day', str(tmp_path / 'day.csv'), '--dets', str(tmp_path / 'dets.npz')]
+
+
+def test_k2_refuses_files_that_do_not_belong_together(tmp_path):
+    """CN-5, CN-6 (Codex 27/11): car tag missing on a frame valid on both sides; other frame times; sha256."""
+    rows, ds = so_inputs(tmp_path)
+    args = write_so(tmp_path / 'a', rows, rows, ds, ds)
+    assert fast.main(args + ['--out', str(tmp_path / 'ok.json')]) == 0
+    assert fast.read_json(tmp_path / 'ok.json')['K2']['dat']
+    fewer = copy.deepcopy(ds)
+    fewer[2][2].clear()
+    with pytest.raises(ValueError, match='car tag is missing'):
+        fast.compare_frames(rows, rows, fewer, ds)
+    shifted = [dict(r, t_s=r['t_s'] + 1) for r in rows]
+    with pytest.raises(ValueError, match='frame times'):
+        fast.compare_frames(rows, shifted, ds, ds)
+    late = [(i, t + 1, d) for i, t, d in ds]
+    with pytest.raises(ValueError, match='frame times'):
+        fast.compare_frames(rows, rows, ds, late)
+    args = write_so(tmp_path / 'b', rows, shifted, ds, ds)
+    assert fast.main(args + ['--out', str(tmp_path / 'b1.json')]) == 2
+    args = write_so(tmp_path / 'c', rows, rows, ds, ds)
+    (tmp_path / 'c/frames.csv').write_bytes((tmp_path / 'c/frames.csv').read_bytes() + b'\n')
+    assert fast.main(args + ['--out', str(tmp_path / 'b2.json')]) == 2
+
+
+def test_k3_node_number_rows_file_and_lost_nodes(tmp_path):
+    """CN-7, CN-10 (Codex 27/11): same node number; rows.csv of that node; two lost nodes need no rows.csv."""
+    rows, ds = so_inputs(tmp_path)
+    args = write_so(tmp_path / 'track', rows, rows, ds, ds)
+    node = copy.deepcopy(NODE)
+    (tmp_path / 'rows.csv').write_text('t,x\n' + ''.join(f'{i / 60},0\n' for i in range(1200)))
+    node['khung_tuong_doi_v1'] = dict(rows_sha256=cm.sha256(tmp_path / 'rows.csv'))
+    fast.write_json(tmp_path / 'node.json', node)
+    fast.write_json(tmp_path / 'cham.json', verdict_of(node))
+    k3 = args + ['--cham-day', str(tmp_path / 'node.json'), '--cham-nhanh', str(tmp_path / 'cham.json')]
+    assert fast.main(k3 + ['--rows-day', str(tmp_path / 'rows.csv'), '--out', str(tmp_path / 'a.json')]) == 0
+    assert fast.read_json(tmp_path / 'a.json')['K3']['dat']
+    assert fast.main(k3 + ['--out', str(tmp_path / 'b.json')]) == 2               # a reference t_done: rows.csv needed
+    (tmp_path / 'other.csv').write_text('t,x\n' + ''.join(f'{i / 30},0\n' for i in range(1200)))
+    assert fast.main(k3 + ['--rows-day', str(tmp_path / 'other.csv'), '--out', str(tmp_path / 'c.json')]) == 2
+    other = dict(verdict_of(node), nut=7)
+    with pytest.raises(ValueError, match='node numbers'):
+        fast.compare_verdict(other, node, [i / 60 for i in range(1200)])
+    lost = dict(outcome='hong_he_do', gate_v3=None, gio_c8b=dict(nut=2))
+    fast.write_json(tmp_path / 'lost.json', lost)
+    fast.write_json(tmp_path / 'cham_lost.json', verdict_of(lost))
+    k3 = args + ['--cham-day', str(tmp_path / 'lost.json'), '--cham-nhanh', str(tmp_path / 'cham_lost.json')]
+    assert fast.main(k3 +['--out', str(tmp_path / 'd.json')]) == 0
+    assert fast.read_json(tmp_path / 'd.json')['K3']['dat']
+
+
+@pytest.mark.parametrize('times,t', [([0, 0.016, 0.032], 2.0), ([0, 0.016, 0.032], -0.01), ([0, 1, 1, 1.03], 1),
+                                     ([0, float('nan'), 0.032], 0.016), ([0, 0.016, 0.032], float('nan'))])
+def test_frame_step_refuses_times_that_do_not_cover_t_done(times, t):
+    """CN-8 (Codex 27/11): finite, strictly increasing frame times that cover the reference t_done."""
+    with pytest.raises(ValueError):
+        fast.frame_step(times, t)
