@@ -6,7 +6,8 @@ python tools/c7_nhanh.py track --video V --session S --hang-so HS --out DIR
 python tools/c7_nhanh.py cham --cau-hinh C.json --frames DIR/frames.csv --out DIR2 [--luoi] [--nut K]
     [--dets D.npz (default dets_nhanh.npz beside the frames; the full chain's dets.npz for its frames)]
 python tools/c7_nhanh.py so --nhanh DIR --day frames.csv --dets dets.npz --out so.json
-    [--cham-nhanh ket_luan_nhanh.json --cham-day nut.json --rows-day rows.csv (of that node)]
+    [--cham-nhanh ket_luan_nhanh.json --cham-day nut.json [--rows-day rows.csv]]
+    (--day: frames.csv beside its track.json; --rows-day: the node's rows.csv, needed when the node has a t_done)
 """
 import argparse
 from bisect import bisect_left
@@ -451,16 +452,19 @@ def cham(a):
         if p.is_file():
             inputs[suffix] = p
     result = dict(nhan='duong_nhanh_v1', sha256={k: cm.sha256(p) for k, p in inputs.items()}, buoc={})
-    # CN-4 (Codex 27/11): the clip, session, frames and detections of the config must be those of the track
-    # (track.json of either chain records all four); a wrong clip in the config would otherwise score silently.
-    info = read_json(inputs['track'])
-    for key, field in (('clip', 'video_sha256'), ('session', 'session_sha256'), ('frames', 'frames_sha256'),
-                       ('dets', 'dets_sha256')):
-        if info.get(field) != result['sha256'][key]:
-            write_json(out / 'ket_luan_nhanh.json', dict(result, loi=f'{key}: sha256 differs from track.json {field}'))
-            raise ValueError(f'{key}: sha256 differs from track.json {field} ({inputs["track"]})')
-    for sub in ('cua_so', 'f12', 'mot_nut'):
-        (out / sub).mkdir()
+
+    def track_matches():
+        # CN-4 (Codex 27/11): the clip, session, frames and detections of the config must be those of the track
+        # (track.json of either chain records all four); a wrong clip in the config would otherwise score silently.
+        # Inside the try below (CNV2-1): a broken track.json still leaves ket_luan_nhanh.json with its error.
+        info = read_json(inputs['track'])
+        if not isinstance(info, dict):
+            raise ValueError(f'{inputs["track"]}: expected a JSON object')
+        for key, field in (('clip', 'video_sha256'), ('session', 'session_sha256'), ('frames', 'frames_sha256'),
+                           ('dets', 'dets_sha256')):
+            if info.get(field) != result['sha256'][key]:
+                raise ValueError(f'{key}: sha256 differs from track.json {field} ({inputs["track"]})')
+
     gio, cua = out / 'gio_so_bo.json', out / 'cua_so/cua_so_v1.jsonl'
     hc, ll = out / 'f8/hc/hieu_chuan_neo.json', out / 'f8/ll/lan_lap.json'
     ref, node = out / 'f12/tham_chieu_v1.json', out / 'mot_nut/nut.json'
@@ -496,6 +500,9 @@ def cham(a):
         return h.get('trang_thai') == 'chua_ket_luan' and h.get('ly_do') == ['thieu_neo']
 
     try:
+        track_matches()
+        for sub in ('cua_so', 'f12', 'mot_nut'):
+            (out / sub).mkdir()
         step('1_gio_so_bo', 'c8b_gio', '--frames', frames, *log, *task, '--out', gio)
         step('2_cua_so', 'c7_score', 'cua-so', '--frames', frames, *task, *hs, *log, '--gio-c8b', gio,
              *run_id, '--clip', cfg['clip'], *session, '--dets', dets, '--out', cua)
@@ -556,7 +563,7 @@ def frame_step(times, t):
         raise ValueError('K3: frame times must be finite and strictly increasing')
     if not math.isfinite(t) or not times[0] <= t <= times[-1]:
         raise ValueError(f'K3: t_done {t} outside the frame times [{times[0]}, {times[-1]}]')
-    j =min(max(bisect_left(times, t), 0), len(times) - 1)
+    j = min(max(bisect_left(times, t), 0), len(times) - 1)
     if j and abs(times[j - 1] - t) <= abs(times[j] - t):
         j -= 1
     steps = [times[j] - times[j - 1]] if j else []
@@ -620,7 +627,25 @@ def delta(a, b, threshold):
     return limit(abs(a - b), threshold)
 
 
-def compare_verdict(fast, node, frame_times):
+def frame_times_of(rows, node):
+    """CN-7 (Codex 27/11, round 2): column t of the reference node's rows.csv, only when sha256 matches the node's
+    khung_tuong_doi_v1.rows_sha256 (a node without it cannot supply a G1 threshold). rows None -> None."""
+    if rows is None:
+        return None
+    recorded = (node.get('khung_tuong_doi_v1') or {}).get('rows_sha256')
+    if recorded is None or recorded != cm.sha256(rows):
+        raise ValueError(f'{rows}: sha256 does not match the node khung_tuong_doi_v1.rows_sha256 ({recorded!r})')
+    with open(rows, newline='', encoding='utf-8') as f:
+        return [float(r['t']) for r in csv.DictReader(f)]
+
+
+def compare_verdict(fast, node, rows):
+    """K3 (design 4.2) of a fast verdict against a reference node. rows: path of the node's rows.csv (verified by
+    frame_times_of), or None when the reference has no t_done (a lost node writes no rows.csv)."""
+    return _compare_verdict(fast, node, frame_times_of(rows, node))
+
+
+def _compare_verdict(fast, node, frame_times):
     """K3 compares both completion times and the union-domain G2–G5 values of the node. frame_times: the frame times
     of the reference node in ITS time base (column t of its rows.csv; t_done is one of them), the G1 threshold is one
     real frame there (frame_step). The clip times t_s of frames.csv are another time base: not usable here."""
@@ -664,9 +689,16 @@ def so(a):
         raise ValueError('--cham-nhanh and --cham-day go together')
     folder = Path(a.nhanh)
     info = read_json(folder / 'track.json')
+    if not isinstance(info, dict):
+        raise ValueError(f'{folder / "track.json"}: expected a JSON object')
     for name, field in (('frames.csv', 'frames_sha256'), ('dets_nhanh.npz', 'dets_sha256')):   # CN-6 (Codex 27/11)
         if info.get(field) != cm.sha256(folder / name):
             raise ValueError(f'{folder / name}: sha256 differs from track.json {field}')
+    # CN-6 (Codex 27/11, round 2): the full-chain frames and detections are those its track.json records
+    day_info = read_json(Path(a.day).with_name('track.json'))
+    for path, field in ((a.day, 'frames_sha256'), (a.dets, 'dets_sha256')):
+        if not isinstance(day_info, dict) or day_info.get(field) != cm.sha256(path):
+            raise ValueError(f'{path}: sha256 differs from {Path(a.day).with_name("track.json")} {field}')
     fast = cm.read_frames(folder / 'frames.csv')
     ref = cm.read_frames(a.day)
     fd, vf, _ = cm.load_dets(folder / 'dets_nhanh.npz')
@@ -678,16 +710,7 @@ def so(a):
     k2 = compare_frames(fast, ref, fd, rd)
     k3 = None
     if a.cham_day:
-        node = read_json(a.cham_day)
-        times = None
-        if a.rows_day:
-            # CN-7 (Codex 27/11): the rows.csv must be the one the node wrote
-            recorded = (node.get('khung_tuong_doi_v1') or {}).get('rows_sha256')
-            if recorded is not None and recorded != cm.sha256(a.rows_day):
-                raise ValueError(f'{a.rows_day}: sha256 differs from the node khung_tuong_doi_v1.rows_sha256')
-            with open(a.rows_day, newline='', encoding='utf-8') as f:
-                times = [float(r['t']) for r in csv.DictReader(f)]
-        k3 = compare_verdict(read_json(a.cham_nhanh), node, times)
+        k3 = compare_verdict(read_json(a.cham_nhanh), read_json(a.cham_day), a.rows_day)
     write_json(a.out, dict(K2=k2, K3=k3, dat=k2['dat'] and (k3 is None or k3['dat'])))
 
 
@@ -696,7 +719,7 @@ class Parser(argparse.ArgumentParser):
         raise ValueError(message)
 
 
-def main(argv=None):
+def build_parser():
     ap = Parser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
     p = sub.add_parser('track')
@@ -722,6 +745,11 @@ def main(argv=None):
     p.add_argument('--cham-nhanh')
     p.add_argument('--cham-day')
     p.add_argument('--rows-day')
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
     try:
         a = ap.parse_args(argv)
         {'track': track, 'cham': cham, 'so': so}[a.cmd](a)
