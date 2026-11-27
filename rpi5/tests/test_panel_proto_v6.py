@@ -20,7 +20,7 @@ def _info(**kw):
 def test_info_layout_and_roundtrip():
     f = pp.encode_info(_info())
     assert len(f) == pp.LEN_INFO == 106
-    assert f[0] == pp.START_INFO and f[1] == pp.PROTO_VERSION == 6
+    assert f[0] == pp.START_INFO and f[1] == pp.PROTO_VERSION == 7
     assert struct.unpack_from('<IHHBB', f, 2) == (SID1, 27, 0, pp.I_LOOP_VALID, pp.CTRL_SRC_PROFILE)
     assert f[12:20] == b'LADRC\x00\x00\x00'
     assert f[20:40] == b'e_vx 0.005 m/s' + bytes(6)
@@ -70,11 +70,11 @@ def test_older_frames_keep_their_layout_only_version_changes():
     # CMD and PROFILE keep their v5 layout; STATUS grew by run_no (Liam 04/11: "A: run_no vào STATUS")
     assert (pp.LEN_CMD, pp.LEN_STATUS, pp.LEN_PROFILE) == (13, 32, 28)
     f = pp.encode_status(pp.Status(sid=SID1))
-    assert f[1] == 6
+    assert f[1] == 7
     old = bytearray(f)
-    old[1] = 5
+    old[1] = 6
     struct.pack_into('<H', old, 30, pp.crc16(bytes(old[:30])))
-    assert pp.StreamParser().feed(bytes(old)) == []                    # a v5 peer is refused
+    assert pp.StreamParser().feed(bytes(old)) == []                    # a v6 peer is refused
 
 
 def test_parser_takes_info_between_other_frames():

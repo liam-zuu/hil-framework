@@ -59,6 +59,14 @@ uint32_t pp_host_ev_dropped(const pp_client_t *c) { return c->ev_dropped; }
 int pp_host_link_open(const pp_client_t *c) { return c->has_status_t; }
 
 const pp_info_t *pp_host_info(const pp_client_t *c) { return c->has_info ? &c->info : NULL; }
+const pp_extra_t *pp_host_extra(const pp_client_t *c) { return c->has_extra ? &c->extra : NULL; }
+uint16_t pp_host_track_run_no(const pp_client_t *c) { return c->track_run_no; }
+const pp_track_series_t *pp_host_track_series(const pp_client_t *c, unsigned series)
+{
+    return series < PP_TRACK_SERIES ? &c->tracks[series] : NULL;
+}
+uint16_t pp_host_track_point_count(const pp_track_series_t *s) { return s->point_count; }
+
 pp_parser_t *pp_host_parser_new(uint8_t accept, uint32_t stale_ms)
 {
     pp_parser_t *p = (pp_parser_t *)malloc(sizeof *p);
@@ -68,11 +76,13 @@ pp_parser_t *pp_host_parser_new(uint8_t accept, uint32_t stale_ms)
 
 void pp_host_parser_free(pp_parser_t *p) { free(p); }
 
-void pp_host_parser_counts(const pp_parser_t *p, uint32_t out[3])
+void pp_host_parser_counts(const pp_parser_t *p, uint32_t out[5])
 {
     out[0] = p->bad_frames;
     out[1] = p->skipped_bytes;
     out[2] = p->stale_drops;
+    out[3] = p->version_mismatch;
+    out[4] = p->last_foreign_version;
 }
 
 app_t *app_host_new(pp_client_t *c)

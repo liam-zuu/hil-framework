@@ -89,6 +89,120 @@ void pp_decode_info(const uint8_t *f, pp_info_t *i)
     text(i->error_text, f + 82, PP_ERROR_TEXT_LEN);
 }
 
+static bool valid_extra(uint8_t flags, uint16_t check_run)
+{
+    return !(flags & PP_X_CHECK_VALID) || check_run != 0;
+}
+
+/* out is already zero-filled. Copy up to the wire width or the first NUL. */
+static void put_text(uint8_t *out, const char *s, size_t width)
+{
+    for (size_t i = 0; i < width && s[i]; i++)
+        out[i] = (uint8_t)s[i] < 0x80 ? (uint8_t)s[i] : '?';
+}
+
+size_t pp_encode_extra(uint8_t *out, const pp_extra_t *e)
+{
+    if (!valid_extra(e->flags, e->check_run))
+        return 0;
+    memset(out, 0, PP_LEN_EXTRA);
+    out[0] = PP_START_EXTRA;
+    out[1] = PP_VERSION;
+    put32(out + 2, e->sid);
+    out[6] = e->flags;
+    out[7] = e->sha_state;
+    put_text(out + 8, e->dut_sha, 12);
+    put_text(out + 20, e->dut_env, 8);
+    put_text(out + 28, e->fault_text, 22);
+    out[50] = e->check_code;
+    put16(out + 51, e->check_run);
+    put_text(out + 53, e->check_text, 22);
+    out[75] = e->reset_index;
+    put16(out + 78, pp_crc16(out, 78));
+    return PP_LEN_EXTRA;
+}
+
+bool pp_decode_extra(const uint8_t *f, pp_extra_t *e)
+{
+    if (!valid_extra(f[6], get16(f + 51)))
+        return false;
+    e->sid = get32(f + 2);
+    e->flags = f[6];
+    e->sha_state = f[7];
+    text(e->dut_sha, f + 8, 12);
+    text(e->dut_env, f + 20, 8);
+    text(e->fault_text, f + 28, 22);
+    e->check_code = f[50];
+    e->check_run = get16(f + 51);
+    text(e->check_text, f + 53, 22);
+    e->reset_index = f[75];
+    return true;
+}
+
+static bool valid_track(int run_no, int series, int chunk, int count, int n)
+{
+    return run_no > 0 && run_no <= UINT16_MAX && series >= 0 && series < PP_TRACK_SERIES &&
+           chunk >= 0 && chunk < count && count <= PP_TRACK_CHUNKS_MAX &&
+           n >= 0 && n <= PP_TRACK_POINTS_MAX;
+}
+
+static bool valid_track_header(const uint8_t *f)
+{
+    return valid_track(get16(f + 6), f[8], f[9], f[10], f[11]);
+}
+
+static int16_t sat_i16(int32_t v)
+{
+    if (v < INT16_MIN) return INT16_MIN;
+    if (v > INT16_MAX) return INT16_MAX;
+    return (int16_t)v;
+}
+
+static int16_t get_i16(const uint8_t *p)
+{
+    int32_t v = get16(p);
+    return (int16_t)(v > INT16_MAX ? v - 65536 : v);
+}
+
+size_t pp_encode_track(uint8_t *out, uint32_t sid, int run_no, int series, int chunk,
+                       int count, int n, const pp_point_input_t *points)
+{
+    if (!valid_track(run_no, series, chunk, count, n) || (n && !points))
+        return 0;
+    memset(out, 0, PP_LEN_TRACK);
+    out[0] = PP_START_TRACK;
+    out[1] = PP_VERSION;
+    put32(out + 2, sid);
+    put16(out + 6, (uint16_t)run_no);
+    out[8] = (uint8_t)series;
+    out[9] = (uint8_t)chunk;
+    out[10] = (uint8_t)count;
+    out[11] = (uint8_t)n;
+    for (int i = 0; i < n; i++) {
+        put16(out + 12 + 4*i, (uint16_t)sat_i16(points[i].x_mm));
+        put16(out + 14 + 4*i, (uint16_t)sat_i16(points[i].y_mm));
+    }
+    put16(out + 104, pp_crc16(out, 104));
+    return PP_LEN_TRACK;
+}
+
+bool pp_decode_track(const uint8_t *f, pp_track_t *t)
+{
+    if (!valid_track_header(f))
+        return false;
+    t->sid = get32(f + 2);
+    t->run_no = get16(f + 6);
+    t->series = f[8];
+    t->chunk = f[9];
+    t->count = f[10];
+    t->n = f[11];
+    for (unsigned i = 0; i < t->n; i++) {
+        t->points[i].x_mm = get_i16(f + 12 + 4*i);
+        t->points[i].y_mm = get_i16(f + 14 + 4*i);
+    }
+    return true;
+}
+
 /* ── StreamParser ── */
 
 static size_t frame_len(uint8_t start)
@@ -98,17 +212,21 @@ static size_t frame_len(uint8_t start)
     case PP_START_STATUS:  return PP_LEN_STATUS;
     case PP_START_PROFILE: return PP_LEN_PROFILE;
     case PP_START_INFO:    return PP_LEN_INFO;
+    case PP_START_EXTRA:   return PP_LEN_EXTRA;
+    case PP_START_TRACK:   return PP_LEN_TRACK;
     default:               return 0;
     }
 }
 
 static bool accepted(const pp_parser_t *p, uint8_t start)
 {
-    switch (start) {        /* start bytes are 0xCC, 0xDD, 0xDE, 0xDF: not contiguous */
+    switch (start) {
     case PP_START_CMD:     return (p->accept & PP_ACCEPT_CMD) != 0;
     case PP_START_STATUS:  return (p->accept & PP_ACCEPT_STATUS) != 0;
     case PP_START_PROFILE: return (p->accept & PP_ACCEPT_PROFILE) != 0;
     case PP_START_INFO:    return (p->accept & PP_ACCEPT_INFO) != 0;
+    case PP_START_EXTRA:   return (p->accept & PP_ACCEPT_EXTRA) != 0;
+    case PP_START_TRACK:   return (p->accept & PP_ACCEPT_TRACK) != 0;
     default:               return false;
     }
 }
@@ -135,17 +253,31 @@ static void scan(pp_parser_t *p, pp_frame_fn fn, void *ctx)
             p->skipped_bytes++;
             continue;
         }
-        if (p->len >= 2 && p->buf[1] != PP_VERSION) {
+        size_t n = frame_len(p->buf[0]);
+        /* version 0 is never valid: drop at once; any other foreign version waits for the
+         * whole candidate like a frame of this version (Python StreamParser, design R-6) */
+        if (p->len >= 2 && p->buf[1] == 0) {
             drop(p, 1);
             p->bad_frames++;
             continue;
         }
-        size_t n = frame_len(p->buf[0]);
         if (p->len < n)
             break;
         if (pp_crc16(p->buf, n - 2) != get16(p->buf + n - 2)) {
             p->bad_frames++;
             drop(p, 1);
+            continue;
+        }
+        if (p->buf[1] != PP_VERSION) {
+            p->version_mismatch++;
+            p->last_foreign_version = p->buf[1];
+            drop(p, n);
+            continue;
+        }
+        if ((p->buf[0] == PP_START_TRACK && !valid_track_header(p->buf)) ||
+            (p->buf[0] == PP_START_EXTRA && !valid_extra(p->buf[6], get16(p->buf + 51)))) {
+            p->bad_frames++;
+            drop(p, n);
             continue;
         }
         uint8_t frame[PP_LEN_MAX];
@@ -356,6 +488,9 @@ static void lose_session(pp_client_t *c, uint32_t now_ms)
     clear_profiles(c);
     c->has_t_session = false;
     c->has_info = false;
+    c->has_extra = false;
+    c->track_run_no = 0;
+    memset(c->tracks, 0, sizeof c->tracks);
     c->has_st = false;
     c->has_t_hello = false;
     pp_client_tick(c, now_ms);
@@ -432,6 +567,40 @@ static void on_status(pp_client_t *c, const pp_status_t *st, uint32_t now_ms)
     pp_client_tick(c, now_ms);
 }
 
+bool pp_track_complete(const pp_track_series_t *s)
+{
+    return s->count && s->received == ((1UL << s->count) - 1);
+}
+
+const pp_point_t *pp_track_point(const pp_track_series_t *s, unsigned index)
+{
+    for (unsigned chunk = 0; chunk < s->count; chunk++) {
+        if (index < s->n[chunk])
+            return &s->points[chunk][index];
+        index -= s->n[chunk];
+    }
+    return NULL;
+}
+
+static void on_track(pp_client_t *c, const pp_track_t *t)
+{
+    if (t->run_no < c->track_run_no)
+        return;
+    if (t->run_no != c->track_run_no) {
+        memset(c->tracks, 0, sizeof c->tracks);
+        c->track_run_no = t->run_no;
+    }
+    pp_track_series_t *s = &c->tracks[t->series];
+    if (s->count != t->count) {
+        memset(s, 0, sizeof *s);
+        s->count = t->count;
+    }
+    s->received |= (uint16_t)(1u << t->chunk);
+    s->point_count = s->point_count - s->n[t->chunk] + t->n;
+    s->n[t->chunk] = t->n;
+    memcpy(s->points[t->chunk], t->points, t->n * sizeof t->points[0]);
+}
+
 void pp_client_on_frame(pp_client_t *c, const uint8_t *frame, size_t len, uint32_t now_ms)
 {
     if (len < 2)
@@ -469,5 +638,12 @@ void pp_client_on_frame(pp_client_t *c, const uint8_t *frame, size_t len, uint32
             c->has_info = true;
             c->info_count++;
         }
+    } else if (frame[0] == PP_START_EXTRA && len == PP_LEN_EXTRA) {
+        if (c->sid && get32(frame + 2) == c->sid && pp_decode_extra(frame, &c->extra))
+            c->has_extra = true;
+    } else if (frame[0] == PP_START_TRACK && len == PP_LEN_TRACK) {
+        pp_track_t track;
+        if (c->sid && get32(frame + 2) == c->sid && pp_decode_track(frame, &track))
+            on_track(c, &track);
     }
 }

@@ -1,7 +1,7 @@
 """The C panel protocol (panel/lib/panel_proto) against the Python reference
-(rpi5/panel_proto.py, v6), on the PC:
+(rpi5/panel_proto.py, v7), on the PC:
 
-  * golden bytes: CRC, CMD encoding, STATUS / PROFILE / INFO decoding, stream parsing of
+  * golden bytes: CRC, CMD encoding, EXTRA / TRACK codecs, STATUS / PROFILE / INFO decoding, stream parsing of
     mixed, cut and corrupted streams (same frames and counters as StreamParser);
   * every two-end scenario of rpi5/tests/test_panel_proto*.py that drives a PanelClient
     through a Bench is run again with the C client in its place (CPanelClient below).
@@ -15,6 +15,7 @@ import random
 import struct
 import subprocess
 import sys
+from dataclasses import replace
 
 import pytest
 
@@ -26,6 +27,7 @@ sys.path.insert(0, os.path.join(ROOT, 'rpi5', 'tests'))
 import panel_proto as pp            # noqa: E402
 import test_panel_proto as tpp      # noqa: E402
 import test_panel_proto_v6 as tv6   # noqa: E402
+import test_panel_proto_v7 as tv7   # noqa: E402
 
 LIB_DIR = os.path.join(ROOT, 'panel', 'lib', 'panel_proto')
 APP_DIR = os.path.join(ROOT, 'panel', 'lib', 'panel_app')
@@ -71,6 +73,32 @@ class CInfo(ct.Structure):
                 ('result_run', ct.c_uint16)]
 
 
+class CExtra(ct.Structure):
+    _fields_ = [('sid', ct.c_uint32), ('flags', ct.c_uint8), ('sha_state', ct.c_uint8),
+                ('dut_sha', ct.c_char * 13), ('dut_env', ct.c_char * 9), ('fault_text', ct.c_char * 23),
+                ('check_code', ct.c_uint8), ('check_run', ct.c_uint16), ('check_text', ct.c_char * 23),
+                ('reset_index', ct.c_uint8)]
+
+    def unpack(self):
+        return pp.Extra(self.sid, self.flags, self.sha_state, _dec(self.dut_sha), _dec(self.dut_env),
+                        _dec(self.fault_text), self.check_code, self.check_run, _dec(self.check_text),
+                        self.reset_index)
+
+
+class CPoint(ct.Structure):
+    _fields_ = [('x_mm', ct.c_int16), ('y_mm', ct.c_int16)]
+
+
+class CPointInput(ct.Structure):
+    _fields_ = [('x_mm', ct.c_int32), ('y_mm', ct.c_int32)]
+
+
+class CTrack(ct.Structure):
+    _fields_ = [('sid', ct.c_uint32), ('run_no', ct.c_uint16), ('series', ct.c_uint8),
+                ('chunk', ct.c_uint8), ('count', ct.c_uint8), ('n', ct.c_uint8),
+                ('points', CPoint * 22)]
+
+
 def _sig(name, res, *args):
     f = getattr(lib, name)
     f.restype, f.argtypes = res, list(args)
@@ -81,6 +109,11 @@ _sig('pp_encode_cmd', ct.c_size_t, ct.c_char_p, ct.c_uint32, ct.c_uint16, ct.c_u
 _sig('pp_decode_status', None, ct.c_char_p, ct.POINTER(CStatus))
 _sig('pp_decode_profile', None, ct.c_char_p, ct.POINTER(CProfile))
 _sig('pp_decode_info', None, ct.c_char_p, ct.POINTER(CInfo))
+_sig('pp_encode_extra', ct.c_size_t, ct.c_char_p, ct.POINTER(CExtra))
+_sig('pp_decode_extra', ct.c_bool, ct.c_char_p, ct.POINTER(CExtra))
+_sig('pp_encode_track', ct.c_size_t, ct.c_char_p, ct.c_uint32, ct.c_int, ct.c_int,
+     ct.c_int, ct.c_int, ct.c_int, ct.POINTER(CPointInput))
+_sig('pp_decode_track', ct.c_bool, ct.c_char_p, ct.POINTER(CTrack))
 _sig('pp_host_client_new', ct.c_void_p, NONCE_FN, SEND_FN)
 _sig('pp_host_client_free', None, ct.c_void_p)
 _sig('pp_client_press', None, ct.c_void_p, ct.c_uint8, ct.c_uint16, ct.c_uint32)
@@ -100,13 +133,19 @@ _sig('pp_host_pending', ct.c_int, ct.c_void_p, ct.POINTER(ct.c_uint16), ct.POINT
 _sig('pp_host_stop', ct.c_int, ct.c_void_p, ct.POINTER(ct.c_uint16))
 _sig('pp_host_profile', ct.c_int, ct.c_void_p, ct.c_int, ct.c_char_p)
 _sig('pp_host_info', ct.POINTER(CInfo), ct.c_void_p)
+_sig('pp_host_extra', ct.POINTER(CExtra), ct.c_void_p)
+_sig('pp_host_track_run_no', ct.c_uint16, ct.c_void_p)
+_sig('pp_host_track_series', ct.c_void_p, ct.c_void_p, ct.c_uint)
+_sig('pp_host_track_point_count', ct.c_uint16, ct.c_void_p)
+_sig('pp_track_complete', ct.c_bool, ct.c_void_p)
+_sig('pp_track_point', ct.POINTER(CPoint), ct.c_void_p, ct.c_uint)
 _sig('pp_host_profile_count', ct.c_int, ct.c_void_p)
 _sig('pp_host_ev_dropped', ct.c_uint32, ct.c_void_p)
 _sig('pp_host_link_open', ct.c_int, ct.c_void_p)
 _sig('pp_host_parser_new', ct.c_void_p, ct.c_uint8, ct.c_uint32)
 _sig('pp_host_parser_free', None, ct.c_void_p)
 _sig('pp_parser_feed', None, ct.c_void_p, ct.c_char_p, ct.c_size_t, ct.c_uint32, FRAME_FN, ct.c_void_p)
-_sig('pp_host_parser_counts', None, ct.c_void_p, ct.POINTER(ct.c_uint32 * 3))
+_sig('pp_host_parser_counts', None, ct.c_void_p, ct.POINTER(ct.c_uint32 * 5))
 
 
 class CEvent(ct.Structure):
@@ -182,6 +221,40 @@ class CPanelClient:
     def on_info(self, info):
         f = pp.encode_info(info)
         self._call(lib.pp_client_on_frame, f, len(f), 0)
+
+    def on_extra(self, extra):
+        f = pp.encode_extra(extra)
+        assert self._call(lib.pp_client_on_frame, f, len(f), 0) == []
+
+    def on_track(self, track):
+        f = pp.encode_track(track)
+        assert self._call(lib.pp_client_on_frame, f, len(f), 0) == []
+
+    @property
+    def extra(self):
+        p = lib.pp_host_extra(self._c)
+        return p.contents.unpack() if p else None
+
+    @property
+    def has_extra(self):
+        return bool(lib.pp_host_extra(self._c))
+
+    @property
+    def track_run_no(self):
+        return lib.pp_host_track_run_no(self._c)
+
+    def track_complete(self, series):
+        return lib.pp_track_complete(lib.pp_host_track_series(self._c, series))
+
+    def track_point_count(self, series):
+        return lib.pp_host_track_point_count(lib.pp_host_track_series(self._c, series))
+
+    def track_points(self, series):
+        s = lib.pp_host_track_series(self._c, series)
+        count = lib.pp_host_track_point_count(s)
+        assert not lib.pp_track_point(s, count)
+        points = [lib.pp_track_point(s, i).contents for i in range(count)]
+        return tuple((p.x_mm, p.y_mm) for p in points)
 
     def link(self, now_ms):
         return bool(lib.pp_client_link(self._c, int(now_ms)))
@@ -315,13 +388,83 @@ def test_non_ascii_byte_drawn_as_question_mark():
     assert _dec(c.name) == 'A?'                       # Python gives 'A�': same position
 
 
+def test_extra_golden_bytes_and_decoding():
+    rnd = random.Random(701)
+    buf = ct.create_string_buffer(pp.LEN_EXTRA)
+
+    def wire_text(s, width):
+        return s[:width].encode('ascii', 'replace').decode('ascii')
+
+    for case in range(40):
+        def word(width):
+            length = (0, width, width + 1)[case] if case < 3 else rnd.randrange(width + 2)
+            return bytes(rnd.choice(b'0123456789abcdef \xe9') for _ in range(length))
+
+        sha, env, fault, reason = (word(w) for w in (12, 8, 22, 22))
+        c = CExtra(rnd.getrandbits(32), rnd.randrange(4), rnd.randrange(5), sha, env, fault,
+                   rnd.randrange(6), rnd.randint(1, 65535), reason, rnd.randrange(256))
+        extra = pp.Extra(c.sid, c.flags, c.sha_state, sha.decode('latin1'), env.decode('latin1'),
+                         fault.decode('latin1'), c.check_code, c.check_run, reason.decode('latin1'),
+                         c.reset_index)
+        wire = pp.encode_extra(extra)
+        assert lib.pp_encode_extra(buf, ct.byref(c)) == len(wire) == 80
+        assert buf.raw == wire
+        decoded = CExtra()
+        assert lib.pp_decode_extra(wire, ct.byref(decoded))
+        expected = replace(extra, dut_sha=wire_text(extra.dut_sha, 12),
+                           dut_env=wire_text(extra.dut_env, 8), fault_text=wire_text(extra.fault_text, 22),
+                           check_text=wire_text(extra.check_text, 22))
+        assert decoded.unpack() == pp.decode(wire) == expected
+    c.flags, c.check_run = pp.X_CHECK_VALID, 0
+    assert lib.pp_encode_extra(buf, ct.byref(c)) == 0
+
+    payload = bytearray(pp.encode_extra(pp.Extra(dut_env='PID'))[:-2])
+    payload[21] = 0xff
+    wire = tv7.seal(payload)
+    assert lib.pp_decode_extra(wire, ct.byref(decoded))
+    assert decoded.unpack().dut_env == 'P?D'
+    assert pp.decode(wire).dut_env == 'P\ufffdD'
+
+
+def test_track_golden_bytes_and_decoding():
+    rnd = random.Random(702)
+    buf = ct.create_string_buffer(pp.LEN_TRACK)
+    for case in range(40):
+        n = (0, 22)[case] if case < 2 else rnd.randrange(23)
+        points = tuple((rnd.randint(-60000, 60000), rnd.randint(-60000, 60000)) for _ in range(n))
+        count = 16 if case < 2 else rnd.randint(1, 16)
+        t = pp.Track(rnd.getrandbits(32), rnd.randint(1, 65535), rnd.randrange(3),
+                     rnd.randrange(count), count, points)
+        coords = (CPointInput * n)(*(CPointInput(x, y) for x, y in points))
+        assert lib.pp_encode_track(buf, t.sid, t.run_no, t.series, t.chunk, count, n, coords) == 106
+        wire = pp.encode_track(t)
+        assert buf.raw == wire
+        c = CTrack()
+        assert lib.pp_decode_track(wire, ct.byref(c))
+        saturated = tuple(tuple(max(-32768, min(32767, v)) for v in xy) for xy in points)
+        result = pp.Track(c.sid, c.run_no, c.series, c.chunk, c.count,
+                          tuple((p.x_mm, p.y_mm) for p in c.points[:c.n]))
+        assert result == pp.decode(wire) == pp.Track(t.sid, t.run_no, t.series, t.chunk, count, saturated)
+
+
+@pytest.mark.parametrize('field,value', [('series', -1), ('series', 3), ('chunk', -1),
+                         ('chunk', 1), ('count', 0), ('count', 17), ('n', -1), ('n', 23),
+                         ('run_no', 0), ('run_no', 65536)])
+def test_invalid_c_track_encode(field, value):
+    fields = dict(run_no=1, series=0, chunk=0, count=1, n=1)
+    fields[field] = value
+    coords = (CPointInput * 23)()
+    assert lib.pp_encode_track(ct.create_string_buffer(106), 1, fields['run_no'], fields['series'],
+                               fields['chunk'], fields['count'], fields['n'], coords) == 0
+
+
 def _c_parse(chunks, accept):
     p = lib.pp_host_parser_new(accept, 50)
     out = []
     cb = FRAME_FN(lambda _ctx, data, n: out.append(pp.decode(bytes(data[:n]))))
     for t_ms, data in chunks:
         lib.pp_parser_feed(p, data, len(data), t_ms, cb, None)
-    counts = (ct.c_uint32 * 3)()
+    counts = (ct.c_uint32 * 5)()
     lib.pp_host_parser_counts(p, ct.byref(counts))
     lib.pp_host_parser_free(p)
     return out, tuple(counts)
@@ -334,7 +477,56 @@ def _py_parse(chunks, accept):
     for t_ms, data in chunks:
         t[0] = t_ms / 1000.0
         out += sp.feed(data)
-    return out, (sp.bad_frames, sp.skipped_bytes, sp.stale_drops)
+    return out, (sp.bad_frames, sp.skipped_bytes, sp.stale_drops,
+                 sp.version_mismatch, sp.last_foreign_version)
+
+
+def test_v7_c_parser_at_every_boundary():
+    frames = tv7.mixed_frames()
+    expected = list(map(pp.decode, frames))
+    for reads in tv7.split_reads(b''.join(frames)):
+        assert _c_parse([(0, data) for data in reads], 0b111110) == (expected, (0, 0, 0, 0, 0))
+
+
+def test_v7_c_parser_reports_foreign_versions():
+    reads, expected = [], []
+    for version, corrupt in [(6, False), (5, True), (0, False), (255, False)]:
+        stream, decoded = tv7.version_stream(version, corrupt)
+        reads.append((0, stream))
+        expected.extend(decoded)
+        out, counts = _c_parse(reads, 0b111111)
+        assert out == expected
+        if version == 6:
+            assert counts == (0, 0, 0, 1, 6)
+        else:
+            assert counts[0] >= 1
+            assert counts[3:] == ((2, 255) if version == 255 else (1, 6))
+
+
+@pytest.mark.parametrize('version', [6, 255])
+def test_v7_foreign_version_at_every_boundary_c_matches_python(version):
+    # R-6 (CODE_PANEL 28/11): a foreign frame is reported however the UART splits the reads,
+    # and both parsers decide the same (decisions depend only on the buffered bytes)
+    stream, decoded = tv7.version_stream(version)
+    for reads in tv7.split_reads(stream):
+        chunks = [(0, data) for data in reads]
+        c = _c_parse(chunks, 0b111111)
+        assert c == _py_parse(chunks, tuple(pp._LEN))
+        assert c == (decoded, (0, 0, 0, 1, version))
+
+
+@pytest.mark.parametrize('offset,value', [(6, 0), (8, 3), (9, 2), (10, 17), (11, 255)])
+def test_malformed_track_header_dropped_by_both_parsers(offset, value):
+    payload = bytearray(pp.encode_track(pp.Track(1, 1, 0, 0, 1))[:-2])
+    payload[offset] = value
+    wire = tv7.seal(payload)
+    assert not lib.pp_decode_track(wire, ct.byref(CTrack()))
+    with pytest.raises(ValueError):
+        pp.decode(wire)
+    reads = [(0, wire + pp.encode_status(pp.Status()))]
+    expected = ([pp.Status()], (1, 0, 0, 0, 0))
+    assert _c_parse(reads, 0b111110) == expected
+    assert _py_parse(reads, (pp.START_TRACK, pp.START_STATUS)) == expected
 
 
 @pytest.mark.parametrize('seed', range(40))
@@ -380,7 +572,7 @@ def _uses_bench(f):
     return 'Bench(' in src or 'PanelClient(' in src
 
 
-_TWO_END = [(name, f) for mod in (tpp, tv6) for name, f in vars(mod).items()
+_TWO_END = [(name, f) for mod in (tpp, tv6, tv7) for name, f in vars(mod).items()
             if name.startswith('test_') and callable(f) and _uses_bench(f)]
 for _name, _f in _TWO_END:
     globals()[_name + '__c'] = _f
@@ -393,10 +585,10 @@ def _c_client(request, monkeypatch):
 
 
 def test_two_end_scenarios_were_found():
-    # 23 Bench scenarios in test_panel_proto.py (handshake ... commands_refused) + 2 in v6;
+    # 23 Bench scenarios in test_panel_proto.py, two in v6, three in v7;
     # a new Bench scenario there makes this fail until it is counted here on purpose
     names = [n for n, _ in _TWO_END]
-    assert len(names) == 25 and 'test_panel_keeps_info_of_its_session_and_forgets_it_when_lost' in names
+    assert len(names) == 28 and 'test_panel_keeps_info_of_its_session_and_forgets_it_when_lost' in names
 
 
 def test_c_client_is_really_used_in_the_scenarios(monkeypatch):

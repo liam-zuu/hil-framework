@@ -92,12 +92,26 @@ def test_xor_blind_two_bit_error_is_caught():
     assert pp.StreamParser().feed(bytes(f)) == []
 
 
-def test_wrong_version_dropped_early():
-    p = pp.StreamParser()
+def test_wrong_version_prefix_waits_then_resyncs():
+    # a start byte + a foreign version waits for a whole candidate; its CRC fails, the parser
+    # drops one byte and still finds the good frame behind it (CODE_PANEL 28/11, design R-6)
+    p = pp.StreamParser(clock=lambda: 0)
     assert p.feed(bytes([pp.START_CMD, pp.PROTO_VERSION + 1])) == []
-    assert p.bad_frames == 1
+    assert (p.bad_frames, p.version_mismatch) == (0, 0)
     good = pp.encode_cmd(1, 1, pp.CMD_STOP)
     assert p.feed(good) == [pp.decode(good)]
+    assert (p.bad_frames, p.version_mismatch, p.last_foreign_version) == (1, 0, 0)
+
+
+def test_v6_frame_in_one_byte_reads_is_reported():
+    # R-6: a v6 panel / daemon sends frames that arrive in small UART reads
+    status = bytearray(pp.encode_status(pp.Status()))
+    status[1] = 6
+    struct.pack_into('<H', status, len(status) - 2, pp.crc16(bytes(status[:-2])))
+    p = pp.StreamParser(clock=lambda: 0)
+    for b in bytes(status):
+        assert p.feed(bytes([b])) == []
+    assert (p.bad_frames, p.version_mismatch, p.last_foreign_version) == (0, 1, 6)
 
 
 def test_partial_frame_times_out_and_resyncs():

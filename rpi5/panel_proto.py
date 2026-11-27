@@ -16,6 +16,10 @@ STATUS carries run_no, so every STATUS says which run it belongs to and the pane
 nothing (Codex round 4 S1-S6, Liam 04/11, PANEL session: "A: run_no vào STATUS"; STATUS is
 32 bytes, CMD and PROFILE keep their layout).
 
+Version 7 adds EXTRA for fault, firmware and run-check information, and TRACK for
+trajectory chunks. CMD, STATUS, PROFILE and INFO keep their v6 layouts and lengths.
+Parsers count CRC-valid complete frames with a foreign nonzero version separately.
+
 Frames (multi-byte fields little-endian; every frame ends with CRC-16/CCITT-FALSE,
 poly 0x1021, init 0xFFFF, over all previous bytes of the frame, start byte included):
 
@@ -87,6 +91,35 @@ poly 0x1021, init 0xFFFF, over all previous bytes of the frame, start byte inclu
     82-103 error_text   ASCII, NUL padded (22): what the FAULT screen says under error_code
     104-105 crc
 
+  EXTRA   daemon -> panel, 80 bytes, ~1 Hz and when it changes. ASCII fields are NUL padded.
+    0,1   0xE0, version
+    2-5   sid
+    6     flags         X_FAULT_ACTIVE (fault window open), X_CHECK_VALID (check_run != 0)
+    7     sha_state     SHA_NONE (show only), SHA_UNKNOWN, SHA_OK, SHA_MISMATCH, SHA_DIRTY
+    8-19  dut_sha       12 ASCII firmware SHA characters
+    20-27 dut_env       8 ASCII firmware environment characters
+    28-49 fault_text    22 ASCII characters naming the open fault window
+    50    check_code    CHK_NONE, CHK_CLEAN, CHK_CLEAN_NO_SPIFIX (H7 UART unavailable),
+                        CHK_BAD, CHK_INCONCLUSIVE or CHK_RUNNING
+    51-52 check_run     run_no to which the check belongs (0 = none)
+    53-74 check_text    22 ASCII characters giving the reason
+    75    reset_index   RESET DUT profile index (0xFF = none)
+    76-77 reserved      zero
+    78-79 crc
+
+  TRACK   daemon -> panel, 106 bytes
+    0,1   0xE1, version
+    2-5   sid
+    6-7   run_no        1..65535, ordered as for STATUS
+    8     series        TR_REF, TR_PLANT or TR_DUT
+    9     chunk         0..count-1
+    10    count         chunks in this series (1..16)
+    11    n             points in this chunk (0..22)
+    12-99 points        22 pairs of signed int16 (x_mm, y_mm), saturated on encode.
+                        Slots after the first n points are zero.
+    100-103 reserved    zero
+    104-105 crc
+
 Daemon rules (DaemonSession):
   * Epoch (B23, B52/N13): next_daemon_epoch() reads, increments and writes the epoch file
     under an exclusive lock, so two daemon starts never get the same epoch; a missing file is
@@ -126,16 +159,22 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-PROTO_VERSION = 6
+PROTO_VERSION = 7
 
 START_CMD     = 0xCC
 START_STATUS  = 0xDD
 START_PROFILE = 0xDE
 START_INFO    = 0xDF
+START_EXTRA   = 0xE0
+START_TRACK   = 0xE1
 LEN_CMD     = 13
 LEN_STATUS  = 32
 LEN_PROFILE = 28
 LEN_INFO    = 106
+LEN_EXTRA   = 80
+LEN_TRACK   = 106
+TRACK_CHUNKS_MAX = 16
+TRACK_POINTS_MAX = 22
 NAME_LEN    = 18
 CTRL_LEN    = 8
 RESULT_LINES = 3
@@ -143,7 +182,7 @@ RESULT_LEN  = 20
 ERROR_TEXT_LEN = 22
 RUN_NO_MAX  = 0xFFFF        # run_no counts 1..RUN_NO_MAX, never wraps in one daemon (0 = no run)
 _LEN = {START_CMD: LEN_CMD, START_STATUS: LEN_STATUS, START_PROFILE: LEN_PROFILE,
-        START_INFO: LEN_INFO}
+        START_INFO: LEN_INFO, START_EXTRA: LEN_EXTRA, START_TRACK: LEN_TRACK}
 
 PROFILE_MAX  = 254
 PROFILE_NONE = 0xFF
@@ -193,6 +232,12 @@ L_ESP32_KNOWN = 1 << 3
 # INFO flags (v6)
 I_LOOP_VALID   = 1 << 0     # loop_us / overruns come from the loop statistics
 I_RESULT_VALID = 1 << 1     # result lines belong to the last finished run
+
+X_FAULT_ACTIVE = 1 << 0
+X_CHECK_VALID = 1 << 1
+SHA_NONE, SHA_UNKNOWN, SHA_OK, SHA_MISMATCH, SHA_DIRTY = range(5)
+CHK_NONE, CHK_CLEAN, CHK_CLEAN_NO_SPIFIX, CHK_BAD, CHK_INCONCLUSIVE, CHK_RUNNING = range(6)
+TR_REF, TR_PLANT, TR_DUT = range(3)
 
 # Where the controller name in INFO comes from (v6; workflow 9.6: load profile + level of proof)
 CTRL_SRC_NONE    = 0        # unknown: the panel shows '-'
@@ -339,8 +384,72 @@ def encode_info(i: Info) -> bytes:
     return _seal(buf)
 
 
+@dataclass
+class Extra:
+    sid: int = 0
+    flags: int = 0
+    sha_state: int = SHA_NONE
+    dut_sha: str = ''
+    dut_env: str = ''
+    fault_text: str = ''
+    check_code: int = CHK_NONE
+    check_run: int = 0
+    check_text: str = ''
+    reset_index: int = PROFILE_NONE
+
+
+def _check_extra(flags: int, check_run: int) -> None:
+    if flags & X_CHECK_VALID and not check_run:
+        raise ValueError('X_CHECK_VALID requires a nonzero check_run')
+
+
+def encode_extra(e: Extra) -> bytes:
+    _check_extra(e.flags, e.check_run)
+    buf = bytearray(LEN_EXTRA)
+    struct.pack_into('<BBIBB', buf, 0, START_EXTRA, PROTO_VERSION, e.sid, e.flags, e.sha_state)
+    buf[8:20] = _ascii(e.dut_sha.partition('\0')[0], 12)
+    buf[20:28] = _ascii(e.dut_env.partition('\0')[0], 8)
+    buf[28:50] = _ascii(e.fault_text.partition('\0')[0], 22)
+    struct.pack_into('<BH', buf, 50, e.check_code, e.check_run)
+    buf[53:75] = _ascii(e.check_text.partition('\0')[0], 22)
+    buf[75] = e.reset_index
+    return _seal(buf)
+
+
+@dataclass
+class Track:
+    sid: int
+    run_no: int
+    series: int
+    chunk: int
+    count: int
+    points: tuple = ()
+
+    @property
+    def n(self) -> int:
+        return len(self.points)
+
+
+def _check_track(run_no: int, series: int, chunk: int, count: int, n: int) -> None:
+    if not 1 <= run_no <= RUN_NO_MAX or not TR_REF <= series <= TR_DUT:
+        raise ValueError('invalid TRACK run_no or series')
+    if not 0 <= chunk < count <= TRACK_CHUNKS_MAX or not 0 <= n <= TRACK_POINTS_MAX:
+        raise ValueError('invalid TRACK chunk, count or n')
+
+
+def encode_track(t: Track) -> bytes:
+    _check_track(t.run_no, t.series, t.chunk, t.count, t.n)
+    buf = bytearray(LEN_TRACK)
+    struct.pack_into('<BBIHBBBB', buf, 0, START_TRACK, PROTO_VERSION, t.sid, t.run_no,
+                     t.series, t.chunk, t.count, t.n)
+    for i, (x, y) in enumerate(t.points):
+        struct.pack_into('<hh', buf, 12 + 4 * i, max(-32768, min(32767, x)),
+                         max(-32768, min(32767, y)))
+    return _seal(buf)
+
+
 def decode(frame: bytes):
-    """One complete, checked frame -> Cmd / Status / Profile / Info."""
+    """Decode a complete frame after the length, version and CRC checks."""
     start = frame[0]
     if start == START_CMD:
         return Cmd(*struct.unpack_from('<IHBH', frame, 2))
@@ -357,19 +466,31 @@ def decode(frame: bytes):
         result_run, = struct.unpack_from('<H', frame, 80)
         return Info(sid, loop_us, overruns, flags, ctrl_src, _text(frame[12:20]), result,
                     _text(frame[82:104]), result_run)
+    if start == START_EXTRA:
+        sid, flags, sha_state = struct.unpack_from('<IBB', frame, 2)
+        check_code, check_run = struct.unpack_from('<BH', frame, 50)
+        _check_extra(flags, check_run)
+        return Extra(sid, flags, sha_state, _text(frame[8:20]), _text(frame[20:28]),
+                     _text(frame[28:50]), check_code, check_run, _text(frame[53:75]), frame[75])
+    if start == START_TRACK:
+        sid, run_no, series, chunk, count, n = struct.unpack_from('<IHBBBB', frame, 2)
+        _check_track(run_no, series, chunk, count, n)
+        points = tuple(struct.iter_unpack('<hh', frame[12:12 + 4 * n]))
+        return Track(sid, run_no, series, chunk, count, points)
     raise ValueError(f"unknown start byte 0x{start:02X}")
 
 
 class StreamParser:
-    """Byte stream -> frames. A wrong version (checked as soon as byte 1 arrives) or a bad
-    CRC drops one byte and resyncs. A partial frame whose last byte arrived more than stale_s
-    ago is dropped before new bytes are added to it (B28: the age is that of the newest
-    buffered byte, and dropping bytes does not make it younger). This is a timeout on the
+    """Byte stream -> frames. A frame with a foreign nonzero version is buffered whole like
+    any frame; if its CRC passes it is counted (version_mismatch, last_foreign_version) and
+    dropped, never decoded. Version zero or a bad CRC drops one byte and resyncs. A partial frame whose last byte
+    arrived more than stale_s ago is dropped before new bytes are added (B28: dropping
+    bytes does not make the newest buffered byte younger). This is a timeout on the
     silence between bytes, not a lifetime of a decoded command. Nothing bounds how long a
     complete frame waits in the UART path: a frame the panel gave up on can still arrive and
     run later (V1); the seq rules and PanelClient's STOP / SYNC handling account for it."""
 
-    def __init__(self, accept=(START_CMD, START_STATUS, START_PROFILE, START_INFO), stale_s: float = 0.05,
+    def __init__(self, accept=tuple(_LEN), stale_s: float = 0.05,
                  clock: Callable[[], float] = time.monotonic):
         self.accept = set(accept)
         self.stale_s = stale_s
@@ -377,6 +498,8 @@ class StreamParser:
         self._buf = bytearray()
         self._t_last: Optional[float] = None        # arrival time of the newest buffered byte
         self.bad_frames = 0
+        self.version_mismatch = 0
+        self.last_foreign_version = 0
         self.skipped_bytes = 0
         self.stale_drops = 0
 
@@ -394,11 +517,15 @@ class StreamParser:
                 del self._buf[:1]
                 self.skipped_bytes += 1
                 continue
-            if len(self._buf) >= 2 and self._buf[1] != PROTO_VERSION:
+            n = _LEN[self._buf[0]]
+            # version 0 is never valid: drop at once. Any other foreign version waits for the
+            # whole candidate (at most LEN_INFO bytes, bounded by stale_s), so a v6 frame that
+            # arrives in small UART reads is still reported (design R-6; CODE_PANEL 28/11).
+            # The decision depends only on the buffered bytes, never on where a read ended.
+            if len(self._buf) >= 2 and self._buf[1] == 0:
                 del self._buf[:1]
                 self.bad_frames += 1
                 continue
-            n = _LEN[self._buf[0]]
             if len(self._buf) < n:
                 break
             frame = bytes(self._buf[:n])
@@ -407,7 +534,14 @@ class StreamParser:
                 del self._buf[:1]
                 continue
             del self._buf[:n]
-            out.append(decode(frame))
+            if frame[1] != PROTO_VERSION:
+                self.version_mismatch += 1
+                self.last_foreign_version = frame[1]
+                continue
+            try:
+                out.append(decode(frame))
+            except ValueError:                  # CRC valid, invalid payload fields
+                self.bad_frames += 1
         return out
 
 
@@ -631,6 +765,10 @@ class PanelClient:
       * INFO (v6): the newest INFO of the session is kept (`info`) and drawn as it is; INFO of
         another sid is ignored; a lost session forgets it. Nothing is sent for INFO: a missing
         INFO only leaves the fields unknown ('-').
+      * EXTRA replaces the previous EXTRA of this session. TRACK keeps one run across all
+        series. Each chunk replaces its slot, a count change restarts its series, and a
+        higher run_no clears all series. Older runs and other sessions are ignored.
+        Losing the session clears both. Neither frame causes a reply.
     tick(now_ms) and the on_* methods return the frames to send now.
     """
 
@@ -653,6 +791,9 @@ class PanelClient:
         self._t_hello: Optional[float] = None
         self.fence = False                          # SYNC at next_seq still due after the handshake (W1)
         self.info: Optional[Info] = None            # newest INFO of the session (v6)
+        self.extra: Optional[Extra] = None
+        self.track_run_no = 0
+        self._tracks: dict[int, list[Optional[tuple]]] = {}
 
     def _new_boot(self) -> int:
         while True:
@@ -745,6 +886,9 @@ class PanelClient:
         self.sid, self.next_seq, self.daemon_boot = 0, None, None
         self.profiles, self.profile_count, self._t_session = {}, None, None
         self.info = None
+        self.extra = None
+        self.track_run_no = 0
+        self._tracks.clear()
         self._t_hello = None
         return self.tick(now_ms)
 
@@ -812,6 +956,36 @@ class PanelClient:
     def on_info(self, info: Info) -> None:
         if self.sid and info.sid == self.sid:
             self.info = info
+
+    @property
+    def has_extra(self) -> bool:
+        return self.extra is not None
+
+    def on_extra(self, extra: Extra) -> None:
+        if self.sid and extra.sid == self.sid:
+            self.extra = extra
+
+    def on_track(self, t: Track) -> None:
+        if not self.sid or t.sid != self.sid or t.run_no < self.track_run_no:
+            return
+        _check_track(t.run_no, t.series, t.chunk, t.count, t.n)
+        if t.run_no != self.track_run_no:
+            self._tracks.clear()
+            self.track_run_no = t.run_no
+        chunks = self._tracks.get(t.series)
+        if chunks is None or len(chunks) != t.count:
+            chunks = self._tracks[t.series] = [None] * t.count
+        chunks[t.chunk] = tuple(t.points)
+
+    def track_complete(self, series: int) -> bool:
+        chunks = self._tracks.get(series)
+        return chunks is not None and None not in chunks
+
+    def track_points(self, series: int) -> tuple:
+        return tuple(point for chunk in self._tracks.get(series, ()) if chunk for point in chunk)
+
+    def track_point_count(self, series: int) -> int:
+        return sum(len(chunk) for chunk in self._tracks.get(series, ()) if chunk)
 
 
 # ── daemon side: non-blocking UART writer (9.6) ───────────────────────────

@@ -1,5 +1,5 @@
 /*
- * panel_proto.h — panel side of the RPi5 daemon <-> panel UART protocol, version 6.
+ * panel_proto.h — panel side of the RPi5 daemon <-> panel UART protocol, version 7.
  *
  * Mirrors rpi5/panel_proto.py byte for byte (frame layouts, CRC, StreamParser) and rule for
  * rule (PanelClient). The Python file is the reference: its docstrings hold the contract;
@@ -31,16 +31,20 @@
 extern "C" {
 #endif
 
-#define PP_VERSION        6
+#define PP_VERSION        7
 
 #define PP_START_CMD      0xCC
 #define PP_START_STATUS   0xDD
 #define PP_START_PROFILE  0xDE
 #define PP_START_INFO     0xDF
+#define PP_START_EXTRA    0xE0
+#define PP_START_TRACK    0xE1
 #define PP_LEN_CMD        13
 #define PP_LEN_STATUS     32     /* run_no at 28-29 (v6 revised, Codex round 4, Liam 04/11: "A") */
 #define PP_LEN_PROFILE    28
 #define PP_LEN_INFO       106
+#define PP_LEN_EXTRA      80
+#define PP_LEN_TRACK      106
 #define PP_LEN_MAX        PP_LEN_INFO
 #define PP_NAME_LEN       18
 #define PP_CTRL_LEN       8
@@ -102,6 +106,15 @@ enum { PP_OUT_NONE, PP_OUT_COMPLETED, PP_OUT_USER_STOP, PP_OUT_ERROR };
 #define PP_I_RESULT_VALID (1u << 1)
 enum { PP_CTRL_SRC_NONE, PP_CTRL_SRC_PROFILE, PP_CTRL_SRC_FW };
 
+#define PP_X_FAULT_ACTIVE (1u << 0)
+#define PP_X_CHECK_VALID  (1u << 1)
+enum { PP_SHA_NONE, PP_SHA_UNKNOWN, PP_SHA_OK, PP_SHA_MISMATCH, PP_SHA_DIRTY };
+enum { PP_CHK_NONE, PP_CHK_CLEAN, PP_CHK_CLEAN_NO_SPIFIX, PP_CHK_BAD, PP_CHK_INCONCLUSIVE,
+       PP_CHK_RUNNING };
+enum { PP_TR_REF, PP_TR_PLANT, PP_TR_DUT, PP_TRACK_SERIES };
+#define PP_TRACK_CHUNKS_MAX 16
+#define PP_TRACK_POINTS_MAX 22
+
 typedef struct {
     uint32_t sid;
     uint16_t daemon_boot, panel_boot, last_cmd_seq;
@@ -131,6 +144,34 @@ typedef struct {
     uint16_t result_run;    /* run (STATUS run_no) the result lines belong to; 0 = none */
 } pp_info_t;
 
+typedef struct {
+    uint32_t sid;
+    uint8_t flags, sha_state;
+    char dut_sha[12 + 1], dut_env[8 + 1], fault_text[22 + 1];
+    uint8_t check_code;
+    uint16_t check_run;
+    char check_text[22 + 1];
+    uint8_t reset_index;    /* PP_PROFILE_NONE when there is no RESET DUT entry */
+} pp_extra_t;
+
+typedef struct { int32_t x_mm, y_mm; } pp_point_input_t;
+typedef struct { int16_t x_mm, y_mm; } pp_point_t;
+
+typedef struct {
+    uint32_t sid;
+    uint16_t run_no;
+    uint8_t series, chunk, count, n;
+    pp_point_t points[PP_TRACK_POINTS_MAX];
+} pp_track_t;
+
+/* A zero return indicates invalid fields. EXTRA takes byte strings, cutting at NUL or the
+ * field width and replacing each non-ASCII input byte with '?'. TRACK saturates coordinates. */
+size_t pp_encode_extra(uint8_t *out, const pp_extra_t *e);
+size_t pp_encode_track(uint8_t *out, uint32_t sid, int run_no, int series, int chunk,
+                       int count, int n, const pp_point_input_t *points);
+bool pp_decode_extra(const uint8_t *f, pp_extra_t *e);
+bool pp_decode_track(const uint8_t *f, pp_track_t *t);
+
 uint16_t pp_crc16(const uint8_t *data, size_t n);
 /* out must hold PP_LEN_CMD bytes; returns PP_LEN_CMD */
 size_t pp_encode_cmd(uint8_t *out, uint32_t sid, uint16_t seq, uint8_t cmd, uint16_t arg);
@@ -150,13 +191,17 @@ typedef struct {
     uint32_t stale_ms;
     uint8_t  accept;           /* PP_ACCEPT_* bits */
     uint32_t bad_frames, skipped_bytes, stale_drops;
+    uint32_t version_mismatch;
+    uint8_t last_foreign_version;  /* 0 until a complete foreign frame passes CRC */
 } pp_parser_t;
 
 #define PP_ACCEPT_CMD     (1u << 0)
 #define PP_ACCEPT_STATUS  (1u << 1)
 #define PP_ACCEPT_PROFILE (1u << 2)
 #define PP_ACCEPT_INFO    (1u << 3)
-#define PP_ACCEPT_PANEL   (PP_ACCEPT_STATUS | PP_ACCEPT_PROFILE | PP_ACCEPT_INFO)
+#define PP_ACCEPT_EXTRA   (1u << 4)
+#define PP_ACCEPT_TRACK   (1u << 5)
+#define PP_ACCEPT_PANEL   (PP_ACCEPT_STATUS | PP_ACCEPT_PROFILE | PP_ACCEPT_INFO | PP_ACCEPT_EXTRA | PP_ACCEPT_TRACK)
 
 void pp_parser_init(pp_parser_t *p, uint8_t accept, uint32_t stale_ms);
 /* One call = one read from the UART (the stale check is done once per call, before the new
@@ -198,6 +243,17 @@ typedef struct {
 } pp_stop_t;
 
 typedef struct {
+    uint8_t count, n[PP_TRACK_CHUNKS_MAX];
+    uint16_t received;        /* one bit per chunk, including empty chunks */
+    uint16_t point_count;
+    pp_point_t points[PP_TRACK_CHUNKS_MAX][PP_TRACK_POINTS_MAX];
+} pp_track_series_t;
+
+bool pp_track_complete(const pp_track_series_t *s);
+/* Index among received points in chunk order. NULL for index >= point_count. */
+const pp_point_t *pp_track_point(const pp_track_series_t *s, unsigned index);
+
+typedef struct {
     pp_nonce_fn nonce;  void *nonce_ctx;
     pp_send_fn  send;   void *send_ctx;
 
@@ -221,6 +277,9 @@ typedef struct {
     char     profile_name[PP_PROFILES_STORED][PP_NAME_LEN + 1];
 
     bool     has_info;  pp_info_t info;     /* newest INFO of the session */
+    bool     has_extra; pp_extra_t extra;
+    uint16_t track_run_no;                  /* zero until the first TRACK of the session */
+    pp_track_series_t tracks[PP_TRACK_SERIES];
     uint32_t info_count;                    /* INFO frames of a session taken so far (never reset) */
     uint32_t profiles_gen;                  /* bumps whenever the kept list changes (count, a name) */
     bool     has_st;    pp_status_t st;     /* newest STATUS of the session (for the screen) */
@@ -235,7 +294,7 @@ bool pp_client_link(const pp_client_t *c, uint32_t now_ms);
 /* user presses SELECT / START / STOP (NAV only moves the cursor and is never sent) */
 void pp_client_press(pp_client_t *c, uint8_t cmd, uint16_t arg, uint32_t now_ms);
 void pp_client_tick(pp_client_t *c, uint32_t now_ms);
-/* a checked frame from the parser (STATUS / PROFILE / INFO) */
+/* a checked daemon frame from the parser */
 void pp_client_on_frame(pp_client_t *c, const uint8_t *frame, size_t len, uint32_t now_ms);
 /* pops the oldest event; false when none */
 bool pp_client_pop_event(pp_client_t *c, pp_event_t *ev);
