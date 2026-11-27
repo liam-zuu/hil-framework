@@ -49,14 +49,15 @@ def run_meta(d):
         return json.load(f)
 
 
-def test_panel_tests_are_group_a_then_o1_floor_tasks_never_k1_k2():
+def test_panel_profiles_keep_group_a_and_o1_indices_then_demos_and_reset():
     from trajectory_pub import GROUP_A
     tests = panel_tests()
     names = [n for n, _ in tests]
-    assert names == list(GROUP_A) + list(O1_PANEL)
+    normal = list(GROUP_A) + list(O1_PANEL)
+    assert names == normal + ['DEMO-ENC', 'DEMO-IMU', 'DEMO-GYRO', 'DEMO-JAM', 'RESET DUT']
     assert not any('K1' in n and n.startswith('O1') or n == 'O1-K2' for n in names)
     assert all(len(n) <= pp.NAME_LEN and n.isascii() for n in names)
-    assert all(a[0] in ('--test', '--o1') and a[1] == n for n, a in tests)
+    assert all(a[0] in ('--test', '--o1') and a[1] == n for n, a in tests[:len(normal)])
 
 
 def test_whole_run_completed_result_and_run_folder(tmp_path, monkeypatch):

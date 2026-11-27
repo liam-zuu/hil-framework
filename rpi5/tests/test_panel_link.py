@@ -1,5 +1,5 @@
-"""panel_link (RPi5 side of the panel UART, v6): STATUS / INFO mapping from RunSnapshot, INFO
-rate, PROFILE list, commands reaching RunControl exactly once over a lossy wire, failures of
+"""panel_link (RPi5 side of the panel UART, v7): STATUS, INFO and EXTRA mapping and timing,
+PROFILE list, commands reaching RunControl exactly once over a lossy wire, failures of
 RunControl reported as RES_FAILED. Panel = the reference PanelClient. No hardware."""
 import random
 
@@ -76,8 +76,10 @@ class Wire:
                     self.up += self.panel.on_status(x, self.t)
                 elif isinstance(x, pp.Profile):
                     self.panel.on_profile(x)
-                else:
+                elif isinstance(x, pp.Info):
                     self.panel.on_info(x)
+                elif isinstance(x, pp.Extra):
+                    self.panel.on_extra(x)
             self.up += self.panel.tick(self.t)
 
     def press(self, cmd, arg=0):
@@ -131,8 +133,10 @@ def test_new_session_does_not_send_info_of_the_old_one():
     old = w.link.sess.sid
     w.panel = pp.PanelClient(iter(range(0x500, 0x600)).__next__)       # panel reboot: new HELLO
     w.step(30)
-    infos = [x for t, x in w.frames if isinstance(x, pp.Info) and t > w.t - 300]
-    assert w.panel.sid != old and w.panel.info is not None and infos[-1].sid == w.panel.sid
+    assert w.panel.sid != old
+    for packet in (pp.Info, pp.Extra):
+        frames = [x for t, x in w.frames if isinstance(x, packet) and t > w.t - 300]
+        assert frames and all(x.sid == w.panel.sid for x in frames)
 
 
 def test_info_rate_constant_and_changing():
@@ -340,9 +344,61 @@ def test_status_keeps_flowing_on_the_wire_during_a_long_profile_list_codex_q9(n)
     ends, i, buf = [], 0, bytes(fifo.data)
     while i < len(buf):                                     # frames are written back to back
         n_f = {pp.START_STATUS: pp.LEN_STATUS, pp.START_PROFILE: pp.LEN_PROFILE,
-               pp.START_INFO: pp.LEN_INFO}[buf[i]]
+               pp.START_INFO: pp.LEN_INFO, pp.START_EXTRA: pp.LEN_EXTRA}[buf[i]]
         if buf[i] == pp.START_STATUS:
             ends.append(fifo.t_out[i + n_f - 1])
         i += n_f
     gaps = [b - a for a, b in zip(ends, ends[1:])]
     assert len(ends) > 20 and max(gaps) < 0.25
+
+
+def test_extra_fields_period_changes_and_minimum_gap():
+    run = Recorder()
+    w = Wire(run)
+    run.snap = RunSnapshot(run_state=pp.ST_RUN, fault_text='LOI ENC FL 2.1s', dut_sha='1234abcdef01',
+                           dut_env='ladrc', sha_state=pp.SHA_OK, reset_index=14)
+    w.step(10)
+    expected = pp.Extra(sid=w.panel.sid, flags=pp.X_FAULT_ACTIVE, fault_text='LOI ENC FL 2.1s',
+                        dut_sha='1234abcdef01', dut_env='ladrc', sha_state=pp.SHA_OK, reset_index=14)
+    assert w.panel.extra == expected
+    first_send = w.link.t_extra
+    run.snap.run_state, run.snap.fault_text, run.snap.note = pp.ST_END, '', 'DUT reset done'
+    w.step(5)
+    assert w.panel.extra == expected
+    w.step(25)
+    extra = w.panel.extra
+    assert extra.flags == 0 and extra.fault_text == '' and extra.check_text == run.snap.note
+    assert (extra.check_run, extra.check_code) == (0, pp.CHK_NONE)
+    assert INFO_MIN_GAP_S <= w.link.t_extra - first_send < INFO_MIN_GAP_S + 0.02
+    w.step(300)
+    times = [t for t, x in w.frames if isinstance(x, pp.Extra)]
+    assert len(times) == 5
+    assert all(abs((b - a) / 1000 - INFO_PERIOD_S) <= 0.02 for a, b in zip(times[1:], times[2:]))
+
+
+def test_fake_run_sends_fixed_extra_over_the_wire():
+    w = Wire(FakeRun())
+    w.step(220)
+    extras = [x for _, x in w.frames if isinstance(x, pp.Extra)]
+    assert len(extras) >= 2
+    assert all(x == pp.Extra(sid=w.panel.sid, dut_sha='facefeed0000', dut_env='PID') for x in extras)
+
+
+def test_stalled_extra_uses_current_window_when_uart_accepts_first_byte():
+    class StalledWire(Wire):
+        stalled = True
+
+        def _w(self, data):
+            if self.stalled and data[0] == pp.START_EXTRA:
+                return 0
+            return super()._w(data)
+
+    run = Recorder()
+    run.snap = RunSnapshot(run_state=pp.ST_RUN, fault_text='LOI ENC FL 0.1s')
+    w = StalledWire(run)
+    w.step(15)
+    assert w.panel.info is not None and w.panel.extra is None
+    run.snap.run_state, run.snap.fault_text = pp.ST_STOPPING, ''
+    w.stalled = False
+    w.step(3)
+    assert w.panel.extra == pp.Extra(sid=w.panel.sid)

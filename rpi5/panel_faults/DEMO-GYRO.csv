@@ -1,0 +1,3 @@
+# hil-fault-schedule v1
+id,fault,target,start_ms,end_ms,params
+DEMO-GYRO,gyro_scale,gz,4000,9000,s=0.3

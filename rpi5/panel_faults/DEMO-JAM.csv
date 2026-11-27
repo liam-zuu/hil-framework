@@ -1,0 +1,5 @@
+# hil-fault-schedule v1
+# Panel demo only. At 10 rad/s the added FL drag is 0.40 + 0.20 = 0.60 N.m.
+# This exceeds nominal FL friction (~0.030 N.m) and the floor contact limit (~0.21 N.m).
+id,fault,target,start_ms,end_ms,params
+DEMO-JAM,wheel_jam,FL,4000,7000,b=0.04;tc=0.20

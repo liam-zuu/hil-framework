@@ -1,5 +1,5 @@
 """
-Panel link — the RPi5 side of the panel UART (protocol v6), in its own process, never inside
+Panel link — the RPi5 side of the panel UART (protocol v7), in its own process, never inside
 the 1 kHz loop (QĐ 17; workflow 9.6). Liam 04/11, PANEL session: "ổn, làm theo đề xuất về phía
 pi": the PANEL session writes this link with a thin run-control interface; the CODE session
 plugs the real run manager (hil_daemon / hil_ctl, stage E) into that interface.
@@ -7,16 +7,16 @@ plugs the real run manager (hil_daemon / hil_ctl, stage E) into that interface.
     panel (ESP32-S3) <--UART ttyAMA0--> PanelLink <--RunControl--> run manager (stage E)
 
 What PanelLink does: frames in/out (StreamParser, TxQueue), the session and seq rules
-(DaemonSession), STATUS every STATUS_PERIOD_S and after every command, INFO every
-INFO_PERIOD_S and when it changes, the PROFILE list after a new session and on PROFILES.
+(DaemonSession), STATUS every STATUS_PERIOD_S and after every command, INFO and EXTRA every
+INFO_PERIOD_S and when they change, the PROFILE list after a new session and on PROFILES.
 What it does not do: decide anything about a run. Every command goes to RunControl.
 
 RunControl contract (what stage E implements):
   * profiles() -> list of test names (ASCII, <= 18 chars shown); index = position. Called on
     every new panel session and on PROFILES; the list must not change while a run is active.
-  * select(index) / start(index) / stop() -> RES_* (panel_proto). They must only REQUEST the
-    action and return at once (never wait for a run to end): the link calls them from its own
-    loop, and a STOP cannot be handled while one of them blocks (panel_proto DaemonSession).
+  * select(index) / start(index) / stop() -> RES_* (panel_proto). The link handles these in
+    its UART loop. START may take one bounded DUT query or one reset pulse. A run and its
+    STOP escalation continue in the background after the command returns.
     Raising or returning RES_FAILED both mean "effect unknown". stop() with nothing to stop
     returns RES_NOT_IDLE; stop() in ST_ERROR acknowledges the fault (the run manager then goes
     to ST_IDLE) [ĐỀ XUẤT: rule of this link and of the fake Pi, not decided for stage E].
@@ -73,6 +73,12 @@ class RunSnapshot:
     result: Sequence[str] = field(default_factory=tuple)   # RESULT lines of the last finished run
     run_no: int = 0                      # current run, or the last one (0 = none yet)
     result_run: int = 0                  # run the result lines belong to (0 = none)
+    sha_state: int = pp.SHA_NONE
+    dut_sha: str = ''
+    dut_env: str = ''
+    fault_text: str = ''                 # populated while a scheduled window is open
+    reset_index: int = pp.PROFILE_NONE
+    note: str = ''                       # RESET DUT feedback, independent of the run result
 
 
 class RunControl(Protocol):
@@ -106,6 +112,17 @@ def info_of(snap: RunSnapshot, sid: int) -> pp.Info:
                    result_run=snap.result_run if valid else 0)
 
 
+def extra_of(snap: RunSnapshot, sid: int) -> pp.Extra:
+    return pp.Extra(sid=sid, flags=pp.X_FAULT_ACTIVE if snap.fault_text else 0, fault_text=snap.fault_text,
+                    sha_state=snap.sha_state, dut_sha=snap.dut_sha, dut_env=snap.dut_env,
+                    reset_index=snap.reset_index, check_text=snap.note)
+
+
+def _due(now, sent_at, frame, previous) -> bool:
+    return (previous is None or now - sent_at >= INFO_PERIOD_S
+            or (frame != previous and now - sent_at >= INFO_MIN_GAP_S))
+
+
 def nonblocking_writer(port) -> Callable[[bytes], int]:
     """write(bytes) -> bytes the OS took now, never waiting (TxQueue contract; Codex Q6:
     pySerial 3.5 on POSIX loops on EAGAIN even with write_timeout=0). POSIX: one os.write on
@@ -134,10 +151,13 @@ class PanelLink:
         self.clock = clock
         self.parser = pp.StreamParser(accept=(pp.START_CMD,), clock=clock)
         self.tx = pp.TxQueue(write, max_profiles=pp.PROFILE_MAX + 1)   # a whole list fits (P14)
-        self.t_status = self.t_info = None
+        self.t_status = self.t_info = self.t_extra = None
         self.rate = baud / 10 * WIRE_RATE_FACTOR     # bytes per second handed to the UART
         self._budget, self._t_budget = float(WIRE_BUDGET_MAX), None
         self.last_info: Optional[bytes] = None
+        self.last_extra: Optional[bytes] = None
+        self._write = write
+        self._pending_extra = self._extra_tail = b''
         self.log = []                       # (t, cmd, seq, result of on_cmd) for the operator
 
     def _exec(self, c: pp.Cmd) -> int:
@@ -163,7 +183,8 @@ class PanelLink:
             self.log.append((now, c.cmd, c.seq, r))
             if r == 'hello':
                 self.tx.clear_session()
-                self.last_info = None                # INFO of the new session at once
+                self.last_info = self.last_extra = None
+                self._pending_extra = b''            # an EXTRA already partly on the wire must finish
             self.tx.put(pp.encode_status(status_of(self.run.snapshot(), self.sess)))
             if r in ('hello', 'profiles'):
                 self._send_profiles()
@@ -178,10 +199,11 @@ class PanelLink:
         if self.sess.sid:
             snap = snap or self.run.snapshot()
             info = pp.encode_info(info_of(snap, self.sess.sid))
-            age = None if self.t_info is None else now - self.t_info
-            if self.last_info is None or age >= INFO_PERIOD_S or (info != self.last_info and age >= INFO_MIN_GAP_S):
+            if _due(now, self.t_info, info, self.last_info):
                 self.t_info, self.last_info = now, info
                 self.tx.put(info)
+            extra = pp.encode_extra(extra_of(snap, self.sess.sid))
+            self._pending_extra = extra if _due(now, self.t_extra, extra, self.last_extra) else b''
         self._pump(now)
 
     def _pump(self, now: float) -> None:
@@ -191,8 +213,21 @@ class PanelLink:
         if self._t_budget is not None:
             self._budget = min(float(WIRE_BUDGET_MAX), self._budget + (now - self._t_budget) * self.rate)
         self._t_budget = now
-        if self._budget >= 1:
+        # TxQueue's FIFO holds profiles. Keep one replaceable EXTRA outside it so a stalled
+        # UART cannot accumulate stale countdowns or evict a profile. Finish each frame on the wire.
+        if not self._extra_tail and self._budget >= 1:
             self._budget -= self.tx.pump(max_bytes=int(self._budget))
+            if self.tx.pending():
+                return
+        frame = self._extra_tail or self._pending_extra
+        if frame and self._budget >= 1:
+            n = self._write(frame[:int(self._budget)])
+            if n:
+                if not self._extra_tail:
+                    self.t_extra, self.last_extra = now, frame
+                    self._pending_extra = b''
+                self._extra_tail = frame[n:]
+                self._budget -= n
 
 
 # ── FAKE run for the bench and --demo (nothing here is a measurement) ─────
@@ -280,7 +315,7 @@ class FakeRun:
                            outcome=self.outcome, data_age_ms=20, h7_ok=self.h7, error_code=self.error_code,
                            error_text=self.error_text, ctrl=self.ctrl, ctrl_src=pp.CTRL_SRC_PROFILE,
                            loop_us=25 + self.rnd.randrange(5), overruns=0, result=self.result,
-                           run_no=self.run_no, result_run=self.result_run)
+                           run_no=self.run_no, result_run=self.result_run, dut_sha='facefeed0000', dut_env=self.ctrl)
 
 
 def serve(port, link: PanelLink, stop_after_s: Optional[float] = None, on_log=print) -> None:
@@ -301,7 +336,7 @@ def serve(port, link: PanelLink, stop_after_s: Optional[float] = None, on_log=pr
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description='RPi5 side of the panel UART (protocol v6)')
+    ap = argparse.ArgumentParser(description='RPi5 side of the panel UART (protocol v7)')
     ap.add_argument('--port', default='/dev/ttyAMA0')
     ap.add_argument('--baud', type=int, default=115200)
     ap.add_argument('--epoch-file', default=os.path.expanduser('~/.hil_panel_epoch'))

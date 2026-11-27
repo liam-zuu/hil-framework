@@ -3,7 +3,7 @@ hil_daemon — stage E of the HIL workflow, reduced version (L79, Liam 11/11, CO
 local_b2daa0f4: "Panel trước", "Tạm thời làm thu gọn").
 
 The run manager behind the panel: it implements panel_link.RunControl, so the panel (ESP32-S3,
-UART ttyAMA0, protocol v6) can list the tests, start one and stop it. One run at a time. Each
+UART ttyAMA0, protocol v7) can list the tests, start one and stop it. One run at a time. Each
 run is `run_hil.py <test args> --finite-run` started as a child process; the daemon follows it
 from the lines it prints and never touches the 1 kHz loop (QĐ 17, workflow 9.6).
 
@@ -14,9 +14,10 @@ a quick look / demo, NOT thesis data. meta.json of every run says mode: panel, d
 false. Thesis numbers still come from the PC (tools/hil_bench_session.py, use 2).
 
 Reduced version, what it leaves for the full one of 28/10 (sections 8.4-8.5, 9.4):
-  * tests: a fixed list (spec S02 group A + the O1 floor tasks of C6, not K1/K2) instead of
+  * tests: a fixed list (spec S02 group A, O1 figure eights, four fault demos and RESET DUT) instead of
     profiles rpi5/profiles/<id>.yaml; no load profile check, no manifest, no hil_ctl over SSH,
-    no hil_session on the PC, no request_id; the controller is only what --ctrl declares.
+    no hil_session on the PC, no request_id. The DUT firmware environment, when known, is
+    shown in preference to the controller declared with --ctrl.
   * H7 state while idle: no SPI frame is exchanged between runs, so the 'H7' light is the
     evidence of the last H7 check: a short probe run at daemon start (probe_h7; --no-probe skips it),
     a new probe every REPROBE_S while idle with the light off (the H7 may boot after the Pi),
@@ -40,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import ipaddress
 import json
 import os
 import re
@@ -52,18 +54,24 @@ import time
 from typing import Callable, List, Optional, Sequence, Tuple
 
 import panel_proto as pp
+import fault_schedule
 from panel_link import RunSnapshot
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(HERE, '..', 'tools'))   # after rpi5/: a tools/ module never shadows one of rpi5/
+import gain_send
 
-# Tests the panel lists, in this order: spec S02 group A (trajectory_pub.GROUP_A, same order)
-# and the C6 floor tasks (run_hil.py --o1; K1, K2 are the final test set, O1 3.7: never here).
 def _o1_panel() -> Tuple[str, ...]:
     import o1_tasks                               # the figure-8 levels, never FINAL_SET (K1, K2)
     return tuple(t for t in o1_tasks.FIG8 if t not in o1_tasks.FINAL_SET)
 
 
 O1_PANEL = _o1_panel()
+DEMO_BASE = 'O1-F05'
+DEMO_NAMES = ('DEMO-ENC', 'DEMO-IMU', 'DEMO-GYRO', 'DEMO-JAM')
+FAULT_NAMES = {'enc_loss': 'ENC', 'imu_loss': 'MAT', 'gyro_scale': 'GYRO', 'wheel_jam': 'JAM'}
+RESET_DUT = 'RESET DUT'
+DUT_RESET_GPIO = 27
 
 # Idle H7 re-check (CODE_PANEL 14/11, Liam Q3 "tự chạy": the daemon starts with the Pi, the H7
 # may still be off or booting): while idle and the H7 light is off, probe again this often.
@@ -80,6 +88,7 @@ E_RUN = 1          # run_hil.py ended in error:<reason> or with exit code != 0
 E_SPAWN = 2        # run_hil.py could not be started
 E_NO_SUMMARY = 3   # run_hil.py ended without a #run_summary line (killed, crashed early)
 E_GROUP = 4        # a process of the run survived SIGKILL (PPI-1/4): START refused until restart
+E_DUT_FW = 5       # DUT reported dirty or unexpected firmware during RUN
 
 # STOP escalation (PPI-1, Codex 14/11 round 1), run by the daemon's own timer from the first STOP,
 # whatever the child prints: level 0 = SIGINT to run_hil.py (soft STOP: setpoint 0, then END);
@@ -93,7 +102,8 @@ SHUTDOWN_S = 12.0   # daemon stop (Ctrl+C, systemd; TimeoutStopSec 15): wait thi
 _PHASES = ('PREPARE', 'ARM', 'RUN', 'STOPPING', 'END')
 _PHASE_ST = {'PREPARE': pp.ST_PREPARE, 'ARM': pp.ST_ARM, 'RUN': pp.ST_RUN,
              'STOPPING': pp.ST_STOPPING, 'END': pp.ST_STOPPING}   # END of the loop: child still closing
-_RE_PHASE = re.compile(r'#phase,(' + '|'.join(_PHASES) + r'),t_ns=')   # PPI-11: whole field only
+_RE_PHASE = re.compile(r'#phase,(' + '|'.join(_PHASES) + r'),t_ns=(\d+)\s*$')
+_SHA12 = re.compile(r'[0-9a-fA-F]{12}')
 _RE_SUMMARY = re.compile(r'#run_summary,(\{.*\})\s*$')
 _RE_MISO = re.compile(r'#miso,checked=(\d+),crc_bad=(\d+),empty=(\d+)')
 _RE_SWA = re.compile(r'#swa,mode=(\w+)')
@@ -106,7 +116,27 @@ def panel_tests() -> List[Tuple[str, List[str]]]:
     from trajectory_pub import GROUP_A
     tests = [(tid, ['--test', tid]) for tid in GROUP_A]
     tests += [(tid, ['--o1', tid]) for tid in O1_PANEL]
+    tests += [(name, ['--o1', DEMO_BASE, '--faults', os.path.join(HERE, 'panel_faults', name + '.csv')])
+              for name in DEMO_NAMES]
+    tests.append((RESET_DUT, []))
     return tests
+
+
+def _expected_sha(value: str) -> str:
+    if not _SHA12.fullmatch(value):
+        raise argparse.ArgumentTypeError('expected 12 hexadecimal digits')
+    return value.lower()
+
+
+def _query_dut(ip: str) -> dict:
+    # exchange builds the nonce-tagged datagram and parses replies from the matching IP and port.
+    # gain_send's --query supplies this GET literal directly to exchange.
+    try:
+        ack, _ = gain_send.exchange(ip, gain_send.PORT, lambda tx: f'#gain_get,v=1,tx={tx}',
+                                    timeout=0.15, tries=1, log=lambda _: None)
+    except OSError:
+        return {}
+    return ack if ack and ack.get('ok') == '1' else {}
 
 
 # Short options of the interpreter that take a value (CPython getopt: '-W x', '-Wx', '-uW x');
@@ -247,7 +277,7 @@ def reset_panel(gpio: int = PANEL_RESET_GPIO, chip: int = RPI5_GPIOCHIP, low_s: 
     pulled, result = False, 'done'
     try:
         try:
-            lg.gpio_claim_output(h, gpio, 0, getattr(lg, 'SET_OPEN_DRAIN', 0))
+            lg.gpio_claim_output(h, gpio, 0, lg.SET_OPEN_DRAIN)
             pulled = True
             sleep(low_s)
         except Exception as exc:
@@ -256,8 +286,10 @@ def reset_panel(gpio: int = PANEL_RESET_GPIO, chip: int = RPI5_GPIOCHIP, low_s: 
         try:
             if pulled:
                 try:
-                    lg.gpio_free(h, gpio)
-                    lg.gpio_claim_input(h, gpio)  # left an input after close (RP1 may keep outputs)
+                    try:
+                        lg.gpio_free(h, gpio)
+                    finally:
+                        lg.gpio_claim_input(h, gpio)  # RP1 may keep the last direction after close
                 except Exception as exc:
                     result = f'failed: GPIO{gpio} release: {exc} (EN may stay low: check the wire)'
                     try:                          # PPI-R3-3: a failing say never cuts the cleanup
@@ -267,8 +299,9 @@ def reset_panel(gpio: int = PANEL_RESET_GPIO, chip: int = RPI5_GPIOCHIP, low_s: 
         finally:
             try:
                 lg.gpiochip_close(h)
-            except Exception:
-                pass
+            except Exception as exc:
+                if result == 'done':
+                    result = f'failed: gpiochip{chip} close: {exc}'
     return result
 
 
@@ -302,9 +335,21 @@ class HilDaemon:
                  extra_args: Sequence[str] = (), ctrl: str = '', mock: bool = False,
                  child_cmd: Optional[Callable[[List[str]], List[str]]] = None,
                  stop_fn: Callable = _posix_stop, clock: Callable[[], float] = time.monotonic,
-                 busy_check: Callable[[Optional[int]], bool] = other_run_hil_running):
+                 busy_check: Callable[[Optional[int]], bool] = other_run_hil_running,
+                 dut_reset_gpio: int = DUT_RESET_GPIO, dut_ip: Optional[str] = None,
+                 expect_dut: Optional[str] = None):
         self.tests = list(tests) if tests is not None else panel_tests()
-        self.runs_dir = runs_dir
+        self.reset_index = next((i for i, (name, _) in enumerate(self.tests) if name == RESET_DUT),
+                                pp.PROFILE_NONE)
+        self.runs_dir = os.path.abspath(runs_dir)
+        self.dut_reset_gpio = dut_reset_gpio
+        self.dut_ip = str(ipaddress.IPv4Address(dut_ip)) if dut_ip is not None else None
+        self.expect_dut = _expected_sha(expect_dut) if expect_dut is not None else None
+        self.sha_state = pp.SHA_UNKNOWN if self.expect_dut or self.dut_ip else pp.SHA_NONE
+        self.dut_sha = self.dut_env = self.note = ''
+        self._fw_error = ''
+        self._fault_rows: Sequence[fault_schedule.Row] = ()
+        self._run_ns: Optional[int] = None
         self.mock = mock
         self.extra_args = list(extra_args) + (['--mock'] if mock else [])
         self.ctrl = ctrl
@@ -329,6 +374,9 @@ class HilDaemon:
         self._reader: Optional[threading.Thread] = None
         self._meta: dict = {}
         self._probing = False               # a probe run_hil.py is running: START is BUSY
+        self._checking = False              # reserved for the post-run check
+        self._querying = False              # idle worker has reserved the DUT for a gain_get
+        self._t_dut_query: Optional[float] = None
         self._wedged = False                # a run's / probe's process survived SIGKILL: START, probe refused
         self._closing = False               # shutdown started: no new START, no new probe
         self._probe_proc = None
@@ -352,16 +400,26 @@ class HilDaemon:
 
     def start(self, index: int) -> int:
         with self._lock:
-            if self.state in pp.ST_ACTIVE:
-                return pp.RES_BUSY
             if not 0 <= index < len(self.tests):
-                return pp.RES_BAD_PROFILE
-            if self._closing or self._probing or self._wedged or self.busy_check(None):
-                return pp.RES_BUSY                 # another run_hil.py (e.g. from the PC, or the probe) owns the SPI
+                return pp.RES_BUSY if self.state in pp.ST_ACTIVE else pp.RES_BAD_PROFILE
+            reason = self._busy_reason()
+            if reason:
+                if index == self.reset_index:
+                    self.note = 'DUT reset skipped: ' + reason
+                return pp.RES_BUSY
+            if index == self.reset_index:
+                return self._reset_dut()
             try:
                 run_no = pp.next_run_no(self.run_no)
             except OverflowError:                  # no number left: refuse, change nothing
                 return pp.RES_FAILED
+            if self.dut_ip:
+                # One bounded exchange in START so its ACK can report a refusal before spawning.
+                self._apply_ack(_query_dut(self.dut_ip))
+                if self.busy_check(None):          # a PC run could have started during the exchange
+                    return pp.RES_BUSY
+            if self.sha_state in (pp.SHA_DIRTY, pp.SHA_MISMATCH):
+                return pp.RES_BAD_PROFILE          # panel: START: BAD TEST, firmware reason in EXTRA
             name, args = self.tests[index]
             self.profile, self.run_no = index, run_no
             self.outcome, self.error_code, self.error_text = pp.OUT_NONE, 0, ''
@@ -369,15 +427,28 @@ class HilDaemon:
             self.quality = pp.Q_DUT_UNCONF              # DUT READY is never checked in a panel run
             self.loop_us = self.overruns = None
             self._t_stop, self._stop_pending, self._seen_phase = None, False, False
-            argv = self.child_cmd([*args, '--finite-run', *self.extra_args])
+            self._fw_error = self.note = ''
+            self._fault_rows, self._run_ns = (), None
+            self.run_dir, self._meta = None, {}
             try:
-                self._open_run_dir(name, argv)
+                self._open_run_dir(name)
+                args = [*args, '--finite-run', *self.extra_args]
+                if '--faults' in args:
+                    args.extend(['--frame-log', os.path.join(self.run_dir, 'frames.npz'),
+                                 '--step-log', os.path.join(self.run_dir, 'steps.csv')])
+                argv = self.child_cmd(args)
+                self._meta['argv'] = argv
+                self._write_meta()
+                if '--faults' in args:
+                    with open(args[args.index('--faults') + 1], encoding='utf-8') as f:
+                        self._fault_rows = sorted(fault_schedule.parse(f.read()), key=lambda r: r.end_ms)
                 self.proc = subprocess.Popen(argv, cwd=HERE, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                              stderr=subprocess.STDOUT, text=True, bufsize=1,
                                              encoding='utf-8', errors='replace', **_spawn_kw())
-            except OSError as exc:
-                self._fail(E_SPAWN, f'spawn {exc.errno}', f'spawn failed: {exc}')
-                self._close_meta(rc=None)
+            except (OSError, ValueError) as exc:
+                self._fail(E_SPAWN, f'start: {exc}', f'start failed: {exc}')
+                if self.run_dir is not None:
+                    self._close_meta(rc=None)
                 return pp.RES_FAILED
             self._meta['pid'] = self.proc.pid
             self._enter(pp.ST_PREPARE)
@@ -393,18 +464,20 @@ class HilDaemon:
                 self._enter(pp.ST_IDLE)
                 self.error_code, self.error_text = 0, ''
                 return pp.RES_OK
-            if self.state not in pp.ST_ACTIVE or self.proc is None:
-                return pp.RES_NOT_IDLE
-            if self._t_stop is not None:
-                return pp.RES_OK                   # STOP again: harmless, the timer escalates
-            self._t_stop = self.clock()
-            self.outcome = pp.OUT_USER_STOP
-            proc = self.proc
-            threading.Thread(target=self._escalate, args=(proc,), name='stop-escalate', daemon=True).start()
-            if not self._seen_phase:
-                self._stop_pending = True          # run_hil installs its STOP handler late: send at #phase
-                return pp.RES_OK
-            return self._signal(proc, 0)
+            return self._stop_run()
+
+    def _stop_run(self) -> int:
+        if self.state not in pp.ST_ACTIVE or self.proc is None:
+            return pp.RES_NOT_IDLE
+        self.outcome = pp.OUT_ERROR if self._fw_error else pp.OUT_USER_STOP
+        if self._t_stop is not None:
+            return pp.RES_OK                       # STOP again: the existing timer escalates
+        self._t_stop = self.clock()
+        threading.Thread(target=self._escalate, args=(self.proc,), name='stop-escalate', daemon=True).start()
+        if not self._seen_phase:
+            self._stop_pending = True              # run_hil installs its STOP handler late: send at #phase
+            return pp.RES_OK
+        return self._signal(self.proc, 0)
 
     def snapshot(self) -> RunSnapshot:
         with self._lock:
@@ -412,9 +485,103 @@ class HilDaemon:
                 run_state=self.state, phase_s=self.clock() - self.t_phase, profile=self.profile,
                 outcome=self.outcome, quality=self.quality, lost=0, data_age_ms=None,
                 h7_ok=self.h7_ok, esp32_ok=None, error_code=self.error_code, error_text=self.error_text,
-                ctrl=self.ctrl, ctrl_src=pp.CTRL_SRC_PROFILE if self.ctrl else pp.CTRL_SRC_NONE,
+                ctrl=self.dut_env or self.ctrl, ctrl_src=(pp.CTRL_SRC_FW if self.dut_env else
+                                                          pp.CTRL_SRC_PROFILE if self.ctrl else pp.CTRL_SRC_NONE),
                 loop_us=self.loop_us, overruns=self.overruns, result=self.result,
-                run_no=self.run_no, result_run=self.result_run)
+                run_no=self.run_no, result_run=self.result_run, reset_index=self.reset_index, note=self.note,
+                sha_state=self.sha_state, dut_sha=self.dut_sha, dut_env=self.dut_env, fault_text=self._fault_text())
+
+    def _fault_text(self) -> str:
+        # The flag follows the RUN schedule clock, independently of the frames exchanged with the H7.
+        if self.state == pp.ST_RUN and self._run_ns is not None:
+            elapsed_ms = (time.monotonic_ns() - self._run_ns) // 1_000_000
+            for row in self._fault_rows:           # earliest ending open window wins
+                if row.start_ms <= elapsed_ms < row.end_ms:
+                    name = FAULT_NAMES.get(row.fault, row.fault)
+                    left_ds = (row.end_ms - elapsed_ms + 99) // 100
+                    return f'LOI {name} {row.target.upper()} {left_ds / 10:.1f}s'[:22]
+        return ''
+
+    def _busy_reason(self) -> str:
+        """Lock held. The reason also fits the three characters left in a reset refusal."""
+        if self.state in pp.ST_ACTIVE:
+            return 'run'
+        if self._probing:
+            return 'H7'
+        if self._checking:
+            return 'chk'
+        if self._querying:
+            return 'DUT'
+        if self._closing:
+            return 'end'
+        if self._wedged:
+            return 'err'
+        return 'PC' if self.busy_check(None) else ''
+
+    def _reset_dut(self) -> int:
+        if self.dut_reset_gpio < 0:
+            self.note = 'DUT reset: no wire'
+            return pp.RES_FAILED
+        result = reset_panel(self.dut_reset_gpio)
+        if result == 'done':
+            self.note = 'DUT reset done'
+            self.dut_sha = self.dut_env = ''
+            self.sha_state = pp.SHA_UNKNOWN
+            return pp.RES_OK
+        print('DUT reset ' + result, flush=True)
+        if result.startswith('skipped'):
+            self.note = 'DUT reset skipped: ' + ('lib' if 'lgpio' in result else 'I/O')
+        else:
+            self.note = 'DUT reset failed: GPIO'
+        return pp.RES_FAILED
+
+    def _set_identity(self, sha: str, env: str, dirty: bool) -> None:
+        # gain_get has no dirty bit. Only a successful RESET DUT clears an observed dirty build.
+        if self.sha_state == pp.SHA_DIRTY:
+            return
+        self.dut_sha = sha.lower() if _SHA12.fullmatch(sha) else ''
+        self.dut_env = env if self.dut_sha else ''
+        if dirty:
+            self.sha_state = pp.SHA_DIRTY
+        elif not self.dut_sha:
+            self.sha_state = pp.SHA_UNKNOWN
+        elif not self.expect_dut:
+            self.sha_state = pp.SHA_NONE
+        else:
+            self.sha_state = pp.SHA_OK if self.dut_sha == self.expect_dut else pp.SHA_MISMATCH
+
+    def _apply_ack(self, ack: dict) -> None:
+        self._t_dut_query = self.clock()
+        self._set_identity(ack.get('sha', ''), ack.get('env', ''), dirty=False)
+
+    def maybe_query_dut(self) -> None:
+        """Called by the idle worker. Release the snapshot lock during the UDP exchange."""
+        with self._lock:
+            if (not self.dut_ip or
+                    (self._t_dut_query is not None and self.clock() - self._t_dut_query < REPROBE_S)
+                    or self._busy_reason()):
+                return
+            self._querying = True
+        ack = {}
+        try:
+            ack = _query_dut(self.dut_ip)
+        finally:
+            with self._lock:
+                self._querying = False
+                self._apply_ack(ack)
+
+    def on_fw_line(self, sha: str, dirty: bool | str, env: str) -> None:
+        """Firmware identity from a DUT #fw line at motor-on."""
+        with self._lock:
+            self._set_identity(sha, env, dirty in (True, '1'))
+            if self.state == pp.ST_RUN:
+                self._check_run_fw()
+
+    def _check_run_fw(self) -> None:
+        if self.proc is not None and self.sha_state in (pp.SHA_DIRTY, pp.SHA_MISMATCH):
+            self._fw_error = 'DUT FW dirty' if self.sha_state == pp.SHA_DIRTY else 'DUT FW wrong'
+            self.error_code, self.error_text = E_DUT_FW, self._fw_error
+            self._stop_run()
 
     # ── H7 check while idle ───────────────────────────────────────────────
     def probe_h7(self, steps: int = 1500, timeout_s: float = 30.0) -> bool:
@@ -423,8 +590,7 @@ class HilDaemon:
         frames were checked and none had a bad CRC or was empty (hil_node '#miso' line).
         Refused (False, h7_ok unchanged) while a run is active or another run_hil.py runs."""
         with self._lock:
-            if (self.state in pp.ST_ACTIVE or self._probing or self._closing or self._wedged
-                    or self.busy_check(None)):
+            if self._busy_reason():
                 return False
             self._probing, self._t_probe = True, self.clock()
         argv = self.child_cmd(['--fixed-omega', '0,0,0,0', '--imu-static', '0,0,0,9.81,0',
@@ -560,7 +726,7 @@ class HilDaemon:
         t_end = time.monotonic() + wait_s
         while time.monotonic() < t_end:
             with self._lock:
-                if self.proc is None and not self._probing:
+                if self.proc is None and not self._probing and not self._querying:
                     return not self._wedged
                 probe = self._probe_proc            # read again each time (PPI-R3-1)
             if probe is not None and probe is not killed:
@@ -569,16 +735,16 @@ class HilDaemon:
             time.sleep(0.05)
         return False
 
-    def _open_run_dir(self, name: str, argv: List[str]) -> None:
+    def _open_run_dir(self, name: str) -> None:
         now = _dt.datetime.now()
         run_id = f'{now:%Y%m%d_%H%M%S}_{name}_{secrets.token_hex(2)}'
-        self.run_dir = os.path.join(self.runs_dir, run_id)
-        os.makedirs(self.run_dir, exist_ok=False)
+        path = os.path.join(self.runs_dir, run_id)
+        os.makedirs(path, exist_ok=False)
+        self.run_dir = path
         self._meta = {'run_id': run_id, 'run_no': self.run_no, 'mode': 'panel', 'data_valid': False,
                       'data_valid_why': 'panel run = quick look / demo (L79, workflow use 1)',
-                      'test': name, 'argv': argv, 'ctrl_declared': self.ctrl or None, 'swa_mode': None,
+                      'test': name, 'ctrl_declared': self.ctrl or None, 'swa_mode': None,
                       'pi_checkout': self._checkout, 'started': now.isoformat(timespec='seconds')}
-        self._write_meta()
 
     def _write_meta(self) -> None:
         """meta.json; a write error (full card) is kept in memory, never stops the run (PPI-6)."""
@@ -607,10 +773,12 @@ class HilDaemon:
                 self._stop_pending = False
                 self._signal(self.proc, 0)
             st = _PHASE_ST[m.group(1)]
-            if m.group(1) == 'RUN':
-                self.h7_ok = True                  # ARM leaves only after 1 s of fresh H7 answers
+            self._run_ns = int(m.group(2)) if st == pp.ST_RUN else None
             if st != self.state:
                 self._enter(st)
+            if st == pp.ST_RUN:
+                self.h7_ok = True                  # ARM leaves only after 1 s of fresh H7 answers
+                self._check_run_fw()               # the motor-on #fw can reach us before this stdout line
             return
         m = _RE_WHOLE.search(line) or _RE_STATS.search(line)
         if m:
@@ -693,7 +861,7 @@ class HilDaemon:
                 self.quality |= pp.Q_SPI_STALE
                 self.h7_ok = False
         outcome = (summary or {}).get('outcome') or ''
-        lines = [f'{outcome or "no summary"} #{self.run_no}'[:pp.RESULT_LEN]]
+        lines = [f'{self._fw_error or outcome or "no summary"} #{self.run_no}'[:pp.RESULT_LEN]]
         if last is not None:
             p99 = '-' if last[0] is None else f'{last[0]:.0f}'
             lines.append(f'p99 {p99} max {last[1]:.0f}us'[:pp.RESULT_LEN])
@@ -703,6 +871,8 @@ class HilDaemon:
             # a process of the run would not die even by SIGKILL: it may hold the SPI
             self._fail(E_GROUP, 'run process left', 'process group of the run still alive after SIGKILL')
             self._wedged = True                    # START stays BUSY until the daemon restarts
+        elif self._fw_error:
+            self._fail(E_DUT_FW, self._fw_error, self._fw_error)
         elif summary is None:
             self._fail(E_NO_SUMMARY, f'no summary rc {rc}', f'run_hil.py exit {rc} without #run_summary')
         elif outcome.startswith('error:') or rc != 0:
@@ -732,6 +902,10 @@ def main(argv=None) -> int:
                     help='skip only the H7 check at start; the idle re-check still turns the light on (PPI-8)')
     ap.add_argument('--panel-reset-gpio', type=int, default=PANEL_RESET_GPIO,
                     help='BCM GPIO wired to the panel EN (pulled low once at start); -1 = no wire')
+    ap.add_argument('--dut-reset-gpio', type=int, default=DUT_RESET_GPIO,
+                    help='BCM GPIO wired to DUT EN for RESET DUT (-1 = no wire)')
+    ap.add_argument('--dut-ip', type=ipaddress.IPv4Address, help='DUT IPv4 address for read-only firmware queries')
+    ap.add_argument('--expect-dut', type=_expected_sha, help='expected DUT firmware SHA (12 hex digits)')
     ap.add_argument('--lock-dir', default=os.path.expanduser('~/.hil_panel_locks'),
                     help='lock folder: one daemon per account and folder (never change it in use)')
     a = ap.parse_args(argv)
@@ -745,7 +919,8 @@ def main(argv=None) -> int:
     os.makedirs(a.lock_dir, exist_ok=True)
     with pp._FileLock(os.path.join(a.lock_dir, 'hil_daemon.lock'), timeout_s=0.5), \
             pp._FileLock(a.epoch_file + '.owner', timeout_s=0.5):
-        daemon = HilDaemon(a.runs_dir, ctrl=a.ctrl, mock=a.mock)
+        daemon = HilDaemon(a.runs_dir, ctrl=a.ctrl, mock=a.mock, dut_reset_gpio=a.dut_reset_gpio,
+                           dut_ip=a.dut_ip, expect_dut=a.expect_dut)
         try:
             return _serve_panel(a, daemon, serial, PanelLink, nonblocking_writer, serve)
         except KeyboardInterrupt:
@@ -788,20 +963,21 @@ def _serve_panel(a, daemon, serial, PanelLink, nonblocking_writer, serve) -> int
         print(f'panel reset GPIO{a.panel_reset_gpio}:', reset_panel(a.panel_reset_gpio), flush=True)
     if a.mock:
         daemon.h7_ok = True                        # fake H7 of run_hil.py --mock always answers
-    else:
-        if not a.no_probe:
-            print('H7 probe ...', flush=True)
-            print('H7 probe:', 'answers' if daemon.probe_h7()
-                  else f'NO ANSWER (panel START blocked; probing again every {REPROBE_S:.0f} s while idle)',
-                  flush=True)
+    elif not a.no_probe:
+        print('H7 probe ...', flush=True)
+        print('H7 probe:', 'answers' if daemon.probe_h7()
+              else f'NO ANSWER (panel START blocked; probing again every {REPROBE_S:.0f} s while idle)',
+              flush=True)
 
+    if not a.mock or daemon.dut_ip:
         def reprobe_loop():
             while not daemon._closing:              # PPI-R2-2: no probe once shutdown started
                 r = daemon.maybe_reprobe()
                 if r is not None:
                     print('H7 re-probe:', 'answers' if r else 'no answer', flush=True)
+                daemon.maybe_query_dut()
                 time.sleep(1.0)
-        threading.Thread(target=reprobe_loop, name='h7-reprobe', daemon=True).start()
+        threading.Thread(target=reprobe_loop, name='idle-probes', daemon=True).start()
     port = open_uart_when_ready(serial, a.port, a.baud)
     with port:
         epoch = pp.next_daemon_epoch(a.epoch_file, create=a.create_epoch)   # only once the UART is up
