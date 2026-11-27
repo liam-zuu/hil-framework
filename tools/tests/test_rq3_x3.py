@@ -639,8 +639,12 @@ def test_x3v2_9_round3_freeze_and_final_same_second(tmp_path, monkeypatch):
     assert (frozen['frozen_at'], run['row']['wall_start']) == (t.isoformat(), t.replace(microsecond=123457).isoformat())
 
 
-@pytest.mark.parametrize('run_id,folder', [('R1', 'results/S03/R1'), ('R1', 'results/S3/R1'), ('S03X', 'r')])
-def test_x3_1_round4_machine_without_kind(tmp_path, run_id, folder):
+@pytest.mark.parametrize('run_id,folder,spec', [('R1', 'results/S03/R1', 'S03'), ('R1', 'results/S3/R1', 'S3'),
+                                                ('S03X', 'r', 'S03')])
+def test_x3_1_round4_machine_without_kind(tmp_path, run_id, folder, spec):
+    result = tmp_path / folder
+    result.mkdir(parents=True)
+    (result / 'meta.yaml').write_text(f'spec: {spec} v8\n', encoding='utf-8')
     args = ['--dataset', str(tmp_path), 'machine', '--campaign', 'RQ2', '--controller', 'PID',
             '--script-run-id', run_id, '--results-dir', folder, '--n-sim-evals', '300',
             '--t-machine-s', '600', '--wall-start', P1[1], '--wall-end', P1[2]]
@@ -660,6 +664,57 @@ def test_x3_1_round4_phase_cannot_be_charged_twice(tmp_path, previous):
     with pytest.raises(rl.LogError, match='duplicate phase'):
         rl.machine_phases(ds, 'S03', 'R2', 'results/S03/R2', phases)
     assert rl.read_rows(str(tmp_path / rl.TUNING)) == rows
+
+
+def test_x3_1_round5_machine_reads_run_spec(tmp_path):
+    folder = tmp_path / 'results/S03Run01'
+    folder.mkdir(parents=True)
+    (folder / 'meta.yaml').write_text('spec: S03 v8 (S03 DOE)\n', encoding='utf-8')
+    with pytest.raises(rl.LogError, match='machine-phases'):
+        rl.machine(str(tmp_path), 'RQ2', 'PID', 'R1', 'results/S03Run01', 300, 600, *P1[1:3])
+    assert not (tmp_path / rl.TUNING).exists()
+
+
+def test_x3v4_1_round5_s04_under_s3(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    ds = tmp_path / 'dataset'
+    ds.mkdir()
+    folder = Path('results/cache/S3/S04/R1')
+    folder.mkdir(parents=True)
+    (folder / 'meta.yaml').write_text('spec: "S04 v6"\ns03_run: results/S03/R1\n', encoding='utf-8')
+    for run_id in ('S04-R1', 'S03X'):
+        row = rl.machine(str(ds), 'RQ2', 'PID', run_id, str(folder), 300, 600, *P1[1:3])
+        assert row['script_run_id'] == run_id
+
+
+@pytest.mark.parametrize('previous', [False, True])
+@pytest.mark.parametrize('alias', ['dot', 'absolute', 'locator'])
+def test_x3_1_round5_same_phase_citations(tmp_path, monkeypatch, previous, alias):
+    monkeypatch.chdir(tmp_path)
+    ds = tmp_path / 'dataset'
+    ds.mkdir()
+    (ds / 'console.txt').touch()
+    (ds / 'counts.txt').touch()
+    refs = ('./console.txt@09:00:00.100', './counts.txt:7-7')
+    if alias == 'dot':
+        other = (refs[0][2:], refs[1])
+    elif alias == 'absolute':
+        other = (f'{ds / "console.txt"}@09:00:00.100', 'dataset/counts.txt:7-7')
+    else:
+        other = ('./console.txt:09:00:00.1', './counts.txt:7')
+    original = (*P1[:7], *refs)
+    duplicate = ('RQ2', *P1[1:7], *other)
+    phases = [duplicate]
+    if previous:
+        rl.machine_phases(str(ds), 'S03', 'first', 'r', [original, P2])
+    else:
+        phases.insert(0, original)
+    before = rl.read_rows(ds / rl.TUNING)
+    with pytest.raises(rl.LogError, match='duplicate phase'):
+        rl.machine_phases(str(ds), 'S03', 'second', 'r', phases)
+    assert rl.read_rows(ds / rl.TUNING) == before
+    different = (*duplicate[:8], './counts.txt:7-8')
+    assert rl.machine_phases(str(ds), 'S03', 'distinct', 'r', [different] if previous else [original, different])
 
 
 def _begin_final(ds, row):
@@ -752,6 +807,35 @@ def test_x3v2_3_round4_end_checks_projected_log(tmp_path, plat, stage, prior, n,
     with pytest.raises(rl.LogError, match=reason):
         rl.end(ds, 'dat', **_final_evidence(row))
     assert p.read_bytes() == before and rl._load_open(ds)
+
+
+@pytest.mark.parametrize('platform,stage', [('SIM', 'final_hil'), ('HW', 'final_hil'),
+                                            ('SIM', 'final'), ('HIL', 'final')])
+def test_x3v2_3_round5_begin_platform(tmp_path, platform, stage):
+    campaign = 'RQ2' if stage == 'final_hil' else 'RQ2-INIT-PID'
+    assert rl.main(['--dataset', str(tmp_path), 'begin', '--session', 'S', '--platform', platform,
+                    '--stage', stage, '--campaign', campaign, '--controller', 'PID', '--task', 'O1-F05',
+                    '--speed', '.5', '--gain-set', 'RQ2-INIT-PID/G0']) != 0
+    assert not rl._load_open(str(tmp_path))
+
+
+@pytest.mark.parametrize('prior,n', [('dat', 5), ('hong_he_do', 3)])
+def test_x3v2_3_round5_sim_cannot_extend_hil_cell(tmp_path, prior, n):
+    args = ('HIL', 'final_hil', 'PID', 'O1-F05', 'RQ2-INIT-PID/G0')
+    row = write_run(tmp_path, 'new', *args, 'dat', .03)
+    history = [write_run(tmp_path, f'past{i}', *args, prior, .03) for i in range(n)]
+    ds = _table_ds(tmp_path, history)
+    wrong = dict(row, platform='SIM')
+    rl._save_open(ds, dict(row=wrong, segments=[], current=None, paused_from=None))
+    path = Path(ds) / rl.TUNING
+    before = path.read_bytes()
+    with pytest.raises(rl.LogError, match='platform'):
+        rl.end(ds, 'dat', **_final_evidence(row))
+    assert path.read_bytes() == before and rl._load_open(ds)
+    rl.append_row(str(path), rl.TUNING_COLS, wrong)
+    for read, error in ((rl.summary, rl.LogError), (LR, ValueError)):
+        with pytest.raises(error, match='platform'):
+            read(ds)
 
 
 def test_x3v3_2_round4_unused_freeze_file_only_blocks_summary(tmp_path):

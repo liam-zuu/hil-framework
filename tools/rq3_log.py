@@ -284,6 +284,7 @@ def floor_effort(ghi_chu: str) -> str:
     return next((label for label in (CLIP_H_NOTE, '12b') if g.startswith(label)), '')
 OUTCOMES = ('dat', 'khong_dat', 'chua_ket_luan', 'hong_he_do')
 PLATFORMS = ('SIM', 'HIL', 'HW')
+FINAL_PLATFORMS = {'final': 'HW', 'final_hil': 'HIL'}
 STEPS = ('flash', 'setup', 'run', 'log', 'analysis')
 CAUSES = ('gain', 'cong_cu_HIL', 'phan_cung_ngau_nhien', 'chua_ro')
 CAP_H, CAP_HW = 10.0, 120               # S05 §4.1: per campaign, tune part only
@@ -341,6 +342,13 @@ def _nonnegative(value, field, count=False) -> None:
         raise LogError(f'{field}: expected a {kind} >= 0, got {value!r}')
 
 
+def check_final_platform(row):
+    stage = row.get('stage')
+    if stage in FINAL_PLATFORMS and row.get('platform') != FINAL_PLATFORMS[stage]:
+        raise LogError(f"{row.get('run_uid')}: {stage} requires platform {FINAL_PLATFORMS[stage]}, "
+                       f"got {row.get('platform')!r}")
+
+
 def check_account_row(row, kind, legacy=False) -> None:
     campaign = row.get('campaign' if kind == TUNING else 'chien_dich') or ''
     account = row.get('khoan') or ''
@@ -353,6 +361,7 @@ def check_account_row(row, kind, legacy=False) -> None:
     if ctrl not in ('', 'PID', 'LADRC'):
         raise LogError(f'{kind}: controller {ctrl!r}, expected PID, LADRC or empty')
     if kind == TUNING:
+        check_final_platform(row)
         owner = campaign.split('-')[-1]
         if owner in ('PID', 'LADRC') and ctrl != owner:
             raise LogError(f'{kind}: controller {ctrl!r} does not match {campaign}')
@@ -1840,6 +1849,7 @@ def check_gate_rows(tun: List[dict], gate_file=None) -> None:
     O1 v11.33: gate_file (gate_c8.GateC8, the summary's --gate-file) gives the so_do set of every gate row
     (row_so_do) and the SHA its gate must carry (gate_file_problem)."""
     for r in tun:
+        check_final_platform(r)
         if r.get('gate_report_only'):                   # SD1-7 (Codex 24/11 round 2): on every row, also one that
             raise LogError(f"{r.get('run_uid')}: gate_report_only {r.get('gate_report_only')!r}: report only is no "
                            'rule since 23/11; the column of before is refused on every row (SD1-7)')   # has no gate
@@ -2871,7 +2881,7 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     evidence_row = dict(run['row'], results_dir=results_dir, esp32_log=esp32_log)
     if esp32_log:
         esp32_path(evidence_row, _results_dir(evidence_row, ds, existing=False))
-    final_boot = (plat, stage) in (('HW', 'final'), ('HIL', 'final_hil'))
+    final_boot = stage in FINAL_PLATFORMS and plat == FINAL_PLATFORMS[stage]
     if not bbad and final_boot and fail_cause == BOOT_FAIL and queries:
         bbad, _ = final_boot_problem(evidence_row, ds, queries)
     if bbad and not (outcome == 'hong_he_do' and fail_cause == BOOT_FAIL):   # R134 (b)
@@ -3118,13 +3128,34 @@ def _machine_row(it, campaign, controller, script_run_id, results_dir, n_sim_eva
     return row
 
 
+def _phase_script_result(ds, results_dir):
+    folder = _results_dir({'results_dir': results_dir}, ds)
+    if not folder:
+        return False
+    path = os.path.join(folder, 'meta.yaml')
+    if not os.path.isfile(path):
+        return False
+    try:
+        import yaml
+    except ImportError as exc:
+        raise LogError(f'{path}: reading script metadata requires PyYAML') from exc
+    try:
+        with open(path, encoding='utf-8-sig') as f:
+            meta = yaml.safe_load(f)
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise LogError(f'{path}: cannot read script metadata ({exc})') from exc
+    if not isinstance(meta, dict):
+        raise LogError(f'{path}: expected a metadata mapping')
+    spec = str(meta.get('spec', '')).split()
+    return meta.get('script_kind') in ('S03', 'S3') or bool(spec and spec[0] in ('S03', 'S3'))
+
+
 def machine(ds: str, campaign: str, controller: str, script_run_id: str, results_dir: str, n_sim_evals: int,
             t_machine_s: float, wall_start: str, wall_end: str, platform: str = 'SIM', stage: str = 'script',
             session: str = 'MACHINE', notes: str = '', script_kind: str = '', n_sim_diagnostic: int = 0,
             **active) -> dict:
     """Record one already allocated row of a script run."""
-    if (script_kind in ('S03', 'S3') or re.search(r'(?<![a-z0-9])s0?3(?!\d)', script_run_id or '', re.I)
-            or re.search(r'(?<![a-z0-9])s0?3(?![a-z0-9])', str(results_dir), re.I)):
+    if script_kind in ('S03', 'S3') or _phase_script_result(ds, results_dir):
         raise LogError('S03/S3: use machine-phases to allocate each controller/account from cited phases')
     row = _machine_row(next_iter_no(ds, session), campaign, controller, script_run_id, results_dir, n_sim_evals,
                        t_machine_s, wall_start, wall_end, platform, stage, session, notes, script_kind,
@@ -3135,23 +3166,32 @@ def machine(ds: str, campaign: str, controller: str, script_run_id: str, results
     return row
 
 
-def _phase_source(text, what, script_run_id):
-    """X3-1 (CODE 26/11): the source of a typed phase number, required, one line."""
+def _phase_source(ds, text, what, script_run_id):
+    """Comparison key for a citation, with relative paths based at the dataset, then the working folder."""
     s = text.strip() if isinstance(text, str) else ''
     # Accept a path (including a Windows drive) and a line/range or clock time.
-    locator = r'(?:[1-9]\d*(?:-[1-9]\d*)?|(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?)'
+    locator = r'(?:0*[1-9]\d*(?:-0*[1-9]\d*)?|(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?)'
     match = re.fullmatch(r'((?:[A-Za-z]:)?[^:*?"<>|\r\n]+)[:@](' + locator + ')', s)
     if not match or re.split(r'[/\\]', match[1])[-1].strip() in ('', '.', '..'):
         raise LogError(f'{script_run_id}: source of the phase {what}: use FILE:LINE, FILE:FIRST-LAST '
                        'or FILE@HH:MM:SS on one line')
-    if '-' in match[2]:
-        first, last = map(int, match[2].split('-'))
+    path, position = match.groups()
+    dataset_path = os.path.join(ds, path)
+    if os.path.isfile(dataset_path) or not os.path.isfile(path):
+        path = dataset_path
+    if ':' in position:
+        if '.' in position:
+            position = position.rstrip('0').rstrip('.')
+    else:
+        first, _, last = position.partition('-')
+        first, last = int(first), int(last or first)
         if last < first:
             raise LogError(f'{script_run_id}: source of the phase {what}: reversed line range {match[2]}')
-    return s
+        position = (first, last)
+    return os.path.normcase(os.path.realpath(path)), position
 
 
-def _logged_phase_sources(rows):
+def _logged_phase_sources(ds, rows):
     """Read individual citations, since a machine row may aggregate several phase intervals."""
     sources = set()
     for r in rows:
@@ -3164,7 +3204,8 @@ def _logged_phase_sources(rows):
                 m = re.fullmatch(r'(.+?)\.\.(.+?) PID \d+/\d+ LADRC \d+/\d+ \(gio: (.+); so: (.+)\)', citation)
                 if not m:
                     raise LogError(f"{r.get('run_uid')}: cannot read logged phase source {citation!r}")
-                sources.add((_parse_t(m[1]), _parse_t(m[2]), m[3], m[4]))
+                sources.add((_parse_t(m[1]), _parse_t(m[2]), _phase_source(ds, m[3], 'start/end', r['run_uid']),
+                             _phase_source(ds, m[4], 'counts', r['run_uid'])))
     return sources
 
 
@@ -3183,21 +3224,21 @@ def machine_phases(ds, script_kind, script_run_id, results_dir, phases, notes=''
     existing = read_rows(path)
     if any(r.get('script_run_id') == script_run_id for r in existing):
         raise LogError(f'{script_run_id}: duplicate script import')
-    sources = _logged_phase_sources(existing)
+    sources = _logged_phase_sources(ds, existing)
     for ph in phases:
         if len(ph) != 9:
             raise LogError(f'{script_run_id}: a phase needs 9 fields (ACCOUNT START END N_PID N_LADRC DIAG_PID '
                            f'DIAG_LADRC SOURCE_TIMES SOURCE_COUNTS), got {len(ph)}')
         account, start, end_, pid, ladrc, pid_diag, ladrc_diag, src_t, src_n = ph
-        src_t = _phase_source(src_t, 'start/end', script_run_id)
-        src_n = _phase_source(src_n, 'counts', script_run_id)
+        time_ref = _phase_source(ds, src_t, 'start/end', script_run_id)
+        count_ref = _phase_source(ds, src_n, 'counts', script_run_id)
         try:
             t0, t1 = _parse_t(start), _parse_t(end_)
             elapsed = (t1 - t0).total_seconds()
         except (ValueError, TypeError) as exc:
             raise LogError(f'{script_run_id}: invalid phase interval {start!r} to {end_!r}') from exc
         interval = (account, t0, t1)
-        source = (t0, t1, src_t, src_n)
+        source = (t0, t1, time_ref, count_ref)
         if interval in intervals or source in sources:
             raise LogError(f'{script_run_id}: duplicate phase {account} {start}..{end_}')
         intervals.add(interval)
@@ -3218,7 +3259,8 @@ def machine_phases(ds, script_kind, script_run_id, results_dir, phases, notes=''
             total[2] += elapsed * (n / (pid + ladrc) if pid + ladrc else 0.5)
             total[3], total[4] = min(total[3], t0), max(total[4], t1)
         cited.setdefault(account, []).append(
-            f'{start}..{end_} PID {pid}/{pid_diag} LADRC {ladrc}/{ladrc_diag} (gio: {src_t}; so: {src_n})')
+            f'{start}..{end_} PID {pid}/{pid_diag} LADRC {ladrc}/{ladrc_diag} '
+            f'(gio: {src_t.strip()}; so: {src_n.strip()})')
     session = 'MACHINE'
     it = next_iter_no(ds, session)
 
