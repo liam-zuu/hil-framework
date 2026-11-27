@@ -114,7 +114,8 @@ def test_next_iter_no_counts_the_open_run_of_the_same_session(ds):
     d, clock = ds
     rl.begin(d, 'MACHINE', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G1')
     assert rl.next_iter_no(d, 'MACHINE') == 2 and rl.next_iter_no(d, 'OTHER') == 1
-    m = rl.machine(d, 'A-PID', 'PID', 'X', 'r', 1, 10, '2026-11-20T09:00:00', '2026-11-20T09:01:00')
+    m = rl.machine(d, 'A-PID', 'PID', 'X', 'r', 1, 10, '2026-11-20T09:00:00', '2026-11-20T09:01:00',
+                   script_kind='S04')
     rl.step(d, 'run')
     clock[0] += dt.timedelta(seconds=60)
     e = rl.end(d, 'hong_he_do', fail_cause='mat_khung')           # B81-1, -2: a judged car run needs more

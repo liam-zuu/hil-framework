@@ -13,6 +13,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import s05_final_table as T  # noqa: E402
 import rq3_log as rl  # noqa: E402  (R134C4-2: the table runs the log's row checks)
+from gain_send import new_tx
 
 COLS = ['timestamp_us', 'tick', 'log_seq', 'motor_on', 'run_active'] + list(T.WHEELS)
 
@@ -229,7 +230,7 @@ def LR(ds, **kw):
 def ack_text(boot='4753dc47', mac='aa:bb', gid=7, ok=1, ma=0):
     """A saved gain_send.py output of setting set `gid` (hil feat/wifi-gain 331cd76 main; B81-14)."""
     return (f'# send 192.168.1.50:5014 #gain_set,v=1,tx=<new each try>,id={gid},ctrl=PID\n'
-            f'# ack tx=12345,req_id={gid},ok={ok},err=,sha=16702ff0e688,env=pid,mac={mac},boot={boot},id={gid},'
+            f'# ack tx={new_tx()},req_id={gid},ok={ok},err=,sha=16702ff0e688,env=pid,mac={mac},boot={boot},id={gid},'
             'applied_n=1,ctrl=PID\n'
             f'# applied: id={gid} ctrl=PID applied_n=1 mac={mac} boot={boot}\n#ket_qua,ma={ma}\n')
 

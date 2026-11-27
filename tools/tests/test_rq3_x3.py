@@ -15,13 +15,13 @@ from test_s05_final_table import GAIN7_FILE, LR, _table_ds, write_gain_file, wri
 def test_x3_1_subsecond_split_and_source_total(tmp_path):
     ds = str(tmp_path)
     start, end = '2026-11-20T09:00:00', '2026-11-20T09:00:01'
-    row = rl.machine(ds, 'B-chung', 'PID', 'X', 'r', 100, .5, start, end)
+    row = rl.machine(ds, 'B-chung', 'PID', 'X', 'r', 100, .5, start, end, script_kind='S04')
     assert float(row['t_machine_s']) == .5
-    rl.machine(ds, 'B-chung', 'LADRC', 'X', 'r', 200, .5, start, end)
+    rl.machine(ds, 'B-chung', 'LADRC', 'X', 'r', 200, .5, start, end, script_kind='S04')
     with pytest.raises(rl.LogError, match='controller/account'):
-        rl.machine(ds, 'B-chung', '', 'X', 'r', 300, 1, start, end)
+        rl.machine(ds, 'B-chung', '', 'X', 'r', 300, 1, start, end, script_kind='S04')
     with pytest.raises(rl.LogError, match='duplicate'):
-        rl.machine(ds, 'B-chung', 'PID', 'X', 'r', 100, .5, start, end)
+        rl.machine(ds, 'B-chung', 'PID', 'X', 'r', 100, .5, start, end, script_kind='S04')
     rl.append_row(str(tmp_path / rl.TUNING), rl.TUNING_COLS, dict(row, run_uid='source:1', controller=''))
     with pytest.raises(rl.LogError, match='controller/account'):
         rl.summary(ds)
@@ -282,9 +282,9 @@ def test_x3_15_same_account_and_numeric_checks_on_write_and_replay(tmp_path):
     ds = str(tmp_path)
     args = ('B-chung', 'PDI', 'X', 'r', 100, float('inf'), '2026-11-20', '2026-11-21')
     with pytest.raises(rl.LogError, match='controller'):
-        rl.machine(ds, *args)
+        rl.machine(ds, *args, script_kind='S04')
     with pytest.raises(rl.LogError, match='finite number'):
-        rl.machine(ds, args[0], 'PID', *args[2:])
+        rl.machine(ds, args[0], 'PID', *args[2:], script_kind='S04')
     p = str(tmp_path / rl.EFFORT)
     rl.append_row(p, rl.EFFORT_COLS, dict(chien_dich='A-PID', khoan='T_H', gio='1'))
     with pytest.raises(rl.LogError, match='exactly one'):
@@ -675,6 +675,43 @@ def test_x3_1_round5_machine_reads_run_spec(tmp_path):
     assert not (tmp_path / rl.TUNING).exists()
 
 
+@pytest.mark.parametrize('layout', ['missing', 'sealed'])
+def test_x3_1_round6_machine_results_dir(tmp_path, layout):
+    run = tmp_path / 'results' / 'R1'
+    folder = run / 'sealed'
+    match = '--script-kind'
+    if layout == 'sealed':
+        folder.mkdir(parents=True)
+        (run / 'meta.yaml').write_text('spec: S03 v8\n', encoding='utf-8')
+        match = 'machine-phases'
+    args = (str(tmp_path), 'RQ2', 'PID', 'R1', str(folder), 300, 600, *P1[1:3])
+    with pytest.raises(rl.LogError, match=match):
+        rl.machine(*args)
+    assert not (tmp_path / rl.TUNING).exists()
+    if layout == 'sealed':
+        with pytest.raises(rl.LogError, match=match):
+            rl.machine(*args, script_kind='S04')
+    else:
+        assert rl.machine(*args, script_kind='S04')['script_kind'] == 'S04'
+
+
+@pytest.mark.parametrize('metadata', [b'# notes only\n', b'- old\n- format\n', b'\xff\xfe\xff'])
+def test_x3v5_1_round6_machine_s04_metadata(tmp_path, metadata):
+    folder = tmp_path / 'R1'
+    folder.mkdir()
+    (folder / 'meta.yaml').write_bytes(metadata)
+    args = ['--dataset', str(tmp_path), 'machine', '--campaign', 'RQ2', '--controller', 'PID',
+            '--script-run-id', 'R1', '--results-dir', 'R1', '--n-sim-evals', '300', '--t-machine-s', '600',
+            '--wall-start', P1[1], '--wall-end', P1[2]]
+    with pytest.raises(rl.LogError, match='--script-kind'):
+        rl.machine(str(tmp_path), 'RQ2', 'PID', 'R1', 'R1', 300, 600, *P1[1:3])
+    assert not (tmp_path / rl.TUNING).exists()
+    assert rl.main(args + ['--script-kind', 'S04']) == 0
+    row, = rl.read_rows(str(tmp_path / rl.TUNING))
+    assert (row['script_kind'], row['t_machine_s'], row['n_sim_evals']) == ('S04', '600.0', '300')
+    assert rl.summary(str(tmp_path))
+
+
 def test_x3v4_1_round5_s04_under_s3(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     ds = tmp_path / 'dataset'
@@ -970,6 +1007,45 @@ def test_x3v4_2_round5_ack_must_belong_to_run(tmp_path):
         rl.summary(ds)
     with pytest.raises(ValueError, match='results_dir'):
         LR(ds)
+
+
+@pytest.mark.parametrize('borrow', ['applied_n', 'same_path', 'copy'])
+def test_x3v5_2_round6_session_ack(tmp_path, borrow):
+    session = tmp_path / 'session'
+    pi = session / 'pi'
+    pi.mkdir(parents=True)
+    rows = []
+    for name in ('A', 'B'):
+        row = write_run(session, name, 'HIL', 'final_hil', 'PID', 'O1-F05', 'A-PID/G07', 'dat', .03)
+        source = Path(row['results_dir'])
+        for suffix in ('.csv', '.csv.events.txt'):
+            (source / ('esp32' + suffix)).rename(pi / (name + suffix))
+        (source / 'gain_ack.txt').rename(pi / (name + '_gain_ack.txt'))
+        (session / 'score.json').write_bytes((source / 'score.json').read_bytes())
+        row.update(results_dir=str(session), esp32_log=f'pi/{name}.csv', gain_ack_file=f'pi/{name}_gain_ack.txt')
+        rows.append(row)
+    a, b = rows
+    if borrow == 'copy':
+        (pi / 'B_gain_ack.txt').write_bytes((pi / 'A_gain_ack.txt').read_bytes())
+    else:
+        b['gain_ack_file'] = 'pi/./A_gain_ack.txt'
+    if borrow == 'applied_n':
+        q = Path(b['query_before_file'])
+        q.write_text(q.read_text().replace('applied_n=1', 'applied_n=2'))
+        b['query_before_sha256'] = rl.sha256_file(str(q))
+    ds = _table_ds(tmp_path, [a])
+    _begin_final(ds, b)
+    log = Path(ds) / rl.TUNING
+    before = log.read_bytes()
+    match = 'applied_n' if borrow == 'applied_n' else 'ACK'
+    with pytest.raises(rl.LogError, match=match):
+        rl.end(ds, 'dat', **_final_evidence(b), esp32_log=b['esp32_log'], gain_ack=b['gain_ack_file'])
+    assert log.read_bytes() == before and rl._load_open(ds)
+    # A mismatched counter alone must also fail replay, even if A was never logged.
+    rl._write_all(str(log), rl.TUNING_COLS, [b] if borrow == 'applied_n' else rows)
+    for read, error in ((rl.summary, rl.LogError), (LR, ValueError)):
+        with pytest.raises(error, match=match):
+            read(ds)
 
 
 def test_x3v4_3_round5_lost_after_so_h(tmp_path):

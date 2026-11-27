@@ -47,7 +47,8 @@ Commands (the operator types them while working; every time stamp is the PC cloc
                                          step (S05 §3.3: every started run counts, EA-6); time of the
                                          steps already logged goes to m7_dev_effort_log.csv
   machine --campaign C --controller PID --script-run-id ID --results-dir D --n-sim-evals N
-         --t-machine-s S --wall-start T --wall-end T [--n-sim-diagnostic N]   allocated fwsim script row
+         --t-machine-s S --wall-start T --wall-end T [--n-sim-diagnostic N] [--script-kind S04]
+                                         declare the kind when the result folder or its metadata is unavailable
   machine-phases --script-kind S03|S3 --script-run-id ID --results-dir D
          --phase ACCOUNT START END N_PID N_LADRC DIAG_PID DIAG_LADRC SOURCE_TIMES SOURCE_COUNTS
                                          repeat for each elapsed phase, including bo. Cite both sources
@@ -98,6 +99,7 @@ import re
 import struct
 import sys
 from collections import defaultdict
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import c7_drift_evidence as drift_evidence
@@ -1422,6 +1424,34 @@ def gain_ack_path(row, results_dir, default='gain_ack.txt'):
     if (results_dir or row.get('gain_ack_file')) and not (results_dir and _inside(path, results_dir)):
         raise LogError(f'{name!r}: gain ACK must resolve under the results_dir of the run')
     return path
+
+
+def check_final_ack_files(rows, ds, default='gain_ack.txt'):
+    """Each saved gain-setting output belongs to one final run, even if copied or renamed."""
+    paths, hashes = {}, {}
+    for row in rows:
+        if row.get('stage') not in FINAL_PLATFORMS or row.get('campaign') not in CAMPAIGNS:
+            continue
+        if not row.get('gain_ack_file') and row.get('run_outcome') not in VALID:
+            continue  # A lost run need not have an ACK.
+        folder = _results_dir(row, ds, existing=False)
+        if not folder:
+            continue
+        path = gain_ack_path(row, folder, default)
+        uid = row.get('run_uid')
+        key = os.path.normcase(os.path.realpath(path))
+        if key in paths:
+            raise LogError(f'{uid}: gain ACK {path!r} already used by {paths[key]}')
+        paths[key] = uid
+        try:
+            digest = sha256_file(path)
+        except FileNotFoundError:
+            continue  # Required evidence is checked against the outcome after so-h.
+        except OSError as exc:
+            raise LogError(f'{uid}: cannot read gain ACK {path!r}: {exc}') from exc
+        if digest in hashes:
+            raise LogError(f'{uid}: gain ACK {path!r} has the same SHA-256 as the ACK of {hashes[digest]}')
+        hashes[digest] = uid
 
 
 def _inside(path: str, folder: str) -> bool:
@@ -3018,6 +3048,7 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     if stage in ('final', 'final_hil'):
         # Earlier clip-H comparisons already known at end can free a slot or reveal a stop.
         check_final_limits(apply_so_h(after[:-1], ds) + [row])
+        check_final_ack_files(after, ds)
     check_map_rows([row])
     check_c8b_rows(after)                              # GT1-8: the time file of no other run
     if any(r.get('fail_cause') == KHONG_NUT for r in after):
@@ -3098,6 +3129,10 @@ def cancel(ds: str) -> dict:
 
 
 # ── rows not tied to one live run ─────────────────────────────────────────
+PHASE_KINDS = ('S03', 'S3')
+MACHINE_KINDS = (*PHASE_KINDS, 'S04')
+
+
 def check_machine_rows(rows):
     seen = set()
     kinds = {}
@@ -3106,16 +3141,17 @@ def check_machine_rows(rows):
         if not sid:
             continue
         c, ctrl, kind = r.get('campaign'), r.get('controller'), r.get('script_kind') or ''
-        accounts = {'': CAMPAIGNS, 'S03': ('B-chung', 'RQ2'), 'S3': ('RQ2',)}
+        accounts = {'': CAMPAIGNS, 'S04': CAMPAIGNS, 'S03': ('B-chung', 'RQ2'), 'S3': ('RQ2',)}
         if (not ctrl or c not in accounts.get(kind, ()) or
-                (kind and (r.get('platform'), r.get('stage')) != ('SIM', 'script'))):
+                (kind in PHASE_KINDS and (r.get('platform'), r.get('stage')) != ('SIM', 'script'))):
             raise LogError(f'{sid}: invalid controller/account for script {kind!r} ({ctrl!r}, {c!r})')
         if _f(r.get('n_sim_diagnostic')) > _f(r.get('n_sim_evals')):
             raise LogError(f'{sid}: diagnostic count exceeds actual count')
         key = sid, ctrl, c
         if key in seen:
             raise LogError(f'{sid}: duplicate script row for {ctrl}, {c}')
-        if kinds.setdefault(sid, kind) != kind:
+        phase_kind = kind if kind in PHASE_KINDS else ''  # Older allocated rows have no kind.
+        if kinds.setdefault(sid, phase_kind) != phase_kind:
             raise LogError(f'{sid}: inconsistent script_kind')
         seen.add(key)
 
@@ -3141,13 +3177,7 @@ def _machine_row(it, campaign, controller, script_run_id, results_dir, n_sim_eva
     return row
 
 
-def _phase_script_result(ds, results_dir):
-    folder = _results_dir({'results_dir': results_dir}, ds)
-    if not folder:
-        return False
-    path = os.path.join(folder, 'meta.yaml')
-    if not os.path.isfile(path):
-        return False
+def _metadata_script_kind(path):
     try:
         import yaml
     except ImportError as exc:
@@ -3155,12 +3185,46 @@ def _phase_script_result(ds, results_dir):
     try:
         with open(path, encoding='utf-8-sig') as f:
             meta = yaml.safe_load(f)
-    except (OSError, UnicodeError, yaml.YAMLError) as exc:
-        raise LogError(f'{path}: cannot read script metadata ({exc})') from exc
-    if not isinstance(meta, dict):
-        raise LogError(f'{path}: expected a metadata mapping')
-    spec = str(meta.get('spec', '')).split()
-    return meta.get('script_kind') in ('S03', 'S3') or bool(spec and spec[0] in ('S03', 'S3'))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return None
+    if isinstance(meta, dict):
+        spec = str(meta.get('spec', '')).split()
+        labels = (meta.get('script_kind'), spec[0] if spec else '')
+        return next((kind for kind in MACHINE_KINDS if kind in labels), None)
+
+
+def _check_machine_kind(ds, results_dir, declared):
+    phase_error = 'S03/S3: use machine-phases to allocate each controller/account from cited phases'
+    if declared in PHASE_KINDS:
+        raise LogError(phase_error)
+    result = _results_dir({'results_dir': results_dir}, ds, existing=False)
+    if not result:
+        raise LogError('machine needs --results-dir')
+    folder = Path(result).resolve()
+    dataset = Path(ds).resolve()
+    ancestors = (folder, *folder.parents)
+    # The dataset and its sibling results tree may be outside the working directory.
+    root = next((p for p in ancestors if p == dataset or p.name.lower() == '05_data'), None)
+    if root is None:
+        root = next((p for p in reversed(ancestors) if p.name.lower() == 'results'), None)
+    if root is None:
+        root = next((p for p in ancestors if p in (dataset.parent, Path.cwd())), folder)
+    identified = False
+    unknown = None
+    for parent in ancestors:
+        path = parent / 'meta.yaml'
+        if path.is_file():
+            kind = _metadata_script_kind(path)
+            if kind in PHASE_KINDS:
+                raise LogError(f'{path}: {phase_error}')
+            if kind:
+                identified = True
+            else:
+                unknown = path
+        if parent == root:
+            break
+    if not declared and (not folder.is_dir() or not identified or unknown):
+        raise LogError(f'{unknown or folder}: declare --script-kind to identify the script run')
 
 
 def machine(ds: str, campaign: str, controller: str, script_run_id: str, results_dir: str, n_sim_evals: int,
@@ -3168,8 +3232,7 @@ def machine(ds: str, campaign: str, controller: str, script_run_id: str, results
             session: str = 'MACHINE', notes: str = '', script_kind: str = '', n_sim_diagnostic: int = 0,
             **active) -> dict:
     """Record one already allocated row of a script run."""
-    if script_kind in ('S03', 'S3') or _phase_script_result(ds, results_dir):
-        raise LogError('S03/S3: use machine-phases to allocate each controller/account from cited phases')
+    _check_machine_kind(ds, results_dir, script_kind)
     row = _machine_row(next_iter_no(ds, session), campaign, controller, script_run_id, results_dir, n_sim_evals,
                        t_machine_s, wall_start, wall_end, platform, stage, session, notes, script_kind,
                        n_sim_diagnostic, active)
@@ -3746,6 +3809,7 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
                 raise LogError(f"{r.get('run_uid')}: {exc}")
     check_machine_rows(tun)
     stopped = check_finals(tun)
+    check_final_ack_files(raw, ds, gain_ack_name)
     for r in tun:
         if r.get('esp32_log'):
             esp32_path(r, _results_dir(r, ds, existing=False))
@@ -4363,14 +4427,14 @@ def main(argv=None) -> int:
     m.add_argument('--n-sim-evals', type=int, required=True)
     m.add_argument('--t-machine-s', type=float, required=True)
     m.add_argument('--n-sim-diagnostic', type=int, default=0)
-    m.add_argument('--script-kind', choices=('S03', 'S3'), default='', help='S03 and S3 require machine-phases')
+    m.add_argument('--script-kind', choices=MACHINE_KINDS, default='', help='S03 and S3 require machine-phases')
     m.add_argument('--platform', default='SIM', choices=PLATFORMS)
     m.add_argument('--stage', default='script', choices=STAGES)
     m.add_argument('--notes', default='')
     for k in STEPS:
         m.add_argument(f'--t-{k}-s', type=float)
     mp = sub.add_parser('machine-phases', help='allocate elapsed S03 or S3 phases and record their totals')
-    mp.add_argument('--script-kind', required=True, choices=('S03', 'S3'))
+    mp.add_argument('--script-kind', required=True, choices=PHASE_KINDS)
     mp.add_argument('--script-run-id', required=True)
     mp.add_argument('--results-dir', required=True)
     mp.add_argument('--phase', nargs=9, action='append', required=True,

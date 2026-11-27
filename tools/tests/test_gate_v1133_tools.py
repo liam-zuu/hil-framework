@@ -551,7 +551,8 @@ def test_c8b_final_follows_the_lost_in_a_row_rule(ds):
             rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, f'f{i}'),
                    results_dir=str(tmp), queries=rl.fake_queries())
         else:
-            end_with_trial(d, 'dat', completed=1, e_perp_max=0.02, results_dir=str(tmp),
+            # X3V5-2: one saved ACK per judged final run, so each such run has its own results_dir
+            end_with_trial(d, 'dat', completed=1, e_perp_max=0.02, results_dir=os.path.join(str(tmp), f'r{i}'),
                    gate=rl.floor_gate(rl.fake_gate(gate_file=gf)), gate_file=gf, queries=rl.fake_queries())
     assert rl.c8b_refusals(rl.read_rows(os.path.join(d, rl.TUNING))) == {}
 

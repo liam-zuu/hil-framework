@@ -432,6 +432,10 @@ def ack_problem(ack, before, run_gain=None):
                 'lai sau khi dat gain (gain da mat) hay file ack cu')
     if (ack.get('mac') or '').lower() != (before.get('mac') or '').lower():
         return f'mac #gain_ack {ack.get("mac")} khac mac hai lan hoi {before.get("mac")}: board khac'
+    if 'applied_n' in ack and 'applied_n' in before:
+        a, b = ack['applied_n'], before['applied_n']
+        if not _dec(a) or not _dec(b) or int(a) != int(b):
+            return f'applied_n #gain_ack {a!r} khong khop lan hoi truoc {b!r}'
     if run_gain is not None:
         # R134C6-2 (Codex round 6): both ids present and decimal before they are compared; two missing or two empty
         # ids are no match

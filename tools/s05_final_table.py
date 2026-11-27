@@ -523,6 +523,7 @@ def load_runs(dataset, score_name, esp32_name, gain_ack_name='gain_ack.txt', ini
         if miss:          # C9D-2 (Liam 17/11 at CODE_C13 "Sửa cả 7 + vòng 2 (Recommended)"): no table before so-h
             raise rl.LogError('luot xe kiem cuoi da phan chua so clip H (lenh rq3_log so-h, ca luot duoi nguong): '
                               + ', '.join(r.get('run_uid', '') for r in miss) + ' (C9D-2)')
+        rl.check_final_ack_files(rows, dataset, gain_ack_name)
         rows = rl.apply_after(rows, dataset)    # S05 v3.37 4.3 clip H comparison, then C8b v3 §5 (rq3_log.apply_moc)
         stopped = rl.check_finals(rows)
         frozen = rl.freeze_rows(dataset, defer_gain_errors=True)

@@ -24,6 +24,8 @@ import datetime as dt
 import json
 import os
 
+from gain_send import new_tx
+
 WHEELS = ('dpwm_fl', 'dpwm_fr', 'dpwm_rl', 'dpwm_rr')        # s05_final_table.WHEELS
 COLS = ['timestamp_us', 'tick', 'log_seq', 'motor_on', 'run_active'] + list(WHEELS)
 QUERY_NAMES = ('gain_query_before.txt', 'gain_query_after.txt')   # rpi5/pc_sender.py QUERY_NAMES
@@ -108,7 +110,7 @@ def answer(boot: str, gid: int, t: tuple, mac: str = MAC) -> str:
 def ack_text(boot: str, gid: int, mac: str = MAC) -> str:
     """A saved gain_send.py output of setting set `gid` (test_s05_final_table.ack_text)."""
     return (f'# send 192.168.1.50:5014 #gain_set,v=1,tx=<new each try>,id={gid},ctrl=PID\n'
-            f'# ack tx=12345,req_id={gid},ok=1,err=,sha={SHA},env=pid,mac={mac},boot={boot},id={gid},'
+            f'# ack tx={new_tx()},req_id={gid},ok=1,err=,sha={SHA},env=pid,mac={mac},boot={boot},id={gid},'
             'applied_n=1,ctrl=PID\n'
             f'# applied: id={gid} ctrl=PID applied_n=1 mac={mac} boot={boot}\n#ket_qua,ma=0\n')
 

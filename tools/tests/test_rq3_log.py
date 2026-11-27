@@ -232,8 +232,9 @@ def test_summary_accounts_split_caps_and_finals(ds, no_moc):
     rl.effort(d, '2026-11-20', '07:00', '08:00', campaign='A-PID', ghi_chu='lap xe')
     # B-chung: allocated script rows per controller (3600 s each, 100 s setup on PID), 2 h common
     rl.machine(d, 'B-chung', 'PID', 'shared', 'r', 2739, 3600, '2026-11-20T09:00:00', '2026-11-20T10:00:00',
-               t_setup_s=100)
-    rl.machine(d, 'B-chung', 'LADRC', 'shared', 'r', 2739, 3600, '2026-11-20T09:00:00', '2026-11-20T10:00:00')
+               t_setup_s=100, script_kind='S04')
+    rl.machine(d, 'B-chung', 'LADRC', 'shared', 'r', 2739, 3600, '2026-11-20T09:00:00', '2026-11-20T10:00:00',
+               script_kind='S04')
     rl.effort(d, '2026-11-20', '10:00', '12:00', campaign='B-chung', ghi_chu='doc S03')
     rl.hwfail(d, '2026-11-20', 'A1', 'A-PID', 'HW', 'tuot banh', 'phan_cung_ngau_nhien', 0.5, iter_no='2')
     s = {r['campaign']: r for r in rl.summary(d)}
@@ -444,9 +445,10 @@ def test_ea17_and_a_r2_4_explore_out_script_rows_in(ds):
     d, clock = ds
     rl.migrate(d)
     row = rl.machine(d, 'B-chung', 'PID', 'shared', 'r', 2739, 3600, '2026-11-20T09:00:00', '2026-11-20T10:00:00',
-                     t_setup_s=100)
+                     t_setup_s=100, script_kind='S04')
     assert row['stage'] == 'script'
-    rl.machine(d, 'B-PID', 'PID', 'X', 'r', 50, 600, '2026-11-20T10:00:00', '2026-11-20T10:10:00', stage='explore')
+    rl.machine(d, 'B-PID', 'PID', 'X', 'r', 50, 600, '2026-11-20T10:00:00', '2026-11-20T10:10:00',
+               stage='explore', script_kind='S04')
     with pytest.raises(rl.LogError, match='machine'):
         rl.begin(d, 'B1', 'B-PID', 'SIM', 'PID', 'O1-F05', '0.5', 'script')
     b = {r['campaign']: r for r in rl.summary(d)}['B-PID']
@@ -474,7 +476,7 @@ def test_ea3_row_across_a_freeze_is_refused_and_after_freeze_share(ds):
 def test_ea4_n_sim_zero_and_empty(ds):
     d, _ = ds
     rl.migrate(d)
-    rl.machine(d, 'B-PID', 'PID', 'X', 'r', 0, 10, '2026-11-20T09:00:00', '2026-11-20T09:01:00')
+    rl.machine(d, 'B-PID', 'PID', 'X', 'r', 0, 10, '2026-11-20T09:00:00', '2026-11-20T09:01:00', script_kind='S04')
     rl.begin(d, 'B1', 'B-PID', 'SIM', 'PID', 'O1-F05', '0.5', 'screen')
     end_(d, 'dat', results_dir='r', gate=rl.fake_gate())   # one live fwsim run, n_sim_evals empty (SC3-2: gate)
     assert {r['campaign']: r for r in rl.summary(d)}['B-PID']['N_SIM'] == '1'
