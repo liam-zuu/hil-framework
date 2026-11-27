@@ -9,7 +9,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import rq3_log as rl
 import s05_final_table as table
-from test_s05_final_table import GAIN7_FILE, LR, _table_ds, write_run
+from test_s05_final_table import GAIN7_FILE, LR, _table_ds, write_gain_file, write_run
 
 
 def test_x3_1_subsecond_split_and_source_total(tmp_path):
@@ -900,3 +900,99 @@ def test_x3v3_6_round4_manual_minutes_and_exact_freeze(tmp_path):
     rl.effort(ds, '2026-11-20', '08:59', '09:01', campaign='A-PID')
     with pytest.raises(rl.LogError, match='across the freeze'):
         rl.summary(ds)
+
+
+@pytest.mark.parametrize('layout,name,task', [('floor', 'C8-P-F05-1_lai5', 'O1-F05'),
+                                              ('lifted', 'pid_k1a', 'O1-K1'),
+                                              ('bench', 'F05-PID', 'O1-F05')])
+def test_x3v4_2_round5_session_paths(tmp_path, layout, name, task):
+    ds = str(tmp_path)
+    plat, stage = ('HIL', 'final_hil') if layout == 'bench' else ('HW', 'final')
+    row = write_run(tmp_path, 'FAKE_session', plat, stage, 'PID', task, 'RQ2-INIT-PID/G1', 'dat', .03)
+    d = Path(row['results_dir'])
+    capture = Path('pi') / name if layout == 'floor' else Path('pi')
+    (d / capture).mkdir(parents=True)
+    csv_name = (capture / f'{name}.csv').as_posix()
+    for suffix in ('', '.events.txt'):
+        (d / ('esp32.csv' + suffix)).rename(d / (csv_name + suffix))
+    sidecars = d / capture if layout == 'floor' else d
+    (sidecars / f'{name}_sender.txt').write_text('FAKE sender')
+    (d / capture / f'{name}_logger.txt').write_text('FAKE logger')
+    if layout == 'lifted':
+        (sidecars / f'{name}_gain_check.txt').write_text('{"ok":true}\n#ket_qua,ma=0\n')
+    ack_name = (capture / f'{name}_gain_ack.txt').as_posix()
+    (d / 'gain_ack.txt').rename(d / ack_name)
+    write_gain_file(tmp_path / 'gain_init_PID.json')
+    _begin_final(ds, row)
+    args = ['--dataset', ds, 'end', '--outcome', 'dat', '--gate-json', str(d / 'score.json'),
+            '--results-dir', str(d), '--esp32-log', csv_name, '--query-before', row['query_before_file'],
+            '--query-after', row['query_after_file']]
+    assert rl.main(args) == 2
+    assert rl.main(args + ['--gain-ack', ack_name]) == 0
+    saved, = rl.read_rows(str(tmp_path / rl.TUNING))
+    assert (saved['esp32_log'], saved['gain_ack_file']) == (csv_name, ack_name)
+    if plat == 'HW':
+        rl.so_h(ds, saved['run_uid'], rl.fake_score_final(str(d), .5))
+    assert rl.summary(ds)
+    assert LR(ds)[0][0]['values']['tv_duty'] is not None
+    # The successful default copy cannot replace the missing ACK actually logged for the run.
+    (d / ack_name).rename(d / 'gain_ack.txt')
+    with pytest.raises(rl.LogError, match=name + '_gain_ack'):
+        rl.summary(ds)
+    with pytest.raises(ValueError, match=name + '_gain_ack'):
+        LR(ds)
+
+
+def test_x3v4_2_round5_legacy_names(tmp_path):
+    row = write_run(tmp_path, 'r', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', .03)
+    row.pop('gain_ack_file', None)  # Original header, before ACK paths were recorded.
+    ds = _table_ds(tmp_path, [row])
+    d = Path(row['results_dir'])
+    (d / 'pi').mkdir()
+    for suffix in ('', '.events.txt'):
+        (d / ('esp32.csv' + suffix)).rename(d / ('pi/capture.csv' + suffix))
+    (d / 'gain_ack.txt').rename(d / 'ack_pid.txt')
+    assert rl.main(['--dataset', ds, 'summary', '--esp32-name', 'pi/capture.csv',
+                    '--gain-ack-name', 'ack_pid.txt']) == 0
+    assert table.load_runs(ds, 'score.json', 'pi/capture.csv', 'ack_pid.txt')[0][0]['values']['tv_duty'] is not None
+
+
+def test_x3v4_2_round5_ack_must_belong_to_run(tmp_path):
+    row = write_run(tmp_path, 'r', 'HIL', 'final_hil', 'PID', 'O1-F05', 'A-PID/G07', 'dat', .03)
+    outside = '../other_ack.txt'
+    (Path(row['results_dir']) / 'gain_ack.txt').rename(tmp_path / 'other_ack.txt')
+    ds = _table_ds(tmp_path, [row])
+    _begin_final(ds, row)
+    with pytest.raises(rl.LogError, match='results_dir'):
+        rl.end(ds, 'dat', gain_ack=outside, **_final_evidence(row))
+    rl._write_all(str(Path(ds) / rl.TUNING), rl.TUNING_COLS, [dict(row, gain_ack_file=outside)])
+    with pytest.raises(rl.LogError, match='results_dir'):
+        rl.summary(ds)
+    with pytest.raises(ValueError, match='results_dir'):
+        LR(ds)
+
+
+def test_x3v4_3_round5_lost_after_so_h(tmp_path):
+    ds = str(tmp_path)
+    row = write_run(tmp_path, 'r', 'HW', 'final', 'PID', 'O1-F05', 'RQ2-INIT-PID/G1', 'dat', .03)
+    rl._write_all(str(tmp_path / rl.TUNING), rl.TUNING_COLS, [row])
+    d = Path(row['results_dir'])
+    rl.so_h(ds, 'r', rl.fake_score_final(str(d), 3., h1=dict(outcome='hong_he_do')))
+    for name in ('gain_ack.txt', 'esp32.csv', 'esp32.csv.events.txt'):
+        (d / name).unlink()
+    assert LR(ds, init_gain={})[0][0]['outcome'] == 'hong_he_do'
+    a = next(r for r in rl.summary(ds) if r['campaign'] == row['campaign'])
+    assert a['final_O1-F05@0.5_invalid'] == '1' and int(a.get('final_O1-F05@0.5_n_valid', 0)) == 0
+    Path(row['query_after_file']).write_text('changed')
+    with pytest.raises(rl.LogError, match='sha256'):
+        rl.summary(ds)
+
+
+@pytest.mark.parametrize('end,hours', [('09:00:20', '0.006'), ('09:00:30.123456', '0.008')])
+def test_x3v4_4_round5_effort_ends_by_freeze(tmp_path, end, hours):
+    ds = str(tmp_path)
+    gain = write_gain_file(tmp_path / 'gain_PID.json')
+    rl.freeze(ds, 'A-PID', 'het_ung_vien', 'A-PID/G1', gain, at='2026-11-20T09:00:30.123456')
+    rl.effort(ds, '2026-11-20', '09:00', end, campaign='A-PID')
+    a = next(r for r in rl.summary(ds) if r['campaign'] == 'A-PID')
+    assert a['T_operator_h'] == a['T_tune_no_hoc_h'] == hours

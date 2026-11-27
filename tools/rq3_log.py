@@ -19,9 +19,11 @@ Commands (the operator types them while working; every time stamp is the PC cloc
                                          (--wait: waiting for the machine, also in t_operator_wait_s)
   pause / resume                         other work in between: not counted (S05 §3.1)
   end    --outcome dat|khong_dat|chua_ket_luan|hong_he_do [--e-perp-max M] [--completed 0|1]
-         [--fail-cause X] [--results-dir D] [--esp32-log CSV] [--gate-json F] [--gate-file C]
+         [--fail-cause X] [--results-dir D] [--esp32-log CSV] [--gain-ack ACK] [--gate-json F] [--gate-file C]
                                          close the run and append its row. CSV defaults to D/esp32.csv.
                                          For final car runs a single named CSV/events pair in D is also accepted.
+                                          ACK defaults to D/gain_ack.txt. On the floor, save the gain setting's
+                                          full gain_send.py stdout under D. On the bench, use pi/<name>_gain_ack.txt.
                                          C = the C8 gate file (O1 v11.33): the conditions that must
                                          decide are recomputed from it (level = task, platform, stage,
                                          campaign); needed when F was scored with it (gate_v3.3)
@@ -58,7 +60,8 @@ Commands (the operator types them while working; every time stamp is the PC cloc
                                          (refused while a run is open: close it first, EA-1)
   freeze --campaign C --stop-reason R [--stop-cause K] --gain-set C/G --gain-file F [--at T]
                                          (sha256 of F computed; gain set id prefixed by the campaign)
-  summary [--gate-file F] [--out S05_summary.csv]   recompute the summary from the logs;
+  summary [--gate-file F] [--out S05_summary.csv] [--gain-ack-name ACK] [--esp32-name CSV]
+                                         recompute the summary from the logs; ACK/CSV names are for unbound final rows.
                                          F = the locked C8 gate file (gate_c8_v1 JSON, tools/gate_c8.py:
                                          gate levels, so_do conditions per level); its sha256 is
                                          reported; every gate row is checked against it (O1 v11.33)
@@ -136,7 +139,7 @@ TUNING_NEW = (['run_uid', 'campaign', 'script_run_id', 'gain_set_id', 'speed_mps
               + ['t_operator_wait_s', 't_machine_s', 'wall_start', 'wall_end', 'n_sim_evals']
               + ['boot_before', 'boot_after']           # R134 (b): S05 4.7 (iv), R3V-9
               + list(QUERY_FILE_COLS)                   # R134 (1), summary reads the two answers again
-              + ['script_kind', 'n_sim_diagnostic', 'trial_gain_file', 'trial_gain_sha256', 'esp32_log']
+              + ['script_kind', 'n_sim_diagnostic', 'trial_gain_file', 'trial_gain_sha256', 'esp32_log', 'gain_ack_file']
               + ['c8b_gio_sha256'])                     # O1 v11.37 D1, S05 v3.43 D3: kiem_gio_c8b (CODE_GATE)
 # tune stop gate v3 (dossier 00_OVERVIEW/2026-11-12_De_xuat_cong_dung_tune_bam_huong_van_toc_v3.md section 6,
 # CG2-12; Liam 12/11 CODE local_87282b70 "làm ngay đi"): per run the measured maximum q, its bound U and
@@ -292,7 +295,7 @@ TUNE_STAGES = ('screen', 'confirm')     # [CÁCH HIỂU] 'explore' is not a tune
 SKIP_PREFIX = ('EXAMPLE', 'PREHIL')      # rows of the June files: examples, reconstruction
 # fields begin / end set themselves; begin refuses them as extra fields (Codex S315-R3-1)
 OWN_FIELDS = ('session_id', 'iter_no', 'run_uid', 'date', 'wall_start', 'wall_end', 'run_outcome', 'fail_cause',
-              'results_dir', 'esp32_log', 'script_kind', 'completed', 'e_perp_max_m', 'c8b_gio_sha256') + tuple(f't_{k}_s' for k in ('flash', 'setup', 'run', 'log',
+              'results_dir', 'esp32_log', 'gain_ack_file', 'script_kind', 'completed', 'e_perp_max_m', 'c8b_gio_sha256') + tuple(f't_{k}_s' for k in ('flash', 'setup', 'run', 'log',
                                                                                         'analysis', 'operator_wait'))
 
 
@@ -1410,6 +1413,14 @@ def esp32_path(row, results_dir, default='esp32.csv'):
     if results_dir or row.get('esp32_log'):
         if not results_dir or not all(_inside(p, results_dir) for p in (path, path + '.events.txt')):
             raise LogError(f'{name!r}: ESP32 CSV and events must resolve under the results_dir of the run')
+    return path
+
+
+def gain_ack_path(row, results_dir, default='gain_ack.txt'):
+    name = row.get('gain_ack_file') or default
+    path = os.path.join(results_dir or '', name)
+    if (results_dir or row.get('gain_ack_file')) and not (results_dir and _inside(path, results_dir)):
+        raise LogError(f'{name!r}: gain ACK must resolve under the results_dir of the run')
     return path
 
 
@@ -2787,11 +2798,12 @@ def boot_problem(before, after) -> Optional[str]:
     return None
 
 
-def final_boot_problem(row, ds, queries):
+def final_boot_problem(row, ds, queries, gain_ack_name='gain_ack.txt', esp32_name=None):
     from s05_final_table import run_evidence_problem
     rd = _results_dir(row, ds)
-    name = 'esp32.csv'
-    if rd and row.get('platform') == 'HW' and not row.get('esp32_log') and not os.path.exists(os.path.join(rd, name)):
+    name = esp32_name or 'esp32.csv'
+    if (rd and row.get('platform') == 'HW' and not row.get('esp32_log') and esp32_name is None
+            and not os.path.exists(os.path.join(rd, name))):
         # Floor logging is separate. A single named CSV/events pair identifies the capture.
         names = [f for f in os.listdir(rd) if f.lower().endswith('.csv') and
                  os.path.isfile(os.path.join(rd, f + '.events.txt'))]
@@ -2799,7 +2811,7 @@ def final_boot_problem(row, ds, queries):
             return 'multiple ESP32 captures: give --esp32-log', None
         if names:
             name = names[0]
-    why = run_evidence_problem(row, queries, 'gain_ack.txt', name, None, rd, boot_only=True)
+    why = run_evidence_problem(row, queries, gain_ack_name, name, None, rd, boot_only=True)
     return why, row.get('esp32_log') or name
 
 
@@ -2847,7 +2859,7 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
         gate_sha256: str = '', boot_before: Optional[str] = None, boot_after: Optional[str] = None,
         query_problem: Optional[str] = None, queries: Optional[tuple] = None, gate_file=None,
         c8b_gio: Optional[str] = None, gate_khong_nut: bool = False, gate_path: str = '', gain_file: str = '',
-        esp32_log: str = '') -> dict:
+        esp32_log: str = '', gain_ack: str = '') -> dict:
     """gate_khong_nut (F11): the scorer file (gate_sha256) is a c8b_luoi file of a run where no node could be scored
     (read_luoi_khong_nut): only chua_ket_luan on the floor, logged with fail cause KHONG_NUT. GC6-12: end reads that
     file itself (gate_path, its sha256 = gate_sha256) and needs the time file c8b_gio (under results_dir, c8b_gio_v1 of
@@ -2878,9 +2890,11 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     if not bbad and queries is None and outcome in VALID and boot_needed(plat, stage):
         bbad = ('the two query answers (gain_send --query outputs read by gain_line_check.read_query) not given: '
                 'two boot strings do not show two questions (R134C4-1)')
-    evidence_row = dict(run['row'], results_dir=results_dir, esp32_log=esp32_log)
+    evidence_row = dict(run['row'], results_dir=results_dir, esp32_log=esp32_log, gain_ack_file=gain_ack)
     if esp32_log:
         esp32_path(evidence_row, _results_dir(evidence_row, ds, existing=False))
+    if gain_ack:
+        gain_ack_path(evidence_row, _results_dir(evidence_row, ds, existing=False))
     final_boot = stage in FINAL_PLATFORMS and plat == FINAL_PLATFORMS[stage]
     if not bbad and final_boot and fail_cause == BOOT_FAIL and queries:
         bbad, _ = final_boot_problem(evidence_row, ds, queries)
@@ -2960,11 +2974,9 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
         raise LogError('paused: "resume" first (or the pause is lost time of the next segment)')
     t = now()
     _close_segment(run, t)
-    row = dict(run['row'])
+    row = evidence_row
     row.update({k: _fmt(v, 0) for k, v in segment_totals(run['segments']).items()})
-    row.update(run_outcome=outcome, wall_end=_iso(t), fail_cause=fail_cause, results_dir=results_dir)
-    if esp32_log:
-        row['esp32_log'] = esp32_log
+    row.update(run_outcome=outcome, wall_end=_iso(t), fail_cause=fail_cause)
     if completed is not None:
         row['completed'] = str(completed)
     if e_perp_max is not None:
@@ -2987,6 +2999,7 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
         if why:
             raise LogError(f'{why}: a run failed by operation, outcome hong_he_do with fail cause {BOOT_FAIL}')
         row['esp32_log'] = name
+        row['gain_ack_file'] = gain_ack or 'gain_ack.txt'
     if notes:
         row['notes'] = (row.get('notes', '') + ' ' + notes).strip()
     if c8b_sha:
@@ -3643,7 +3656,8 @@ def check_finals(tun):
     return check_final_limits(tun)
 
 
-def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = '', gate_file=None) -> List[dict]:
+def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = '', gate_file=None,
+            gain_ack_name='gain_ack.txt', esp32_name=None) -> List[dict]:
     """S05_summary.csv rows (S05 v3.7). Accounts (§3.2):
       * a tuning row counts for its `campaign`; an effort row for `chien_dich`, or `khoan` when it is empty;
         a hardware-failure row for `chien_dich` (B-chung split like the effort rows);
@@ -3732,16 +3746,17 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
                 raise LogError(f"{r.get('run_uid')}: {exc}")
     check_machine_rows(tun)
     stopped = check_finals(tun)
-    for r in raw:
+    for r in tun:
         if r.get('esp32_log'):
             esp32_path(r, _results_dir(r, ds, existing=False))
-        if r.get('stage') in ('final', 'final_hil') and r.get('run_uid') in queries:
-            why, _ = final_boot_problem(r, ds, queries[r['run_uid']])
-            if why:
-                raise LogError(f"{r.get('run_uid')}: {why}")
-    for r in tun:
+        if r.get('gain_ack_file'):
+            gain_ack_path(r, _results_dir(r, ds, existing=False))
         if r.get('stage') in ('final', 'final_hil'):
             check_final_freeze(r, frz)
+            if r.get('run_outcome') in VALID and not r.get(RETRO_FLAG) and r.get('run_uid') in queries:
+                why, _ = final_boot_problem(r, ds, queries[r['run_uid']], gain_ack_name, esp32_name)
+                if why:
+                    raise LogError(f"{r.get('run_uid')}: {why}")
     check_c8b_rows(tun)                             # O1 v11.37 D1, S05 v3.43 D3
     check_khong_nut_rows(tun, ds)                   # GC6-12, GC7-4
     c8b_rep = defaultdict(lambda: {'n': 0, 'stopped': []})
@@ -3879,9 +3894,9 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
                 add(tgt, 'T_noh_s', h, share)
                 start = t
                 if tgt in frz and t and len(r['bat_dau']) == 5:
-                    # A manual HH:MM start in the freeze minute counts as post-freeze.
+                    # The minute-only start is ambiguous only when the interval extends beyond the freeze.
                     cut = _parse_t(frz[tgt]['frozen_at'])
-                    if cut.replace(second=0, microsecond=0) == t:
+                    if cut.replace(second=0, microsecond=0) == t and t_end and t_end > cut:
                         start = cut
                 spans_freeze(tgt, start, t_end, f"effort row {r.get('ngay')} {r.get('bat_dau')}")
                 if not frozen_before(tgt, start):
@@ -3989,8 +4004,8 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
 
 
 def write_summary(ds: str, out_path: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = '',
-                  gate_file=None) -> List[dict]:
-    rows = summary(ds, gate, gate_sha256, gate_file)
+                  gate_file=None, gain_ack_name='gain_ack.txt', esp32_name=None) -> List[dict]:
+    rows = summary(ds, gate, gate_sha256, gate_file, gain_ack_name=gain_ack_name, esp32_name=esp32_name)
     extra = sorted({k for r in rows for k in r} - set(SUMMARY_HEAD))
     _write_all(out_path, SUMMARY_HEAD + extra, rows)
     return rows
@@ -4338,6 +4353,7 @@ def main(argv=None) -> int:
     e.add_argument('--query-before', default='', help='gain_send.py --query output just before the run (R134 (b))')
     e.add_argument('--query-after', default='', help='gain_send.py --query output just after the run (R134 (b))')
     e.add_argument('--esp32-log', default='', help='ESP32 CSV, absolute or relative to --results-dir (default esp32.csv)')
+    e.add_argument('--gain-ack', default='', help='saved gain_send.py setting output under --results-dir (default gain_ack.txt)')
     e.add_argument('--gain-file', default='', help='trial gain file of this tune run (S05 §6.3 L90)')
     for name in ('fail-cause', 'results-dir', 'notes'):
         e.add_argument('--' + name, default='')
@@ -4387,6 +4403,8 @@ def main(argv=None) -> int:
     z.add_argument('--stop-cause', default='', choices=('',) + STOP_CAUSES)
     o = sub.add_parser('summary')
     o.add_argument('--out', default='')
+    o.add_argument('--gain-ack-name', default='gain_ack.txt', help='ACK for final rows without a logged ACK path')
+    o.add_argument('--esp32-name', help='ESP32 CSV for final rows without a logged CSV path')
     o.add_argument('--gate-file-fake', action='store_true', help='accept a FAKE gate file (tests, demo only; GC6-14)')
     o.add_argument('--gate-file', default=None, help='the locked C8 gate file (gate_c8_v1 JSON, tools/gate_c8.py)')
     d = sub.add_parser('demo')
@@ -4462,7 +4480,7 @@ def main(argv=None) -> int:
                       gate_sha256=gj_sha,
                       gate_path=a.gate_json if kn else '',
                       gate_file=read_gate_file(a.gate_file, a.gate_file_fake) if a.gate_file else None, c8b_gio=a.c8b_gio or None,
-                      gain_file=a.gain_file, esp32_log=a.esp32_log, **boots)
+                      gain_file=a.gain_file, esp32_log=a.esp32_log, gain_ack=a.gain_ack, **boots)
             print('row', row['run_uid'], {k: row[f't_{k}_s'] for k in STEPS}, 'wait', row['t_operator_wait_s'])
             note = refusal_note(ds, row)
             if note:
@@ -4494,7 +4512,8 @@ def main(argv=None) -> int:
             print('frozen', a.campaign, row['gain_sha256'])
         elif a.cmd == 'summary':
             gf = read_gate_file(a.gate_file, a.gate_file_fake) if a.gate_file else None
-            rows = write_summary(ds, a.out or os.path.join(ds, SUMMARY), gate_file=gf)
+            rows = write_summary(ds, a.out or os.path.join(ds, SUMMARY), gate_file=gf,
+                                 gain_ack_name=a.gain_ack_name, esp32_name=a.esp32_name)
             for r in rows:
                 print(r['campaign'], r['T_operator_h'], 'h', 'N_HW', r['N_HW'], 'gate', r['gate_result'] or '-')
             n_old = count_no_gate(read_rows(os.path.join(ds, TUNING)))         # R134C2-11 (SC3-2)

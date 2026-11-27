@@ -557,6 +557,7 @@ def load_runs(dataset, score_name, esp32_name, gain_ack_name='gain_ack.txt', ini
         d = rl._results_dir(r, dataset, existing=False)
         try:
             ep = rl.esp32_path(r, d, esp32_name)
+            ap = rl.gain_ack_path(r, d, gain_ack_name)
         except rl.LogError as exc:
             raise ValueError(f"{r.get('run_uid')}: {exc}") from exc
         qs = queries.get(r.get('run_uid'))
@@ -610,7 +611,7 @@ def load_runs(dataset, score_name, esp32_name, gain_ack_name='gain_ack.txt', ini
             if not reason:
                 rows_ep, n_drop = read_esp32_log_info(ep)
                 tv = tv_duty_esp32(rows_ep, t_end, t0_us=t0, queries=qs,
-                                   events=read_events(ep), ack=glc.read_ack(os.path.join(d, gain_ack_name)))
+                                   events=read_events(ep), ack=glc.read_ack(ap))
                 tv['rows_dropped'] = n_drop
             values, run['missing'] = run_values(score, task, tv)
             run['values'].update(values)
@@ -758,19 +759,20 @@ def run_evidence_problem(row, queries, gain_ack_name, esp32_name, gain_file, res
         return 'thieu results_dir cua luot'
     d = results_dir
     qb, qa = queries
-    ap = os.path.join(d, gain_ack_name)
-    ack = glc.read_ack(ap)
-    if ack is None:
-        return (f'{gain_ack_name} hong (khong mot dong # ack ok=1, hay dong cuoi khong ma=0)' if os.path.exists(ap)
-                else f'thieu {gain_ack_name}: moi luot kiem cuoi dat gain bang --gain-file (Liam 14/11)')
-    why = glc.ack_problem(ack, qb, {'id': qb.get('id')})
-    if why:
-        return why
     import rq3_log as rl
     try:
+        ap = rl.gain_ack_path(row, d, gain_ack_name)
         esp32_log = rl.esp32_path(row, d, esp32_name)
     except rl.LogError as exc:
         return str(exc)
+    ack = glc.read_ack(ap)
+    if ack is None:
+        name = row.get('gain_ack_file') or gain_ack_name
+        return (f'{name} hong (khong mot dong # ack ok=1, hay dong cuoi khong ma=0)' if os.path.exists(ap)
+                else f'thieu {name}: moi luot kiem cuoi dat gain bang --gain-file (Liam 14/11)')
+    why = glc.ack_problem(ack, qb, {'id': qb.get('id')})
+    if why:
+        return why
     if boot_only:
         return run_gain_problem(esp32_log, None, expected_boot=qb['boot'])
     if gain_file is None:
