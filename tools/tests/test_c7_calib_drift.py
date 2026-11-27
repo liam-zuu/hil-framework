@@ -522,6 +522,13 @@ def test_x3_18_x3v2_5_x3v2_6_round3_gop_to_so_h(tmp_path, drift):
         (tmp_path / rl.SO_H).unlink()
         if not external:
             assert combined['calib_drift']['version'] == version
+    if not drift['vuot']:
+        with pytest.raises(ValueError, match='second score'):
+            cd.combine(drift, h0, tr('s0'), 'f0', h1, tr('s1', frames='f1'), 'f1')
+        combined['calib_drift']['h1_score'] = h1
+        final.write_text(json.dumps(combined), encoding='utf-8')
+        with pytest.raises(rl.LogError, match='h1_score'):
+            rl.so_h(ds, 'S:1', str(final), str(raw))
     if version.endswith('_v2'):
         malformed = _drop(drift, 'tag_offset')
         raw.write_text(json.dumps(malformed), encoding='utf-8')

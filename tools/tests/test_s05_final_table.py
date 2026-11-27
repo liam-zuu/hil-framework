@@ -1173,17 +1173,20 @@ def test_c8_2_a_read_error_stays_with_its_candidate(tmp_path, monkeypatch):
     import rq3_log
     a = write_run(tmp_path, 'p1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
     ds = _table_ds(tmp_path, [a], frozen=(('A-PID', 'A-PID/G07'), ('B-LADRC', 'B-LADRC/G02')))
-    real, read = rq3_log.sha256_file, []
+    read = []
 
     name = 'gain_A-PID_G07.json'                                     # the relative name S05_freeze.csv holds
     in_ds = os.path.join(ds, name)                                   # candidate 1; candidate 2 is `name` (work folder)
 
-    def sha(path, bad):
+    blocked = {os.path.join(ds, 'gain_B-LADRC_G02.json')}
+
+    def open_candidate(path, *args, **kwargs):
         read.append(path)
-        if bad(path):
+        if path in blocked:
             raise PermissionError(13, 'Permission denied', path)
-        return real(path)
-    monkeypatch.setattr(rq3_log, 'sha256_file', lambda p: sha(p, lambda x: x.endswith('gain_B-LADRC_G02.json')))
+        return open(path, *args, **kwargs)
+
+    monkeypatch.setattr(rq3_log, 'open', open_candidate, raising=False)
     with pytest.raises(ValueError, match='B-LADRC/G02.*khong doc duoc'):
         LR(ds)
     # good copy in the dataset, unreadable copy of the same name in the work folder: never read
@@ -1192,14 +1195,14 @@ def test_c8_2_a_read_error_stays_with_its_candidate(tmp_path, monkeypatch):
     write_gain_file(work / name)
     monkeypatch.chdir(work)
     read.clear()
-    monkeypatch.setattr(rq3_log, 'sha256_file', lambda p: sha(p, lambda x: x == name))
+    blocked = {name}
     assert len(LR(ds)[0]) == 1 and in_ds in read and name not in read
     # the dataset copy unreadable, the work copy has the sha256: taken
-    monkeypatch.setattr(rq3_log, 'sha256_file', lambda p: sha(p, lambda x: x == in_ds))
+    blocked = {in_ds}
     runs, _ = LR(ds)
     assert runs[0]['gain_file'] == name
     # both unreadable: the run of the set is refused, the reason names both candidates
-    monkeypatch.setattr(rq3_log, 'sha256_file', lambda p: sha(p, lambda x: x in (in_ds, name)))
+    blocked = {in_ds, name}
     with pytest.raises(ValueError, match=r'A-PID/G07.*khong doc duoc.*khong doc duoc'):
         LR(ds)
 

@@ -10,8 +10,9 @@ tv_duty (S03 Y3, S05 4.7 (1)), from the cumulative firmware counters dpwm_fl..dp
 (AGV 54b7269: vel_ctrl_applied() adds |pwm_k - pwm_k-1| after motor_set(), only while the motor is on):
   t = 0     the first data line with run_active = 1 (motor on and a VALID trajectory: the command pose
             starts there, pos_ctrl.h); it must follow a line with run_active = 0 whose log_seq is the
-            one before (no lost line at the edge), or come within EDGE_MAX_MS of it
-  t_end     t = 0 + t_end of the run (seconds after t = 0, from the scorer of that run)
+            one before (on HIL, a gap within EDGE_MAX_MS is allowed). A supplied camera t0_log_us
+            must equal the timestamp of that edge in the same logger segment.
+  t_end     t = 0 + the scored duration (camera: t_end_union, HIL: t_end)
   a, b      the first and the last data line with t = 0 <= timestamp_us <= t_end, motor_on = 1
   tv_duty = sum over 4 wheels (dpwm(b) - dpwm(a)) / PWM_MAX / ((t_b - t_a) s)        [1/s]
   no number (tv_duty empty, reason given) when:
@@ -187,9 +188,14 @@ def t_end_err_ms(t_end_s, esp_pi_ppm=None, pi_period_ppm=None):
 # ---------------------------------------------------------------- tv_duty
 def _int(v):
     try:
-        return int(float(v))
+        return int(str(v))
     except (TypeError, ValueError):
-        return None
+        # Accept an integral decimal representation, while rejecting fractional counters.
+        try:
+            n = float(v)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return int(n) if n.is_integer() else None
 
 
 def read_esp32_log_info(path):
@@ -233,6 +239,9 @@ def tv_duty_esp32(rows, t_end_s, edge_max_ms=EDGE_MAX_MS, t0_us=None, queries=No
         out['reason'] = 'log thieu cot ' + ','.join(k for k in need if not rows or k not in rows[0])
         return out
     ts = [_int(r['timestamp_us']) for r in rows]
+    if None in ts:
+        out['reason'] = 'timestamp_us khong phai so nguyen'
+        return out
     if any(r.get('run_active') not in ('0', '1') for r in rows):
         out['reason'] = 'run_active khong phai 0/1: khong xac minh duoc canh len duy nhat'
         return out
@@ -247,13 +256,18 @@ def tv_duty_esp32(rows, t_end_s, edge_max_ms=EDGE_MAX_MS, t0_us=None, queries=No
         out['reason'] = 'dong dau file da run_active = 1: khong thay canh len'
         return out
     prev, first = rows[i0 - 1], rows[i0]
+    if prev.get('_segment') != first.get('_segment'):
+        out['reason'] = 'canh run_active qua hai doan logger'
+        return out
     prev_seq, first_seq = _int(prev['log_seq']), _int(first['log_seq'])
-    if None in (prev_seq, first_seq, ts[i0 - 1], ts[i0]) or first_seq <= prev_seq or ts[i0] <= ts[i0 - 1]:
+    if None in (prev_seq, first_seq) or first_seq <= prev_seq or ts[i0] <= ts[i0 - 1]:
         out['reason'] = 'log_seq hay timestamp_us khong xac dinh duoc canh run_active'
         return out
     contiguous = first_seq == prev_seq + 1
     gap_ms = (ts[i0] - ts[i0 - 1]) / 1000
     out.update(t0_edge_contiguous=contiguous, t0_edge_gap_ms=gap_ms)
+    # S05 §4.7(i): a car score supplies t0_log_us and needs the preceding line.
+    # On HIL a short gap at the edge is permitted.
     if not contiguous and (t0_us is not None or gap_ms > edge_max_ms):
         out['reason'] = f'mat dong o canh t = 0 ({gap_ms:.1f} ms)'
         return out
@@ -288,7 +302,7 @@ def tv_duty_esp32(rows, t_end_s, edge_max_ms=EDGE_MAX_MS, t0_us=None, queries=No
         return out
     tk = [_int(rows[i]['tick']) for i in win]
     sq = [_int(rows[i]['log_seq']) for i in win]
-    if any(y <= x for x, y in zip(tk, tk[1:])) or any(y <= x for x, y in zip(sq, sq[1:])):
+    if None in tk or None in sq or any(y <= x for x, y in zip(tk, tk[1:])) or any(y <= x for x, y in zip(sq, sq[1:])):
         out['reason'] = 'tick hay log_seq khong tang deu (dat lai bo dem hay khoi dong lai)'
         return out
     # RS-5 tail (R134C-4): the line right after b in the normalized lines, same logger segment,
@@ -426,21 +440,9 @@ def gain_files(dataset, init_gain=None, frozen=None):
             raise ValueError(f'--init-gain {ctrl}=...: controller one of {CONTROLLERS}')
         if not os.path.isfile(f):
             raise ValueError(f'--init-gain {ctrl}={f}: no such file')
-        out[f'RQ2-INIT-{ctrl}'] = dict(file=f, sha256=rl.sha256_file(f), source='--init-gain', want=_want(f, ctrl))
+        path, want, sha = rl.read_gain(f, ctrl)
+        out[f'RQ2-INIT-{ctrl}'] = dict(file=path, sha256=sha, source='--init-gain', want=want)
     return out
-
-
-FW_CTRL = {'PID': 'PID', 'LADRC': 'ADRC'}     # controller of the log -> ctrl of the gain file / '#gain' line
-
-
-def _want(path, ctrl):
-    try:
-        w = glc.load_gain_file(path)
-    except glc.InputError as e:
-        raise ValueError(f'gain file: {e}')
-    if w['ctrl'] != FW_CTRL.get(ctrl):
-        raise ValueError(f'gain file {path}: ctrl {w["ctrl"]}, the set is of {ctrl} (ctrl {FW_CTRL.get(ctrl)})')
-    return w
 
 
 def gain_file_of(gain_set_id, files):
@@ -510,7 +512,8 @@ def load_runs(dataset, score_name, esp32_name, gain_ack_name='gain_ack.txt', ini
     try:
         # O1 v11.33 (CODE_GATE): the rows checked against the C8 gate file (path, --gate-file): report-only conditions
         # recomputed from it, the gate file SHA of every run (rq3_log.check_gate_rows)
-        rl.check_gate_rows(rows, rl.read_gate_file(gate_file, gate_file_fake) if gate_file else None)   # GC6-14
+        gf_c8 = rl.read_gate_file(gate_file, gate_file_fake) if gate_file else None
+        rl.check_gate_rows(rows, gf_c8)   # GC6-14
         rl.check_map_rows(rows)
         queries = rl.check_query_rows(rows, dataset, query_before_name, query_after_name)
         miss = rl.so_h_missing(rows, dataset, stages=('final',))
@@ -525,7 +528,7 @@ def load_runs(dataset, score_name, esp32_name, gain_ack_name='gain_ack.txt', ini
                 rl.check_task(r.get('trajectory', ''), r.get('speed_mps', ''))
     except rl.LogError as e:
         raise ValueError(f'm7_tuning_log.csv: {e}')
-    files = gain_files(dataset, init_gain, frozen)                                              # R134C6-1
+    files = gain_files(dataset, init_gain, frozen)
     runs, bad = [], []
     for r in rows:
         plat = next((p for p in PLATFORMS if r.get('platform') == p[0] and r.get('stage') == p[2]), None)
@@ -543,12 +546,11 @@ def load_runs(dataset, score_name, esp32_name, gain_ack_name='gain_ack.txt', ini
                             f"{r.get('gain_set_id')!r} khong vao bang")
             continue
         gf = files.get(gain_key)
-        if r.get('stage') in ('final', 'final_hil'):
-            try:
-                rl.check_final_freeze(r, frozen)
-            except rl.LogError as exc:
-                bad.append(str(exc))
-                continue
+        try:
+            rl.check_final_freeze(r, frozen)
+        except rl.LogError as exc:
+            bad.append(str(exc))
+            continue
         d = rl._results_dir(r, dataset)
         ep = rl.esp32_path(r, d, esp32_name)
         qs = queries.get(r.get('run_uid'))
@@ -577,9 +579,20 @@ def load_runs(dataset, score_name, esp32_name, gain_ack_name='gain_ack.txt', ini
             if plat[0] == 'HIL':
                 run.update({k: json.dumps(score[k], ensure_ascii=False, separators=(',', ':'))
                             for k in HIL_SCORE_BLOCKS if score.get(k) is not None})
-                if score.get('gate_v3'):
-                    gate = rl.gate_columns(score['gate_v3'])
-                    run.update({k: gate.get(k, '') for k in (*rl.G1_COLS, *GATE_RUN_FIELDS)})
+                # The G1 fields and per-gate counts in the appendix come from the checked row.
+                # Verify that the scorer file bound by its SHA actually produced those columns.
+                try:
+                    gate = rl.gate_of(score, score_name, allow_null=run['outcome'] == 'hong_he_do')
+                    if gate is not None:
+                        rl.validate_gate(gate, 'HIL', rl.row_so_do(r, gf_c8))
+                        cols = rl.gate_columns(gate, r['gate_json_sha256'])
+                        different = [k for k in rl.GATE_COLS if cols.get(k, '') != r.get(k, '')]
+                        if different:
+                            raise ValueError(f"{r['run_uid']}: scorer and logged gate differ in {', '.join(different)}")
+                    elif rl.has_gate(r):
+                        raise ValueError(f"{r['run_uid']}: logged gate missing from scorer file")
+                except rl.LogError as exc:
+                    raise ValueError(f"{r['run_uid']}: {exc}") from exc
                 run['values'].update({k: score[k] for k in QUANTITIES if k != 'tv_duty' and _a_number(score.get(k))})
         if run['outcome'] in VALID:
             t0, t_end, reason = score_window(score, plat[0])
@@ -686,7 +699,7 @@ def run_gain_problem(esp32_path, want, expected_boot=None, exact_first_seq=False
         for seq in sorted(seqs):                                                         # (1)
             st = glc.run_start(events, seq)
             where = f'moc bat dau first_seq={seq} ({len(seqs)} moc trong events)'
-            if want is not None and st['gain'] is None:
+            if st['gain'] is None:
                 return f'dong #gain cua {where}: {"; ".join(st["why"])} (S05 6.3)'
             if expected_boot and st['boot'] != expected_boot.lower():
                 return f'boot cua luot {st["boot"]} (#us,ev=start) khac boot cua hai lan hoi {expected_boot}'

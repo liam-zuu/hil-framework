@@ -297,6 +297,7 @@ def main(argv=None):
             print('# INCOMPLETE answer: ' + '; '.join(errs))
             print('#ket_qua,ma=4')
             return 4
+        # Keep the verified nonce so readers of the saved pair can detect a repeated reply.
         print('#gain_running,' + ','.join(f'{k}={v}' for k, v in ack.items() if k not in ('req_id', 'ok', 'err')))
         print('#ket_qua,ma=0')
         return 0

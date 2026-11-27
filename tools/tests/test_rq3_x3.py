@@ -369,6 +369,9 @@ def test_x3_6_round3_hil_appendix_preserves_scorer_fields(tmp_path):
     assert {k: json.loads(saved[k]) for k in blocks} == blocks
     assert (saved['g1_t_done_1'], saved['g1_t_deadline']) == (r['g1_t_done_1'], r['g1_t_deadline'])
     assert float(saved['tv_duty']) == pytest.approx(4.)
+    ds = _table_ds(tmp_path, [dict(r, g1_t_done_1='9.6')])
+    with pytest.raises(ValueError, match='g1_t_done_1'):
+        LR(ds)
 
 
 @pytest.mark.parametrize('task', ['O1-F05', 'O1-K1'])
@@ -404,14 +407,21 @@ def test_x3_8_round3_end_and_summary_check_final_hil_boot(tmp_path):
     kw = dict(results_dir=str(d), gate=rl.fake_gate())
     with pytest.raises(rl.LogError, match='boot'):
         rl.end(ds, 'dat', queries=rl.fake_queries('dcba', folder=ds), **kw)
-    rl.end(ds, 'dat', queries=rl.fake_queries('abcd', folder=ds), **kw)
     ep = d / 'esp32.csv.events.txt'
-    ep.write_text(ep.read_text(encoding='utf-8').replace('boot=abcd', 'boot=dcba'), encoding='utf-8')
+    events = ep.read_text(encoding='utf-8')
+    ep.write_text('\n'.join(line.replace('boot=abcd', 'boot=dcba') if '#gain,' in line else line
+                            for line in events.splitlines()), encoding='utf-8')
+    with pytest.raises(rl.LogError, match='boot'):
+        rl.end(ds, 'dat', queries=rl.fake_queries('abcd', folder=ds), **kw)
+    ep.write_text(events, encoding='utf-8')
+    rl.end(ds, 'dat', queries=rl.fake_queries('abcd', folder=ds), **kw)
+    ep.write_text(events.replace('boot=abcd', 'boot=dcba'), encoding='utf-8')
     with pytest.raises(rl.LogError, match='boot'):
         rl.summary(ds)
 
 
-def test_x3_8_round3_gain_send_saves_query_tx(monkeypatch, capsys):
+def test_x3_8_round3_gain_send_saves_query_tx(monkeypatch, capsys, tmp_path):
+    import gain_line_check as glc
     import gain_send
     import s05_fake_runs as fr
     gain = fr.sample_gain()
@@ -419,7 +429,14 @@ def test_x3_8_round3_gain_send_saves_query_tx(monkeypatch, capsys):
                env='pid', ok='1', tx='472')
     monkeypatch.setattr(gain_send, 'exchange', lambda *a: (ack, 1))
     assert gain_send.main(['--query', '--ip', 'localhost']) == 0
-    assert 'tx=472' in capsys.readouterr().out.split('#gain_running,')[1].splitlines()[0].split(',')
+    reply = capsys.readouterr().out
+    queries = []
+    for i in (1, 2):
+        path = tmp_path / f'query{i}.txt'
+        path.write_text(glc.query_pc_line(i, i + .1) + reply, encoding='utf-8')
+        queries.append(glc.read_query(str(path)))
+    assert queries[0]['tx'] == '472'
+    assert 'cung tx' in glc.query_problem(*queries, check_run_boot=False)
 
 
 def test_x3_9_round3_trial_gain_write_and_replay(tmp_path):
@@ -444,7 +461,8 @@ def test_x3_9_round3_trial_gain_write_and_replay(tmp_path):
 
 @pytest.mark.parametrize('bad,match', [(dict(gain_file='missing.json'), 'not found'),
                                       (dict(gain_sha256='0' * 64), 'gain_sha256'),
-                                      (dict(frozen_at='bad'), 'frozen_at')])
+                                      (dict(frozen_at='bad'), 'frozen_at'),
+                                      (dict(frozen_at='2026-11-19'), 'frozen_at')])
 def test_x3_14_round3_replay_each_freeze(tmp_path, bad, match):
     from test_s05_final_table import write_gains
     ds = str(tmp_path)
@@ -461,9 +479,12 @@ def test_x3_14_round3_replay_each_freeze(tmp_path, bad, match):
 def test_x3_14_round3_begin_final_hil_requires_its_freeze(tmp_path):
     from test_s05_final_table import write_gains
     ds = str(tmp_path)
+    args = (ds, 'S', 'RQ2', 'HIL', 'PID', 'O1-F05', '.5', 'final_hil')
+    with pytest.raises(rl.LogError, match='needs a row'):
+        rl.begin(*args, gain_set='A-PID/G07')
     write_gains(ds)
     with pytest.raises(rl.LogError, match='frozen'):
-        rl.begin(ds, 'S', 'RQ2', 'HIL', 'PID', 'O1-F05', '.5', 'final_hil', gain_set='A-PID/G999')
+        rl.begin(*args, gain_set='A-PID/G999')
     assert not (tmp_path / rl.OPEN_RUN).exists()
 
 
@@ -494,6 +515,17 @@ def test_x3v2_3_round3_initial_gain_one_cell(tmp_path, outcome, n, match, platfo
         LR(ds)
 
 
+def test_x3v2_3_round3_initial_cell_requires_the_run_account(tmp_path):
+    row = write_run(tmp_path, 'run', 'HIL', 'final_hil', 'PID', 'O1-F05', 'RQ2-INIT-PID/G1', 'hong_he_do', .03)
+    ds = _table_ds(tmp_path, [dict(row, campaign='A-PID')])
+    with pytest.raises(ValueError, match='account RQ2'):
+        LR(ds)
+    row.update(stage='final', platform='HW', campaign='RQ2-INIT-PID', gain_set_id='RQ2-INIT-LADRC/G1')
+    ds = _table_ds(tmp_path, [row])
+    with pytest.raises(rl.LogError, match='does not belong'):
+        rl.summary(ds)
+
+
 @pytest.mark.parametrize('second_edge', [False, True])
 def test_x3v2_4_round3_t0_must_match_unique_edge(second_edge):
     from test_s05_final_table import Log, zigzag
@@ -519,6 +551,15 @@ def test_x3v2_4_round3_t0_needs_a_recorded_zero():
     tv = table.tv_duty_esp32(log.rows, .05, t0_us=int(log.rows[i]['timestamp_us']),
                              check_gain_line=False, check_boot=False)
     assert tv['tv_duty'] is None and 'run_active' in tv['reason']
+    log.rows[i - 1].update(run_active='0', _segment='earlier boot')
+    tv = table.tv_duty_esp32(log.rows, .05, t0_us=int(log.rows[i]['timestamp_us']),
+                             check_gain_line=False, check_boot=False)
+    assert tv['tv_duty'] is None and 'doan logger' in tv['reason']
+    del log.rows[i - 1]['_segment']
+    t0 = int(log.rows[i]['timestamp_us'])
+    log.rows[i]['timestamp_us'] = f'{t0}.5'
+    tv = table.tv_duty_esp32(log.rows, .05, t0_us=t0, check_gain_line=False, check_boot=False)
+    assert tv['tv_duty'] is None and 'timestamp_us' in tv['reason']
 
 
 def test_x3v2_7_round3_query_names_check_logged_pair(tmp_path):
@@ -568,6 +609,15 @@ def test_x3v2_8_round3_bench_log_end_migrate_summary_table(tmp_path):
     assert all(r['esp32_log'].replace('\\', '/').endswith('pi/F05-PID.csv') for r in rows)
     assert rl.summary(ds)
     assert LR(ds, init_gain={'PID': gf})[0][0]['values']['tv_duty'] is not None
+    # A default-named copy cannot stand in for the logged events, on either reader.
+    d = tmp_path / 'final_hil'
+    for suffix in ('', '.events.txt'):
+        (d / ('esp32.csv' + suffix)).write_bytes((d / ('pi/F05-PID.csv' + suffix)).read_bytes())
+    (d / 'pi/F05-PID.csv.events.txt').unlink()
+    with pytest.raises(rl.LogError, match='events'):
+        rl.summary(ds)
+    with pytest.raises(ValueError, match='events'):
+        LR(ds, init_gain={'PID': gf})
     (tmp_path / 'hil_check/pi/F05-PID.csv.events.txt').unlink()
     with pytest.raises(rl.LogError, match='events'):
         rl.check_trial_gain(rows[0], ds)

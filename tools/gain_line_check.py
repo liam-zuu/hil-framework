@@ -333,8 +333,16 @@ def read_query(path):
     file, or None (no file, not exactly one such line, the last line is not '#ket_qua,ma=0', no hex boot)."""
     if not path or not os.path.isfile(path):
         return None
-    with open(path, encoding='utf-8') as f:
-        lines = [x.strip() for x in f if x.strip()]
+    with open(path, 'rb') as f:
+        return parse_query(f.read(), path)
+
+
+def parse_query(raw, path):
+    """Parse an answer from the bytes read (and, during replay, hashed) for this path."""
+    try:
+        lines = [x.strip() for x in raw.decode('utf-8').splitlines() if x.strip()]
+    except UnicodeDecodeError:
+        return None
     run = [x for x in lines if x.startswith('#gain_running,')]
     if len(run) != 1 or not lines or lines[-1] != '#ket_qua,ma=0':
         return None
@@ -472,6 +480,15 @@ def run_boot_of(csv_path, events_path=None):
 # ---------------------------------------------------------------- gain file
 def load_gain_file(path: str) -> dict:
     """{'ctrl', 'id', 'gains' {name: float32 bytes}} of a gain file (gain_send.load_file format)."""
+    try:
+        with open(path, 'rb') as f:
+            return parse_gain_file(f.read(), path)
+    except OSError as exc:
+        raise InputError(f'{path}: {exc}') from exc
+
+
+def parse_gain_file(raw: bytes, path: str) -> dict:
+    """Parse the same bytes the caller hashed when verifying a logged gain file."""
     def no_dup(pairs):
         d = {}
         for k, v in pairs:
@@ -480,14 +497,13 @@ def load_gain_file(path: str) -> dict:
             d[k] = v
         return d
     try:
-        with open(path, encoding='utf-8') as f:
-            d = json.load(f, object_pairs_hook=no_dup)
-    except (OSError, ValueError) as e:
+        d = json.loads(raw.decode('utf-8'), object_pairs_hook=no_dup)
+    except ValueError as e:
         raise InputError(f'{path}: {e}')
     if not isinstance(d, dict) or not isinstance(d.get('gains'), dict):
         raise InputError(f'{path}: an object with "ctrl", "id" and "gains" expected')
     ctrl, set_id = d.get('ctrl'), d.get('id')
-    if ctrl not in NAMES:
+    if not isinstance(ctrl, str) or ctrl not in NAMES:
         raise InputError(f'{path}: ctrl {ctrl!r}')
     if isinstance(set_id, bool) or not isinstance(set_id, int) or not 1 <= set_id <= ID_MAX:
         raise InputError(f'{path}: id must be an integer 1..{ID_MAX}, got {set_id!r}')

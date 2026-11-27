@@ -11,7 +11,11 @@ V2_FIELDS = ('D_H_vi_tri_mm', 'D_H_huong_deg', 'eps_H_huong_deg', 'trang_thai_vi
 
 
 def _number(value, name, positive=False):
-    if type(value) not in (int, float) or not math.isfinite(value) or value < 0 or (positive and value == 0):
+    try:
+        finite = type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        finite = False
+    if not finite or value < 0 or (positive and value == 0):
         raise ValueError(f'{name}: expected a finite number {">" if positive else ">="} 0')
     return value
 
@@ -98,3 +102,20 @@ def check(d):
     if d['vuot'] != over:
         raise ValueError(f'vuot {d["vuot"]} differs from {over} by the measured drift and thresholds')
     return version
+
+
+def outcome(o0, o1, vuot, thieu):
+    """J v6 §5: combine the two judgments only when the comparison calls for H1."""
+    if thieu or not vuot:
+        if o1 is not None:
+            raise ValueError('unexpected outcome_h1 without a second scoring')
+        if thieu:
+            return ('hong_he_do' if o0 == 'hong_he_do' else 'chua_ket_luan'), ['thieu_H1']
+        return o0, []
+    if o1 not in ('dat', 'khong_dat', 'chua_ket_luan', 'hong_he_do'):
+        raise ValueError(f'vuot requires an H1 outcome, got {o1!r}')
+    if 'hong_he_do' in (o0, o1):
+        return 'hong_he_do', ['calib_drift']
+    if o0 == o1:
+        return o0, ['calib_drift']
+    return 'chua_ket_luan', ['calib_drift', 'calib_drift_split']

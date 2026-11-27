@@ -47,8 +47,8 @@ Commands (the operator types them while working; every time stamp is the PC cloc
          --t-machine-s S --wall-start T --wall-end T [--n-sim-diagnostic N]   allocated fwsim script row
   machine-phases --script-kind S03|S3 --script-run-id ID --results-dir D
          --phase ACCOUNT START END N_PID N_LADRC DIAG_PID DIAG_LADRC SOURCE_TIMES SOURCE_COUNTS
-                                         repeat for each elapsed phase, including bo; the two sources (file,
-                                         line the numbers were typed from) are required (X3-1)
+                                         repeat for each elapsed phase, including bo. Cite both sources
+                                         as FILE:LINE, FILE:FIRST-LAST or FILE@HH:MM:SS (X3-1).
   hoc-start --campaign C --ghi-chu X / hoc-end [--ghi-chu X]   a hoc segment, time stamps written
                                          by the script (S05 §3.1 R-2, EA-7)
   effort --date D --start HH:MM --end HH:MM (--campaign C | --khoan K) [--nhan hoc] --ghi-chu X
@@ -308,7 +308,15 @@ def _iso(t: dt.datetime) -> str:
 
 
 def _parse_t(s: str) -> dt.datetime:
-    return dt.datetime.fromisoformat(s)
+    t = dt.datetime.fromisoformat(s)
+    # Stored PC clocks are local. Compare an explicit UTC offset on the same clock.
+    return t.astimezone().replace(tzinfo=None) if t.tzinfo else t
+
+
+def _freeze_time(s: str) -> dt.datetime:
+    if not isinstance(s, str) or not ('T' in s or ' ' in s):
+        raise ValueError('frozen_at needs both date and time')
+    return _parse_t(s)
 
 
 def _f(x) -> float:
@@ -1335,7 +1343,12 @@ def check_query_rows(tun: List[dict], ds: str, query_before_name=None, query_aft
             f = next((c for c in cand if os.path.isfile(c)), None)
             if f is None:
                 raise LogError(f'{uid}: {cf} {p!r} not found (tried {cand}; R134 (1))')
-            if sha256_file(f) != sha:
+            try:
+                with open(f, 'rb') as stream:
+                    raw = stream.read()
+            except OSError as exc:
+                raise LogError(f'{uid}: cannot read {cf} {f!r}: {exc}') from exc
+            if hashlib.sha256(raw).hexdigest() != sha:
                 raise LogError(f'{uid}: {f} changed after the run was logged (sha256 differs from {cs}; R134 (1))')
             name = query_before_name if when == 'before' else query_after_name
             if name is not None and r.get('stage') in ('final', 'final_hil'):
@@ -1343,7 +1356,7 @@ def check_query_rows(tun: List[dict], ds: str, query_before_name=None, query_aft
                 expected = os.path.join(folder, name) if folder else ''
                 if not expected or os.path.normcase(os.path.realpath(expected)) != os.path.normcase(os.path.realpath(f)):
                     raise LogError(f'{uid}: --query-{when}-name {name!r} differs from the logged query file {p!r}')
-            qs.append(glc.read_query(f))
+            qs.append(glc.parse_query(raw, f))
         if not need:
             continue
         why = glc.query_problem(qs[0], qs[1], check_run_boot=False)
@@ -1363,17 +1376,10 @@ def so_h_outcome(o0: str, o1: Optional[str], vuot: bool, thieu: bool) -> tuple:
     the H0 outcome, no flag; clip H at the end missing: chua_ket_luan, flag thieu_H1, a lost run stays lost; above
     eps_H: lost in either -> hong_he_do, the same -> kept, different -> chua_ket_luan; flag calib_drift, plus
     calib_drift_split when the two differ (a lost run in one of the two is no split)."""
-    if thieu:
-        return ('hong_he_do' if o0 == 'hong_he_do' else 'chua_ket_luan'), ['thieu_H1']
-    if not vuot:
-        return o0, []
-    if o1 not in OUTCOMES:
-        raise LogError(f'above eps_H the H1 outcome must be one of {OUTCOMES}, got {o1!r}')
-    if 'hong_he_do' in (o0, o1):
-        return 'hong_he_do', ['calib_drift']
-    if o0 == o1:
-        return o0, ['calib_drift']
-    return 'chua_ket_luan', ['calib_drift', 'calib_drift_split']
+    try:
+        return drift_evidence.outcome(o0, o1, vuot, thieu)
+    except ValueError as exc:
+        raise LogError(str(exc)) from exc
 
 
 def _results_dir(r: dict, ds: str) -> Optional[str]:
@@ -1451,7 +1457,7 @@ def check_score_final(r: dict, path: str, ds: str, drift=None, new=False) -> tup
         with open(path, encoding='utf-8') as f:
             d = json.load(f)
         cd = d['calib_drift']
-        o0, o1, flags = cd['outcome_h0'], cd.get('outcome_h1'), list(cd['flags'])
+        o0, o1, flags = cd['outcome_h0'], cd.get('outcome_h1'), cd['flags']
         vuot, thieu = cd['vuot'], cd['thieu_H1']
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise LogError(f'score_final {path!r}: not an output of c7_calib_drift.py gop ({exc})')
@@ -1466,8 +1472,11 @@ def check_score_final(r: dict, path: str, ds: str, drift=None, new=False) -> tup
                 raise LogError(f'run {uid}: score_final and --drift disagree in {k}')
     elif new and 'version' not in cd and not any(k in cd for k in drift_evidence.V2_FIELDS):
         raise LogError(f'run {uid}: unversioned position-only gop: give --drift with the original v1 or v2 comparison')
-    if not isinstance(vuot, bool) or not isinstance(thieu, bool) or not set(flags) <= set(SO_H_FLAGS):
-        raise LogError(f'score_final {path!r}: vuot, thieu_H1 must be true/false, flags in {SO_H_FLAGS}')
+    combined_version = check_drift_thresholds(cd, uid)
+    if drift is not None and combined_version != version:
+        raise LogError(f'run {uid}: score_final and --drift disagree in version')
+    if not isinstance(flags, list) or any(flag not in SO_H_FLAGS for flag in flags):
+        raise LogError(f'score_final {path!r}: expected a list of flags in {SO_H_FLAGS}')
     if o0 != r.get('run_outcome'):
         raise LogError(f"run {uid}: outcome_h0 {o0!r} of the file is not the logged outcome "
                        f"{r.get('run_outcome')!r} (another run, or the log was written with another scoring)")
@@ -1483,9 +1492,6 @@ def check_score_final(r: dict, path: str, ds: str, drift=None, new=False) -> tup
             {k: v for k, v in h0.items() if k != 'outcome'}:
         raise LogError(f'run {uid}: score_final {path!r} is not the H0 scorer file of the run ({h0p}) with only '
                        f'outcome and calib_drift added (C9D-1)')
-    combined_version = check_drift_thresholds(cd, uid)
-    if drift is not None and combined_version != version:
-        raise LogError(f'run {uid}: score_final and --drift disagree in version')
     if vuot and not thieu:
         h1 = cd.get('h1_score')
         if not isinstance(h1, dict) or h1.get('outcome') != o1:
@@ -1526,6 +1532,8 @@ def check_score_final(r: dict, path: str, ds: str, drift=None, new=False) -> tup
                 check_outcome_vs_gate(o1, g1, 'HW', fc, sd)
             except LogError as exc:
                 raise LogError(f'run {uid}: outcome_h1 {o1} and the gate of the H1 score: {exc} (C9D-5, C9D2-2)')
+    elif cd.get('h1_score') is not None:
+        raise LogError(f'run {uid}: unexpected h1_score without a second scoring')
     final, want = so_h_outcome(o0, o1, vuot, thieu)
     if d.get('outcome') != final or sorted(flags) != sorted(want):
         raise LogError(f"score_final {path!r}: outcome {d.get('outcome')!r}, flags {flags} disagree with "
@@ -1627,7 +1635,7 @@ def apply_so_h(tun: List[dict], ds: str) -> List[dict]:
         if s.get('vuot') != ('true' if cd['vuot'] else 'false'):      # RC1-1: vuot decides the H1 scoring (apply_moc)
             raise LogError(f"{SO_H}: run {r.get('run_uid')}: vuot {s.get('vuot')!r} is not that of the score_final file")
         if (s.get('D_H_mm') or '') != _num(cd['D_H_mm']):
-            raise LogError(f'{SO_H}: run {uid}: D_H_mm differs from the comparison file')
+            raise LogError(f"{SO_H}: run {r.get('run_uid')}: D_H_mm differs from the comparison file")
         if (final, sorted(want)) != (s.get('outcome_sau'), sorted(flags)):
             raise LogError(f"{SO_H}: run {r.get('run_uid')}: outcome_sau / flags disagree with the rule of O1 §4")
         r = dict(r, run_outcome=final, so_h_flags=','.join(flags))
@@ -2064,7 +2072,9 @@ def final_key(r: dict) -> tuple:
     gs = r.get('gain_set_id', '')
     if r.get('stage') in ('final', 'final_hil'):
         gs = final_gain_key(gs)
-        if not gs and r.get('stage') == 'final' and r.get('campaign') in ('RQ2-INIT-PID', 'RQ2-INIT-LADRC'):
+        if r.get('stage') == 'final' and r.get('campaign') in ('RQ2-INIT-PID', 'RQ2-INIT-LADRC'):
+            if gs and gs != r['campaign']:
+                raise LogError(f"{r.get('run_uid')}: gain set {gs} does not belong to {r['campaign']}")
             gs = r['campaign']  # Historical floor rows can identify the initial set by campaign alone.
     return (r.get('stage', ''), r.get('campaign', ''), gs, r.get('platform', ''),
             *condition_key(r))
@@ -2770,18 +2780,14 @@ def check_trial_gain(row, ds, fill=False):
             and row.get('platform') in ('HW', 'HIL') and row.get('run_outcome') in VALID):
         return
     import gain_line_check as glc
-    from s05_final_table import _want, run_gain_problem
+    from s05_final_table import run_gain_problem
 
     uid = row.get('run_uid')
     p, sha = row.get('trial_gain_file'), row.get('trial_gain_sha256')
     if not p or not sha:
         raise LogError(f'{uid}: judged tune run needs --gain-file (trial_gain_file / trial_gain_sha256; S05 6.3 L90)')
-    candidates = [p] if os.path.isabs(p) else [os.path.join(ds, p), p]
     try:
-        gain = next((f for f in candidates if os.path.isfile(f) and sha256_file(f) == sha), None)
-        if gain is None:
-            raise LogError(f'{uid}: trial gain file {p!r} missing or SHA-256 differs')
-        want = _want(gain, row.get('controller'))
+        _, want, _ = read_gain(p, row.get('controller'), ds, sha)
         for name in GAINS:
             col = 'g_' + name
             bits = want['gains'].get(glc.ALIASES.get(name, name))
@@ -3293,16 +3299,15 @@ def freeze(ds: str, campaign: str, stop_reason: str, gain_set: str, gain_file: s
         raise LogError(f'--gain-file {base!r}: name must contain "gain_" and end in .json (.gitattributes L81)')
     if campaign in freeze_rows(ds, campaign):
         raise LogError(f'{campaign} already frozen')
-    from s05_final_table import _want
     try:
-        _want(gain_file, campaign.split('-')[-1])
+        _, _, gain_sha = read_gain(gain_file, campaign.split('-')[-1])
     except ValueError as exc:
         raise LogError(str(exc)) from exc
-    at = at or now().isoformat(timespec='microseconds')
     try:
-        _parse_t(at)
+        t = _freeze_time(at) if at else now()
     except (ValueError, TypeError) as exc:
         raise LogError(f'--at {at!r}: invalid frozen_at') from exc
+    at = t.isoformat(timespec='microseconds')
     if stop_reason == 'khoi_xac_nhan_dat':                                         # C9D-4
         why = confirm_block_problem(apply_after(live_rows(read_rows(os.path.join(ds, TUNING))), ds), ds, campaign,
                                     gain_set, at)
@@ -3310,7 +3315,7 @@ def freeze(ds: str, campaign: str, stop_reason: str, gain_set: str, gain_file: s
             raise LogError(f'--stop-reason khoi_xac_nhan_dat: {why} (C9D-4)')
     row = {'campaign': campaign, 'frozen_at': at, 'stop_reason': stop_reason,
            'stop_cause': stop_cause, 'gain_set_id': gain_set, 'gain_file': gain_file.replace('\\', '/'),       # same text on any OS
-           'gain_sha256': sha256_file(gain_file), 'notes': notes}
+           'gain_sha256': gain_sha, 'notes': notes}
     append_row(os.path.join(ds, FREEZE), FREEZE_COLS, row)
     return row
 
@@ -3327,36 +3332,41 @@ def freeze_rows(ds, campaign=None):
         if c not in TUNED or gain_owner(gs) != c:
             raise LogError(f'{FREEZE}: gain_set_id {gs!r} does not belong to campaign {c!r}')
         try:
-            _parse_t(r['frozen_at'])
+            _freeze_time(r['frozen_at'])
         except (KeyError, TypeError, ValueError) as exc:
             raise LogError(f'{FREEZE}: {gs}: invalid frozen_at {r.get("frozen_at")!r}') from exc
-        path, want = frozen_gain(ds, r)
+        try:
+            path, want, _ = read_gain(r.get('gain_file') or '', c.split('-')[-1], ds, r.get('gain_sha256') or '')
+        except ValueError as exc:
+            raise LogError(f'{FREEZE}: {gs}: {exc}') from exc
         rows[c] = dict(r, gain_file=path, want=want)
     return rows
 
 
-def frozen_gain(ds, row):
-    from s05_final_table import _want
-
-    gs, path = row['gain_set_id'], row.get('gain_file') or ''
-    candidates = [path] if os.path.isabs(path) else [os.path.join(ds, path), path]
+def read_gain(path, controller, ds=None, expected_sha=None):
+    """Resolve the logged name and decode exactly the bytes used for its SHA-256."""
+    import gain_line_check as glc
+    candidates = [os.path.join(ds, path), path] if ds and not os.path.isabs(path) else [path]
     problems = []
     for p in candidates:
         if not os.path.isfile(p):
             continue
         try:
-            sha = sha256_file(p)
+            with open(p, 'rb') as f:
+                raw = f.read()
         except OSError as exc:
             problems.append(f'{p}: khong doc duoc ({exc})')
             continue
-        if sha == row.get('gain_sha256'):
-            try:
-                return p, _want(p, row['campaign'].split('-')[-1])
-            except ValueError as exc:
-                raise LogError(f'{FREEZE}: {gs}: {exc}') from exc
-        problems.append(f'{p}: khac gain_sha256 ({sha})')
+        sha = hashlib.sha256(raw).hexdigest()
+        if expected_sha is not None and sha != expected_sha:
+            problems.append(f'{p}: khac gain_sha256 (SHA-256 {sha})')
+            continue
+        want = glc.parse_gain_file(raw, p)
+        if want['ctrl'] != {'PID': 'PID', 'LADRC': 'ADRC'}.get(controller):
+            raise ValueError(f"gain file {p}: ctrl {want['ctrl']}, the set is of {controller}")
+        return p, want, sha
     details = '; '.join(problems) if problems else f'not found (tried {candidates})'
-    raise LogError(f'{FREEZE}: gain_file {path!r} of {gs}: {details}')
+    raise ValueError(f'gain_file {path!r}: {details}')
 
 
 def check_final_freeze(row, freezes=None, *, ds=None):
@@ -3512,6 +3522,8 @@ def check_finals(tun):
     stopped = _final_stops(tun)
     valid = defaultdict(int)
     for r in tun:
+        if r.get('stage') == 'final_hil' and r.get('campaign') != 'RQ2':
+            raise LogError(f"{r.get('run_uid')}: a final_hil run is account RQ2 (§4.6)")
         if r.get('stage') in ('final', 'final_hil') and not r.get(RETRO_FLAG) and r.get('run_outcome') in VALID:
             key = final_key(r)
             valid[key] += 1
@@ -3602,8 +3614,6 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
 
     for r in tun:
         check_account_row(r, TUNING, legacy=True)
-        if r.get('stage') == 'final_hil' and r.get('campaign') != 'RQ2':
-            raise LogError(f"{r.get('run_uid')}: a final_hil run is account RQ2 (§4.6)")
         if r.get('platform') in ('HIL', 'HW'):
             try:
                 check_task(r.get('trajectory', ''), r.get('speed_mps', ''))
@@ -4217,7 +4227,7 @@ def main(argv=None) -> int:
     m.add_argument('--n-sim-evals', type=int, required=True)
     m.add_argument('--t-machine-s', type=float, required=True)
     m.add_argument('--n-sim-diagnostic', type=int, default=0)
-    m.add_argument('--script-kind', choices=('S03', 'S3'), default='')
+    m.add_argument('--script-kind', choices=('S03', 'S3'), default='', help='S03 and S3 require machine-phases')
     m.add_argument('--platform', default='SIM', choices=PLATFORMS)
     m.add_argument('--stage', default='script', choices=STAGES)
     m.add_argument('--notes', default='')

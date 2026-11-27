@@ -512,9 +512,7 @@ def combine(drift, sc0, tr0, fr0_sha, sc1=None, tr1=None, fr1_sha=None):
     if not drift['vuot'] or drift['thieu_H1']:
         if sc1 is not None or tr1 is not None:
             raise ValueError('drift.json: below eps_H or clip H at the end missing, but a second score was given')
-        if drift['thieu_H1']:
-            info['flags'] = ['thieu_H1']
-            out['outcome'] = 'hong_he_do' if o0 == 'hong_he_do' else 'chua_ket_luan'
+        out['outcome'], info['flags'] = evidence.outcome(o0, None, drift['vuot'], drift['thieu_H1'])
         out['calib_drift'] = info
         return out
     if sc1 is None or tr1 is None or fr1_sha is None:
@@ -534,16 +532,8 @@ def combine(drift, sc0, tr0, fr0_sha, sc1=None, tr1=None, fr1_sha=None):
     # Liam 17/11 "Moi lan tu ghep gio": each score matched the clocks on its own frames; both kept, not averaged
     info.update(offset_s_h0=sc0['offset_s'], offset_s_h1=sc1['offset_s'],          # null: that scoring lost it
                 offset_src_h0=sc0.get('offset_src'), offset_src_h1=sc1.get('offset_src'))
-    info['flags'] = ['calib_drift']
-    if 'hong_he_do' in (o0, o1):
-        final = 'hong_he_do'                                          # Q3
-    elif o0 == o1:
-        final = o0
-    else:
-        final = 'chua_ket_luan'
-        info['flags'].append('calib_drift_split')
+    out['outcome'], info['flags'] = evidence.outcome(o0, o1, drift['vuot'], drift['thieu_H1'])
     info['h1_score'] = sc1                                            # CD1-6: kept whole
-    out['outcome'] = final
     out['calib_drift'] = info
     return out
 
