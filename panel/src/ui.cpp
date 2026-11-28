@@ -15,6 +15,8 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
 #include <esp_heap_caps.h>
+#include <algorithm>
+#include <cfloat>
 
 #include "fonts/ui_font_big.h"
 #include "fonts/ui_font_body.h"
@@ -402,6 +404,103 @@ void scr_run(const PanelView &v)
     stat_card(204, 264, "Quality", q, c->st.quality ? AMBER_T : GREEN_T);
 }
 
+constexpr int PLOT_POINTS = 200;
+
+/* pp_track_point() flattens received chunks. Keep the gaps for the pen-up moves. */
+template<class Visit>
+void visit_track(const pp_track_series_t &s, Visit visit)
+{
+    bool first = true;
+    int seen = 0;
+    for (int chunk = 0; chunk < s.count; chunk++) {
+        if (!(s.received & (1u << chunk))) {
+            first = true;
+            continue;
+        }
+        for (int i = 0; i < s.n[chunk]; i++) {
+            visit(s.points[chunk][i], first);
+            first = false;
+            if (++seen == PLOT_POINTS) return;
+        }
+    }
+}
+
+void result_plot(const pp_client_t *c, uint16_t run, int w)
+{
+    const int x = 12, y = 114, h = 116, pad = 10;
+    const int cx = x + w / 2;
+    card(x, y, w, h, 10, CARD, BG);
+    if (!run || c->track_run_no != run) {
+        text_c(cx, y + h / 2 + 5, "no trajectory", ui_font_small, MUTED, CARD);
+        return;
+    }
+
+    const char *const labels[] = {"ref", "plant", "DUT"};
+    const uint16_t colors[] = {BLUE_T, AMBER, GREEN_H};
+    int xmin = INT16_MAX, xmax = INT16_MIN, ymin = INT16_MAX, ymax = INT16_MIN;
+    int top = y + 28;
+    for (int k = 0; k < PP_TRACK_SERIES; k++) {
+        const pp_track_series_t &s = c->tracks[k];
+        int lx = x + pad + k * (w - 2 * pad) / PP_TRACK_SERIES;
+        g->fillRect(lx, y + 12, 9, 2, colors[k]);
+        text(lx + 13, y + 18, labels[k], ui_font_small, TXT, CARD);
+        if (!pp_track_complete(&s) || s.point_count > PLOT_POINTS) {
+            text(lx, y + 33, "partial", ui_font_small, MUTED, CARD);
+            top = y + 42;
+        }
+        visit_track(s, [&](const pp_point_t &p, bool) {
+            xmin = std::min<int>(xmin, p.x_mm);
+            xmax = std::max<int>(xmax, p.x_mm);
+            ymin = std::min<int>(ymin, p.y_mm);
+            ymax = std::max<int>(ymax, p.y_mm);
+        });
+    }
+    const int bottom = y + h - pad;
+    const float cy = (top + bottom) * 0.5f;
+    if (xmin > xmax) {
+        text_c(cx, (int)cy + 5, "no trajectory", ui_font_small, MUTED, CARD);
+        return;
+    }
+    const float sx = xmax > xmin ? (float)(w - 2 * pad) / (xmax - xmin) : FLT_MAX;
+    const float sy = ymax > ymin ? (float)(bottom - top) / (ymax - ymin) : FLT_MAX;
+    const float scale = std::min(sx, sy);
+    const float mid_x = (xmin + xmax) * 0.5f, mid_y = (ymin + ymax) * 0.5f;
+    for (int k = 0; k < PP_TRACK_SERIES; k++) {
+        int last_x = 0, last_y = 0;
+        visit_track(c->tracks[k], [&](const pp_point_t &p, bool first) {
+            int px = (int)(cx + (p.x_mm - mid_x) * scale + 0.5f);
+            int py = (int)(cy - (p.y_mm - mid_y) * scale + 0.5f);
+            if (first) g->drawPixel(px, py, colors[k]);
+            else g->drawLine(last_x, last_y, px, py, colors[k]);
+            last_x = px;
+            last_y = py;
+        });
+    }
+}
+
+void result_check(const pp_client_t *c, uint16_t run)
+{
+    const pp_extra_t &e = c->extra;
+    if (!run || !c->has_extra || !(e.flags & PP_X_CHECK_VALID) || e.check_run != run)
+        return;
+    char reason[48];
+    const char *label;
+    uint16_t color;
+    switch (e.check_code) {
+    case PP_CHK_CLEAN_NO_SPIFIX: label = "CLEAN (SPIfix not checked)"; color = AMBER_T; break;
+    case PP_CHK_CLEAN:           label = "CLEAN"; color = GREEN_T; break;
+    case PP_CHK_RUNNING:         label = "checking..."; color = MUTED; break;
+    case PP_CHK_BAD:
+        snprintf(reason, sizeof reason, "BAD: %s", e.check_text);
+        label = reason; color = RED_T; break;
+    case PP_CHK_INCONCLUSIVE:
+        snprintf(reason, sizeof reason, "INCONCLUSIVE: %s", e.check_text);
+        label = reason; color = AMBER_T; break;
+    default: return;
+    }
+    text(12, 250, label, ui_font_small, color, BG);
+}
+
 void scr_result(const PanelView &v)
 {
     const pp_client_t *c = v.a->c;
@@ -420,7 +519,7 @@ void scr_result(const PanelView &v)
     card_line(12, 44, 456, 62, 10, fill, line, BG);
     run_line(28, 72, c, true, soft, soft, fill);
     text(28, 98, out, ui_font_head, word, fill);
-    uint16_t run = app_run(v.a);                /* R1-R5: lines only of this run */
+    uint16_t run = app_view(v.a, v.now).result_run;
     if (run)
         snprintf(s, sizeof s, "Run #%u", run);
     else
@@ -429,20 +528,26 @@ void scr_result(const PanelView &v)
     card(456 - cw, 60, cw, 28, 14, chipf, fill);
     text(456 - cw + 14, 80, s, ui_font_body, chipt, chipf);
 
-    card(12, 116, 456, 128, 10, CARD, BG);
     app_result_t r = app_result(v.a);
-    if (r == APP_RES_FRESH) {
-        for (int k = 0; k < PP_RESULT_LINES; k++) {
-            if (c->info.result[k][0])
-                text(28, 148 + 40 * k, c->info.result[k], ui_font_body, TXT, CARD);
-            if (k < PP_RESULT_LINES - 1)
-                g->drawFastHLine(28, 161 + 40 * k, 424, DIV);
-        }
-    } else {
-        const char *m = c->st.outcome != PP_OUT_COMPLETED ? "No result lines" :
-                        r == APP_RES_WAITING ? "Waiting for result..." : "Result of another run (see PC)";
-        text(28, 186, m, ui_font_body, MUTED, CARD);
+    const char *message = c->st.outcome != PP_OUT_COMPLETED ? "No result lines" :
+                          r == APP_RES_WAITING ? "Waiting for result..." : "Result of another run (see PC)";
+    const int lines = r == APP_RES_FRESH ? PP_RESULT_LINES : 1;
+    const char *rows[PP_RESULT_LINES] = {message};
+    int inner = 184;
+    for (int k = 0; k < lines; k++) {
+        if (r == APP_RES_FRESH) rows[k] = c->info.result[k];
+        inner = std::max(inner, width_of(rows[k], ui_font_small));
     }
+    int info_x = 468 - inner - 20;
+    result_plot(c, run, info_x - 8 - 12);
+    card(info_x, 114, inner + 20, 116, 10, CARD, BG);
+    for (int k = 0; k < lines; k++) {
+        const uint8_t *font = width_of(rows[k], ui_font_body) <= inner ? ui_font_body : ui_font_small;
+        text(info_x + 10, lines == 1 ? 178 : 140 + 37 * k, rows[k], font,
+             r == APP_RES_FRESH ? TXT : MUTED, CARD);
+        if (k + 1 < lines) g->drawFastHLine(info_x + 10, 151 + 37 * k, inner, DIV);
+    }
+    result_check(c, run);
 
     quality_text(c->st.quality, q, sizeof q);
     snprintf(s, sizeof s, "Lost %u " DOT " Quality %s", c->st.lost, q);
@@ -537,6 +642,28 @@ uint32_t ui_signature(const PanelView &v)
         }
     } else if (s == APP_SCR_RUN && fault_active(c)) {
         fnv(c->extra.fault_text, strlen(c->extra.fault_text) + 1);
+    } else if (s == APP_SCR_RESULT) {
+        fnv(&c->track_run_no, sizeof c->track_run_no);
+        for (const pp_track_series_t &series : c->tracks) {
+            fnv(&series.count, sizeof series.count);
+            fnv(&series.received, sizeof series.received);
+            fnv(&series.point_count, sizeof series.point_count);
+            if (run && run == c->track_run_no) {
+                /* A repeated chunk can replace its coordinates at the same point count. */
+                fnv(series.n, series.count);
+                for (int i = 0; i < series.count; i++)
+                    fnv(series.points[i], series.n[i] * sizeof(pp_point_t));
+            }
+        }
+        fnv(&c->has_extra, sizeof c->has_extra);
+        if (c->has_extra) {
+            const pp_extra_t &e = c->extra;
+            uint8_t valid = e.flags & PP_X_CHECK_VALID;
+            fnv(&valid, sizeof valid);
+            fnv(&e.check_run, sizeof e.check_run);
+            fnv(&e.check_code, sizeof e.check_code);
+            fnv(e.check_text, strlen(e.check_text) + 1);
+        }
     } else if (s == APP_SCR_NOLINK && app_proto_mismatch(v.a, v.now)) {
         fnv(&v.a->proto_foreign_ver, sizeof v.a->proto_foreign_ver);
     }

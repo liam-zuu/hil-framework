@@ -4,6 +4,7 @@
  * screen choice, result rules and texts are those of lib/panel_app and src/ui.cpp.
  * Numbers are made up for the picture (FAKE = what panel/tools/fake_pi.py sends). */
 #include <assert.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -74,11 +75,61 @@ static void shot(const char *dir, const char *name)
     printf("%s\n", name);
 }
 
+static void figure_eight(uint16_t run, bool partial)
+{
+    const int samples = 161;  /* 8 s at 20 Hz, including both endpoints */
+    const int chunks = (samples + PP_TRACK_POINTS_MAX - 1) / PP_TRACK_POINTS_MAX;
+    const double pi = acos(-1.0);
+    for (int k = 0; k < PP_TRACK_SERIES; k++) {
+        for (int chunk = 0; chunk < chunks; chunk++) {
+            if (partial && k == PP_TR_PLANT && chunk == 4) continue;
+            pp_point_input_t points[PP_TRACK_POINTS_MAX];
+            int n = 0;
+            for (int i = chunk * PP_TRACK_POINTS_MAX; i < samples && n < PP_TRACK_POINTS_MAX; i++) {
+                double t = i / 20.0, a = 2 * pi * t / 8;
+                double x = (k == PP_TR_DUT ? 790 : 850) * sin(a);
+                double y = (k == PP_TR_DUT ? 220 : 260) * sin(2 * a);
+                if (k == PP_TR_PLANT && t >= 4 && t <= 6)
+                    y += 220 * sin(pi * (t - 4) / 2);
+                points[n++] = {(int32_t)lround(x), (int32_t)lround(y)};
+            }
+            uint8_t frame[PP_LEN_TRACK];
+            size_t len = pp_encode_track(frame, C.sid, run, k, chunk, chunks, n, points);
+            assert(len == sizeof frame);
+            pp_client_on_frame(&C, frame, len, NOW);
+        }
+    }
+}
+
+/* Render optional wire frames on top of a waiting RESULT for the host tests. */
+static int probe_result(const char *dir, const char *frames)
+{
+    base();
+    C.st.run_state = PP_ST_END;
+    C.st.outcome = PP_OUT_COMPLETED;
+    FILE *f = fopen(frames, "rb");
+    if (!f) { perror(frames); return 1; }
+    pp_parser_t parser;
+    pp_parser_init(&parser, PP_ACCEPT_PANEL, PP_PARSER_STALE_MS);
+    uint8_t buf[PP_LEN_MAX];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) != 0)
+        pp_parser_feed(&parser, buf, n, NOW, [](void *, const uint8_t *frame, size_t len) {
+            pp_client_on_frame(&C, frame, len, NOW);
+        }, nullptr);
+    fclose(f);
+    TFT_eSPI::on_text = [](const char *s) { printf("text %s\n", s); };
+    shot(dir, "probe");
+    printf("signature %u\n", (unsigned)ui_signature({&A, NOW}));
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = argc > 1 ? argv[1] : ".";
     PanelView v{&A, NOW};
     printf("%s\n", ui_begin());
+    if (argc == 3) return probe_result(dir, argv[2]);
 
     base(); C.sid = 0; C.has_st = false; C.has_status_t = false;
     shot(dir, "01_nolink_waiting");
@@ -168,6 +219,31 @@ int main(int argc, char **argv)
     app_update(&A, NOW);
     shot(dir, "16_nolink_proto_mismatch");
     assert(ui_signature(v) != ui_signature({&A, NOW + PP_NO_LINK_MS}));
+
+    base(); C.st.run_state = PP_ST_END; C.st.outcome = PP_OUT_COMPLETED;
+    strcpy(C.profile_name[C.st.profile], "O1-F05");
+    C.info.ctrl_src = PP_CTRL_SRC_FW;
+    C.info.flags |= PP_I_RESULT_VALID; C.info.result_run = C.st.run_no;
+    strcpy(C.info.result[0], "completed #3");
+    strcpy(C.info.result[1], "e_max 220 e_end 0");
+    strcpy(C.info.result[2], "p99 27 max 38us");
+    C.has_extra = true; C.extra.flags = PP_X_CHECK_VALID;
+    C.extra.check_run = C.st.run_no; C.extra.check_code = PP_CHK_CLEAN_NO_SPIFIX;
+    figure_eight(C.st.run_no, false);
+    shot(dir, "17_result_track_clean");
+
+    C.extra.check_code = PP_CHK_BAD;
+    strcpy(C.extra.check_text, "pos_reset +1");
+    shot(dir, "18_result_track_bad");
+
+    memset(C.tracks, 0, sizeof C.tracks);
+    figure_eight(C.st.run_no, true);
+    C.extra.check_code = PP_CHK_RUNNING;
+    shot(dir, "19_result_track_partial");
+
+    C.st.run_no++;
+    C.extra.check_code = PP_CHK_CLEAN;
+    shot(dir, "20_result_other_run_track");
 
     printf("missing_glyphs %d\n", TFT_eSPI::missing_glyphs());
 

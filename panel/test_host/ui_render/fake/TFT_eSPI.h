@@ -12,6 +12,7 @@
  */
 #pragma once
 #include <math.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -54,6 +55,19 @@ public:
     {
         if (x >= 0 && y >= 0 && x < w && y < h)
             buf[y][x] = c;
+    }
+    void drawLine(int x, int y, int x1, int y1, uint16_t c)
+    {
+        const int dx = abs(x1 - x), dy = -abs(y1 - y);
+        const int sx = x < x1 ? 1 : -1, sy = y < y1 ? 1 : -1;
+        int err = dx + dy;
+        for (;;) {
+            drawPixel(x, y, c);
+            if (x == x1 && y == y1) return;
+            const int twice = 2 * err;
+            if (twice >= dy) { err += dy; x += sx; }
+            if (twice <= dx) { err += dx; y += sy; }
+        }
     }
     void fillRect(int x, int y, int ww, int hh, uint16_t c)
     {
@@ -190,8 +204,10 @@ public:
             }
         cursor_x += g->adv;
     }
+    inline static void (*on_text)(const char *) = nullptr;
     int16_t drawString(const char *s, int x, int y)
     {
+        if (on_text) on_text(s);
         cursor_x = x; cursor_y = y;
         while (*s) drawGlyph(utf8(s));
         return (int16_t)(cursor_x - x);
