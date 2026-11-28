@@ -58,6 +58,8 @@ typedef struct {
     uint32_t profiles_gen;
     uint8_t  result_profile;     /* test of the RESULT shown (PP_PROFILE_NONE elsewhere) */
     uint16_t result_run;         /* run (st.run_no) of the RESULT shown; 0 elsewhere (R5) */
+    bool     start_reset;        /* START here is RESET DUT (EXTRA reset_index; Sol PDS-7) */
+    bool     start_ok;           /* START here would be sent (app_start_allowed) */
 } app_view_t;
 
 typedef struct {
@@ -70,6 +72,7 @@ typedef struct {
     uint32_t start_sid;              /* session and profile of the last START sent */
     uint8_t  start_profile;
     bool     start_feedback;         /* its answer is displayed and EXTRA may still add a reset note */
+    char     start_note0[sizeof(((pp_extra_t *)0)->check_text)];   /* EXTRA note when it was sent (PDS-8) */
     uint32_t proto_foreign_n;
     uint8_t  proto_foreign_ver;
     uint32_t proto_foreign_seen, proto_foreign_ms;
@@ -83,6 +86,8 @@ void app_update(app_t *a, uint32_t now);
 app_screen_t app_screen(const app_t *a, uint32_t now);
 bool app_ready(const app_t *a, uint32_t now);       /* link + H7 answering */
 bool app_start_allowed(const app_t *a, int profile, uint32_t now);
+/* the test START would act on: cursor on HOME, the test shown on RESULT; -1 elsewhere */
+int app_start_profile(const app_t *a, uint32_t now);
 bool app_proto_mismatch(const app_t *a, uint32_t now);
 
 /* LINK LED (separate LED, Liam 05/11: "thêm đèn link đi, nếu không dùng thì thôi"): slow

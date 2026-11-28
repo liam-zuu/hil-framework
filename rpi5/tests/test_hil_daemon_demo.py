@@ -2,6 +2,7 @@
 import json
 import sys
 import threading
+import time
 from fractions import Fraction
 from pathlib import Path
 
@@ -48,6 +49,23 @@ def test_schedules_load_on_default_o1_plant(monkeypatch, name, fault, target, en
     row, = run_hil.load_faults(parsed, n_omega_modes=0, hil_cfg=cfg, load_schedule=False).rows
     assert (row.fault, row.target, row.start_ms, row.end_ms, dict(row.params)) == (
         fault, target, 4000, end_ms, params)
+
+
+def test_mock_lists_only_the_demos_run_hil_mock_accepts(monkeypatch, tmp_path):
+    # Sol PDS-10: --mock refuses DEMO-IMU, DEMO-GYRO (IMU source) and DEMO-JAM (traction plant)
+    mock_names = [name for name, _ in hd.panel_tests(mock=True)]
+    assert [n for n in mock_names if n.startswith('DEMO-')] == list(hd.DEMO_MOCK) == ['DEMO-ENC']
+    assert [n for n, _ in hd.panel_tests() if n.startswith('DEMO-')] == list(hd.DEMO_NAMES)
+    args = dict(hd.panel_tests(mock=True))['DEMO-ENC']
+    monkeypatch.setattr(sys, 'argv', ['run_hil.py', *args, '--finite-run', '--mock', '--frame-log', 'frames.npz',
+                                     '--step-log', 'steps.csv'])
+    parsed = run_hil._parse_args()
+    assert parsed.mock
+    cfg = HILConfig(imu_static=parsed.imu_static, imu_profile=parsed.imu_profile)
+    cfg.lifecycle, _ = run_hil._finite_run_config(parsed, o1_tasks.make_spec(parsed.o1))
+    row, = run_hil.load_faults(parsed, n_omega_modes=0, hil_cfg=cfg, load_schedule=False).rows
+    assert (row.fault, row.target) == ('enc_loss', 'FL')
+    assert [n for n, _ in hd.HilDaemon(str(tmp_path), mock=True).tests if n.startswith('DEMO-')] == ['DEMO-ENC']
 
 
 def test_jam_slows_fl_at_the_same_duty():
@@ -368,6 +386,26 @@ def test_logger_ready_before_run_then_dirty_event_stops_fake_owner(tmp_path, mon
         assert d.start(0) == pp.RES_BAD_PROFILE
     finally:
         assert d.shutdown()
+
+
+def test_shutdown_never_leaves_the_logger_alive(tmp_path, monkeypatch, udp):
+    # Sol PDS-3: a logger that only dies by kill must not outlive shutdown(), even when the
+    # run's own stop chain is longer than the shutdown budget
+    d = daemon(tmp_path, dut_ip=IP)
+    script = ("import pathlib,sys,time\n"
+              "pathlib.Path(sys.argv[1]).write_text('{}')\n"
+              "time.sleep(60)\n")  # ignores the STOP line: only a kill ends it
+    d._logger_cmd = lambda folder: [sys.executable, '-c', script, str(folder / 'logger_ready.json')]
+    d.stop_term_s = d.stop_kill_s = 5.0
+    monkeypatch.setenv('FAKE_RUN_S', '30')
+    assert d.start(0) == pp.RES_OK
+    wait_for(d, (pp.ST_RUN,))
+    logger = d._logger_proc
+    assert logger is not None and logger.poll() is None
+    t0 = time.monotonic()
+    d.shutdown(wait_s=1.0)
+    assert time.monotonic() - t0 < 1.0 + 3.0
+    assert logger.poll() is not None
 
 
 def test_unready_logger_is_reaped_and_run_proceeds(tmp_path, monkeypatch, udp):

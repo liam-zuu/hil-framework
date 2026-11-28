@@ -89,7 +89,8 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t len)
 static void leds(uint32_t now)
 {
     app_screen_t s = app_screen(&g_app, now);
-    bool start_on = (s == APP_SCR_HOME || s == APP_SCR_RESULT) && app_ready(&g_app, now);
+    int p = app_start_profile(&g_app, now);    /* Sol PDS-14: the same rule as the START button */
+    bool start_on = (s == APP_SCR_HOME || s == APP_SCR_RESULT) && p >= 0 && app_start_allowed(&g_app, p, now);
     bool stop_on = s == APP_SCR_RUN || s == APP_SCR_FAULT || g_c.stop.active;
     digitalWrite(PIN_LED_START, start_on ? HIGH : LOW);
     digitalWrite(PIN_LED_STOP, stop_on ? HIGH : LOW);

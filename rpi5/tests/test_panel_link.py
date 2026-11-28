@@ -488,3 +488,19 @@ def test_partial_track_finishes_before_new_session_status_then_old_chunks_stop()
     last_old = max(i for i, f in enumerate(frames) if f.sid == sid)
     assert isinstance(frames[last_old], pp.Track)
     assert isinstance(frames[last_old + 1], pp.Status) and frames[last_old + 1].sid == link.sess.sid
+
+
+def test_foreign_version_frames_give_one_operator_line_per_change_pds13():
+    # Sol PDS-13: a v6 panel is told on the Pi log, once per change of the counter
+    import struct
+    from panel_link import log_foreign
+    v6 = bytearray(pp.encode_cmd(1, 1, pp.CMD_STOP))
+    v6[1] = 6
+    v6[-2:] = struct.pack('<H', pp.crc16(bytes(v6[:-2])))
+    parser, lines = pp.StreamParser(), []
+    seen = log_foreign(parser, 0, lines.append)
+    assert seen == 0 and lines == []
+    assert parser.feed(bytes(v6)) == []
+    seen = log_foreign(parser, seen, lines.append)
+    seen = log_foreign(parser, seen, lines.append)
+    assert seen == 1 and lines == ['panel sends protocol v6, Pi speaks v7: reflash the panel (1 frames ignored)']

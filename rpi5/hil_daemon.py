@@ -71,6 +71,8 @@ def _o1_panel() -> Tuple[str, ...]:
 O1_PANEL = _o1_panel()
 DEMO_BASE = 'O1-F05'
 DEMO_NAMES = ('DEMO-ENC', 'DEMO-IMU', 'DEMO-GYRO', 'DEMO-JAM')
+# run_hil.py --mock refuses the others (IMU source, traction plant needed: Sol PDS-10, 28/11)
+DEMO_MOCK = ('DEMO-ENC',)
 # RUN banner text, English like the panel screens (Liam 28/11 at CODE_PANEL: "dùng tiếng anh full nhé")
 FAULT_NAMES = {'enc_loss': 'ENC LOSS', 'imu_loss': 'IMU LOSS', 'gyro_scale': 'GYRO SCALE', 'wheel_jam': 'WHEEL JAM'}
 _WHEEL_TARGET = ('enc_loss', 'wheel_jam')   # the wheel is named; imu / gz targets are implied by the name
@@ -117,13 +119,14 @@ _RE_STATS = re.compile(r'p99=([0-9.]+|None) us\s+max=([0-9.]+|None) us\s+>warn: 
 _RE_WHOLE = re.compile(r'whole run .*?p99=([0-9.]+|None) us .*?max=([0-9.]+) us .*?overruns=(\d+)')
 
 
-def panel_tests() -> List[Tuple[str, List[str]]]:
-    """(name shown on the panel, run_hil.py arguments) of every test, fixed order."""
+def panel_tests(mock: bool = False) -> List[Tuple[str, List[str]]]:
+    """(name shown on the panel, run_hil.py arguments) of every test, fixed order. --mock: only
+    the fault demos run_hil.py --mock accepts (DEMO_MOCK)."""
     from trajectory_pub import GROUP_A
     tests = [(tid, ['--test', tid]) for tid in GROUP_A]
     tests += [(tid, ['--o1', tid]) for tid in O1_PANEL]
     tests += [(name, ['--o1', DEMO_BASE, '--faults', os.path.join(HERE, 'panel_faults', name + '.csv')])
-              for name in DEMO_NAMES]
+              for name in (DEMO_MOCK if mock else DEMO_NAMES)]
     tests.append((RESET_DUT, []))
     return tests
 
@@ -344,7 +347,7 @@ class HilDaemon:
                  busy_check: Callable[[Optional[int]], bool] = other_run_hil_running,
                  dut_reset_gpio: int = DUT_RESET_GPIO, dut_ip: Optional[str] = None,
                  expect_dut: Optional[str] = None):
-        self.tests = list(tests) if tests is not None else panel_tests()
+        self.tests = list(tests) if tests is not None else panel_tests(mock)
         self.reset_index = next((i for i, (name, _) in enumerate(self.tests) if name == RESET_DUT),
                                 pp.PROFILE_NONE)
         self.runs_dir = os.path.abspath(runs_dir)
@@ -385,6 +388,7 @@ class HilDaemon:
         self.tracks = {}
         self._note_at = None
         self._logger_thread = None
+        self._logger_proc = None            # the UDP logger of the run, for shutdown() (Sol PDS-3)
         self._run_done = threading.Event()
         self._shutdown = threading.Event()
         self._querying = False              # idle worker has reserved the DUT for a gain_get
@@ -518,9 +522,11 @@ class HilDaemon:
                 continue
         info['group_gone'] = _reap_group(proc.pid if _spawn_kw() else None) and proc.poll() is not None
         info['exit_code'] = proc.poll()
-        if not info['group_gone']:
-            with self._lock:
+        with self._lock:
+            if not info['group_gone']:
                 self._wedged = True
+            if self._logger_proc is proc:
+                self._logger_proc = None
         try:
             proc.stdin.close()
         except OSError:
@@ -553,6 +559,8 @@ class HilDaemon:
                 with (folder / 'logger.log').open('wb') as log:
                     logger = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
                                               text=True, **_spawn_kw())
+                with self._lock:
+                    self._logger_proc = logger
                 deadline = time.monotonic() + LOGGER_READY_S
                 while logger.poll() is None and not self._stop_pending and time.monotonic() < deadline:
                     if ready.is_file():
@@ -867,20 +875,41 @@ class HilDaemon:
             self._closing = True
             self._shutdown.set()
             active = self.state in pp.ST_ACTIVE
+            logger = self._logger_proc
         if active:
             self.stop()
+        if logger is not None and logger.poll() is None:
+            # Sol PDS-3: the logger closes in parallel with the run, not after it (its own stop
+            # chain starts only at the end of the run and could outlast wait_s)
+            try:
+                self.stop_fn(logger, 0)
+            except OSError:
+                pass
         killed = None
         t_end = time.monotonic() + wait_s
         while time.monotonic() < t_end:
             with self._lock:
                 if (self.state not in pp.ST_ACTIVE and self.proc is None and not self._checking
-                        and not self._probing and not self._querying):
+                        and not self._probing and not self._querying and self._logger_proc is None):
                     return not self._wedged
                 probe = self._probe_proc            # read again each time (PPI-R3-1)
             if probe is not None and probe is not killed:
                 self._kill_probe(probe)
                 killed = probe
             time.sleep(0.05)
+        with self._lock:
+            logger = self._logger_proc
+        if logger is not None and logger.poll() is None:
+            # out of time: the logger dies with the daemon, never left holding the UDP port
+            try:
+                self.stop_fn(logger, 2)
+            except OSError:
+                pass
+            _reap_group(logger.pid if _spawn_kw() else None, wait_s=0)
+            try:
+                logger.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                pass
         return False
 
     def _open_run_dir(self, name: str) -> None:
@@ -1051,7 +1080,11 @@ class HilDaemon:
                 self._logger_thread.join()
             if sys.platform.startswith('linux'):
                 os.nice(10)  # Linux niceness is per thread; the UART thread keeps its priority.
-            logger_ready = self._meta.get('logger', {}).get('ready', False)
+            logger = self._meta.get('logger', {})
+            logger_ready = logger.get('ready', False)
+            # Alive until the daemon stopped it, then closed cleanly: only then can its log vouch
+            # for the whole run (Sol PDS-1). A logger that died on its own gives no clean verdict.
+            logger_ok = bool(logger_ready and logger.get('stop_signals') and logger.get('exit_code') == 0)
             dut = None
             if logger_ready:
                 try:
@@ -1067,7 +1100,7 @@ class HilDaemon:
             except (OSError, ValueError) as exc:
                 errors.append(str(exc))
             check, other = panel_result.run_check(folder, '--faults' in self._meta.get('argv', ()),
-                                                 logger_ready, dut, self._shutdown)
+                                                 logger_ok, dut, self._shutdown)
         except Exception as exc:
             check = panel_result.inconclusive(f'{type(exc).__name__}: {exc}')
         with self._lock:

@@ -369,12 +369,22 @@ class FakeRun:
                            run_no=self.run_no, result_run=self.result_run, dut_sha='facefeed0000', dut_env=self.ctrl)
 
 
+def log_foreign(parser, seen: int, on_log=print) -> int:
+    """One operator line when CRC-valid frames of another protocol version arrive (Sol PDS-13):
+    the panel firmware and the Pi speak different versions, the panel needs a reflash."""
+    n = parser.version_mismatch
+    if n != seen:
+        on_log(f'panel sends protocol v{parser.last_foreign_version}, Pi speaks v{pp.PROTO_VERSION}: '
+               f'reflash the panel ({n} frames ignored)')
+    return n
+
+
 def serve(port, link: PanelLink, stop_after_s: Optional[float] = None, on_log=print) -> None:
     """Loop: read what the UART has, feed, poll, print new log lines. port: pyserial object
     opened with timeout=0 (read never waits) and write_timeout=0 (write never waits)."""
     t_end = None if stop_after_s is None else time.monotonic() + stop_after_s
     names = {v: k[4:] for k, v in vars(pp).items() if k.startswith('CMD_')}
-    n_log = 0
+    n_log = n_foreign = 0
     while t_end is None or time.monotonic() < t_end:
         data = port.read(256)
         if data:
@@ -383,6 +393,7 @@ def serve(port, link: PanelLink, stop_after_s: Optional[float] = None, on_log=pr
         for t, cmd, seq, r in link.log[n_log:]:
             on_log(f'{t:10.3f}  {names.get(cmd, cmd):8s} seq {seq:5d} -> {r}')
         n_log = len(link.log)
+        n_foreign = log_foreign(link.parser, n_foreign, on_log)
         time.sleep(0.005)
 
 

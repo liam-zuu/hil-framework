@@ -155,9 +155,11 @@ void app_update(app_t *a, uint32_t now)
         else
             snprintf(a->msg, sizeof a->msg, "%s refused: busy or no link, press again", cmd_name(ev.cmd));
     }
-    /* The STATUS answer and its EXTRA note can arrive in separate UART reads. */
+    /* The STATUS answer and its EXTRA note can arrive in separate UART reads. A note already
+     * there when START was sent belongs to an earlier reset (Sol PDS-8): only a new one counts. */
     if (a->start_feedback && reset_profile(c, a->start_profile) && !(c->extra.flags & PP_X_CHECK_VALID) &&
-        c->extra.check_text[0] && strcmp(a->msg, c->extra.check_text) != 0)
+        c->extra.check_text[0] && strcmp(c->extra.check_text, a->start_note0) != 0 &&
+        strcmp(a->msg, c->extra.check_text) != 0)
         snprintf(a->msg, sizeof a->msg, "%s", c->extra.check_text);
     if (c->has_daemon_boot && (!a->has_daemon_boot || c->daemon_boot != a->daemon_boot)) {
         a->has_daemon_boot = true;              /* another daemon: its runs count from 1 again */
@@ -184,14 +186,26 @@ app_view_t app_view(const app_t *a, uint32_t now)
     bool result = v.screen == APP_SCR_RESULT;
     v.result_profile = (result && a->c->has_st) ? a->c->st.profile : PP_PROFILE_NONE;
     v.result_run = result ? app_run(a) : 0;
+    int p = v.screen == APP_SCR_HOME ? v.cursor : result ? v.result_profile : -1;
+    if (p >= 0 && p != PP_PROFILE_NONE) {           /* Sol PDS-7: what START does is part of the view */
+        v.start_reset = reset_profile(a->c, p);
+        v.start_ok = app_start_allowed(a, p, now);
+    }
     return v;
+}
+
+int app_start_profile(const app_t *a, uint32_t now)
+{
+    app_view_t v = app_view(a, now);
+    int p = v.screen == APP_SCR_HOME ? v.cursor : v.screen == APP_SCR_RESULT ? v.result_profile : -1;
+    return p == PP_PROFILE_NONE ? -1 : p;
 }
 
 bool app_view_same(const app_view_t *x, const app_view_t *y)
 {
     return x->screen == y->screen && x->cursor == y->cursor && x->sid == y->sid &&
            x->profiles_gen == y->profiles_gen && x->result_profile == y->result_profile &&
-           x->result_run == y->result_run;
+           x->result_run == y->result_run && x->start_reset == y->start_reset && x->start_ok == y->start_ok;
 }
 
 void app_drawing(app_t *a)
@@ -218,6 +232,7 @@ static void start(app_t *a, int profile, uint32_t now)
     if (!already_pending && c->pending.active) {
         a->start_sid = c->sid;
         a->start_profile = (uint8_t)profile;
+        snprintf(a->start_note0, sizeof a->start_note0, "%s", c->has_extra ? c->extra.check_text : "");
     }
 }
 
@@ -237,7 +252,8 @@ void app_buttons(app_t *a, uint8_t ev, uint32_t now)
     app_view_t v = app_view(a, now);
     if (!a->drawn_valid || a->drawn.screen != v.screen || a->drawn.sid != v.sid ||
         a->drawn.profiles_gen != v.profiles_gen || a->drawn.result_profile != v.result_profile ||
-        a->drawn.result_run != v.result_run) {
+        a->drawn.result_run != v.result_run || a->drawn.start_reset != v.start_reset ||
+        a->drawn.start_ok != v.start_ok) {
         a->start_feedback = false;
         snprintf(a->msg, sizeof a->msg, "Screen changing: press again");   /* P2, Q3, R5 */
         return;

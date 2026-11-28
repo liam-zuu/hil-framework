@@ -45,6 +45,17 @@ def read_dut(path):
     return columns
 
 
+def dut_complete(dut):
+    """True when the DUT log shows its run ending: a row with run_active 0 after the last row
+    with run_active 1 (Sol PDS-1, PDS-9). A log cut during the run (logger died, datagrams lost
+    at the end) is not complete; its last rows cannot vouch for the end of the run."""
+    if not dut:
+        return False
+    active = dut.get('run_active') or []
+    last = max((i for i, a in enumerate(active) if a == 1), default=None)
+    return last is not None and any(a == 0 for a in active[last + 1:])
+
+
 def _dut_points(dut):
     ref, estimate = [], []
     start = end = None
@@ -119,6 +130,8 @@ def trajectory(pose_file, dut):
     except FileNotFoundError:
         plant = []
     maximum, last = _errors(plant, ref)  # before decimation or int16 wire saturation
+    if not dut_complete(dut):
+        last = None  # no error at the end of a run the DUT log does not reach (Sol PDS-9)
     tracks = {series: _chunks(points) for series, points in
               ((pp.TR_REF, ref), (pp.TR_PLANT, plant), (pp.TR_DUT, estimate)) if points}
     return tracks, maximum, last
@@ -151,18 +164,21 @@ def _short(reason):
     return ' '.join(plain.encode('ascii', 'ignore').decode().split())[:22]
 
 
-def inconclusive(reason):
-    return dict(code=pp.CHK_INCONCLUSIVE, text=_short(reason), reason=reason)
+def inconclusive(reason, text=None):
+    """text: English words for the panel (Liam 28/11: "dùng tiếng anh full nhé"); reason is kept
+    whole in meta.json, whatever its language."""
+    return dict(code=pp.CHK_INCONCLUSIVE, text=_short(text or reason), reason=reason)
 
 
-def _decode(folder, logger_ready, cancel, timeout):
+def _decode(folder, cancel, timeout):
     frames = folder / 'frames.npz'
     if not frames.is_file():
         raise FileNotFoundError('missing frames.npz')
     out = folder / 'decode.json'  # s06_frames_decode --out takes a directory
+    # No --esp32-events: that option reads the S06 logger's '<t_rx monotonic>	<payload>' lines,
+    # agv_logger writes '<ISO time> <payload>' (Sol PDS-2). Without run marks the decoder counts
+    # empty MISO frames over the whole file (after the first ANSWER_LAG): stricter, never cleaner.
     cmd = tool_cmd('s06_frames_decode.py', frames, '--out', out)
-    if logger_ready:
-        cmd.extend(['--esp32-events', str(folder / 'esp32.csv.events.txt')])
     if cancel.is_set():
         raise ValueError('check cancelled')
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8',
@@ -195,18 +211,23 @@ def _decode(folder, logger_ready, cancel, timeout):
         return rc, json.load(f)
 
 
-def run_check(folder, fault, logger_ready, dut, cancel, timeout=120):
+def run_check(folder, fault, logger_ok, dut, cancel, timeout=120):
+    """logger_ok: the UDP logger was alive until the daemon stopped it and closed cleanly (exit 0).
+    A clean verdict needs that and a DUT log that reaches the end of the run (dut_complete);
+    a proven bad run (bad frames, a pose reset seen) stays BAD without them."""
     reset = reset_error = None
+    complete = bool(logger_ok) and dut_complete(dut)
     try:
         if dut:
             # All logger rows, including the inactive tail that can reveal a lost reset.
             reset = pos_reset_mid(dut['run_active'], dut['pos_reset_n'], dut['motor_on'])
     except ValueError as exc:
         reset_error = str(exc)
-    details = dict(pos_reset_mid=reset, pos_reset_error=reset_error, spifix='not checked')
+    details = dict(pos_reset_mid=reset, pos_reset_error=reset_error, dut_log_complete=complete,
+                   spifix='not checked')
     other = []
     try:
-        rc, summary = _decode(folder, logger_ready, cancel, timeout)
+        rc, summary = _decode(folder, cancel, timeout)
         problems, conditions = summary['problems'], summary['conditions']
         empty, crc = (summary['frames'][key] for key in ('empty_in_run', 'miso_crc_bad'))
         if (not isinstance(problems, list) or not isinstance(conditions, list)
@@ -216,26 +237,29 @@ def run_check(folder, fault, logger_ready, dut, cancel, timeout=120):
             raise ValueError('invalid decoder summary')
         details.update(decoder_exit=rc, empty_in_run=empty, miso_crc_bad=crc,
                        problems=problems, conditions=conditions)
+        # English words for the panel; the decoder's own (Vietnamese) lines stay in meta.json
+        bad, bad_text = '', ''
+        if empty:
+            bad = bad_text = f'empty_in_run {empty}'
+        elif crc:
+            bad = bad_text = f'miso_crc_bad {crc}'
         if fault:
             # The decoder excludes the first ANSWER_LAG replies in empty_in_run.
             # Its problems() lists these two frame counters first when nonzero.
             other = problems[int(bool(empty)) + int(bool(crc)):] + conditions
-            bad = ''
-            if empty:
-                bad = f'empty_in_run {empty}'
-            elif crc:
-                bad = f'miso_crc_bad {crc}'
-        else:
-            bad = problems[0] if rc == 1 else ''
+        elif rc == 1 and not bad:
+            bad, bad_text = problems[0], f'decoder problems {len(problems)}'
         if reset_error:
-            verdict = inconclusive(reset_error)
+            verdict = inconclusive(reset_error, 'pos_reset_n goes back')
         elif bad or reset:
             reason = bad or f'pos_reset_mid {reset}'
-            verdict = dict(code=pp.CHK_BAD, text=_short(reason), reason=reason)
+            verdict = dict(code=pp.CHK_BAD, text=_short(bad_text or reason), reason=reason)
         elif reset is None:
             verdict = inconclusive('no pos_reset')
+        elif not complete:
+            verdict = inconclusive('DUT log incomplete: logger stopped early, failed, or no row after the run')
         elif not fault and rc == 3:
-            verdict = inconclusive(conditions[0])
+            verdict = inconclusive(conditions[0], f'decoder conditions {len(conditions)}')
         else:
             verdict = dict(code=pp.CHK_CLEAN_NO_SPIFIX, text='SPIfix not checked')
     except (OSError, ValueError, TypeError, KeyError, IndexError) as exc:

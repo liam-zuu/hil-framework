@@ -18,6 +18,7 @@ lib.app_host_cursor.restype, lib.app_host_cursor.argtypes = ct.c_int, [ct.c_void
 lib.app_host_msg.restype, lib.app_host_msg.argtypes = ct.c_char_p, [ct.c_void_p]
 lib.app_host_parser_stats.restype, lib.app_host_parser_stats.argtypes = None, [ct.c_void_p, ct.c_void_p]
 lib.app_start_allowed.restype, lib.app_start_allowed.argtypes = ct.c_bool, [ct.c_void_p, ct.c_int, ct.c_uint32]
+lib.app_start_profile.restype, lib.app_start_profile.argtypes = ct.c_int, [ct.c_void_p, ct.c_uint32]
 lib.app_proto_mismatch.restype, lib.app_proto_mismatch.argtypes = ct.c_bool, [ct.c_void_p, ct.c_uint32]
 lib.app_run.restype, lib.app_run.argtypes = ct.c_uint16, [ct.c_void_p]
 lib.app_update.restype, lib.app_update.argtypes = None, [ct.c_void_p, ct.c_uint32]
@@ -29,7 +30,8 @@ lib.app_result.restype, lib.app_result.argtypes = ct.c_int, [ct.c_void_p]
 
 class AppView(ct.Structure):
     _fields_ = [('screen', ct.c_int), ('cursor', ct.c_uint8), ('sid', ct.c_uint32),
-                ('profiles_gen', ct.c_uint32), ('result_profile', ct.c_uint8), ('result_run', ct.c_uint16)]
+                ('profiles_gen', ct.c_uint32), ('result_profile', ct.c_uint8), ('result_run', ct.c_uint16),
+                ('start_reset', ct.c_bool), ('start_ok', ct.c_bool)]
 
 
 lib.app_view.restype, lib.app_view.argtypes = AppView, [ct.c_void_p, ct.c_uint32]
@@ -149,6 +151,9 @@ def test_reset_start_uses_the_advertised_index_without_h7(reset_bench):
     b.inject(pp.encode_extra(pp.Extra(sid=b.panel.sid, reset_index=1)))
     assert not lib.app_ready(b.app, b.t)
     assert lib.app_start_allowed(b.app, 1, b.t)
+    assert b.press(START) == [] and b.msg == 'Screen changing: press again'   # Sol PDS-7: not drawn yet
+    b.draw()
+    assert lib.app_start_profile(b.app, b.t) == 1
     cmd, = map(pp.decode, b.press(START))
     assert (cmd.cmd, cmd.arg) == (pp.CMD_START, 1)
 
@@ -186,6 +191,7 @@ def test_reset_answer_uses_extra_note_even_if_cursor_moved(reset_bench, note_bef
     b = reset_bench
     extra = pp.Extra(sid=b.panel.sid, reset_index=1)
     b.inject(pp.encode_extra(extra))
+    b.draw()
     b.run.start = lambda index: pp.RES_FAILED
     b.press(START)
     extra.check_text = 'DUT reset: no wire'
@@ -205,10 +211,38 @@ def test_run_check_is_not_a_reset_note(reset_bench):
     b = reset_bench
     b.inject(pp.encode_extra(pp.Extra(sid=b.panel.sid, reset_index=1, flags=pp.X_CHECK_VALID,
                                       check_run=1, check_code=pp.CHK_RUNNING, check_text='checking')))
+    b.draw()
     b.run.start = lambda index: pp.RES_BUSY
     b.press(START)
     b.step(10)
     assert b.msg == 'START: BUSY'
+
+
+def test_an_earlier_reset_note_never_relabels_a_new_answer_pds8(reset_bench):
+    # Sol PDS-8: reset 1 done, reset 2 fails before its own EXTRA arrives: the old note stays out
+    b = reset_bench
+    extra = pp.Extra(sid=b.panel.sid, reset_index=1, check_text='DUT reset done')
+    b.inject(pp.encode_extra(extra))
+    b.draw()
+    b.run.start = lambda index: pp.RES_FAILED
+    b.press(START)
+    b.step(10)
+    assert b.msg == 'START: FAILED (effect unknown)'
+    extra.check_text = 'DUT reset: no wire'
+    _feed(b, pp.encode_extra(extra))
+    assert b.msg == 'DUT reset: no wire'
+
+
+def test_extra_naming_the_cursor_entry_changes_the_view_pds7(reset_bench):
+    # Sol PDS-7: the START rule of the entry under the cursor is part of what was drawn
+    b = reset_bench
+    before = b.view()
+    assert not before.start_reset and not before.start_ok
+    b.inject(pp.encode_extra(pp.Extra(sid=b.panel.sid, reset_index=1)))
+    after = b.view()
+    assert after.start_reset and after.start_ok
+    assert not lib.app_view_same(ct.byref(before), ct.byref(after))
+    assert b.press(START) == [] and b.msg == 'Screen changing: press again'
 
 
 def test_refused_reset_press_does_not_relabel_a_normal_start_answer():
