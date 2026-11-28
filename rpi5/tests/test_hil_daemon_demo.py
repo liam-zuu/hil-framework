@@ -108,9 +108,9 @@ def test_flag_uses_run_timestamp_earliest_end_and_is_cut_at_phase_change(tmp_pat
         d._parse(f'#phase,RUN,t_ns={origin_ns}', {})
         now = [origin_ns]
         monkeypatch.setattr(hd.time, 'monotonic_ns', lambda: now[0])
-        for delta, text in [(3_999_999_999, ''), (4_000_000_000, 'LOI ENC FL 3.0s'),
-                            (4_900_000_000, 'LOI ENC FL 2.1s'), (6_999_999_999, 'LOI ENC FL 0.1s'),
-                            (7_000_000_000, 'LOI GYRO GZ 2.0s'), (9_000_000_000, '')]:
+        for delta, text in [(3_999_999_999, ''), (4_000_000_000, 'ENC LOSS FL 3.0s left'),
+                            (4_900_000_000, 'ENC LOSS FL 2.1s left'), (6_999_999_999, 'ENC LOSS FL 0.1s left'),
+                            (7_000_000_000, 'GYRO SCALE 2.0s left'), (9_000_000_000, '')]:
             now[0] = origin_ns + delta
             extra = extra_of(d.snapshot(), 1)
             assert (extra.flags, extra.fault_text) == (pp.X_FAULT_ACTIVE if text else 0, text)

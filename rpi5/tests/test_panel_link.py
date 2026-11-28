@@ -355,10 +355,10 @@ def test_status_keeps_flowing_on_the_wire_during_a_long_profile_list_codex_q9(n)
 def test_extra_fields_period_changes_and_minimum_gap():
     run = Recorder()
     w = Wire(run)
-    run.snap = RunSnapshot(run_state=pp.ST_RUN, fault_text='LOI ENC FL 2.1s', dut_sha='1234abcdef01',
+    run.snap = RunSnapshot(run_state=pp.ST_RUN, fault_text='ENC LOSS FL 2.1s left', dut_sha='1234abcdef01',
                            dut_env='ladrc', sha_state=pp.SHA_OK, reset_index=14)
     w.step(10)
-    expected = pp.Extra(sid=w.panel.sid, flags=pp.X_FAULT_ACTIVE, fault_text='LOI ENC FL 2.1s',
+    expected = pp.Extra(sid=w.panel.sid, flags=pp.X_FAULT_ACTIVE, fault_text='ENC LOSS FL 2.1s left',
                         dut_sha='1234abcdef01', dut_env='ladrc', sha_state=pp.SHA_OK, reset_index=14)
     assert w.panel.extra == expected
     first_send = w.link.t_extra
@@ -394,7 +394,7 @@ def test_stalled_extra_uses_current_window_when_uart_accepts_first_byte():
             return super()._w(data)
 
     run = Recorder()
-    run.snap = RunSnapshot(run_state=pp.ST_RUN, fault_text='LOI ENC FL 0.1s')
+    run.snap = RunSnapshot(run_state=pp.ST_RUN, fault_text='ENC LOSS FL 0.1s left')
     w = StalledWire(run)
     w.step(15)
     assert w.panel.info is not None and w.panel.extra is None

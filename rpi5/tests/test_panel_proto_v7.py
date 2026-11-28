@@ -108,7 +108,7 @@ def test_panel_keeps_extra_and_clears_demo_data_on_session_loss():
     assert not panel.has_extra
     bench.step(10)
     first = pp.Extra(sid=SID1, dut_sha='123456abcdef')
-    second = pp.Extra(sid=SID1, flags=pp.X_FAULT_ACTIVE, fault_text='LOI: ENC FL 2.1s')
+    second = pp.Extra(sid=SID1, flags=pp.X_FAULT_ACTIVE, fault_text='ENC LOSS FL 2.1s left')
     panel.on_extra(first)
     assert panel.has_extra and panel.extra == first
     panel.on_extra(second)

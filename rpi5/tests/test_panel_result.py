@@ -90,11 +90,11 @@ def decoder_double(monkeypatch, folder, rc, empty=0, crc=0, logger_ready=False):
 
 
 @pytest.mark.parametrize('fault,rc,empty,crc,counts,code,text', [
-    (False, 0, 0, 0, [4, 4, 4], pp.CHK_CLEAN_NO_SPIFIX, 'chua kiem SPIfix'),
+    (False, 0, 0, 0, [4, 4, 4], pp.CHK_CLEAN_NO_SPIFIX, 'SPIfix not checked'),
     (False, 1, 0, 0, [4, 4, 4], pp.CHK_BAD, 'loi IMU trong report,'),
     (False, 3, 0, 0, [4, 4, 4], pp.CHK_INCONCLUSIVE, 'missing TICK'),
-    (True, 1, 0, 0, [4, 4, 4], pp.CHK_CLEAN_NO_SPIFIX, 'chua kiem SPIfix'),
-    (True, 3, 0, 0, [4, 4, 4], pp.CHK_CLEAN_NO_SPIFIX, 'chua kiem SPIfix'),
+    (True, 1, 0, 0, [4, 4, 4], pp.CHK_CLEAN_NO_SPIFIX, 'SPIfix not checked'),
+    (True, 3, 0, 0, [4, 4, 4], pp.CHK_CLEAN_NO_SPIFIX, 'SPIfix not checked'),
     (True, 1, 1, 0, [4, 4, 4], pp.CHK_BAD, 'empty_in_run 1'),
     (True, 1, 0, 2, [4, 4, 4], pp.CHK_BAD, 'miso_crc_bad 2'),
     (True, 1, 0, 0, [4, 4, 5], pp.CHK_BAD, 'pos_reset_mid 1'),

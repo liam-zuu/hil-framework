@@ -237,7 +237,7 @@ def run_check(folder, fault, logger_ready, dut, cancel, timeout=120):
         elif not fault and rc == 3:
             verdict = inconclusive(conditions[0])
         else:
-            verdict = dict(code=pp.CHK_CLEAN_NO_SPIFIX, text='chua kiem SPIfix')
+            verdict = dict(code=pp.CHK_CLEAN_NO_SPIFIX, text='SPIfix not checked')
     except (OSError, ValueError, TypeError, KeyError, IndexError) as exc:
         verdict = inconclusive(str(exc))
     return {**details, **verdict}, other

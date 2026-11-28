@@ -71,7 +71,9 @@ def _o1_panel() -> Tuple[str, ...]:
 O1_PANEL = _o1_panel()
 DEMO_BASE = 'O1-F05'
 DEMO_NAMES = ('DEMO-ENC', 'DEMO-IMU', 'DEMO-GYRO', 'DEMO-JAM')
-FAULT_NAMES = {'enc_loss': 'ENC', 'imu_loss': 'MAT', 'gyro_scale': 'GYRO', 'wheel_jam': 'JAM'}
+# RUN banner text, English like the panel screens (Liam 28/11 at CODE_PANEL: "dùng tiếng anh full nhé")
+FAULT_NAMES = {'enc_loss': 'ENC LOSS', 'imu_loss': 'IMU LOSS', 'gyro_scale': 'GYRO SCALE', 'wheel_jam': 'WHEEL JAM'}
+_WHEEL_TARGET = ('enc_loss', 'wheel_jam')   # the wheel is named; imu / gz targets are implied by the name
 RESET_DUT = 'RESET DUT'
 DUT_RESET_GPIO = 27
 
@@ -642,7 +644,8 @@ class HilDaemon:
                 if row.start_ms <= elapsed_ms < row.end_ms:
                     name = FAULT_NAMES.get(row.fault, row.fault)
                     left_ds = (row.end_ms - elapsed_ms + 99) // 100
-                    return f'LOI {name} {row.target.upper()} {left_ds / 10:.1f}s'[:22]
+                    where = f' {row.target.upper()}' if row.fault in _WHEEL_TARGET else ''
+                    return f'{name}{where} {left_ds / 10:.1f}s left'[:22]
         return ''
 
     def _busy_reason(self) -> str:
