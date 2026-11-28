@@ -61,7 +61,7 @@ def test_error_uses_nearest_relative_time_before_decimation(tmp_path):
     pose = tmp_path / 'pose.csv'
     write_csv(pose, 't_ns,phase,x,y,th', [(123, 'RUN', 1, 2, 0), (123+55_000_000, 'RUN', 1.1, 2, 0),
                                            (123+75_000_000, 'RUN', 1.115, 2, 0)])
-    dut = dict(timestamp_us=[200, 30200, 70200, 80200, 90200], run_active=[1]*4 + [0], segment=[0]*5,
+    dut = dict(timestamp_us=[200, 30200, 70200, 80200, 90200], run_active=[1]*4 + [0], segment=[0]*5, segment_status=['ok']*5,
                pos_x_ref=[0, 0, .13, .2, 9], pos_y_ref=[0]*5, pos_x=[0]*5, pos_y=[0]*5)
     _, maximum, last = pr.trajectory(pose, dut)
     assert (maximum, last) == pytest.approx((30, 15))
@@ -112,7 +112,7 @@ def decoder_double(monkeypatch, folder, rc, empty=0, crc=0):
 ])
 def test_verdict(tmp_path, monkeypatch, fault, rc, empty, crc, counts, code, text):
     decoder_double(monkeypatch, tmp_path, rc, empty, crc)
-    dut = (dict(timestamp_us=[0, 10, 20], run_active=[0, 1, 0], segment=[0]*3, motor_on=[0, 1, 1],
+    dut = (dict(timestamp_us=[0, 10, 20], run_active=[0, 1, 0], segment=[0]*3, segment_status=['ok']*3, motor_on=[0, 1, 1],
                 pos_reset_n=counts) if counts else None)
     check, other = pr.run_check(tmp_path, fault, bool(dut), dut, threading.Event())
     assert check['code'] == code and check['text'].startswith(text)
@@ -144,7 +144,7 @@ def test_decoder_failure_never_clean(tmp_path, monkeypatch, script, timeout, rea
 ])
 def test_clean_needs_the_whole_dut_log(tmp_path, monkeypatch, logger_ok, active, counts, code, text):
     # Sol PDS-1: a logger that died during the run cannot vouch for pos_reset_n 0
-    dut = dict(timestamp_us=[0, 10, 20], run_active=active, segment=[0]*3, motor_on=[0, 1, 1],
+    dut = dict(timestamp_us=[0, 10, 20], run_active=active, segment=[0]*3, segment_status=['ok']*3, motor_on=[0, 1, 1],
                pos_reset_n=counts)
     for fault in (False, True):
         folder = tmp_path / str(fault)
@@ -157,7 +157,7 @@ def test_clean_needs_the_whole_dut_log(tmp_path, monkeypatch, logger_ok, active,
 
 def test_a_late_datagram_from_before_the_run_is_not_its_end_pds2_3(tmp_path, monkeypatch):
     # Sol PDS2-3: UDP order (200000, 1), (300000, 1), (100000, 0): the inactive row is older
-    dut = dict(timestamp_us=[200000, 300000, 100000], run_active=[1, 1, 0], segment=[0]*3, motor_on=[1, 1, 1],
+    dut = dict(timestamp_us=[200000, 300000, 100000], run_active=[1, 1, 0], segment=[0]*3, segment_status=['ok']*3, motor_on=[1, 1, 1],
                pos_reset_n=[4, 4, 4], pos_x_ref=[0, .1, 0], pos_y_ref=[0]*3, pos_x=[0]*3, pos_y=[0]*3)
     assert not pr.dut_complete(dut)
     assert pr.dut_complete({**dut, 'timestamp_us': [200000, 300000, 400000]})
@@ -189,7 +189,8 @@ def test_decoder_failure_text_is_fixed_english_pds2_4(tmp_path, monkeypatch, scr
 def test_end_of_run_is_the_latest_active_sample_of_the_same_segment_pds3_2(tmp_path, monkeypatch, stamps,
                                                                             active, segment, complete):
     n = len(stamps)
-    dut = dict(timestamp_us=stamps, run_active=active, segment=segment, motor_on=[1]*n, pos_reset_n=[4]*n,
+    dut = dict(timestamp_us=stamps, run_active=active, segment=segment,
+               segment_status=None if segment is None else ['ok']*n, motor_on=[1]*n, pos_reset_n=[4]*n,
                pos_x_ref=[0]*n, pos_y_ref=[0]*n, pos_x=[0]*n, pos_y=[0]*n)
     assert pr.dut_complete(dut) is complete
     decoder_double(monkeypatch, tmp_path, 0)
@@ -214,3 +215,41 @@ def test_a_missing_decoder_program_is_not_a_missing_input_pds3_3(tmp_path, monke
     monkeypatch.setattr(pr, 'tool_cmd', lambda *args: [str(tmp_path / 'no_such_program')])
     check, _ = pr.run_check(tmp_path, False, False, None, threading.Event())
     assert check['code'] == pp.CHK_INCONCLUSIVE and check['text'] == 'decoder failed'
+
+
+def _dut(stamps, active, segment, status=None, x_ref=None):
+    n = len(stamps)
+    return dict(timestamp_us=stamps, run_active=active, segment=segment, segment_status=status or ['ok']*n,
+                motor_on=[1]*n, pos_reset_n=[4]*n, pos_x_ref=x_ref or [0]*n, pos_y_ref=[0]*n,
+                pos_x=[0]*n, pos_y=[0]*n)
+
+
+def test_an_end_in_an_older_segment_does_not_cover_a_run_cut_after_a_reboot_pds4_2(tmp_path, monkeypatch):
+    # Sol PDS4-2: segment 0 ends (20.0 s active, 20.1 s inactive), the DUT reboots, segment 1
+    # has 0.1 s inactive then 0.2, 0.3 s active and the log is cut
+    dut = _dut([20000000, 20100000, 100000, 200000, 300000], [1, 0, 0, 1, 1], [0, 0, 1, 1, 1])
+    assert pr.run_end_us(dut) is None
+    decoder_double(monkeypatch, tmp_path, 0)
+    check, _ = pr.run_check(tmp_path, False, True, dut, threading.Event())
+    assert check['code'] == pp.CHK_INCONCLUSIVE
+
+
+@pytest.mark.parametrize('status,end', [
+    (['ok', 'ok', 'ambiguous'], None),          # Sol PDS4-3: the end sample was placed with doubt
+    (['ambiguous', 'ok', 'ok'], None),          # the latest active sample was placed with doubt
+    (['ok', 'ok', 'ok'], 20000000),
+])
+def test_end_samples_must_be_placed_without_doubt_pds4_3(status, end):
+    dut = _dut([20000000, 20100000, 20150000], [1, 0, 0], [0, 0, 0], status)
+    dut['segment_status'][1] = 'duplicate'      # an inactive sample that cannot vouch either
+    assert pr.run_end_us(dut) == end
+
+
+def test_end_error_uses_the_same_latest_active_sample_pds4_4(tmp_path):
+    # Sol PDS4-4: arrival (100000,1), (350000,0), (300000,1), (200000,1): the run ends at 300000
+    pose = tmp_path / 'pose.csv'
+    write_csv(pose, 't_ns,phase,x,y,th', [(t * 1000, 'RUN', 0, 0, 0) for t in range(0, 300001, 50000)])
+    dut = _dut([100000, 350000, 300000, 200000], [1, 0, 1, 1], [0]*4, x_ref=[0, 9, .12, .02])
+    assert pr.run_end_us(dut) == 300000
+    _, maximum, last = pr.trajectory(pose, dut)
+    assert last == pytest.approx(120) and maximum == pytest.approx(120)

@@ -45,56 +45,73 @@ def read_dut(path):
     # agv_logger: <out>.segments.csv, one row per CSV data row, same order; 'segment' = the DUT
     # boot / time segment the line was placed in (empty when not placed). Missing or of another
     # length: no segment evidence (Sol PDS3-2).
-    columns['segment'] = None
+    # 'segment_status': 'ok', 'duplicate', 'conflict', 'ambiguous', 'no_seq' (Sol PDS4-3).
+    columns['segment'] = columns['segment_status'] = None
     try:
         with Path(str(path) + '.segments.csv').open(encoding='utf-8', newline='') as f:
-            segment = [_number(row, 'segment') for row in csv.DictReader(f)]
-        if len(segment) == len(columns['run_active']):
-            columns['segment'] = segment
+            rows = list(csv.DictReader(f))
+        if len(rows) == len(columns['run_active']):
+            columns['segment'] = [_number(row, 'segment') for row in rows]
+            columns['segment_status'] = [row.get('status') or '' for row in rows]
     except OSError:
         pass
     return columns
 
 
-def dut_complete(dut):
-    """True when the DUT log shows its run ending: a row with run_active 0 after the last row
-    with run_active 1, in log order and in DUT time (timestamp_us later; Sol PDS-1, PDS-9,
-    PDS2-3: a late UDP datagram from before the run is not an end). A log cut during the run
-    (logger died, datagrams lost at the end) is not complete."""
+def run_end_us(dut):
+    """DUT time (timestamp_us) of the last active sample when the DUT log shows its run ending,
+    else None (Sol PDS-1, PDS-9, PDS2-3, PDS3-2, PDS4-2, PDS4-3). The end is shown by an inactive
+    sample later in DUT time than the latest active one (datagrams can arrive out of order), in
+    the same agv_logger segment; every active sample must lie in that one segment (a reboot
+    inside the run is no end), and both samples must be placed without doubt (status 'ok').
+    A log cut during the run (logger died, datagrams lost at the end) has no end."""
     if not dut:
-        return False
+        return None
     active = dut.get('run_active') or []
     stamps = dut.get('timestamp_us') or []
-    segment = dut.get('segment')
-    if not active or segment is None or not len(stamps) == len(segment) == len(active):
-        return False
-    # Sol PDS3-2: the latest active sample in DUT time (datagrams can arrive out of order), and
-    # an inactive sample later than it in the same segment (another boot is not this run's end)
-    rows = [(t, g) for a, t, g in zip(active, stamps, segment) if a == 1 and math.isfinite(t)]
-    if not rows:
-        return False
-    t_last, g_last = max(rows)
-    if not math.isfinite(g_last):
-        return False
-    return any(a == 0 and math.isfinite(t) and t > t_last and g == g_last
-               for a, t, g in zip(active, stamps, segment))
+    segment, status = dut.get('segment'), dut.get('segment_status')
+    if not active or segment is None or status is None:
+        return None
+    if not len(stamps) == len(segment) == len(status) == len(active):
+        return None
+    rows = [(t, g, st) for a, t, g, st in zip(active, stamps, segment, status) if a == 1 and math.isfinite(t)]
+    if not rows or len({g for _, g, _ in rows}) != 1:
+        return None                      # no active sample, or active samples in more than one segment
+    t_last, g_last, st_last = max(rows, key=lambda r: r[0])
+    if not math.isfinite(g_last) or st_last != 'ok':
+        return None
+    if any(a == 0 and math.isfinite(t) and t > t_last and g == g_last and st == 'ok'
+           for a, t, g, st in zip(active, stamps, segment, status)):
+        return t_last
+    return None
+
+
+def dut_complete(dut):
+    """True when run_end_us() finds the end of the DUT run."""
+    return run_end_us(dut) is not None
 
 
 def _dut_points(dut):
     ref, estimate = [], []
     start = end = None
     if dut:
+        # DUT time, not arrival order (Sol PDS4-4): the run spans the earliest to the latest
+        # active sample, the same latest sample run_end_us() uses for the end of the run
+        times = [us for a, us in zip(dut['run_active'], dut['timestamp_us']) if a == 1 and math.isfinite(us)]
+        if times:
+            start = min(times)
+            end = (max(times) - start) * 1000  # common relative time, ns
         for i, active in enumerate(dut['run_active']):
             us = dut['timestamp_us'][i]
             if active != 1 or not math.isfinite(us):
                 continue
-            if start is None:
-                start = us
-            end = (us - start) * 1000  # common relative time, ns
+            t = (us - start) * 1000
             for points, x_key, y_key in ((ref, 'pos_x_ref', 'pos_y_ref'), (estimate, 'pos_x', 'pos_y')):
                 x, y = dut[x_key][i] * 1000, dut[y_key][i] * 1000
                 if math.isfinite(x) and math.isfinite(y):
-                    points.append((end, x, y))
+                    points.append((t, x, y))
+        ref.sort(key=lambda p: p[0])
+        estimate.sort(key=lambda p: p[0])
     return ref, estimate, end
 
 
