@@ -3,6 +3,7 @@
  * The client and app states are set by hand (as the link task would leave them); the
  * screen choice, result rules and texts are those of lib/panel_app and src/ui.cpp.
  * Numbers are made up for the picture (FAKE = what panel/tools/fake_pi.py sends). */
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -76,6 +77,7 @@ static void shot(const char *dir, const char *name)
 int main(int argc, char **argv)
 {
     const char *dir = argc > 1 ? argv[1] : ".";
+    PanelView v{&A, NOW};
     printf("%s\n", ui_begin());
 
     base(); C.sid = 0; C.has_st = false; C.has_status_t = false;
@@ -133,12 +135,45 @@ int main(int argc, char **argv)
     C.st.links = PP_L_RPI | PP_L_H7 | PP_L_ESP32_KNOWN;  /* ESP32 known and down (future H7 bit) */
     strcpy(A.msg, "STOP: FAILED (effect unknown)");
     shot(dir, "12_fault_no_text_esp32_down");
+
+    base();
+    C.has_extra = true;
+    C.extra.sid = C.sid;
+    C.extra.reset_index = 3;
+    C.profile_count = C.profiles_have = 4;
+    C.profile_ok[3] = true; strcpy(C.profile_name[3], "RESET DUT");
+    C.extra.sha_state = PP_SHA_OK;
+    strcpy(C.extra.dut_sha, "2da73b9e45c1");
+    strcpy(C.extra.dut_env, "PID"); C.info.ctrl_src = PP_CTRL_SRC_FW;
+    shot(dir, "13_home_sha_ok");
+
+    C.extra.sha_state = PP_SHA_MISMATCH;
+    C.st.links = PP_L_RPI;
+    A.cursor = C.extra.reset_index;
+    shot(dir, "14_home_sha_wrong_cursor_reset");
+
+    base();
+    C.st.run_state = PP_ST_RUN; C.st.phase_ds = 59;
+    strcpy(C.profile_name[C.st.profile], "DEMO-ENC");
+    C.has_extra = true; C.extra.sid = C.sid; C.extra.reset_index = PP_PROFILE_NONE;
+    C.extra.flags = PP_X_FAULT_ACTIVE;
+    strcpy(C.extra.fault_text, "ENC LOSS FL 2.1s left");
+    shot(dir, "15_run_fault_banner");
+    uint32_t fault_sig = ui_signature(v);
+    C.extra.flags = 0;
+    assert(ui_signature(v) != fault_sig);
+
+    base(); C.sid = 0; C.has_st = false; C.has_status_t = false;
+    A.proto_foreign_n = 1; A.proto_foreign_ver = 6;
+    app_update(&A, NOW);
+    shot(dir, "16_nolink_proto_mismatch");
+    assert(ui_signature(v) != ui_signature({&A, NOW + PP_NO_LINK_MS}));
+
     printf("missing_glyphs %d\n", TFT_eSPI::missing_glyphs());
 
     /* every frame must start from a clean screen (bench 05/11: the right third kept old
      * pixels): NO LINK drawn after RUN must equal NO LINK drawn after FAULT */
     static uint16_t after_run[320][480];
-    PanelView v{&A, NOW};
     base(); C.st.run_state = PP_ST_RUN; C.st.phase_ds = 63; ui_draw(v);
     base(); C.sid = 0; C.has_st = false; C.has_status_t = false; ui_draw(v);
     memcpy(after_run, ui_render_screen()->buf, sizeof after_run);

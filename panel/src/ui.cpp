@@ -1,8 +1,7 @@
 /* ui.cpp - screens of panel M2, new look (Liam 05/11, PANEL session: "khá đẹp rồi đấy, làm
  * theo bản mới đi"; mock-up 03_CODE/docs/panel/2026-11-05_Mockup_Panel_M2_giao_dien_moi_v1.html
  * in the thesis repo): dark background, rounded cards and chips, smooth (anti-aliased) fonts.
- * Same data as before, protocol v6 only: nothing new is asked from the RPi5, the screen choice,
- * the buttons and the signature rules are unchanged (lib/panel_app).
+ * Screen selection and START eligibility come from lib/panel_app.
  *
  * Fonts: src/fonts/ (one header per font), made by tools/make_vlw_font.py (DejaVu Sans). One smooth font is
  * loaded at a time (TFT_eSPI keeps a single gFont), so text() switches only when it changes.
@@ -233,10 +232,42 @@ void scr_nolink(const PanelView &v)
     g->drawSmoothArc(240, 132, 37, 31, 0, 360, RING, BG, false);
     g->drawSmoothArc(240, 132, 37, 31, 180, 270, AMBER, BG, true);   /* 0 = 6 o'clock, clockwise */
     text_c(240, 208, "NO LINK", ui_font_head, AMBER, BG);
-    text_c(240, 236, v.a->c->sid ? "No STATUS from the RPi5" : "Waiting for the RPi5 daemon", ui_font_body,
-           MUTED, BG);
+    if (app_proto_mismatch(v.a, v.now)) {
+        char s[48];
+        snprintf(s, sizeof s, "Protocol v%u, panel v%u: reflash", v.a->proto_foreign_ver, PP_VERSION);
+        text_c(240, 236, s, ui_font_body, AMBER_T, BG);
+    } else {
+        text_c(240, 236, v.a->c->sid ? "No STATUS from the RPi5" : "Waiting for the RPi5 daemon",
+               ui_font_body, MUTED, BG);
+    }
     if (v.a->c->stop.active)
         text_c(240, 266, "STOP pending (resending)", ui_font_bold, RED_T, BG);
+}
+
+void firmware_line(const pp_client_t *c)
+{
+    const pp_extra_t &e = c->extra;
+    bool has_sha = c->has_extra && e.dut_sha[0];
+    char dut[16];
+    snprintf(dut, sizeof dut, "DUT %.8s", has_sha ? e.dut_sha : "-");
+    int x = text(12, 111, dut, ui_font_small, TXT, BG);
+    if (has_sha) {
+        const char *state = "";
+        uint16_t col = MUTED;
+        switch (e.sha_state) {
+        case PP_SHA_OK:       state = "OK";    col = GREEN_T; break;
+        case PP_SHA_MISMATCH: state = "WRONG"; col = AMBER;   break;
+        case PP_SHA_DIRTY:    state = "DIRTY"; col = AMBER;   break;
+        case PP_SHA_NONE:     break;
+        default:              state = "?";     break;
+        }
+        if (state[0])
+            x = text(x + 4, 111, state, ui_font_small, col, BG);
+    }
+    int h7_x = 468 - width_of("H7 -", ui_font_small);
+    if (c->has_extra && e.dut_env[0] && x + 12 + width_of(e.dut_env, ui_font_small) + 12 <= h7_x)
+        text(x + 12, 111, e.dut_env, ui_font_small, MUTED, BG);
+    text(h7_x, 111, "H7 -", ui_font_small, MUTED, BG);
 }
 
 void scr_home(const PanelView &v)
@@ -249,7 +280,10 @@ void scr_home(const PanelView &v)
     text(22, 86, k.name, ui_font_bold, BLUE_T, BLUE_BG);
     text(12 + w + 8, 85, k.state, ui_font_small, k.state_col, BG);
 
-    bool ready = app_ready(v.a, v.now);
+    int n = c->has_profile_count ? c->profile_count : 0;
+    if (v.a->cursor < n && c->has_extra && v.a->cursor == c->extra.reset_index)
+        text_r(468, 56, "START = reset DUT", ui_font_small, BLUE_T, BG);
+    bool ready = app_start_allowed(v.a, v.a->cursor, v.now);
     const char *rs = ready ? "READY" : "NOT READY";
     uint16_t fill = ready ? GREEN_BG : AMBER_BG, dot = ready ? GREEN : AMBER, fg = ready ? GREEN_T : AMBER_T;
     int rw = 30 + width_of(rs, ui_font_bold) + 14;
@@ -257,13 +291,13 @@ void scr_home(const PanelView &v)
     g->fillSmoothCircle(470 - rw + 18, 77, 5, dot, fill);
     text(470 - rw + 30, 83, rs, ui_font_bold, fg, fill);
 
-    int n = c->has_profile_count ? c->profile_count : 0;
+    firmware_line(c);
     if (!n) {
         text(12, 140, c->has_profile_count ? "No tests on the RPi5" : "Loading test list...", ui_font_body,
              MUTED, BG);
         return;
     }
-    const int rows = 4, row_h = 40, stride = 46, y0 = 106;
+    const int rows = 4, row_h = 36, stride = 42, y0 = 121;
     int first = v.a->cursor - rows / 2;
     if (first > n - rows) first = n - rows;
     if (first < 0) first = 0;
@@ -275,16 +309,16 @@ void scr_home(const PanelView &v)
         uint16_t rowbg = cur ? ROW_SEL : CARD;
         if (cur) {
             card_line(12, y, 456, row_h, 8, ROW_SEL, BLUE, BG);
-            card(12, y + 8, 4, 24, 2, BLUE, ROW_SEL);
-            text(28, y + 26, ui_profile_name(c, i), ui_font_bold, WHITE, rowbg);
+            card(12, y + 6, 4, 24, 2, BLUE, ROW_SEL);
+            text(28, y + 24, ui_profile_name(c, i), ui_font_bold, WHITE, rowbg);
         } else {
             card(12, y, 456, row_h, 8, CARD, BG);
-            text(28, y + 26, ui_profile_name(c, i), ui_font_body, ROWTXT, rowbg);
+            text(28, y + 24, ui_profile_name(c, i), ui_font_body, ROWTXT, rowbg);
         }
         if (sel) {
             int bw = width_of("Selected", ui_font_small) + 24;
-            card(458 - bw, y + 9, bw, 22, 11, BLUE_CHIP, rowbg);
-            text(458 - bw + 12, y + 24, "Selected", ui_font_small, BLUE_PALE, BLUE_CHIP);
+            card(458 - bw, y + 7, bw, 22, 11, BLUE_CHIP, rowbg);
+            text(458 - bw + 12, y + 22, "Selected", ui_font_small, BLUE_PALE, BLUE_CHIP);
         }
     }
 }
@@ -319,6 +353,11 @@ void stat_card(int x, int w, const char *label, const char *value, uint16_t col)
     text(x + 12, 245, value, f, col, CARD);
 }
 
+bool fault_active(const pp_client_t *c)
+{
+    return c->has_extra && (c->extra.flags & PP_X_FAULT_ACTIVE);
+}
+
 void scr_run(const PanelView &v)
 {
     const pp_client_t *c = v.a->c;
@@ -336,6 +375,11 @@ void scr_run(const PanelView &v)
     x = text(x + 6, 176, "s", ui_font_head, MUTED, BG);
     snprintf(s, sizeof s, "In %s", phase_name(c->st.run_state));
     text(x + 14, 174, s, ui_font_small, MUTED, BG);
+
+    if (fault_active(c)) {
+        card_line(12, 262, 456, 24, 6, AMBER_BG, AMBER, BG);
+        text_c(240, 280, c->extra.fault_text, ui_font_bold, AMBER_T, AMBER_BG);
+    }
 
     const char *stop = c->stop_state == PP_STOP_REQUESTED ? "STOP requested" :
                        c->stop_state == PP_STOP_ACKED ? "STOP acknowledged, stopping" : nullptr;
@@ -481,6 +525,21 @@ uint32_t ui_signature(const PanelView &v)
     fnv(&c->profiles_have, sizeof c->profiles_have);
     bool link = c->sid && pp_client_link(c, v.now);
     fnv(&link, sizeof link);
+    if (s == APP_SCR_HOME) {
+        bool ready = app_start_allowed(v.a, v.a->cursor, v.now);
+        fnv(&ready, sizeof ready);
+        if (c->has_extra) {
+            const pp_extra_t &e = c->extra;
+            fnv(&e.reset_index, sizeof e.reset_index);
+            fnv(&e.sha_state, sizeof e.sha_state);
+            fnv(e.dut_sha, strlen(e.dut_sha) + 1);
+            fnv(e.dut_env, strlen(e.dut_env) + 1);
+        }
+    } else if (s == APP_SCR_RUN && fault_active(c)) {
+        fnv(c->extra.fault_text, strlen(c->extra.fault_text) + 1);
+    } else if (s == APP_SCR_NOLINK && app_proto_mismatch(v.a, v.now)) {
+        fnv(&v.a->proto_foreign_ver, sizeof v.a->proto_foreign_ver);
+    }
     /* field by field: struct padding is not hashed (data age alone is not worth a redraw) */
     if (c->has_st) {
         const pp_status_t &st = c->st;
