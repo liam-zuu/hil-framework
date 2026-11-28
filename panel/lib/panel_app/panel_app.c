@@ -20,6 +20,33 @@ bool app_ready(const app_t *a, uint32_t now)
     return c->sid && pp_client_link(c, now) && c->has_st && (c->st.links & PP_L_H7);
 }
 
+static bool reset_profile(const pp_client_t *c, int profile)
+{
+    return c->has_extra && c->extra.reset_index != PP_PROFILE_NONE && profile == c->extra.reset_index;
+}
+
+static const char *start_problem(const app_t *a, int profile, uint32_t now)
+{
+    const pp_client_t *c = a->c;
+    bool ready = reset_profile(c, profile) ? c->sid && pp_client_link(c, now) : app_ready(a, now);
+    if (!ready)
+        return "NOT READY: START not sent";
+    if (!app_profile_ok(a, profile))
+        return "Test list not complete: START not sent";
+    return NULL;
+}
+
+bool app_start_allowed(const app_t *a, int profile, uint32_t now)
+{
+    return start_problem(a, profile, now) == NULL;
+}
+
+bool app_proto_mismatch(const app_t *a, uint32_t now)
+{
+    return a->proto_foreign_recent && now - a->proto_foreign_ms < PP_NO_LINK_MS &&
+           app_screen(a, now) == APP_SCR_NOLINK;
+}
+
 bool app_link_led(const app_t *a, uint32_t now)
 {
     uint32_t half = app_screen(a, now) == APP_SCR_NOLINK ? APP_LED_FAST_MS : APP_LED_SLOW_MS;
@@ -106,10 +133,21 @@ static const char *res_name(uint8_t r)
 
 void app_update(app_t *a, uint32_t now)
 {
-    (void)now;
+    if (a->proto_foreign_n != a->proto_foreign_seen) {
+        a->proto_foreign_seen = a->proto_foreign_n;
+        a->proto_foreign_ms = now;
+        a->proto_foreign_recent = true;
+    } else if (now - a->proto_foreign_ms >= PP_NO_LINK_MS) {
+        a->proto_foreign_recent = false;
+    }
     pp_client_t *c = a->c;
+    if (a->start_sid != c->sid) {
+        a->start_sid = 0;
+        a->start_feedback = false;
+    }
     pp_event_t ev;
     while (pp_client_pop_event(c, &ev)) {
+        a->start_feedback = ev.what == PP_EV_DONE && ev.cmd == PP_CMD_START && a->start_sid;
         if (ev.what == PP_EV_DONE)
             snprintf(a->msg, sizeof a->msg, "%s: %s", cmd_name(ev.cmd), res_name(ev.result));
         else if (ev.what == PP_EV_UNVERIFIED)
@@ -117,6 +155,10 @@ void app_update(app_t *a, uint32_t now)
         else
             snprintf(a->msg, sizeof a->msg, "%s refused: busy or no link, press again", cmd_name(ev.cmd));
     }
+    /* The STATUS answer and its EXTRA note can arrive in separate UART reads. */
+    if (a->start_feedback && reset_profile(c, a->start_profile) && !(c->extra.flags & PP_X_CHECK_VALID) &&
+        c->extra.check_text[0] && strcmp(a->msg, c->extra.check_text) != 0)
+        snprintf(a->msg, sizeof a->msg, "%s", c->extra.check_text);
     if (c->has_daemon_boot && (!a->has_daemon_boot || c->daemon_boot != a->daemon_boot)) {
         a->has_daemon_boot = true;              /* another daemon: its runs count from 1 again */
         a->daemon_boot = c->daemon_boot;
@@ -165,19 +207,26 @@ void app_drawn(app_t *a, const app_view_t *v)
 
 static void start(app_t *a, int profile, uint32_t now)
 {
-    if (!app_ready(a, now)) {
-        snprintf(a->msg, sizeof a->msg, "NOT READY: START not sent");
+    const char *problem = start_problem(a, profile, now);
+    if (problem) {
+        snprintf(a->msg, sizeof a->msg, "%s", problem);
         return;
     }
-    if (!app_profile_ok(a, profile)) {
-        snprintf(a->msg, sizeof a->msg, "Test list not complete: START not sent");
-        return;
+    pp_client_t *c = a->c;
+    bool already_pending = c->pending.active;
+    pp_client_press(c, PP_CMD_START, (uint16_t)profile, now);
+    if (!already_pending && c->pending.active) {
+        a->start_sid = c->sid;
+        a->start_profile = (uint8_t)profile;
     }
-    pp_client_press(a->c, PP_CMD_START, (uint16_t)profile, now);   /* nothing to begin here (R3) */
 }
 
 void app_buttons(app_t *a, uint8_t ev, uint32_t now)
 {
+    if (!ev)
+        return;
+    if (ev & (APP_EV_STOP | APP_EV_START | APP_EV_SELECT))
+        a->start_feedback = false;
     app_screen_t s = app_screen(a, now);
     if (ev & APP_EV_STOP) {                     /* P1: always, first, nothing else this read */
         pp_client_press(a->c, PP_CMD_STOP, 0, now);
@@ -185,12 +234,11 @@ void app_buttons(app_t *a, uint8_t ev, uint32_t now)
             close_result(a);
         return;
     }
-    if (!ev)
-        return;
     app_view_t v = app_view(a, now);
     if (!a->drawn_valid || a->drawn.screen != v.screen || a->drawn.sid != v.sid ||
         a->drawn.profiles_gen != v.profiles_gen || a->drawn.result_profile != v.result_profile ||
         a->drawn.result_run != v.result_run) {
+        a->start_feedback = false;
         snprintf(a->msg, sizeof a->msg, "Screen changing: press again");   /* P2, Q3, R5 */
         return;
     }

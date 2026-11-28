@@ -95,3 +95,9 @@ app_t *app_host_new(pp_client_t *c)
 void app_host_free(app_t *a) { free(a); }
 int app_host_cursor(const app_t *a) { return a->cursor; }
 const char *app_host_msg(const app_t *a) { return a->msg; }
+
+void app_host_parser_stats(app_t *a, const pp_parser_t *p)
+{
+    a->proto_foreign_n = p->version_mismatch;
+    a->proto_foreign_ver = p->last_foreign_version;
+}

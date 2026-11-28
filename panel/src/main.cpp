@@ -1,7 +1,7 @@
 /*
  * Panel M2 of the HIL box (QĐ 17, QĐ 22): ESP32-S3 + ST7796 + 4 buttons.
  * The panel only draws and forwards buttons; the RPi5 daemon owns the run state.
- * Protocol v6 (lib/panel_proto, mirror of rpi5/panel_proto.py); buttons -> commands and the
+ * Protocol v7 (lib/panel_proto, mirror of rpi5/panel_proto.py); buttons -> commands and the
  * screen choice in lib/panel_app (plain C, tested on the PC). Controller choice is way (c):
  * the panel only shows the controller running (INFO); it is changed by flashing an env.
  *
@@ -109,6 +109,8 @@ static void link_task(void *)
             pp_parser_feed(&g_parser, buf, k, now, frame_cb, &now);
         }
         pp_client_tick(&g_c, now);
+        g_app.proto_foreign_n = g_parser.version_mismatch;
+        g_app.proto_foreign_ver = g_parser.last_foreign_version;
         app_update(&g_app, now);                /* events of the frames first (Q8) */
         uint8_t ev = buttons_poll(now);
         if (ev) {

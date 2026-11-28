@@ -23,8 +23,7 @@
  *    run arrives (so a run number used again after 65535 runs is never hidden) and when the
  *    daemon changes (daemon_boot: run numbers start again). A link gap inside the same END
  *    does not reopen it;
- *  - the view holds the run of the RESULT shown (R5);
- *  - R3: START no longer needs to know whether the press went out (nothing is begun on it).
+ *  - the view holds the run of the RESULT shown (R5).
  * Assumption kept from the protocol (panel_proto.py, B25): frames arrive in order, no old
  * copy of a STATUS arrives late.
  */
@@ -68,6 +67,13 @@ typedef struct {
     app_view_t drawn;
     bool     has_daemon_boot;  uint16_t daemon_boot;   /* run numbers belong to this daemon */
     bool     closed_valid;  uint16_t closed_run;       /* RESULT of this run closed by the user */
+    uint32_t start_sid;              /* session and profile of the last START sent */
+    uint8_t  start_profile;
+    bool     start_feedback;         /* its answer is displayed and EXTRA may still add a reset note */
+    uint32_t proto_foreign_n;
+    uint8_t  proto_foreign_ver;
+    uint32_t proto_foreign_seen, proto_foreign_ms;
+    bool     proto_foreign_recent;
     char     msg[56];                /* feedback line */
 } app_t;
 
@@ -75,7 +81,9 @@ void app_init(app_t *a, pp_client_t *c);
 /* after the UART bytes and pp_client_tick of this pass, with the same now */
 void app_update(app_t *a, uint32_t now);
 app_screen_t app_screen(const app_t *a, uint32_t now);
-bool app_ready(const app_t *a, uint32_t now);       /* START allowed: link + H7 answering */
+bool app_ready(const app_t *a, uint32_t now);       /* link + H7 answering */
+bool app_start_allowed(const app_t *a, int profile, uint32_t now);
+bool app_proto_mismatch(const app_t *a, uint32_t now);
 
 /* LINK LED (separate LED, Liam 05/11: "thêm đèn link đi, nếu không dùng thì thôi"): slow
  * blink (APP_LED_SLOW_MS on, APP_LED_SLOW_MS off) while the link to the RPi5 is up (the

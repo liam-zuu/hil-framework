@@ -10,11 +10,15 @@ import pytest
 from test_panel_c import FRAME_FN, CPanelClient, lib    # noqa: F401  (also puts rpi5/ on sys.path)
 import panel_proto as pp                                # noqa: E402
 from panel_link import FakeRun, PanelLink              # noqa: E402
+from test_panel_proto_v7 import seal                   # noqa: E402
 
 lib.app_host_new.restype, lib.app_host_new.argtypes = ct.c_void_p, [ct.c_void_p]
 lib.app_host_free.argtypes = [ct.c_void_p]
 lib.app_host_cursor.restype, lib.app_host_cursor.argtypes = ct.c_int, [ct.c_void_p]
 lib.app_host_msg.restype, lib.app_host_msg.argtypes = ct.c_char_p, [ct.c_void_p]
+lib.app_host_parser_stats.restype, lib.app_host_parser_stats.argtypes = None, [ct.c_void_p, ct.c_void_p]
+lib.app_start_allowed.restype, lib.app_start_allowed.argtypes = ct.c_bool, [ct.c_void_p, ct.c_int, ct.c_uint32]
+lib.app_proto_mismatch.restype, lib.app_proto_mismatch.argtypes = ct.c_bool, [ct.c_void_p, ct.c_uint32]
 lib.app_run.restype, lib.app_run.argtypes = ct.c_uint16, [ct.c_void_p]
 lib.app_update.restype, lib.app_update.argtypes = None, [ct.c_void_p, ct.c_uint32]
 lib.app_screen.restype, lib.app_screen.argtypes = ct.c_int, [ct.c_void_p, ct.c_uint32]
@@ -46,7 +50,7 @@ class AppBench:
         self.link = PanelLink(epoch, self.run, self._w, clock=self.clock)
         self.panel = CPanelClient(iter(range(0x700, 0x800)).__next__)
         self.app = lib.app_host_new(self.panel._c)
-        self.parser = lib.pp_host_parser_new(0b1110, 50)
+        self.parser = lib.pp_host_parser_new(0b111110, 50)
         self.drop = lambda f: False
         self._cb = FRAME_FN(self._frame)
 
@@ -71,6 +75,7 @@ class AppBench:
             data, self.wire = bytes(self.wire), bytearray()
             lib.pp_parser_feed(self.parser, data, len(data), self.t, self._cb, None)
             lib.pp_client_tick(self.panel._c, self.t)
+            lib.app_host_parser_stats(self.app, self.parser)
             lib.app_update(self.app, self.t)
             if draw:
                 self.draw()
@@ -125,6 +130,122 @@ def ready():
     b.step(150)
     assert b.screen == HOME and b.panel.profile_count == 3
     return b
+
+
+@pytest.fixture
+def reset_bench():
+    b = AppBench(names=('T0', 'RESET DUT'))
+    b.run.h7 = False
+    b.drop = lambda f: f[0] == pp.START_EXTRA
+    b.step(150)
+    b.press(NAV)
+    b.draw()
+    assert b.screen == HOME and b.cursor == 1 and b.panel.extra is None
+    return b
+
+
+def test_reset_start_uses_the_advertised_index_without_h7(reset_bench):
+    b = reset_bench
+    b.inject(pp.encode_extra(pp.Extra(sid=b.panel.sid, reset_index=1)))
+    assert not lib.app_ready(b.app, b.t)
+    assert lib.app_start_allowed(b.app, 1, b.t)
+    cmd, = map(pp.decode, b.press(START))
+    assert (cmd.cmd, cmd.arg) == (pp.CMD_START, 1)
+
+
+def test_reset_start_requires_a_live_link(reset_bench):
+    b = reset_bench
+    b.inject(pp.encode_extra(pp.Extra(sid=b.panel.sid, reset_index=1)))
+    b.t += pp.NO_LINK_MS
+    b.draw()
+    assert b.panel.sid and b.screen == NOLINK
+    assert not lib.app_start_allowed(b.app, 1, b.t) and b.press(START) == []
+
+
+@pytest.mark.parametrize(('index', 'foreign'), [(None, False), (pp.PROFILE_NONE, False),
+                                                (0, False), (1, True)])
+def test_start_without_h7_requires_current_extra_naming_this_entry(reset_bench, index, foreign):
+    b = reset_bench
+    if index is not None:
+        b.inject(pp.encode_extra(pp.Extra(sid=b.panel.sid + foreign, reset_index=index)))
+    assert not lib.app_start_allowed(b.app, 1, b.t)
+    assert b.press(START) == [] and 'NOT READY' in b.msg
+
+
+def test_reset_start_requires_the_profile_name(reset_bench):
+    b = reset_bench
+    b.inject(pp.encode_profile(b.panel.sid, 0, 3, 'T0'))  # changed list, only name 0 received
+    b.inject(pp.encode_extra(pp.Extra(sid=b.panel.sid, reset_index=1)))
+    b.draw()
+    assert not lib.app_start_allowed(b.app, 1, b.t)
+    assert b.press(START) == [] and 'not complete' in b.msg
+
+
+@pytest.mark.parametrize('note_before_ack', [False, True])
+def test_reset_answer_uses_extra_note_even_if_cursor_moved(reset_bench, note_before_ack):
+    b = reset_bench
+    extra = pp.Extra(sid=b.panel.sid, reset_index=1)
+    b.inject(pp.encode_extra(extra))
+    b.run.start = lambda index: pp.RES_FAILED
+    b.press(START)
+    extra.check_text = 'DUT reset: no wire'
+    if note_before_ack:
+        b.press(NAV)
+        b.inject(pp.encode_extra(extra))
+        assert b.msg != extra.check_text
+    b.step(10)
+    if not note_before_ack:
+        assert b.msg == 'START: FAILED (effect unknown)'
+        b.press(NAV)
+        _feed(b, pp.encode_extra(extra))
+    assert b.msg == extra.check_text
+
+
+def test_run_check_is_not_a_reset_note(reset_bench):
+    b = reset_bench
+    b.inject(pp.encode_extra(pp.Extra(sid=b.panel.sid, reset_index=1, flags=pp.X_CHECK_VALID,
+                                      check_run=1, check_code=pp.CHK_RUNNING, check_text='checking')))
+    b.run.start = lambda index: pp.RES_BUSY
+    b.press(START)
+    b.step(10)
+    assert b.msg == 'START: BUSY'
+
+
+def test_refused_reset_press_does_not_relabel_a_normal_start_answer():
+    b = ready()
+    b.inject(pp.encode_extra(pp.Extra(sid=b.panel.sid, reset_index=1, check_text='DUT reset done')))
+    b.press(START)
+    b.press(NAV)
+    b.draw()
+    assert b.press(START) == []
+    b.step(10)
+    assert b.msg == 'START: OK'
+
+
+def test_proto_mismatch_only_on_no_link_within_window_from_last_growth():
+    b = AppBench()
+    b.drop = lambda f: True
+    status = bytearray(pp.encode_status(pp.Status())[:-2])
+    status[1] = 6
+    foreign = seal(status)
+    assert not lib.app_proto_mismatch(b.app, b.t)
+    b.wire += foreign
+    b.step()
+    assert b.screen == NOLINK and lib.app_proto_mismatch(b.app, b.t)
+    b.step(40)
+    b.wire += foreign
+    b.step()
+    last = b.t
+    b.step(49)
+    assert lib.app_proto_mismatch(b.app, last + pp.NO_LINK_MS - 1)
+    assert not lib.app_proto_mismatch(b.app, last + pp.NO_LINK_MS)
+    b.step()
+    assert not lib.app_proto_mismatch(b.app, b.t)
+    b.drop = lambda f: False
+    b.step(100)
+    b.wire += foreign
+    b.step()
+    assert b.screen == HOME and not lib.app_proto_mismatch(b.app, b.t)
 
 
 def test_stop_right_after_start_before_any_status_reaches_the_run_codex_p1():
