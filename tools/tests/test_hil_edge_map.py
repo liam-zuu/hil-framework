@@ -416,12 +416,13 @@ def test_refusals_firmware_clock_frames():
                      (FW + [dict(sha='54b7269abcde', dirty='0')], '54b7269abcde')):
         em = run(s, fw=fw)
         assert not em['ok'] and word in em['reason'], em['reason']
-    for fw in ([dict(sha='5bde4c55bf3a', dirty='0', env='ladrc')],              # 5bde4c5: same count read (15/11)
-               FW + [dict(sha='5bde4c55bf3a', dirty='0', env='esp32-s3-devkitc-1')]):
-        em = run(s, fw=fw)
-        assert em['ok'], em['reason']
-    em = run(s, fw=[dict(sha='5bde4c55bf3a', dirty='1')])
-    assert not em['ok'] and 'dirty=1' in em['reason']
+    for sha in ('5bde4c55bf3a', '18820107799e'):
+        clean = dict(sha=sha, dirty='0', env='ladrc')
+        for fw in ([clean], FW + [clean]):
+            em = run(s, fw=fw)
+            assert em['ok'], em['reason']
+        em = run(s, fw=[dict(clean, dirty='1')])
+        assert not em['ok'] and 'dirty=1' in em['reason']
     for ppm in (None, 150.0, -101.0):                                   # L100: the ESP32 / Pi estimate is reported only
         em = run(s, esp_pi_ppm=ppm)
         assert em['ok'] and em['esp_pi_ppm'] == ppm, em['reason']
@@ -1091,16 +1092,21 @@ def test_scorer_cli_esp_log_errors(tmp_path):
 
 # full AGV SHAs of FW_COUNTS_AT_TICK (the #fw line prints 12 characters; the repo check needs the commit itself)
 AGV_FULL_SHA = {'16702ff0e688': '16702ff0e6884d776c3fcc4d563d5ab8bd6d084e',
-                '5bde4c55bf3a': '5bde4c55bf3a645bad3ad84b90aca5d872204b64'}
+                '5bde4c55bf3a': '5bde4c55bf3a645bad3ad84b90aca5d872204b64',
+                '18820107799e': '18820107799e417019cfa4c1be2fc4fef9a3b5eb'}
 AGV_DEFAULT = r'D:/CLAUDE_THESIS/03_CODE/AGV_FIRMWARE'
 
 
 def test_fw_check_lists_and_refusals():
-    """fw_check alone (no gcc, no oracle; Codex MAP5-R1-1 answer 3): both listed firmware accepted, alone or
+    """fw_check alone (no gcc, no oracle; Codex MAP5-R1-1 answer 3): listed firmware accepted, alone or
     together; anything else, dirty, no #fw or no events file refused."""
     assert M.fw_check([dict(sha='16702ff0e688', dirty='0', env='esp32-s3-devkitc-1')]) == ''     # MAP5-R2-2
-    assert M.fw_check([dict(sha='5bde4c55bf3a', dirty='0', env='ladrc')]) == ''
     assert M.fw_check([dict(sha='16702ff0e688', dirty='0'), dict(sha='5bde4c55bf3a', dirty='0')]) == ''
+    for short, full in AGV_FULL_SHA.items():
+        clean = dict(sha=short, dirty='0', env='ladrc')
+        assert M.fw_check([clean]) == ''
+        assert M.fw_check(FW + [dict(clean, sha=full)]) == ''
+        assert 'dirty=1' in M.fw_check(FW + [dict(clean, dirty='1')])
     for fw, word in (([dict(sha='5bde4c55bf3a', dirty='1')], 'dirty=1'), ([dict(sha='5bde4c5', dirty='0')], '5bde4c5'),
                      ([dict(sha='2c026415dfc6', dirty='0')], '2c026415dfc6'),
                      ([dict(sha='5bde4c55bf3a', dirty='0'), dict(sha='cfc892b0ba28', dirty='0')], 'cfc892b0ba28'),
