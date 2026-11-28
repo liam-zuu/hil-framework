@@ -42,6 +42,17 @@ def read_dut(path):
         for row in csv.DictReader(f):
             for key, values in columns.items():
                 values.append(_number(row, key))
+    # agv_logger: <out>.segments.csv, one row per CSV data row, same order; 'segment' = the DUT
+    # boot / time segment the line was placed in (empty when not placed). Missing or of another
+    # length: no segment evidence (Sol PDS3-2).
+    columns['segment'] = None
+    try:
+        with Path(str(path) + '.segments.csv').open(encoding='utf-8', newline='') as f:
+            segment = [_number(row, 'segment') for row in csv.DictReader(f)]
+        if len(segment) == len(columns['run_active']):
+            columns['segment'] = segment
+    except OSError:
+        pass
     return columns
 
 
@@ -54,13 +65,19 @@ def dut_complete(dut):
         return False
     active = dut.get('run_active') or []
     stamps = dut.get('timestamp_us') or []
-    if len(stamps) != len(active):
+    segment = dut.get('segment')
+    if not active or segment is None or not len(stamps) == len(segment) == len(active):
         return False
-    last = max((i for i, a in enumerate(active) if a == 1), default=None)
-    if last is None or not math.isfinite(stamps[last]):
+    # Sol PDS3-2: the latest active sample in DUT time (datagrams can arrive out of order), and
+    # an inactive sample later than it in the same segment (another boot is not this run's end)
+    rows = [(t, g) for a, t, g in zip(active, stamps, segment) if a == 1 and math.isfinite(t)]
+    if not rows:
         return False
-    return any(a == 0 and math.isfinite(t) and t > stamps[last]
-               for a, t in zip(active[last + 1:], stamps[last + 1:]))
+    t_last, g_last = max(rows)
+    if not math.isfinite(g_last):
+        return False
+    return any(a == 0 and math.isfinite(t) and t > t_last and g == g_last
+               for a, t, g in zip(active, stamps, segment))
 
 
 def _dut_points(dut):
@@ -177,10 +194,14 @@ def inconclusive(reason, text=None):
     return dict(code=pp.CHK_INCONCLUSIVE, text=_short(text or reason), reason=reason)
 
 
+class NoFrames(ValueError):
+    """frames.npz of the run is missing (the input, not the decoder; Sol PDS3-3)."""
+
+
 def _decode(folder, cancel, timeout):
     frames = folder / 'frames.npz'
     if not frames.is_file():
-        raise FileNotFoundError('missing frames.npz')
+        raise NoFrames('missing frames.npz')
     out = folder / 'decode.json'  # s06_frames_decode --out takes a directory
     # No --esp32-events: that option reads the S06 logger's '<t_rx monotonic>	<payload>' lines,
     # agv_logger writes '<ISO time> <payload>' (Sol PDS-2). Without run marks the decoder counts
@@ -271,7 +292,7 @@ def run_check(folder, fault, logger_ok, dut, cancel, timeout=120):
             verdict = dict(code=pp.CHK_CLEAN_NO_SPIFIX, text='SPIfix not checked')
     except (OSError, ValueError, TypeError, KeyError, IndexError) as exc:
         # fixed English words on the glass (Sol PDS2-4); the decoder's own message stays in meta.json
-        text = ('no frames.npz' if isinstance(exc, FileNotFoundError) else
+        text = ('no frames.npz' if isinstance(exc, NoFrames) else
                 'check cancelled' if str(exc) == 'check cancelled' else
                 'decoder timeout' if str(exc) == 'decoder timeout' else 'decoder failed')
         verdict = inconclusive(str(exc), text)

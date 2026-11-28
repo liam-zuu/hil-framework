@@ -38,6 +38,8 @@ def test_rotated_square_time_alignment_and_decimation(tmp_path):
     esp_rows.append((esp_rows[-1][0] + 50_000, 0, 99, 99, 99, 99))  # the run ends inside the log
     write_csv(pose, 't_ns,phase,x,y,th', rows)
     write_csv(esp, 'timestamp_us,run_active,pos_x_ref,pos_y_ref,pos_x,pos_y', esp_rows)
+    write_csv(tmp_path / 'esp32.csv.segments.csv', 'row,log_seq,timestamp_us,segment,status',
+              [(i + 1, i, r[0], 0, 'ok') for i, r in enumerate(esp_rows)])
     tracks, maximum, last = pr.trajectory(pose, pr.read_dut(esp))
     assert maximum < 1 and last < 1
     assert set(tracks) == {pp.TR_PLANT, pp.TR_DUT, pp.TR_REF}
@@ -59,7 +61,7 @@ def test_error_uses_nearest_relative_time_before_decimation(tmp_path):
     pose = tmp_path / 'pose.csv'
     write_csv(pose, 't_ns,phase,x,y,th', [(123, 'RUN', 1, 2, 0), (123+55_000_000, 'RUN', 1.1, 2, 0),
                                            (123+75_000_000, 'RUN', 1.115, 2, 0)])
-    dut = dict(timestamp_us=[200, 30200, 70200, 80200, 90200], run_active=[1]*4 + [0],
+    dut = dict(timestamp_us=[200, 30200, 70200, 80200, 90200], run_active=[1]*4 + [0], segment=[0]*5,
                pos_x_ref=[0, 0, .13, .2, 9], pos_y_ref=[0]*5, pos_x=[0]*5, pos_y=[0]*5)
     _, maximum, last = pr.trajectory(pose, dut)
     assert (maximum, last) == pytest.approx((30, 15))
@@ -110,8 +112,8 @@ def decoder_double(monkeypatch, folder, rc, empty=0, crc=0):
 ])
 def test_verdict(tmp_path, monkeypatch, fault, rc, empty, crc, counts, code, text):
     decoder_double(monkeypatch, tmp_path, rc, empty, crc)
-    dut = (dict(timestamp_us=[0, 10, 20], run_active=[0, 1, 0], motor_on=[0, 1, 1], pos_reset_n=counts)
-           if counts else None)
+    dut = (dict(timestamp_us=[0, 10, 20], run_active=[0, 1, 0], segment=[0]*3, motor_on=[0, 1, 1],
+                pos_reset_n=counts) if counts else None)
     check, other = pr.run_check(tmp_path, fault, bool(dut), dut, threading.Event())
     assert check['code'] == code and check['text'].startswith(text)
     assert len(check['text'].encode('ascii')) <= 22 and check['text'].isascii()
@@ -142,7 +144,8 @@ def test_decoder_failure_never_clean(tmp_path, monkeypatch, script, timeout, rea
 ])
 def test_clean_needs_the_whole_dut_log(tmp_path, monkeypatch, logger_ok, active, counts, code, text):
     # Sol PDS-1: a logger that died during the run cannot vouch for pos_reset_n 0
-    dut = dict(timestamp_us=[0, 10, 20], run_active=active, motor_on=[0, 1, 1], pos_reset_n=counts)
+    dut = dict(timestamp_us=[0, 10, 20], run_active=active, segment=[0]*3, motor_on=[0, 1, 1],
+               pos_reset_n=counts)
     for fault in (False, True):
         folder = tmp_path / str(fault)
         folder.mkdir()
@@ -154,7 +157,7 @@ def test_clean_needs_the_whole_dut_log(tmp_path, monkeypatch, logger_ok, active,
 
 def test_a_late_datagram_from_before_the_run_is_not_its_end_pds2_3(tmp_path, monkeypatch):
     # Sol PDS2-3: UDP order (200000, 1), (300000, 1), (100000, 0): the inactive row is older
-    dut = dict(timestamp_us=[200000, 300000, 100000], run_active=[1, 1, 0], motor_on=[1, 1, 1],
+    dut = dict(timestamp_us=[200000, 300000, 100000], run_active=[1, 1, 0], segment=[0]*3, motor_on=[1, 1, 1],
                pos_reset_n=[4, 4, 4], pos_x_ref=[0, .1, 0], pos_y_ref=[0]*3, pos_x=[0]*3, pos_y=[0]*3)
     assert not pr.dut_complete(dut)
     assert pr.dut_complete({**dut, 'timestamp_us': [200000, 300000, 400000]})
@@ -174,3 +177,40 @@ def test_decoder_failure_text_is_fixed_english_pds2_4(tmp_path, monkeypatch, scr
     assert check['code'] == pp.CHK_INCONCLUSIVE and check['text'] == text
     check, _ = pr.run_check(tmp_path / 'none', False, False, None, threading.Event())
     assert check['text'] == 'no frames.npz'
+
+
+@pytest.mark.parametrize('stamps,active,segment,complete', [
+    ([100000, 300000, 200000, 250000], [1, 1, 1, 0], [0]*4, False),   # 250000 is older than the latest active 300000
+    ([100000, 300000, 200000, 350000], [1, 1, 1, 0], [0]*4, True),
+    ([2000000, 2100000, 12400000], [1, 1, 0], [0, 0, 1], False),      # the inactive line is another boot
+    ([2000000, 2100000, 2200000], [1, 1, 0], [0, 0, float('nan')], False),  # not placed: no evidence
+    ([2000000, 2100000, 2200000], [1, 1, 0], None, False),            # no segments file
+])
+def test_end_of_run_is_the_latest_active_sample_of_the_same_segment_pds3_2(tmp_path, monkeypatch, stamps,
+                                                                            active, segment, complete):
+    n = len(stamps)
+    dut = dict(timestamp_us=stamps, run_active=active, segment=segment, motor_on=[1]*n, pos_reset_n=[4]*n,
+               pos_x_ref=[0]*n, pos_y_ref=[0]*n, pos_x=[0]*n, pos_y=[0]*n)
+    assert pr.dut_complete(dut) is complete
+    decoder_double(monkeypatch, tmp_path, 0)
+    check, _ = pr.run_check(tmp_path, False, True, dut, threading.Event())
+    assert (check['code'] == pp.CHK_CLEAN_NO_SPIFIX) is complete
+
+
+def test_read_dut_takes_segments_only_when_they_match_the_rows(tmp_path):
+    esp = tmp_path / 'esp32.csv'
+    write_csv(esp, 'timestamp_us,run_active', [(10, 1), (20, 0)])
+    assert pr.read_dut(esp)['segment'] is None
+    seg = tmp_path / 'esp32.csv.segments.csv'
+    write_csv(seg, 'row,log_seq,timestamp_us,segment,status', [(1, 0, 10, 0, 'ok')])
+    assert pr.read_dut(esp)['segment'] is None
+    write_csv(seg, 'row,log_seq,timestamp_us,segment,status', [(1, 0, 10, 0, 'ok'), (2, 1, 20, '', 'ambiguous')])
+    got = pr.read_dut(esp)['segment']
+    assert got[0] == 0 and math.isnan(got[1])
+
+
+def test_a_missing_decoder_program_is_not_a_missing_input_pds3_3(tmp_path, monkeypatch):
+    (tmp_path / 'frames.npz').touch()
+    monkeypatch.setattr(pr, 'tool_cmd', lambda *args: [str(tmp_path / 'no_such_program')])
+    check, _ = pr.run_check(tmp_path, False, False, None, threading.Event())
+    assert check['code'] == pp.CHK_INCONCLUSIVE and check['text'] == 'decoder failed'

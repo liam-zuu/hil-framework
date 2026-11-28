@@ -389,6 +389,7 @@ class HilDaemon:
         self._note_at = None
         self._logger_thread = None
         self._logger_proc = None            # the UDP logger of the run, for shutdown() (Sol PDS-3)
+        self._logger_spawning = False       # its Popen is running outside the lock (Sol PDS3-1)
         self._run_done = threading.Event()
         self._shutdown = threading.Event()
         self._querying = False              # idle worker has reserved the DUT for a gain_get
@@ -556,16 +557,31 @@ class HilDaemon:
         try:
             try:
                 cmd = info['argv'] = self._logger_cmd(folder)
-                # Spawn and publish under the lock (Sol PDS2-1): shutdown() either sees the
-                # handle or has set _closing first, and then no logger is started at all.
+                # Hand-over (Sol PDS2-1, PDS3-1): no spawn once shutdown() set _closing; the
+                # spawn itself runs outside the lock (STOP, snapshot, shutdown never wait on it);
+                # shutdown() waits for _logger_spawning, and a logger that appears after
+                # shutdown() began is killed here at once.
                 with self._lock:
-                    if self._closing:
-                        info['reason'] = 'daemon closing'
+                    spawn = not self._closing
+                    if spawn:
+                        self._logger_spawning = True
                     else:
+                        info['reason'] = 'daemon closing'
+                if spawn:
+                    try:
                         with (folder / 'logger.log').open('wb') as log:
                             logger = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log,
                                                       stderr=subprocess.STDOUT, text=True, **_spawn_kw())
-                        self._logger_proc = logger
+                    finally:
+                        with self._lock:
+                            self._logger_spawning = False
+                            self._logger_proc = logger
+                            late = self._closing
+                    if late and logger is not None:
+                        try:
+                            self.stop_fn(logger, 2)
+                        except OSError:
+                            pass
                 deadline = time.monotonic() + LOGGER_READY_S
                 while (logger is not None and logger.poll() is None and not self._stop_pending
                        and not self._closing and time.monotonic() < deadline):
@@ -896,7 +912,8 @@ class HilDaemon:
         while time.monotonic() < t_end:
             with self._lock:
                 if (self.state not in pp.ST_ACTIVE and self.proc is None and not self._checking
-                        and not self._probing and not self._querying and self._logger_proc is None):
+                        and not self._probing and not self._querying and self._logger_proc is None
+                        and not self._logger_spawning):
                     return not self._wedged
                 probe = self._probe_proc            # read again each time (PPI-R3-1)
             if probe is not None and probe is not killed:
