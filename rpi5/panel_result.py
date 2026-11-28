@@ -47,13 +47,20 @@ def read_dut(path):
 
 def dut_complete(dut):
     """True when the DUT log shows its run ending: a row with run_active 0 after the last row
-    with run_active 1 (Sol PDS-1, PDS-9). A log cut during the run (logger died, datagrams lost
-    at the end) is not complete; its last rows cannot vouch for the end of the run."""
+    with run_active 1, in log order and in DUT time (timestamp_us later; Sol PDS-1, PDS-9,
+    PDS2-3: a late UDP datagram from before the run is not an end). A log cut during the run
+    (logger died, datagrams lost at the end) is not complete."""
     if not dut:
         return False
     active = dut.get('run_active') or []
+    stamps = dut.get('timestamp_us') or []
+    if len(stamps) != len(active):
+        return False
     last = max((i for i, a in enumerate(active) if a == 1), default=None)
-    return last is not None and any(a == 0 for a in active[last + 1:])
+    if last is None or not math.isfinite(stamps[last]):
+        return False
+    return any(a == 0 and math.isfinite(t) and t > stamps[last]
+               for a, t in zip(active[last + 1:], stamps[last + 1:]))
 
 
 def _dut_points(dut):
@@ -250,7 +257,7 @@ def run_check(folder, fault, logger_ok, dut, cancel, timeout=120):
         elif rc == 1 and not bad:
             bad, bad_text = problems[0], f'decoder problems {len(problems)}'
         if reset_error:
-            verdict = inconclusive(reset_error, 'pos_reset_n goes back')
+            verdict = inconclusive(reset_error, 'pos_reset invalid')
         elif bad or reset:
             reason = bad or f'pos_reset_mid {reset}'
             verdict = dict(code=pp.CHK_BAD, text=_short(bad_text or reason), reason=reason)
@@ -263,5 +270,9 @@ def run_check(folder, fault, logger_ok, dut, cancel, timeout=120):
         else:
             verdict = dict(code=pp.CHK_CLEAN_NO_SPIFIX, text='SPIfix not checked')
     except (OSError, ValueError, TypeError, KeyError, IndexError) as exc:
-        verdict = inconclusive(str(exc))
+        # fixed English words on the glass (Sol PDS2-4); the decoder's own message stays in meta.json
+        text = ('no frames.npz' if isinstance(exc, FileNotFoundError) else
+                'check cancelled' if str(exc) == 'check cancelled' else
+                'decoder timeout' if str(exc) == 'decoder timeout' else 'decoder failed')
+        verdict = inconclusive(str(exc), text)
     return {**details, **verdict}, other

@@ -106,11 +106,12 @@ def decoder_double(monkeypatch, folder, rc, empty=0, crc=0):
     (False, 0, 0, 0, [4, 4, 5], pp.CHK_BAD, 'pos_reset_mid 1'),
     (False, 0, 0, 0, None, pp.CHK_INCONCLUSIVE, 'no pos_reset'),
     (True, 1, 0, 0, None, pp.CHK_INCONCLUSIVE, 'no pos_reset'),
-    (True, 0, 0, 0, [4, 4, 0], pp.CHK_INCONCLUSIVE, 'pos_reset_n goes back'),
+    (True, 0, 0, 0, [4, 4, 0], pp.CHK_INCONCLUSIVE, 'pos_reset invalid'),
 ])
 def test_verdict(tmp_path, monkeypatch, fault, rc, empty, crc, counts, code, text):
     decoder_double(monkeypatch, tmp_path, rc, empty, crc)
-    dut = dict(run_active=[0, 1, 0], motor_on=[0, 1, 1], pos_reset_n=counts) if counts else None
+    dut = (dict(timestamp_us=[0, 10, 20], run_active=[0, 1, 0], motor_on=[0, 1, 1], pos_reset_n=counts)
+           if counts else None)
     check, other = pr.run_check(tmp_path, fault, bool(dut), dut, threading.Event())
     assert check['code'] == code and check['text'].startswith(text)
     assert len(check['text'].encode('ascii')) <= 22 and check['text'].isascii()
@@ -141,7 +142,7 @@ def test_decoder_failure_never_clean(tmp_path, monkeypatch, script, timeout, rea
 ])
 def test_clean_needs_the_whole_dut_log(tmp_path, monkeypatch, logger_ok, active, counts, code, text):
     # Sol PDS-1: a logger that died during the run cannot vouch for pos_reset_n 0
-    dut = dict(run_active=active, motor_on=[0, 1, 1], pos_reset_n=counts)
+    dut = dict(timestamp_us=[0, 10, 20], run_active=active, motor_on=[0, 1, 1], pos_reset_n=counts)
     for fault in (False, True):
         folder = tmp_path / str(fault)
         folder.mkdir()
@@ -149,3 +150,27 @@ def test_clean_needs_the_whole_dut_log(tmp_path, monkeypatch, logger_ok, active,
         check, _ = pr.run_check(folder, fault, logger_ok, dut, threading.Event())
         assert check['code'] == code and check['text'].startswith(text)
         assert check['dut_log_complete'] == (logger_ok and active[-1] == 0)
+
+
+def test_a_late_datagram_from_before_the_run_is_not_its_end_pds2_3(tmp_path, monkeypatch):
+    # Sol PDS2-3: UDP order (200000, 1), (300000, 1), (100000, 0): the inactive row is older
+    dut = dict(timestamp_us=[200000, 300000, 100000], run_active=[1, 1, 0], motor_on=[1, 1, 1],
+               pos_reset_n=[4, 4, 4], pos_x_ref=[0, .1, 0], pos_y_ref=[0]*3, pos_x=[0]*3, pos_y=[0]*3)
+    assert not pr.dut_complete(dut)
+    assert pr.dut_complete({**dut, 'timestamp_us': [200000, 300000, 400000]})
+    decoder_double(monkeypatch, tmp_path, 0)
+    check, _ = pr.run_check(tmp_path, False, True, dut, threading.Event())
+    assert check['code'] == pp.CHK_INCONCLUSIVE and check['text'].startswith('DUT log incomplete')
+
+
+@pytest.mark.parametrize('script,text', [
+    ('import sys; sys.stderr.write("lỗi đầu vào"); sys.exit(2)', 'decoder failed'),
+    ('import time; time.sleep(60)', 'decoder timeout'),
+])
+def test_decoder_failure_text_is_fixed_english_pds2_4(tmp_path, monkeypatch, script, text):
+    (tmp_path / 'frames.npz').touch()
+    monkeypatch.setattr(pr, 'tool_cmd', lambda *args: [sys.executable, '-c', script])
+    check, _ = pr.run_check(tmp_path, False, False, None, threading.Event(), .5)
+    assert check['code'] == pp.CHK_INCONCLUSIVE and check['text'] == text
+    check, _ = pr.run_check(tmp_path / 'none', False, False, None, threading.Event())
+    assert check['text'] == 'no frames.npz'

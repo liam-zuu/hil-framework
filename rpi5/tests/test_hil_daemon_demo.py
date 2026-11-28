@@ -408,6 +408,64 @@ def test_shutdown_never_leaves_the_logger_alive(tmp_path, monkeypatch, udp):
     assert logger.poll() is not None
 
 
+@pytest.mark.parametrize('closing_first', [False, True])
+def test_shutdown_during_logger_spawn_in_prepare_pds2_1(tmp_path, monkeypatch, udp, closing_first):
+    # Sol PDS2-1: shutdown() while the worker is inside the logger spawn (PREPARE, no handle yet)
+    # must still stop that logger; a shutdown that came first means no logger is spawned
+    d = daemon(tmp_path, dut_ip=IP)
+    script = ("import pathlib,sys,time\n"
+              "pathlib.Path(sys.argv[1]).write_text('{}')\n"
+              "time.sleep(60)\n")  # ignores the STOP line: only a kill ends it
+    d._logger_cmd = lambda folder: [sys.executable, '-c', script, str(folder / 'logger_ready.json')]
+    d.stop_term_s = d.stop_kill_s = 5.0
+    entered, release, spawned = threading.Event(), threading.Event(), []
+    popen = hd.subprocess.Popen
+
+    def spawn(cmd, **kw):
+        if script in cmd:
+            entered.set()
+            assert release.wait(5)
+            spawned.append(popen(cmd, **kw))
+            return spawned[-1]
+        return popen(cmd, **kw)
+
+    monkeypatch.setattr(hd.subprocess, 'Popen', spawn)
+    if closing_first:
+        # shutdown() sets _closing while the worker is still building the logger command
+        cmd = d._logger_cmd
+        ahead, go = threading.Event(), threading.Event()
+
+        def slow_cmd(folder):
+            ahead.set()
+            assert go.wait(5)
+            return cmd(folder)
+
+        d._logger_cmd = slow_cmd
+        release.set()
+    assert d.start(0) == pp.RES_OK
+    if closing_first:
+        assert ahead.wait(5)
+        done = threading.Thread(target=d.shutdown, kwargs=dict(wait_s=3.0))
+        done.start()
+        time.sleep(0.2)
+        assert d._closing
+        go.set()
+        done.join(10)
+        assert not done.is_alive()
+        assert spawned == [] and run_meta(d)['logger']['reason'] == 'daemon closing'
+    else:
+        assert entered.wait(5)
+        assert d.state == pp.ST_PREPARE and d._logger_proc is None
+        done = threading.Thread(target=d.shutdown, kwargs=dict(wait_s=1.0))
+        done.start()
+        time.sleep(1.5)                         # past wait_s: shutdown() must wait for the spawn
+        release.set()
+        done.join(10)
+        assert not done.is_alive()
+        time.sleep(0.5)
+        assert len(spawned) == 1 and spawned[0].poll() is not None
+
+
 def test_unready_logger_is_reaped_and_run_proceeds(tmp_path, monkeypatch, udp):
     d = daemon(tmp_path, dut_ip=IP)
     d._logger_cmd = lambda folder: [sys.executable, '-c', 'import sys; sys.stdin.readline()']

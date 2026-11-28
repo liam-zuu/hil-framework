@@ -504,3 +504,25 @@ def test_foreign_version_frames_give_one_operator_line_per_change_pds13():
     seen = log_foreign(parser, seen, lines.append)
     seen = log_foreign(parser, seen, lines.append)
     assert seen == 1 and lines == ['panel sends protocol v6, Pi speaks v7: reflash the panel (1 frames ignored)']
+
+
+def test_serve_logs_a_foreign_version_panel_pds2_5():
+    # Sol PDS2-5: the line comes out of the real serve() loop, not only the helper
+    import struct
+    from panel_link import serve
+    v6 = bytearray(pp.encode_cmd(1, 1, pp.CMD_STOP))
+    v6[1] = 6
+    v6[-2:] = struct.pack('<H', pp.crc16(bytes(v6[:-2])))
+
+    class Port:
+        def __init__(self):
+            self.chunks = [bytes(v6)]
+
+        def read(self, n):
+            return self.chunks.pop(0) if self.chunks else b''
+
+    lines = []
+    link = PanelLink(5, FakeRun(), lambda b: len(b))
+    serve(Port(), link, stop_after_s=0.2, on_log=lines.append)
+    assert [l for l in lines if 'reflash' in l] == [
+        'panel sends protocol v6, Pi speaks v7: reflash the panel (1 frames ignored)']

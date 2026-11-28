@@ -556,13 +556,19 @@ class HilDaemon:
         try:
             try:
                 cmd = info['argv'] = self._logger_cmd(folder)
-                with (folder / 'logger.log').open('wb') as log:
-                    logger = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
-                                              text=True, **_spawn_kw())
+                # Spawn and publish under the lock (Sol PDS2-1): shutdown() either sees the
+                # handle or has set _closing first, and then no logger is started at all.
                 with self._lock:
-                    self._logger_proc = logger
+                    if self._closing:
+                        info['reason'] = 'daemon closing'
+                    else:
+                        with (folder / 'logger.log').open('wb') as log:
+                            logger = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log,
+                                                      stderr=subprocess.STDOUT, text=True, **_spawn_kw())
+                        self._logger_proc = logger
                 deadline = time.monotonic() + LOGGER_READY_S
-                while logger.poll() is None and not self._stop_pending and time.monotonic() < deadline:
+                while (logger is not None and logger.poll() is None and not self._stop_pending
+                       and not self._closing and time.monotonic() < deadline):
                     if ready.is_file():
                         info['ready'] = True
                         break
